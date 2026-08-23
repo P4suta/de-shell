@@ -1,0 +1,80 @@
+name: Bug report
+description: Report reproducible behavior that differs from de-shell's contract.
+title: "bug: "
+labels:
+  - bug
+  - triage
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not disclose vulnerabilities here. Use the private security reporting
+        link in the issue chooser or follow SECURITY.md.
+  - type: input
+    id: version
+    attributes:
+      label: de-shell version or commit
+      placeholder: 0.1.0 or a full commit SHA
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Linux
+        - macOS
+        - Windows
+        - Multiple platforms
+    validations:
+      required: true
+  - type: dropdown
+    id: shell
+    attributes:
+      label: Source shell
+      options:
+        - POSIX sh
+        - Bash
+        - zsh
+        - fish
+        - PowerShell
+        - cmd
+        - Nushell
+        - Unknown or trace-only adapter
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Include the smallest script, project config, scenario, and command that reproduce the issue.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected observations
+      description: Include exit code, stdout/stderr, filesystem, process, and network effects that matter.
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual observations
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Sanitized diagnostics
+      description: Remove secrets, credentials, private source, and personal data before attaching logs or evidence.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Pre-submission checks
+      options:
+        - label: I searched existing issues and discussions.
+          required: true
+        - label: This report contains no secrets or private vulnerability details.
+          required: true

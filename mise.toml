@@ -1,0 +1,91 @@
+[tools]
+opam = "2.5.2"
+actionlint = "1.7.12"
+rust = "1.98.0"
+powershell = "7.6.5"
+gh = "2.96.0"
+
+[env]
+CARGO_BUILD_JOBS = "1"
+
+[tasks.setup]
+description = "Create the project-local OCaml 5.5 switch and install dependencies"
+run = [
+  "opam init --cli=2.5 --bare --no-setup --yes",
+  "opam switch create . 5.5.0 --cli=2.5 --deps-only --with-test --with-dev-setup --locked --yes || opam install . --cli=2.5 --switch=. --deps-only --with-test --with-dev-setup --locked --yes",
+]
+
+[tasks.build]
+description = "Build de-shell"
+run = [
+  "opam exec --switch=. -- dune build -j 1",
+  "cargo build --locked --manifest-path adapters/nushell/Cargo.toml",
+]
+
+[tasks.deshell]
+description = "Run the project-local deshell CLI"
+run = "opam exec --switch=. -- dune exec deshell --"
+
+[tasks.lint]
+description = "Lint package metadata and GitHub Actions"
+run = [
+  "opam lint de-shell.opam de-shell.opam.locked",
+  "actionlint .github/workflows/ci.yml .github/workflows/dependency-review.yml .github/workflows/scorecard.yml",
+]
+
+[tasks."github:apply"]
+description = "Apply the canonical GitHub repository settings and Rulesets"
+run = "pwsh -NoLogo -NoProfile -File scripts/github-repository.ps1 -Mode Apply -Repository P4suta/de-shell"
+
+[tasks."github:verify"]
+description = "Verify GitHub repository settings and Rulesets against the canonical policy"
+run = "pwsh -NoLogo -NoProfile -File scripts/github-repository.ps1 -Mode Verify -Repository P4suta/de-shell"
+
+[tasks."test:fast"]
+description = "Run deterministic unit and property tests"
+run = "opam exec --switch=. -- dune build -j 1 @test-fast"
+
+[tasks."test:contract"]
+description = "Run CLI, schema, and adapter contract tests"
+run = [
+  "cargo test --locked --manifest-path adapters/nushell/Cargo.toml",
+  "opam exec --switch=. -- dune build -j 1 @test-contract",
+]
+
+[tasks."test:adapters"]
+description = "Run official parser adapter contracts"
+run = "cargo test --locked --manifest-path adapters/nushell/Cargo.toml"
+
+[tasks."test:platform"]
+description = "Run platform-facing tests"
+run = "opam exec --switch=. -- dune build -j 1 @test-platform"
+
+[tasks."test:differential"]
+description = "Run differential behavior tests"
+run = "opam exec --switch=. -- dune build -j 1 @test-differential"
+
+[tasks."test:security"]
+description = "Run security regression tests"
+run = "opam exec --switch=. -- dune build -j 1 @test-security"
+
+[tasks.test]
+description = "Run the complete test suite"
+run = [
+  "cargo test --locked --manifest-path adapters/nushell/Cargo.toml",
+  "opam exec --switch=. -- dune build -j 1 @test-all",
+]
+
+[tasks.package]
+description = "Build the installable opam package"
+run = [
+  "opam exec --switch=. -- dune build -j 1 -p de-shell",
+  "opam exec --switch=. -- dune exec ./test/package_check.bc -- _build/install/default",
+]
+
+[tasks.fmt]
+description = "Format OCaml and Dune sources"
+run = "opam exec --switch=. -- dune fmt || opam exec --switch=. -- dune fmt"
+
+[tasks."fmt:check"]
+description = "Check OCaml and Dune source formatting"
+run = "opam exec --switch=. -- dune build @fmt"

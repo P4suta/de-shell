@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Private vulnerability report
+    url: https://github.com/P4suta/de-shell/security/advisories/new
+    about: Report exploitable security issues privately; never open a public issue.
+  - name: Support and usage questions
+    url: https://github.com/P4suta/de-shell/discussions/categories/q-a
+    about: Ask for help using de-shell or interpreting its evidence.
+  - name: Design discussion
+    url: https://github.com/P4suta/de-shell/discussions/categories/ideas
+    about: Discuss an early idea before filing a concrete proposal.

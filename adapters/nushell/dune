@@ -1,0 +1,15 @@
+(rule
+ (targets deshell-nushell-adapter.exe)
+ (deps
+  Cargo.toml
+  Cargo.lock
+  (source_tree src))
+ (action
+  (progn
+   (run cargo build --locked --release --manifest-path Cargo.toml)
+   (copy target/release/deshell-nushell-adapter%{ext_exe} %{targets}))))
+
+(install
+ (package de-shell)
+ (section libexec)
+ (files deshell-nushell-adapter.exe))

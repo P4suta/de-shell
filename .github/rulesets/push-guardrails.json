@@ -1,0 +1,28 @@
+{
+  "name": "Repository push guardrails",
+  "target": "push",
+  "enforcement": "active",
+  "bypass_actors": [],
+  "conditions": {
+    "ref_name": {
+      "include": [
+        "~ALL"
+      ],
+      "exclude": []
+    }
+  },
+  "rules": [
+    {
+      "type": "max_file_path_length",
+      "parameters": {
+        "max_file_path_length": 240
+      }
+    },
+    {
+      "type": "max_file_size",
+      "parameters": {
+        "max_file_size": 10
+      }
+    }
+  ]
+}

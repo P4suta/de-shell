@@ -1,0 +1,5 @@
+(install
+ (package de-shell)
+ (section libexec)
+ (files
+  (adapter.ps1 as deshell-powershell-adapter.ps1)))

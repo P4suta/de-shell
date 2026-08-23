@@ -1,0 +1,29 @@
+* text=auto
+
+*.ml text eol=lf
+*.mli text eol=lf
+*.rs text eol=lf
+*.ps1 text eol=lf
+*.sh text eol=lf
+*.json text eol=lf
+*.toml text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.md text eol=lf
+*.opam text eol=lf
+*.locked text eol=lf
+dune text eol=lf
+dune-project text eol=lf
+LICENSE text eol=lf
+
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.gz binary

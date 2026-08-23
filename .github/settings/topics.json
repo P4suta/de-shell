@@ -1,0 +1,14 @@
+{
+  "names": [
+    "automation",
+    "behavioral-compiler",
+    "devtools",
+    "effect-system",
+    "migration",
+    "ocaml",
+    "program-analysis",
+    "shell",
+    "static-analysis",
+    "tdd"
+  ]
+}

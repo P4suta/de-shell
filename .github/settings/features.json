@@ -1,0 +1,6 @@
+{
+  "vulnerability_alerts": true,
+  "dependabot_security_updates": true,
+  "private_vulnerability_reporting": true,
+  "immutable_releases": true
+}

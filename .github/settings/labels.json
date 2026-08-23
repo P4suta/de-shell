@@ -1,0 +1,87 @@
+[
+  {
+    "name": "adapter",
+    "color": "5319E7",
+    "description": "Interpreter or protocol adapter"
+  },
+  {
+    "name": "breaking-change",
+    "color": "B60205",
+    "description": "Requires an explicit compatibility decision"
+  },
+  {
+    "name": "bug",
+    "color": "D73A4A",
+    "description": "Confirmed or reported defect"
+  },
+  {
+    "name": "compiler",
+    "color": "1D76DB",
+    "description": "Parsing, lowering, IR, rewrite, or verification"
+  },
+  {
+    "name": "dependencies",
+    "color": "0366D6",
+    "description": "Dependency or toolchain update"
+  },
+  {
+    "name": "documentation",
+    "color": "0075CA",
+    "description": "Documentation-only change"
+  },
+  {
+    "name": "enhancement",
+    "color": "A2EEEF",
+    "description": "New or improved behavior"
+  },
+  {
+    "name": "exporter",
+    "color": "0E8A16",
+    "description": "Internal, Dagger, Nushell, or CWL output"
+  },
+  {
+    "name": "github-actions",
+    "color": "000000",
+    "description": "GitHub Actions dependency or workflow"
+  },
+  {
+    "name": "good first issue",
+    "color": "7057FF",
+    "description": "Scoped for a first contribution"
+  },
+  {
+    "name": "help wanted",
+    "color": "008672",
+    "description": "Maintainers welcome focused assistance"
+  },
+  {
+    "name": "ocaml",
+    "color": "EC6813",
+    "description": "OCaml implementation or ecosystem"
+  },
+  {
+    "name": "runtime",
+    "color": "006B75",
+    "description": "Runner, observation, sandbox, or replay"
+  },
+  {
+    "name": "rust",
+    "color": "DEA584",
+    "description": "Rust Nushell adapter or agent"
+  },
+  {
+    "name": "security",
+    "color": "B60205",
+    "description": "Security hardening or advisory remediation"
+  },
+  {
+    "name": "skip-changelog",
+    "color": "EDEDED",
+    "description": "Exclude from generated release notes"
+  },
+  {
+    "name": "triage",
+    "color": "FBCA04",
+    "description": "Needs reproduction, scope, or priority decision"
+  }
+]

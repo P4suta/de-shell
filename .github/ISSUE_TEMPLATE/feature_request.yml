@@ -1,0 +1,44 @@
+name: Feature request
+description: Propose a compiler, adapter, runtime, exporter, or workflow capability.
+title: "proposal: "
+labels:
+  - enhancement
+  - triage
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: Describe the automation or migration outcome that is currently impossible or unsafe.
+    validations:
+      required: true
+  - type: textarea
+    id: contract
+    attributes:
+      label: Proposed user-facing contract
+      description: Show the intended CLI, adapter protocol, IR, or exported behavior.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: semantics
+    attributes:
+      label: Behavioral and guarantee implications
+      description: Explain source shells, platforms, effects, evidence levels, residual behavior, and compatibility.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: true
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope checks
+      options:
+        - label: This keeps equivalent rewrite and behavior-changing modernization separate.
+          required: true
+        - label: Unsupported behavior will remain explicit rather than being silently dropped.
+          required: true

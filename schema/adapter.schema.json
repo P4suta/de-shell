@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://deshell.dev/schema/adapter/v1",
+  "title": "de-shell Adapter JSON-RPC Envelope",
+  "type": "object",
+  "oneOf": [
+    {
+      "type": "object",
+      "required": ["jsonrpc", "id", "method", "params"],
+      "properties": {
+        "jsonrpc": { "const": "2.0" },
+        "id": { "type": ["integer", "string"] },
+        "method": {
+          "enum": [
+            "deshell.handshake",
+            "frontend.detect",
+            "frontend.parse",
+            "frontend.instrument",
+            "frontend.lower",
+            "frontend.rewrite",
+            "frontend.emit",
+            "discoverer.discover",
+            "discoverer.patch",
+            "observer.run",
+            "exporter.export",
+            "synthesizer.propose"
+          ]
+        },
+        "params": { "type": "object" }
+      },
+      "additionalProperties": true
+    },
+    {
+      "type": "object",
+      "required": ["jsonrpc", "id"],
+      "properties": {
+        "jsonrpc": { "const": "2.0" },
+        "id": { "type": ["integer", "string", "null"] },
+        "result": { "type": "object" },
+        "error": {
+          "type": "object",
+          "required": ["code", "message"],
+          "properties": {
+            "code": { "type": "integer" },
+            "message": { "type": "string" },
+            "data": true
+          },
+          "additionalProperties": true
+        }
+      },
+      "oneOf": [
+        { "required": ["result"] },
+        { "required": ["error"] }
+      ],
+      "additionalProperties": true
+    }
+  ]
+}

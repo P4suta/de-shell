@@ -1,0 +1,14 @@
+cff-version: 1.2.0
+message: If you use de-shell, cite the software and the exact release or commit.
+title: de-shell
+type: software
+authors:
+  - name: de-shell contributors
+repository-code: https://github.com/P4suta/de-shell
+url: https://github.com/P4suta/de-shell
+license: Apache-2.0
+version: 0.1.0
+abstract: >-
+  A behavioral compiler that inventories shell automation, lowers supported
+  behavior into a typed Effect IR, and preserves unsupported behavior as
+  explicit executable residual capsules.

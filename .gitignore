@@ -1,0 +1,10 @@
+/_build/
+/_opam/
+/adapters/nushell/target/
+/.opam-switch/
+/.tools/
+/.opam-root/
+*.install
+*.merlin
+.DS_Store
+Thumbs.db

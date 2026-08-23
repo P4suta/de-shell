@@ -1,0 +1,4 @@
+(library
+ (name deshell)
+ (public_name de-shell.lib)
+ (libraries cmdliner threads unix yojson))

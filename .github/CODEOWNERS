@@ -1,0 +1,13 @@
+# The default owner also covers files not listed more specifically below.
+* @P4suta
+
+# Changes to repository policy and supply-chain automation require owner review.
+/.github/ @P4suta
+/.github/workflows/ @P4suta
+/.github/rulesets/ @P4suta
+/scripts/github-repository.ps1 @P4suta
+/mise.toml @P4suta
+/mise.lock @P4suta
+/de-shell.opam @P4suta
+/de-shell.opam.locked @P4suta
+/SECURITY.md @P4suta
