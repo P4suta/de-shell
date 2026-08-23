@@ -33,16 +33,17 @@ let classification_of_kind = function
   | Scanner.Candidate -> Candidate
 
 let locator_line locator =
-  match String.rindex_opt locator ':' with
-  | None -> None
-  | Some separator ->
-      begin try
-        Some
-          (int_of_string
-             (String.sub locator (separator + 1)
-                (String.length locator - separator - 1)))
-      with Failure _ -> None
-      end
+  if String.starts_with ~prefix:"source:" locator then
+    match String.split_on_char ':' locator with
+    | [ "source"; _language; line; _column ] -> int_of_string_opt line
+    | _ -> None
+  else
+    match String.rindex_opt locator ':' with
+    | None -> None
+    | Some separator ->
+        int_of_string_opt
+          (String.sub locator (separator + 1)
+             (String.length locator - separator - 1))
 
 let line_at content line_number =
   if line_number <= 0 then None

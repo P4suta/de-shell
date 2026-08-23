@@ -134,6 +134,22 @@ let test_task_bindings_and_secrets_are_validated () =
         "secret declaration" true
         (List.exists (Test_support.contains ~needle:"secret missing") errors)
 
+let test_environment_may_be_declared_secret () =
+  let body =
+    Ir.node ~id:"secret-environment-body"
+      ~guarantee:(Ir.Formal { basis = "test" })
+      (Ir.Exec (Ir.exec [ "emit"; "${BUILD_TOKEN}" ]))
+  in
+  let task =
+    Ir.task ~name:"main" ~environment:[ "BUILD_TOKEN" ]
+      ~secrets:[ "BUILD_TOKEN" ] ~body ()
+  in
+  match Ir.validate_plan (Ir.plan ~entrypoint:"main" [ task ]) with
+  | Ok () -> ()
+  | Error errors ->
+      Alcotest.fail
+        ("secret-backed environment was rejected: " ^ String.concat "; " errors)
+
 let test_task_call_arguments_match_inputs () =
   let helper =
     Ir.task ~name:"helper"
@@ -328,6 +344,8 @@ let () =
             test_task_call_target_must_exist;
           Alcotest.test_case "task bindings/secrets" `Quick
             test_task_bindings_and_secrets_are_validated;
+          Alcotest.test_case "secret environment" `Quick
+            test_environment_may_be_declared_secret;
           Alcotest.test_case "task call arguments" `Quick
             test_task_call_arguments_match_inputs;
           Alcotest.test_case "source span" `Quick

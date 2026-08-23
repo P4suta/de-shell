@@ -358,22 +358,25 @@ let validate_plan plan =
         task.environment;
       List.iter
         (fun secret ->
-          match
-            List.find_opt
-              (fun (binding : binding) -> binding.name = secret)
-              task.inputs
-          with
-          | None ->
-              errors :=
-                Printf.sprintf "task %s secret %s is not an input" task.name
-                  secret
-                :: !errors
-          | Some { value_type = Secret _; _ } -> ()
-          | Some _ ->
-              errors :=
-                Printf.sprintf "task %s secret %s must use a secret type"
-                  task.name secret
-                :: !errors)
+          if List.mem secret task.environment then ()
+          else
+            match
+              List.find_opt
+                (fun (binding : binding) -> binding.name = secret)
+                task.inputs
+            with
+            | None ->
+                errors :=
+                  Printf.sprintf
+                    "task %s secret %s is not an input or environment entry"
+                    task.name secret
+                  :: !errors
+            | Some { value_type = Secret _; _ } -> ()
+            | Some _ ->
+                errors :=
+                  Printf.sprintf "task %s secret %s must use a secret type"
+                    task.name secret
+                  :: !errors)
         task.secrets;
       List.iter
         (fun (binding : binding) ->

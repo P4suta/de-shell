@@ -74,7 +74,8 @@ let config_for_extension extension =
              [
                always "child_process.exec(";
                always "childProcess.exec(";
-               always "execSync(";
+               always "child_process.execSync(";
+               always "childProcess.execSync(";
              ]
            "javascript")
   | ".go" ->
@@ -257,7 +258,7 @@ let identifier_character = function
   | 'a' .. 'z' | 'A' .. 'Z' | '0' .. '9' | '_' -> true
   | _ -> false
 
-let find_marker line marker =
+let find_marker_from line marker start =
   let marker_length = String.length marker in
   let rec loop index =
     if index + marker_length > String.length line then None
@@ -270,7 +271,9 @@ let find_marker line marker =
       if valid_boundary then Some index else loop (index + 1)
     else loop (index + 1)
   in
-  if marker = "" then None else loop 0
+  if marker = "" then None else loop start
+
+let find_marker line marker = find_marker_from line marker 0
 
 let compact value =
   value |> String.to_seq
@@ -290,21 +293,28 @@ let contains ~needle value =
   in
   needle = "" || loop 0
 
-let javascript_imports_exec content =
+let javascript_imports_binding content binding =
   let compact = compact content in
+  let instantiate pattern =
+    match String.index_opt pattern '%' with
+    | None -> pattern
+    | Some index ->
+        String.sub pattern 0 index ^ binding
+        ^ String.sub pattern (index + 2) (String.length pattern - index - 2)
+  in
   List.exists
-    (fun binding -> contains ~needle:binding compact)
+    (fun pattern -> contains ~needle:(instantiate pattern) compact)
     [
-      "import{exec}from\"node:child_process\"";
-      "import{exec}from'node:child_process'";
-      "import{exec}from\"child_process\"";
-      "import{exec}from'child_process'";
-      "const{exec}=require(\"node:child_process\")";
-      "const{exec}=require('node:child_process')";
-      "const{exec}=require(\"child_process\")";
-      "const{exec}=require('child_process')";
-      "let{exec}=require(\"node:child_process\")";
-      "let{exec}=require('node:child_process')";
+      "import{%s}from\"node:child_process\"";
+      "import{%s}from'node:child_process'";
+      "import{%s}from\"child_process\"";
+      "import{%s}from'child_process'";
+      "const{%s}=require(\"node:child_process\")";
+      "const{%s}=require('node:child_process')";
+      "const{%s}=require(\"child_process\")";
+      "const{%s}=require('child_process')";
+      "let{%s}=require(\"node:child_process\")";
+      "let{%s}=require('node:child_process')";
     ]
 
 type literal = { value : string; start : int; finish : int; delimiter : char }
@@ -464,105 +474,180 @@ let host_interpolates config line literal =
   | "csharp" | "fsharp" -> literal.start > 0 && line.[literal.start - 1] = '$'
   | _ -> false
 
-let direct_detection config line_number line masked =
-  let rec find = function
-    | [] -> None
-    | rule :: rest ->
-        begin match find_marker masked rule.marker with
-        | Some index when condition_matches masked rule.condition ->
-            let command_start = index + String.length rule.marker in
-            let kind, source =
-              match first_literal_after line command_start with
-              | Some literal
-                when not
-                       (host_interpolates config line literal
-                       || dynamic_operator_after masked literal.finish) ->
-                  (Embedded, literal.value)
-              | Some _ -> (Candidate, candidate_source line)
-              | None -> (Candidate, candidate_source line)
-            in
-            Some
-              {
-                kind;
-                interpreter = "platform-shell";
-                locator =
-                  Printf.sprintf "source:%s:%d" config.language line_number;
-                source;
-              }
-        | Some _ | None -> find rest
-        end
-  in
-  find config.direct_rules
+let source_locator config line_number column =
+  Printf.sprintf "source:%s:%08d:%08d" config.language line_number column
 
-let argv_detection config line_number line masked =
-  let detect marker anywhere =
-    match find_marker masked marker with
-    | None -> None
-    | Some index ->
-        let start = if anywhere then 0 else index + String.length marker in
-        let literals = extract_literals line start in
-        let values = List.map (fun literal -> literal.value) literals in
-        begin match recognize_argv values with
-        | No_shell -> None
-        | Dynamic interpreter ->
-            Some
-              {
-                kind = Candidate;
-                interpreter;
-                locator =
-                  Printf.sprintf "source:%s:%d" config.language line_number;
-                source = candidate_source line;
-              }
-        | Static (interpreter, _, consumed)
-          when let command_literal = List.nth literals (consumed - 1) in
-               let after_command = skip_space masked command_literal.finish in
-               List.length literals > consumed
-               || after_command < String.length masked
-                  && masked.[after_command] = ','
-               || List.exists (host_interpolates config line) literals
-               || dynamic_operator_after masked start ->
-            Some
-              {
-                kind = Candidate;
-                interpreter;
-                locator =
-                  Printf.sprintf "source:%s:%d" config.language line_number;
-                source = candidate_source line;
-              }
-        | Static (interpreter, source, _) ->
-            Some
-              {
-                kind = Embedded;
-                interpreter;
-                locator =
-                  Printf.sprintf "source:%s:%d" config.language line_number;
-                source;
-              }
-        end
+let direct_rule_allowed config masked rule index =
+  let member_receiver =
+    index > 0 && (masked.[index - 1] = '.' || masked.[index - 1] = '>')
   in
-  let rec first anywhere = function
-    | [] -> None
-    | marker :: rest ->
-        begin match detect marker anywhere with
-        | Some _ as detection -> detection
-        | None -> first anywhere rest
-        end
+  if
+    config.language = "javascript"
+    && (rule.marker = "exec(" || rule.marker = "execSync(")
+  then not member_receiver
+  else if config.language = "c-family" || config.language = "php" then
+    not member_receiver
+  else true
+
+let direct_detections config line_number line masked =
+  let statement_start index =
+    let rec loop cursor =
+      if cursor <= 0 then 0
+      else if masked.[cursor - 1] = ';' then cursor
+      else loop (cursor - 1)
+    in
+    loop index
   in
-  match first false config.argv_markers with
-  | Some _ as detection -> detection
-  | None -> first true config.argv_anywhere_markers
+  let statement_finish index =
+    match String.index_from_opt masked index ';' with
+    | Some separator -> separator
+    | None -> String.length masked
+  in
+  let detections =
+    List.concat_map
+      (fun rule ->
+        let rec find start accumulator =
+          match find_marker_from masked rule.marker start with
+          | Some index when direct_rule_allowed config masked rule index ->
+              let statement_start = statement_start index in
+              let statement_finish = statement_finish index in
+              let statement_length = statement_finish - statement_start in
+              let statement_line =
+                String.sub line statement_start statement_length
+              in
+              let statement_masked =
+                String.sub masked statement_start statement_length
+              in
+              if not (condition_matches statement_masked rule.condition) then
+                find (index + String.length rule.marker) accumulator
+              else
+                let command_start = index + String.length rule.marker in
+                let kind, source =
+                  match first_literal_after line command_start with
+                  | Some literal
+                    when not
+                           (host_interpolates config line literal
+                           || dynamic_operator_after
+                                (String.sub masked 0 statement_finish)
+                                literal.finish) ->
+                      (Embedded, literal.value)
+                  | Some _ -> (Candidate, candidate_source statement_line)
+                  | None -> (Candidate, candidate_source statement_line)
+                in
+                let detection =
+                  {
+                    kind;
+                    interpreter = "platform-shell";
+                    locator = source_locator config line_number (index + 1);
+                    source;
+                  }
+                in
+                find
+                  (index + String.length rule.marker)
+                  ((index, detection) :: accumulator)
+          | Some index -> find (index + String.length rule.marker) accumulator
+          | None -> List.rev accumulator
+        in
+        find 0 [])
+      config.direct_rules
+  in
+  detections
+  |> List.sort (fun (left, _) (right, _) -> Int.compare left right)
+  |> List.map snd
+
+let argv_detections config line_number line masked =
+  let statement_start index =
+    let rec loop cursor =
+      if cursor <= 0 then 0
+      else if masked.[cursor - 1] = ';' then cursor
+      else loop (cursor - 1)
+    in
+    loop index
+  in
+  let statement_finish index =
+    match String.index_from_opt masked index ';' with
+    | Some separator -> separator
+    | None -> String.length masked
+  in
+  let detect marker anywhere index =
+    let segment_start = if anywhere then statement_start index else index in
+    let segment_finish = statement_finish index in
+    let segment_length = segment_finish - segment_start in
+    let segment_line = String.sub line segment_start segment_length in
+    let segment_masked = String.sub masked segment_start segment_length in
+    let start =
+      if anywhere then 0 else index + String.length marker - segment_start
+    in
+    let literals = extract_literals segment_line start in
+    let values = List.map (fun literal -> literal.value) literals in
+    begin match recognize_argv values with
+    | No_shell -> None
+    | Dynamic interpreter ->
+        Some
+          {
+            kind = Candidate;
+            interpreter;
+            locator = source_locator config line_number (index + 1);
+            source = candidate_source segment_line;
+          }
+    | Static (interpreter, _, consumed)
+      when let command_literal = List.nth literals (consumed - 1) in
+           let after_command =
+             skip_space segment_masked command_literal.finish
+           in
+           List.length literals > consumed
+           || after_command < String.length segment_masked
+              && segment_masked.[after_command] = ','
+           || List.exists (host_interpolates config segment_line) literals
+           || dynamic_operator_after segment_masked start ->
+        Some
+          {
+            kind = Candidate;
+            interpreter;
+            locator = source_locator config line_number (index + 1);
+            source = candidate_source segment_line;
+          }
+    | Static (interpreter, source, _) ->
+        Some
+          {
+            kind = Embedded;
+            interpreter;
+            locator = source_locator config line_number (index + 1);
+            source;
+          }
+    end
+  in
+  let for_marker anywhere marker =
+    let rec loop start accumulator =
+      match find_marker_from masked marker start with
+      | None -> List.rev accumulator
+      | Some index ->
+          let accumulator =
+            match detect marker anywhere index with
+            | None -> accumulator
+            | Some detection -> (index, detection) :: accumulator
+          in
+          loop (index + String.length marker) accumulator
+    in
+    loop 0 []
+  in
+  List.concat_map (for_marker false) config.argv_markers
+  @ List.concat_map (for_marker true) config.argv_anywhere_markers
+  |> List.sort (fun (left, _) (right, _) -> Int.compare left right)
+  |> List.map snd
 
 let detect ~path content =
   match config_for_extension (Filename.extension path) with
   | None -> []
   | Some config ->
       let config =
-        if config.language = "javascript" && javascript_imports_exec content
-        then
-          {
-            config with
-            direct_rules = config.direct_rules @ [ always "exec(" ];
-          }
+        if config.language = "javascript" then
+          let imported =
+            [ "exec"; "execSync" ]
+            |> List.filter (javascript_imports_binding content)
+            |> List.map (fun binding -> always (binding ^ "("))
+          in
+          { config with direct_rules = config.direct_rules @ imported }
         else config
       in
       let _, detections =
@@ -571,15 +656,13 @@ let detect ~path content =
         |> List.fold_left
              (fun (in_block, detections) (line_number, line) ->
                let masked, in_block = mask_line config in_block line in
-               let detection =
-                 match direct_detection config line_number line masked with
-                 | Some _ as detection -> detection
-                 | None -> argv_detection config line_number line masked
+               let line_detections =
+                 direct_detections config line_number line masked
+                 @ argv_detections config line_number line masked
+                 |> List.sort (fun left right ->
+                     String.compare left.locator right.locator)
                in
-               ( in_block,
-                 Option.fold ~none:detections
-                   ~some:(fun value -> value :: detections)
-                   detection ))
+               (in_block, List.rev_append line_detections detections))
              (false, [])
       in
       List.rev detections

@@ -18,7 +18,9 @@ required to call a release 1.0.
 ## 0.2 POSIX vertical slice — implemented core
 
 - conservative POSIX sh/Bash lowering with precise source maps
-- literal commands, pipelines, sequences, `&&`, simple `if`, and static `for`
+- literal commands, immutable assignments, pipelines, sequences, `&&`,
+  homogeneous `||`, simple `if`, and static `for`
+- declared environment and secret propagation through nested runtime tasks
 - equivalent rewrite rules and separate modernization profiles
 - command-effect model, bounded concolic scenarios, and differential engine
 - disposable rootless OCI specification and observer agent
@@ -33,14 +35,17 @@ guess.
 - syntax-aware embedded-shell inventory and call graph
 - conservative host-language callsite inventory across major JVM, .NET,
   native, BEAM, and scripting-language families
+- separate line-and-column locators for same-line callsites and import-aware
+  JavaScript direct-shell APIs
 - exact-call-only transactional callsite replacement
 - official PowerShell AST oracle contract and conservative cmd frontend
 - Windows Sandbox hardening, agent mapping, lifecycle, and result decoding
 - Hyper-V guest-agent protocol
 - Nushell and CWL exporters with strict capability rejection
 
-The signed Hyper-V launcher and official CWL runner certification remain release
-artifacts/gates.
+The signed Hyper-V launcher and release-corpus-wide official runner
+certification remain release artifacts/gates. A representative CWL/Dagger
+artifact is already validated and executed by the optional pinned local gate.
 
 Host-language inventory is deliberately broader than host-language rewriting.
 Each syntax family needs a CST-aware patcher before its source callsites can be
@@ -60,7 +65,8 @@ macOS guest execution remain release gates.
 ## 0.9–1.0 Hardening — release gates
 
 - collect and minimize failures from real automation projects before each fix
-- validate generated Dagger and CWL artifacts with their official current tools
+- validate the complete release artifact corpus with official Dagger and CWL
+  tools (the representative pinned local gate is implemented)
 - publish a digest-pinned multi-shell lab image and record its digest in locks
 - build and sign native binaries/installers for Linux, macOS, and Windows
 - supply signed Hyper-V and Virtualization.framework launcher helpers

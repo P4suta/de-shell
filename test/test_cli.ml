@@ -285,6 +285,69 @@ let test_run_uses_project_root_as_process_cwd executable () =
     "process cwd" (Unix.realpath root)
     (Unix.realpath (String.trim ran.stdout))
 
+let test_analyze_declares_and_run_inherits_environment executable () =
+  Test_support.with_temp_dir @@ fun root ->
+  let variable = "DESHELL_CLI_API_TOKEN" in
+  let expected = "inherited-through-typed-ir" in
+  let previous = Sys.getenv_opt variable in
+  Fun.protect
+    ~finally:(fun () ->
+      Unix.putenv variable (Option.value ~default:"" previous))
+    (fun () ->
+      Unix.putenv variable expected;
+      let command =
+        if Sys.win32 then
+          Printf.sprintf "cmd.exe /d /s /c echo \"$%s\"" variable
+        else Printf.sprintf "/bin/echo \"$%s\"" variable
+      in
+      initialize_and_analyze executable root "environment.sh"
+        ("#!/bin/sh\nset -eu\n" ^ command ^ "\n");
+      let plan_path = Filename.concat root ".deshell/plan.json" in
+      let plan = Yojson.Safe.from_file plan_path in
+      let task =
+        Yojson.Safe.Util.(plan |> member "tasks" |> to_list |> List.hd)
+      in
+      let environment =
+        Yojson.Safe.Util.(task |> member "environment" |> to_list)
+        |> List.map Yojson.Safe.Util.to_string
+      in
+      Alcotest.(check (list string))
+        "declared environment" [ variable ] environment;
+      let secrets =
+        Yojson.Safe.Util.(task |> member "secrets" |> to_list)
+        |> List.map Yojson.Safe.Util.to_string
+      in
+      Alcotest.(check (list string)) "classified secret" [ variable ] secrets;
+      let run arguments =
+        let result =
+          Test_support.run_process executable
+            ([ "run"; "--root"; root ] @ arguments)
+        in
+        if result.status <> 0 then
+          Alcotest.failf "run exited %d: %s" result.status
+            (String.trim result.stderr);
+        Alcotest.(check string)
+          "inherited value" expected
+          (String.trim result.stdout)
+      in
+      run [];
+      let evidence =
+        Yojson.Safe.from_file (Filename.concat root ".deshell/evidence.json")
+      in
+      let exec_id =
+        Yojson.Safe.Util.(evidence |> member "nodes" |> to_list)
+        |> List.find_map (fun value ->
+            match
+              Yojson.Safe.Util.
+                ( value |> member "operation" |> to_string,
+                  value |> member "id" |> to_string )
+            with
+            | "exec", id -> Some id
+            | _ -> None)
+        |> Option.get
+      in
+      run [ "--node"; exec_id ])
+
 let test_trace_only_analysis_and_bridge executable () =
   Test_support.with_temp_dir @@ fun root ->
   initialize_and_analyze executable root "build.ps1" "Write-Output $env:VALUE\n";
@@ -535,6 +598,8 @@ let () =
             (test_run_and_export executable);
           Alcotest.test_case "run project cwd" `Quick
             (test_run_uses_project_root_as_process_cwd executable);
+          Alcotest.test_case "environment inheritance" `Quick
+            (test_analyze_declares_and_run_inherits_environment executable);
           Alcotest.test_case "trace-only and bridge" `Quick
             (test_trace_only_analysis_and_bridge executable);
           Alcotest.test_case "modernize preview/apply" `Quick

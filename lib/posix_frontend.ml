@@ -10,6 +10,9 @@ type result = { root : Ir.node; diagnostics : diagnostic list }
 type token = { text : string; dynamic : bool; start_byte : int; end_byte : int }
 type item = Word of token | Pipe of int | Separator of int
 
+let ( let* ) result continuation =
+  match result with Ok value -> continuation value | Error _ as error -> error
+
 let split_words value =
   value |> String.split_on_char ' '
   |> List.concat_map (String.split_on_char '\t')
@@ -140,10 +143,17 @@ let lex source =
     start_word !index;
     Buffer.add_char buffer character
   in
+  let add_literal_dollar () =
+    start_word !index;
+    Buffer.add_string buffer "$$"
+  in
   while !index < length && !failure = None do
     let character = source.[!index] in
     begin match !state with
-    | `Single -> if character = '\'' then state := `Normal else add character
+    | `Single ->
+        if character = '\'' then state := `Normal
+        else if character = '$' then add_literal_dollar ()
+        else add character
     | `Double ->
         if character = '"' then state := `Normal
         else if character = '\\' then
@@ -153,7 +163,8 @@ let lex source =
             let escaped = source.[!index + 1] in
             if List.mem escaped [ '$'; '`'; '"'; '\\'; '\n' ] then begin
               incr index;
-              if escaped <> '\n' then add escaped
+              if escaped = '$' then add_literal_dollar ()
+              else if escaped <> '\n' then add escaped
             end
             else add character
           end
@@ -178,7 +189,8 @@ let lex source =
             else begin
               start_word !index;
               incr index;
-              if source.[!index] <> '\n' then
+              if source.[!index] = '$' then Buffer.add_string buffer "$$"
+              else if source.[!index] <> '\n' then
                 Buffer.add_char buffer source.[!index]
             end
         | '#' when not !started ->
@@ -197,6 +209,18 @@ let lex source =
               Some
                 "redirection and asynchronous shell operators require a \
                  residual capsule"
+        | '['
+          when (not !started)
+               && !index + 1 < length
+               && List.mem source.[!index + 1] [ ' '; '\t'; '\r'; '\n' ] ->
+            add character
+        | ']'
+          when (not !started)
+               && (!index + 1 = length
+                  || List.mem
+                       source.[!index + 1]
+                       [ ' '; '\t'; '\r'; '\n'; ';'; '|'; '&' ]) ->
+            add character
         | '$' | '`' | '*' | '?' | '[' | ']' | '{' | '}' ->
             dynamic := true;
             add character
@@ -812,16 +836,730 @@ let parse_for ~path source start_byte end_byte =
               end
         end
 
+let line_ranges source =
+  let length = String.length source in
+  let rec loop start index accumulator =
+    if index = length then List.rev ((start, index) :: accumulator)
+    else if source.[index] = '\n' then
+      loop (index + 1) (index + 1) ((start, index) :: accumulator)
+    else loop start (index + 1) accumulator
+  in
+  if length = 0 then [] else loop 0 0 []
+
+let blank_range bytes start_byte end_byte =
+  for index = start_byte to end_byte - 1 do
+    if Bytes.get bytes index <> '\n' then Bytes.set bytes index ' '
+  done
+
+let parameter_name value =
+  valid_environment_name value
+  || value <> ""
+     && String.for_all (function '0' .. '9' -> true | _ -> false) value
+
+let static_parameter_default value =
+  not
+    (String.exists
+       (function '$' | '`' | '{' | '}' | '\n' | '\r' -> true | _ -> false)
+       value)
+
+let parameter_template bindings expression =
+  let parameter =
+    match String.index_opt expression ':' with
+    | Some separator
+      when separator + 1 < String.length expression
+           && expression.[separator + 1] = '-' ->
+        Ok
+          ( String.sub expression 0 separator,
+            Some
+              (String.sub expression (separator + 2)
+                 (String.length expression - separator - 2)) )
+    | Some _ -> Error "parameter operator is outside the strict static subset"
+    | None -> Ok (expression, None)
+  in
+  let* name, default = parameter in
+  if not (parameter_name name) then Error "invalid parameter expansion"
+  else
+    match default with
+    | Some fallback when not (static_parameter_default fallback) ->
+        Error "dynamic parameter default is outside the strict static subset"
+    | Some fallback -> Ok (Printf.sprintf "${%s:-%s}" name fallback)
+    | None ->
+        begin match List.assoc_opt name bindings with
+        | Some value -> Ok value
+        | None -> Ok ("${" ^ name ^ "}")
+        end
+
+let expand_assignment_word bindings source =
+  let length = String.length source in
+  let output = Buffer.create length in
+  let state = ref `Normal in
+  let failure = ref None in
+  let index = ref 0 in
+  let add_literal_dollar () = Buffer.add_string output "$$" in
+  let add_parameter start finish expression =
+    match parameter_template bindings expression with
+    | Error message -> failure := Some message
+    | Ok value ->
+        Buffer.add_string output value;
+        index := finish;
+        ignore start
+  in
+  let parse_parameter () =
+    if !index + 1 >= length then failure := Some "trailing parameter marker"
+    else
+      match source.[!index + 1] with
+      | '(' ->
+          failure := Some "command substitution is outside the static subset"
+      | '{' ->
+          begin match String.index_from_opt source (!index + 2) '}' with
+          | None -> failure := Some "unterminated parameter expansion"
+          | Some close ->
+              let expression =
+                String.sub source (!index + 2) (close - !index - 2)
+              in
+              add_parameter !index close expression
+          end
+      | '0' .. '9' as digit ->
+          add_parameter !index (!index + 1) (String.make 1 digit)
+      | character
+        when match character with
+             | 'A' .. 'Z' | 'a' .. 'z' | '_' -> true
+             | _ -> false ->
+          let rec finish cursor =
+            if cursor < length then
+              match source.[cursor] with
+              | 'A' .. 'Z' | 'a' .. 'z' | '0' .. '9' | '_' -> finish (cursor + 1)
+              | _ -> cursor
+            else cursor
+          in
+          let finish = finish (!index + 1) in
+          let name = String.sub source (!index + 1) (finish - !index - 1) in
+          add_parameter !index (finish - 1) name
+      | _ ->
+          failure := Some "special shell parameter is outside the static subset"
+  in
+  while !index < length && !failure = None do
+    let character = source.[!index] in
+    begin match !state with
+    | `Single ->
+        if character = '\'' then state := `Normal
+        else if character = '$' then add_literal_dollar ()
+        else Buffer.add_char output character
+    | `Double ->
+        begin match character with
+        | '"' -> state := `Normal
+        | '$' -> parse_parameter ()
+        | '`' ->
+            failure := Some "command substitution is outside the static subset"
+        | '\\' when !index + 1 < length ->
+            let escaped = source.[!index + 1] in
+            if List.mem escaped [ '$'; '`'; '"'; '\\'; '\n' ] then begin
+              incr index;
+              if escaped = '$' then add_literal_dollar ()
+              else if escaped <> '\n' then Buffer.add_char output escaped
+            end
+            else Buffer.add_char output character
+        | _ -> Buffer.add_char output character
+        end
+    | `Normal ->
+        begin match character with
+        | '\'' -> state := `Single
+        | '"' -> state := `Double
+        | '$' -> parse_parameter ()
+        | '`' ->
+            failure := Some "command substitution is outside the static subset"
+        | '\\' when !index + 1 < length ->
+            incr index;
+            if source.[!index] = '$' then add_literal_dollar ()
+            else if source.[!index] <> '\n' then
+              Buffer.add_char output source.[!index]
+        | ' ' | '\t' | '\r' | '\n' | ';' | '|' | '&' | '<' | '>' | '*' | '?'
+        | '[' | ']' ->
+            failure := Some "assignment word requires dynamic shell semantics"
+        | _ -> Buffer.add_char output character
+        end
+    end;
+    incr index
+  done;
+  match (!failure, !state) with
+  | Some message, _ -> Error message
+  | None, (`Single | `Double) -> Error "unterminated assignment quote"
+  | None, `Normal -> Ok (Buffer.contents output)
+
+let standalone_assignment line =
+  match String.index_opt line '=' with
+  | None -> None
+  | Some separator ->
+      let name = String.sub line 0 separator |> String.trim in
+      if not (valid_environment_name name) then None
+      else
+        let prefix = String.sub line 0 separator in
+        if String.trim prefix <> prefix then None
+        else
+          Some
+            ( name,
+              String.sub line (separator + 1)
+                (String.length line - separator - 1) )
+
+let strict_set line =
+  match split_words line with
+  | "set" :: options ->
+      let flags =
+        List.concat_map
+          (fun option ->
+            if String.length option > 1 && option.[0] = '-' then
+              String.sub option 1 (String.length option - 1)
+              |> String.to_seq |> List.of_seq
+            else [ '?' ])
+          options
+      in
+      options <> []
+      && List.for_all (fun flag -> flag = 'e' || flag = 'u') flags
+      && List.mem 'e' flags && List.mem 'u' flags
+  | _ -> false
+
+let marker_for source used index length =
+  let alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ" in
+  let rec candidate nonce =
+    if nonce >= 26 * 26 then None
+    else
+      let value =
+        String.init length (fun position ->
+            if position = 0 then 'Z'
+            else
+              alphabet.[(nonce + (position * 7) + (index * 11))
+                        mod String.length alphabet])
+      in
+      if contains source value || List.mem_assoc value used then
+        candidate (nonce + 1)
+      else Some value
+  in
+  candidate 0
+
+let rewrite_command_parameters ~bindings source =
+  let bytes = Bytes.of_string source in
+  let length = String.length source in
+  let mappings = ref [] in
+  let state = ref `Normal in
+  let word_started = ref false in
+  let failure = ref None in
+  let index = ref 0 in
+  let replace_parameter start finish expression =
+    match parameter_template bindings expression with
+    | Error message -> failure := Some message
+    | Ok template ->
+        let marker_length = finish - start in
+        begin match
+          marker_for source !mappings (List.length !mappings) marker_length
+        with
+        | None -> failure := Some "too many parameter references to map safely"
+        | Some marker ->
+            Bytes.blit_string marker 0 bytes start marker_length;
+            mappings := (marker, template) :: !mappings;
+            index := finish - 1
+        end
+  in
+  let parse_parameter quoted =
+    if not quoted then
+      failure :=
+        Some "unquoted parameter expansion requires field splitting semantics"
+    else if !index + 1 >= length then
+      failure := Some "trailing parameter marker"
+    else
+      match source.[!index + 1] with
+      | '(' ->
+          failure := Some "command substitution is outside the static subset"
+      | '{' ->
+          begin match String.index_from_opt source (!index + 2) '}' with
+          | None -> failure := Some "unterminated parameter expansion"
+          | Some close ->
+              let expression =
+                String.sub source (!index + 2) (close - !index - 2)
+              in
+              replace_parameter !index (close + 1) expression
+          end
+      | '0' .. '9' as digit ->
+          replace_parameter !index (!index + 2) (String.make 1 digit)
+      | character
+        when match character with
+             | 'A' .. 'Z' | 'a' .. 'z' | '_' -> true
+             | _ -> false ->
+          let rec finish cursor =
+            if cursor < length then
+              match source.[cursor] with
+              | 'A' .. 'Z' | 'a' .. 'z' | '0' .. '9' | '_' -> finish (cursor + 1)
+              | _ -> cursor
+            else cursor
+          in
+          let finish = finish (!index + 1) in
+          let name = String.sub source (!index + 1) (finish - !index - 1) in
+          replace_parameter !index finish name
+      | _ ->
+          failure := Some "special shell parameter is outside the static subset"
+  in
+  while !index < length && !failure = None do
+    let character = source.[!index] in
+    begin match !state with
+    | `Single -> if character = '\'' then state := `Normal
+    | `Double ->
+        begin match character with
+        | '"' -> state := `Normal
+        | '\\' -> incr index
+        | '$' -> parse_parameter true
+        | '`' ->
+            failure := Some "command substitution is outside the static subset"
+        | _ -> ()
+        end
+    | `Normal ->
+        begin match character with
+        | '\'' ->
+            state := `Single;
+            word_started := true
+        | '"' ->
+            state := `Double;
+            word_started := true
+        | '\\' ->
+            incr index;
+            word_started := true
+        | '#' when not !word_started ->
+            while !index < length && source.[!index] <> '\n' do
+              incr index
+            done;
+            word_started := false
+        | '$' -> parse_parameter false
+        | '`' ->
+            failure := Some "command substitution is outside the static subset"
+        | ' ' | '\t' | '\r' | '\n' | ';' | '|' | '&' -> word_started := false
+        | _ -> word_started := true
+        end
+    end;
+    incr index
+  done;
+  match (!failure, !state) with
+  | Some message, _ -> Error message
+  | None, (`Single | `Double) -> Error "unterminated command quote"
+  | None, `Normal -> Ok (Bytes.to_string bytes, List.rev !mappings)
+
+let apply_template_mappings mappings value =
+  List.fold_left
+    (fun value (marker, template) ->
+      replace_all value ~pattern:marker ~replacement:template)
+    value mappings
+
+let rec map_template_node mappings (node : Ir.node) =
+  let map = map_template_node mappings in
+  let map_value = apply_template_mappings mappings in
+  let operation =
+    match node.operation with
+    | Ir.Exec command ->
+        Ir.Exec
+          {
+            argv = List.map map_value command.argv;
+            environment =
+              List.map
+                (fun (name, value) -> (name, map_value value))
+                command.environment;
+            working_directory = Option.map map_value command.working_directory;
+          }
+    | Ir.Pipeline nodes -> Ir.Pipeline (List.map map nodes)
+    | Ir.Sequence nodes -> Ir.Sequence (List.map map nodes)
+    | Ir.Parallel nodes -> Ir.Parallel (List.map map nodes)
+    | Ir.Condition { predicate; if_true; if_false } ->
+        Ir.Condition
+          {
+            predicate = map predicate;
+            if_true = map if_true;
+            if_false = Option.map map if_false;
+          }
+    | Ir.Match { value; cases; default } ->
+        Ir.Match
+          {
+            value = map_value value;
+            cases = List.map (fun (pattern, body) -> (pattern, map body)) cases;
+            default = Option.map map default;
+          }
+    | Ir.For_each { variable; items; body } ->
+        Ir.For_each
+          { variable; items = List.map map_value items; body = map body }
+    | Ir.Try_finally { body; finalizer } ->
+        Ir.Try_finally { body = map body; finalizer = map finalizer }
+    | Ir.Task_call call ->
+        Ir.Task_call
+          {
+            call with
+            arguments =
+              List.map
+                (fun (name, value) -> (name, map_value value))
+                call.arguments;
+          }
+    | Ir.File_read value -> Ir.File_read (map_value value)
+    | Ir.File_write write ->
+        Ir.File_write
+          {
+            write with
+            path = map_value write.path;
+            contents = map_value write.contents;
+          }
+    | Ir.File_remove value -> Ir.File_remove (map_value value)
+    | Ir.Network_request request ->
+        Ir.Network_request
+          { method_ = map_value request.method_; uri = map_value request.uri }
+    | Ir.Opaque_capsule capsule -> Ir.Opaque_capsule capsule
+  in
+  { node with operation }
+
+let fail_fast_sequence ~path ~source nodes =
+  let next_id = ref 0 in
+  let rec chain = function
+    | [] ->
+        Ir.node
+          ~id:(make_id ~path ~index:69_999 source)
+          ~guarantee:(Ir.Formal { basis = "posix-strict-empty-v1" })
+          (Ir.Sequence [])
+    | [ node ] -> node
+    | predicate :: rest ->
+        incr next_id;
+        let node_index = 70_000 + !next_id in
+        let if_true = chain rest in
+        let source_span =
+          match (predicate.Ir.source, if_true.Ir.source) with
+          | Some first, Some last -> Some (cover_spans first last)
+          | Some span, None | None, Some span -> Some span
+          | None, None -> None
+        in
+        Ir.node ?source:source_span
+          ~id:(make_id ~path ~index:node_index source)
+          ~guarantee:(Ir.Formal { basis = "posix-set-e-fail-fast-v1" })
+          (Ir.Condition { predicate; if_true; if_false = None })
+  in
+  chain nodes
+
+let next_line_start source end_byte =
+  if end_byte < String.length source && source.[end_byte] = '\n' then
+    end_byte + 1
+  else end_byte
+
+let line_text source (start_byte, end_byte) =
+  String.sub source start_byte (end_byte - start_byte)
+
+let line_is_if value =
+  let value = String.trim value in
+  value = "if" || String.starts_with ~prefix:"if " value
+
+let line_is_keyword keyword value = String.trim value = keyword
+
+let line_continues value =
+  let value = String.trim value in
+  List.exists
+    (fun suffix -> String.ends_with ~suffix value)
+    [ "\\"; "&&"; "||"; "|" ]
+
+let strict_statement_ranges source start_byte end_byte =
+  let lines =
+    line_ranges source
+    |> List.filter (fun (start, finish) ->
+        finish > start_byte && start < end_byte)
+  in
+  let rec take_if depth finish = function
+    | [] -> Error "multiline if is missing fi"
+    | ((line_start, line_end) as line) :: rest ->
+        let text = line_text source line in
+        if line_is_if text then take_if (depth + 1) line_end rest
+        else if line_is_keyword "fi" text then
+          if depth = 1 then Ok (line_end, rest)
+          else take_if (depth - 1) line_end rest
+        else take_if depth (max finish line_end) rest
+  in
+  let rec take_continuation finish previous = function
+    | [] ->
+        if line_continues previous then
+          Error "continued command is missing its next line"
+        else Ok (finish, [])
+    | ((_, line_end) as line) :: rest ->
+        if not (line_continues previous) then Ok (finish, line :: rest)
+        else
+          let text = line_text source line in
+          take_continuation line_end text rest
+  in
+  let rec collect accumulator = function
+    | [] -> Ok (List.rev accumulator)
+    | ((line_start, line_end) as line) :: rest ->
+        let text = line_text source line in
+        let trimmed = String.trim text in
+        if trimmed = "" || String.starts_with ~prefix:"#" trimmed then
+          collect accumulator rest
+        else if line_is_if text && not (contains trimmed "; fi") then
+          begin match take_if 1 line_end rest with
+          | Error _ as error -> error
+          | Ok (finish, remaining) ->
+              collect ((line_start, finish) :: accumulator) remaining
+          end
+        else if
+          List.exists
+            (fun keyword -> line_is_keyword keyword text)
+            [ "then"; "else"; "elif"; "fi" ]
+        then Error ("unexpected shell control keyword: " ^ trimmed)
+        else
+          begin match take_continuation line_end text rest with
+          | Error _ as error -> error
+          | Ok (finish, remaining) ->
+              collect ((line_start, finish) :: accumulator) remaining
+          end
+  in
+  collect [] lines
+
+let first_non_space source start_byte end_byte =
+  let rec loop index =
+    if index >= end_byte then end_byte
+    else
+      match source.[index] with
+      | ' ' | '\t' | '\r' | '\n' -> loop (index + 1)
+      | _ -> index
+  in
+  loop start_byte
+
+let rec lower_strict_range ~path ~source start_byte end_byte =
+  let start_byte, end_byte = trim_bounds source start_byte end_byte in
+  if start_byte = end_byte then Error "strict command is empty"
+  else if starts_at source ~offset:start_byte "if " then
+    begin match parse_if ~path source start_byte end_byte with
+    | Some result when result.diagnostics = [] && not (has_residual result.root)
+      ->
+        Ok result.root
+    | Some _ | None ->
+        lower_strict_multiline_if ~path ~source start_byte end_byte
+    end
+  else
+    let within_range operator =
+      match find_top_level source ~from:start_byte operator with
+      | Some separator when separator < end_byte -> Some separator
+      | Some _ | None -> None
+    in
+    match (within_range "&&", within_range "||") with
+    | Some _, Some _ -> Error "mixed && and || chains require explicit grouping"
+    | Some separator, None ->
+        let* predicate =
+          lower_strict_range ~path ~source start_byte separator
+        in
+        let* if_true =
+          lower_strict_range ~path ~source (separator + 2) end_byte
+        in
+        let span = span_for_range ~path source ~start_byte ~end_byte in
+        Ok
+          (Ir.node
+             ~id:(make_id ~path ~index:(80_000 + start_byte) source)
+             ~guarantee:(Ir.Formal { basis = "posix-strict-and-condition-v1" })
+             ~source:span
+             (Ir.Condition { predicate; if_true; if_false = None }))
+    | None, Some separator ->
+        let* predicate =
+          lower_strict_range ~path ~source start_byte separator
+        in
+        let* if_false =
+          lower_strict_range ~path ~source (separator + 2) end_byte
+        in
+        let success =
+          Ir.node
+            ~id:(make_id ~path ~index:(85_000 + separator) source)
+            ~guarantee:
+              (Ir.Formal { basis = "posix-strict-or-short-circuit-v1" })
+            ~source:
+              (span_for_range ~path source ~start_byte:separator
+                 ~end_byte:(separator + 2))
+            (Ir.Sequence [])
+        in
+        let span = span_for_range ~path source ~start_byte ~end_byte in
+        Ok
+          (Ir.node
+             ~id:(make_id ~path ~index:(86_000 + start_byte) source)
+             ~guarantee:(Ir.Formal { basis = "posix-strict-or-condition-v1" })
+             ~source:span
+             (Ir.Condition
+                { predicate; if_true = success; if_false = Some if_false }))
+    | None, None -> lower_fragment ~path ~source start_byte end_byte
+
+and lower_strict_sequence ~path ~source start_byte end_byte =
+  let* ranges = strict_statement_ranges source start_byte end_byte in
+  let rec lower accumulator = function
+    | [] -> Ok (List.rev accumulator)
+    | (start_byte, end_byte) :: rest ->
+        let* node = lower_strict_range ~path ~source start_byte end_byte in
+        lower (node :: accumulator) rest
+  in
+  let* nodes = lower [] ranges in
+  Ok (fail_fast_sequence ~path ~source nodes)
+
+and lower_strict_multiline_if ~path ~source start_byte end_byte =
+  let lines =
+    line_ranges source
+    |> List.filter (fun (start, finish) ->
+        finish > start_byte && start < end_byte)
+  in
+  match lines with
+  | [] -> Error "multiline if is empty"
+  | (first_start, first_end) :: rest ->
+      let first_keyword = first_non_space source first_start first_end in
+      if
+        first_keyword + 2 > first_end
+        || not (starts_at source ~offset:first_keyword "if")
+      then Error "multiline if does not start with if"
+      else
+        let predicate_start =
+          first_non_space source (first_keyword + 2) first_end
+        in
+        let then_line = ref None in
+        let else_line = ref None in
+        let fi_line = ref None in
+        let depth = ref 1 in
+        let failure = ref None in
+        List.iter
+          (fun ((line_start, line_end) as line) ->
+            if !failure = None && !fi_line = None then
+              let text = line_text source line in
+              if line_is_if text then incr depth
+              else if line_is_keyword "fi" text then
+                if !depth = 1 then fi_line := Some (line_start, line_end)
+                else decr depth
+              else if !depth = 1 && line_is_keyword "then" text then
+                if !then_line = None then
+                  then_line := Some (line_start, line_end)
+                else failure := Some "multiline if has multiple then keywords"
+              else if !depth = 1 && line_is_keyword "else" text then
+                if !then_line = None then
+                  failure := Some "multiline if has else before then"
+                else if !else_line = None then
+                  else_line := Some (line_start, line_end)
+                else failure := Some "multiline if has multiple else keywords"
+              else if !depth = 1 && line_is_keyword "elif" text then
+                failure := Some "elif is outside the strict static subset")
+          rest;
+        begin match (!failure, !then_line, !fi_line) with
+        | Some message, _, _ -> Error message
+        | None, None, _ -> Error "multiline if is missing then"
+        | None, _, None -> Error "multiline if is missing fi"
+        | None, Some (then_start, then_end), Some (fi_start, _) ->
+            let* predicate =
+              lower_strict_range ~path ~source predicate_start then_start
+            in
+            let true_end =
+              Option.fold ~none:fi_start
+                ~some:(fun (start, _) -> start)
+                !else_line
+            in
+            let* if_true =
+              lower_strict_sequence ~path ~source
+                (next_line_start source then_end)
+                true_end
+            in
+            let* if_false =
+              match !else_line with
+              | Some (_, else_end) ->
+                  let* branch =
+                    lower_strict_sequence ~path ~source
+                      (next_line_start source else_end)
+                      fi_start
+                  in
+                  Ok (Some branch)
+              | None ->
+                  Ok
+                    (Some
+                       (Ir.node
+                          ~id:
+                            (make_id ~path ~index:(85_000 + start_byte) source)
+                          ~guarantee:
+                            (Ir.Formal
+                               { basis = "posix-if-no-match-success-v1" })
+                          ~source:
+                            (span_for_range ~path source ~start_byte:fi_start
+                               ~end_byte:fi_start)
+                          (Ir.Sequence [])))
+            in
+            Ok
+              (Ir.node
+                 ~id:(make_id ~path ~index:(86_000 + start_byte) source)
+                 ~guarantee:
+                   (Ir.Formal { basis = "posix-strict-multiline-if-v1" })
+                 ~source:(span_for_range ~path source ~start_byte ~end_byte)
+                 (Ir.Condition { predicate; if_true; if_false }))
+        end
+
+let lower_strict_script ~path source =
+  let rewritten = Bytes.of_string source in
+  let bindings = ref [] in
+  let in_header = ref true in
+  let found_strict_set = ref false in
+  let failure = ref None in
+  List.iter
+    (fun (start_byte, end_byte) ->
+      if !failure = None then
+        let line = String.sub source start_byte (end_byte - start_byte) in
+        let trimmed = String.trim line in
+        if !in_header then
+          if trimmed = "" || String.starts_with ~prefix:"#" trimmed then ()
+          else if String.starts_with ~prefix:"set " trimmed then
+            if strict_set trimmed then begin
+              found_strict_set := true;
+              blank_range rewritten start_byte end_byte
+            end
+            else
+              failure :=
+                Some "shell options are outside the strict static subset"
+          else
+            match standalone_assignment line with
+            | Some (name, word) ->
+                begin match expand_assignment_word !bindings word with
+                | Error message -> failure := Some message
+                | Ok value ->
+                    bindings :=
+                      (name, value) :: List.remove_assoc name !bindings;
+                    blank_range rewritten start_byte end_byte
+                end
+            | None -> in_header := false
+        else
+          match standalone_assignment line with
+          | Some _ ->
+              failure :=
+                Some
+                  "assignment after an executable command requires mutable \
+                   shell state"
+          | None -> ())
+    (line_ranges source);
+  if not !found_strict_set then None
+  else
+    Some
+      (match !failure with
+      | Some reason -> residual ~path ~source ~reason ()
+      | None ->
+          begin match
+            rewrite_command_parameters ~bindings:!bindings
+              (Bytes.to_string rewritten)
+          with
+          | Error reason -> residual ~path ~source ~reason ()
+          | Ok (rewritten, mappings) ->
+              begin match
+                lower_strict_sequence ~path ~source:rewritten 0
+                  (String.length rewritten)
+              with
+              | Error reason -> residual ~path ~source ~reason ()
+              | Ok root ->
+                  let root = map_template_node mappings root in
+                  { root; diagnostics = [] }
+              end
+          end)
+
 let lower ~path source =
-  let start_byte, end_byte = trim_bounds source 0 (String.length source) in
-  match parse_if ~path source start_byte end_byte with
+  match lower_strict_script ~path source with
   | Some result -> result
-  | None ->
-      begin match parse_for ~path source start_byte end_byte with
+  | None -> (
+      let start_byte, end_byte = trim_bounds source 0 (String.length source) in
+      match parse_if ~path source start_byte end_byte with
       | Some result -> result
       | None ->
-          begin match parse_and ~path source start_byte end_byte with
+          begin match parse_for ~path source start_byte end_byte with
           | Some result -> result
-          | None -> lower_basic ~path source
-          end
-      end
+          | None ->
+              begin match parse_and ~path source start_byte end_byte with
+              | Some result -> result
+              | None -> lower_basic ~path source
+              end
+          end)
