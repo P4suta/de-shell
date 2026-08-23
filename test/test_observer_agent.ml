@@ -18,7 +18,9 @@ let test_combines_process_and_filesystem_observation () =
   Test_support.with_temp_dir @@ fun root ->
   Test_support.write_file (Filename.concat root "changed") "before";
   let execute request =
-    Alcotest.(check string) "working directory" root request.Observer_agent.cwd;
+    Alcotest.(check string)
+      "working directory" (Unix.realpath root)
+      (Unix.realpath request.Observer_agent.cwd);
     Test_support.write_file (Filename.concat root "changed") "after";
     Test_support.write_file (Filename.concat root "created") "new";
     Ok

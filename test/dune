@@ -96,6 +96,7 @@
   ../CHANGELOG.md
   ../CODE_OF_CONDUCT.md
   ../GOVERNANCE.md
+  ../mise.toml
   ../SECURITY.md
   ../SUPPORT.md
   ../.github/CODEOWNERS
@@ -110,8 +111,8 @@
   ../.github/workflows/scorecard.yml
   ../.github/rulesets/default-branch.json
   ../.github/rulesets/release-tags.json
-  ../.github/rulesets/push-guardrails.json
   ../.github/settings/repository.json
+  ../.github/settings/capabilities.json
   ../.github/settings/topics.json
   ../.github/settings/actions.json
   ../.github/settings/selected-actions.json
@@ -119,7 +120,10 @@
   ../.github/settings/fork-approval.json
   ../.github/settings/features.json
   ../.github/settings/labels.json
+  ../adapters/nushell/dune
   ../scripts/github-repository.ps1
+  ../scripts/repository-guardrails.ps1
+  test_repository_guardrails.ps1
   ../schema/effect-ir.schema.json
   ../schema/evidence.schema.json
   ../schema/adapter.schema.json)
@@ -147,6 +151,14 @@
     DESHELL_REPOSITORY_ROOT
     %{workspace_root}
     (run %{exe:test_repository_policy.bc}))
+   (run
+    pwsh
+    -NoLogo
+    -NoProfile
+    -File
+    %{dep:test_repository_guardrails.ps1}
+    -GuardrailScript
+    %{dep:../scripts/repository-guardrails.ps1})
    (run %{exe:test_exporter.bc})
    (setenv
     DESHELL_PROCESS_AGENT

@@ -153,6 +153,12 @@ versioned JSON-RPC 2.0 over stdin/stdout with message limits and forward-compati
 unknown fields. Exporters are strict by default and reject any node they cannot
 represent.
 
+Repository governance follows the same explicit-capability rule: branch and
+release-tag Rulesets are enforced natively. GitHub does not expose push Rulesets
+for this public, personal-account repository, so the required CI gate enforces
+the equivalent tracked-file size and path-length guardrails and records the
+platform limitation in `.github/settings/capabilities.json`.
+
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the TDD contract and
 [ROADMAP.md](ROADMAP.md) for the remaining release-only gates. Support questions
 belong in [Discussions](https://github.com/P4suta/de-shell/discussions), and

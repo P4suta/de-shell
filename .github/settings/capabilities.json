@@ -1,0 +1,9 @@
+{
+  "push_ruleset": {
+    "status": "unavailable",
+    "reason": "GitHub rejects push Rulesets for public repositories and for repositories owned by a personal account",
+    "fallback": "The required CI gate runs mise run repository:guardrails on every push and pull request",
+    "max_file_size_mib": 10,
+    "max_file_path_length": 240
+  }
+}

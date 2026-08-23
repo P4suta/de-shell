@@ -45,6 +45,13 @@ mise run github:verify
 The apply task changes remote repository settings and therefore requires an
 authenticated `gh` session with repository administration permission.
 
+GitHub does not offer push-target Rulesets to public repositories owned by a
+personal account. The canonical capability record in
+`.github/settings/capabilities.json` preserves that residual reason. The required
+CI gate enforces the intended 10 MiB file-size and 240-character path limits via
+`mise run repository:guardrails`; if the repository is transferred to an
+organization, maintainers should reevaluate native push Rulesets.
+
 The repository pins opam, Rust, PowerShell, and actionlint through mise. Do not
 replace those tools with unpinned host versions in tests or release scripts.
 Build and test commands deliberately use one OCaml/Rust job so the same workflow

@@ -11,6 +11,10 @@ CARGO_BUILD_JOBS = "1"
 [tasks.setup]
 description = "Create the project-local OCaml 5.5 switch and install dependencies"
 run = [
+  "opam init --cli=2.5 --bare --no-setup --no",
+  "opam switch create . 5.5.0 --cli=2.5 --deps-only --with-test --with-dev-setup --locked --assume-depexts --yes || opam install . --cli=2.5 --switch=. --deps-only --with-test --with-dev-setup --locked --assume-depexts --yes",
+]
+run_windows = [
   "opam init --cli=2.5 --bare --no-setup --yes",
   "opam switch create . 5.5.0 --cli=2.5 --deps-only --with-test --with-dev-setup --locked --yes || opam install . --cli=2.5 --switch=. --deps-only --with-test --with-dev-setup --locked --yes",
 ]
@@ -29,9 +33,14 @@ run = "opam exec --switch=. -- dune exec deshell --"
 [tasks.lint]
 description = "Lint package metadata and GitHub Actions"
 run = [
+  "mise run repository:guardrails",
   "opam lint de-shell.opam de-shell.opam.locked",
   "actionlint .github/workflows/ci.yml .github/workflows/dependency-review.yml .github/workflows/scorecard.yml",
 ]
+
+[tasks."repository:guardrails"]
+description = "Reject tracked files over 10 MiB or paths over 240 characters"
+run = "pwsh -NoLogo -NoProfile -File scripts/repository-guardrails.ps1"
 
 [tasks."github:apply"]
 description = "Apply the canonical GitHub repository settings and Rulesets"

@@ -11,13 +11,13 @@ let read_file path =
     (fun () -> really_input_string channel (in_channel_length channel))
 
 let rec remove_tree path =
-  if Sys.file_exists path then
-    if Sys.is_directory path then begin
+  match Unix.lstat path with
+  | exception Unix.Unix_error (Unix.ENOENT, _, _) -> ()
+  | { Unix.st_kind = Unix.S_DIR; _ } ->
       Sys.readdir path
       |> Array.iter (fun name -> remove_tree (Filename.concat path name));
       Unix.rmdir path
-    end
-    else Sys.remove path
+  | _ -> Sys.remove path
 
 let with_temp_dir f =
   let marker = Filename.temp_file "deshell-test-" "" in

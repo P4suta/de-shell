@@ -13,15 +13,17 @@ let read relative =
     ~finally:(fun () -> close_in_noerr channel)
     (fun () -> really_input_string channel (in_channel_length channel))
 
-let contains haystack needle =
+let substring_index haystack needle =
   let haystack_length = String.length haystack in
   let needle_length = String.length needle in
   let rec loop index =
-    if index + needle_length > haystack_length then false
-    else if String.sub haystack index needle_length = needle then true
+    if index + needle_length > haystack_length then None
+    else if String.sub haystack index needle_length = needle then Some index
     else loop (index + 1)
   in
-  needle_length = 0 || loop 0
+  if needle_length = 0 then Some 0 else loop 0
+
+let contains haystack needle = Option.is_some (substring_index haystack needle)
 
 let required_files () =
   [
@@ -40,8 +42,8 @@ let required_files () =
     ".github/workflows/scorecard.yml";
     ".github/rulesets/default-branch.json";
     ".github/rulesets/release-tags.json";
-    ".github/rulesets/push-guardrails.json";
     ".github/settings/repository.json";
+    ".github/settings/capabilities.json";
     ".github/settings/topics.json";
     ".github/settings/actions.json";
     ".github/settings/selected-actions.json";
@@ -49,7 +51,9 @@ let required_files () =
     ".github/settings/fork-approval.json";
     ".github/settings/features.json";
     ".github/settings/labels.json";
+    "adapters/nushell/dune";
     "scripts/github-repository.ps1";
+    "scripts/repository-guardrails.ps1";
     "SECURITY.md";
     "SUPPORT.md";
     "CODE_OF_CONDUCT.md";
@@ -131,6 +135,17 @@ let default_branch_ruleset () =
   in
   check bool "default branch selected" true
     (List.mem "~DEFAULT_BRANCH" includes);
+  let bypass_actors =
+    member "bypass_actors" ruleset |> Yojson.Safe.Util.to_list
+  in
+  check int "one pull-request-only bypass actor" 1 (List.length bypass_actors);
+  let bypass_actor = List.hd bypass_actors in
+  check string "repository admin bypass role" "RepositoryRole"
+    (member "actor_type" bypass_actor |> Yojson.Safe.Util.to_string);
+  check int "repository admin role id" 5
+    (member "actor_id" bypass_actor |> Yojson.Safe.Util.to_int);
+  check string "bypass requires a pull request" "pull_request"
+    (member "bypass_mode" bypass_actor |> Yojson.Safe.Util.to_string);
   let types = rule_types ruleset in
   [
     "deletion";
@@ -156,6 +171,37 @@ let default_branch_ruleset () =
   in
   check bool "stable required CI gate" true (List.mem "Required gate" contexts)
 
+let release_tag_ruleset () =
+  let ruleset = json ".github/rulesets/release-tags.json" in
+  check string "tag target" "tag"
+    (member "target" ruleset |> Yojson.Safe.Util.to_string);
+  check string "tag enforcement" "active"
+    (member "enforcement" ruleset |> Yojson.Safe.Util.to_string);
+  let includes =
+    member "conditions" ruleset
+    |> member "ref_name" |> member "include" |> strings
+  in
+  check (list string) "release tag namespace" [ "refs/tags/v*" ] includes;
+  let types = rule_types ruleset in
+  [ "deletion"; "non_fast_forward"; "required_signatures" ]
+  |> List.iter (fun rule ->
+      check bool ("release tag rule " ^ rule) true (List.mem rule types))
+
+let push_guardrail_fallback () =
+  let capabilities = json ".github/settings/capabilities.json" in
+  let push_ruleset = member "push_ruleset" capabilities in
+  check string "push Ruleset capability" "unavailable"
+    (member "status" push_ruleset |> Yojson.Safe.Util.to_string);
+  check int "fallback maximum file size" 10
+    (member "max_file_size_mib" push_ruleset |> Yojson.Safe.Util.to_int);
+  check int "fallback maximum path length" 240
+    (member "max_file_path_length" push_ruleset |> Yojson.Safe.Util.to_int);
+  let mise = read "mise.toml" in
+  check bool "mise exposes repository guardrail task" true
+    (contains mise "[tasks.\"repository:guardrails\"]");
+  check bool "lint executes repository guardrails" true
+    (contains mise "mise run repository:guardrails")
+
 let repository_security_settings () =
   let actions = json ".github/settings/actions.json" in
   check bool "Actions enabled" true
@@ -171,6 +217,47 @@ let repository_security_settings () =
       check string setting "enabled"
         (member setting security |> member "status"
        |> Yojson.Safe.Util.to_string))
+
+let github_reconciliation_handles_unordered_topics () =
+  let script = read "scripts/github-repository.ps1" in
+  check bool "topics are compared as an unordered string set" true
+    (contains script
+       "Assert-StringSetEqual -Expected $expectedTopics.names -Actual \
+        $topicsState.names")
+
+let ci_bootstraps_platform_dependencies () =
+  let ci = read ".github/workflows/ci.yml" in
+  check bool "mise Rust is materialized before opam" true
+    (contains ci "rustc --version"
+    && contains ci "cargo --version"
+    && Option.value ~default:max_int (substring_index ci "cargo --version")
+       < Option.value ~default:max_int
+           (substring_index ci "run: mise run setup"));
+  check bool "Linux installs the opam sandbox dependency" true
+    (contains ci "sudo apt-get install --yes apparmor bubblewrap");
+  check bool "Linux-only package installation" true
+    (contains ci "if: runner.os == 'Linux'");
+  check bool "Linux keeps opam bubblewrap sandboxing enabled" true
+    (contains ci "apparmor_parser --replace" && contains ci "userns,");
+  let mise = read "mise.toml" in
+  check bool "mise-owned depexts are explicit to opam" true
+    (contains mise "--assume-depexts");
+  check bool "Unix sandbox failure is fail-closed" true
+    (contains mise "opam init --cli=2.5 --bare --no-setup --no");
+  check bool "Windows preserves opam-managed MinGW depexts" true
+    (contains mise "run_windows = ["
+    && contains mise
+         "--with-dev-setup --locked --yes || opam install . --cli=2.5 \
+          --switch=.")
+
+let rust_adapter_package_rule_is_hermetic () =
+  let dune = read "adapters/nushell/dune" in
+  check bool "Cargo output is a declared directory target" true
+    (contains dune "(dir cargo-target)");
+  check bool "Cargo uses an explicit target directory" true
+    (contains dune "--target-dir");
+  check bool "generated Cargo artifact is not a static copy dependency" false
+    (contains dune "(copy target/release")
 
 let ownership_and_ci () =
   let owners = read ".github/CODEOWNERS" in
@@ -189,7 +276,15 @@ let suite =
     test_case "workflow actions use immutable SHAs" `Quick
       workflow_actions_are_pinned;
     test_case "default branch ruleset" `Quick default_branch_ruleset;
+    test_case "release tag ruleset" `Quick release_tag_ruleset;
+    test_case "push guardrail fallback" `Quick push_guardrail_fallback;
     test_case "repository security settings" `Quick repository_security_settings;
+    test_case "unordered GitHub topics" `Quick
+      github_reconciliation_handles_unordered_topics;
+    test_case "platform dependency bootstrap" `Quick
+      ci_bootstraps_platform_dependencies;
+    test_case "hermetic Rust adapter package" `Quick
+      rust_adapter_package_rule_is_hermetic;
     test_case "ownership and stable CI" `Quick ownership_and_ci;
   ]
 

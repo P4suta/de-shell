@@ -274,12 +274,13 @@ let test_run_and_export executable () =
 
 let test_run_uses_project_root_as_process_cwd executable () =
   Test_support.with_temp_dir @@ fun root ->
-  let source = if Sys.win32 then "cmd.exe /d /s /c cd\n" else "pwd\n" in
+  let source = if Sys.win32 then "cmd.exe /d /s /c cd\n" else "/bin/pwd\n" in
   initialize_and_analyze executable root
     (if Sys.win32 then "cwd.cmd" else "cwd.sh")
     source;
   let ran = Test_support.run_process executable [ "run"; "--root"; root ] in
-  Alcotest.(check int) "run exit" 0 ran.status;
+  if ran.status <> 0 then
+    Alcotest.failf "run exited %d: %s" ran.status (String.trim ran.stderr);
   Alcotest.(check string)
     "process cwd" (Unix.realpath root)
     (Unix.realpath (String.trim ran.stdout))

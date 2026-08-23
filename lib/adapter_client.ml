@@ -67,6 +67,16 @@ let connect_process ~program ~arguments ~timeout_seconds ~max_bytes () =
           ignore (process_status pid)
         end
       in
+      let terminate_before_join () =
+        if Atomic.compare_and_set alive true false then begin
+          (try Unix.kill pid Sys.sigkill with Unix.Unix_error _ -> ());
+          close_noerr parent_stdin;
+          (* Reap the child before joining: its closed stdout releases the
+             blocked reader on Windows without closing that descriptor from a
+             competing thread. *)
+          try ignore (Unix.waitpid [] pid) with Unix.Unix_error _ -> ()
+        end
+      in
       let disconnected () =
         "adapter process disconnected" ^ process_status pid
       in
@@ -174,7 +184,9 @@ let connect_process ~program ~arguments ~timeout_seconds ~max_bytes () =
                 Thread.join worker;
                 result
             | None ->
-                terminate ();
+                terminate_before_join ();
+                Thread.join worker;
+                close_noerr parent_stdout;
                 Error
                   (Printf.sprintf "adapter process timed out after %.3g seconds"
                      timeout_seconds)

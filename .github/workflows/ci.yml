@@ -38,6 +38,26 @@ jobs:
           version: 2026.8.6
           cache: true
 
+      - name: Materialize mise Rust toolchain
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Install Linux opam sandbox dependency
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes apparmor bubblewrap
+          sudo tee /etc/apparmor.d/deshell-bwrap > /dev/null <<'APPARMOR'
+          abi <abi/4.0>,
+          include <tunables/global>
+
+          /usr/bin/bwrap flags=(unconfined) {
+            userns,
+          }
+          APPARMOR
+          sudo apparmor_parser --replace /etc/apparmor.d/deshell-bwrap
+
       - name: Create project-local OCaml switch
         run: mise run setup
 
