@@ -28,6 +28,30 @@ url = "https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_
 url_api = "https://api.github.com/repos/rhysd/actionlint/releases/assets/384924919"
 provenance = "github-attestations"
 
+[[tools.dagger]]
+version = "0.21.8"
+backend = "aqua:dagger/dagger"
+
+[tools.dagger."platforms.linux-x64"]
+checksum = "sha256:53e226c7da8fb75171e58c35759d736d961ce8b3a12db0baa7b7107954fccc5a"
+url = "https://github.com/dagger/dagger/releases/download/v0.21.8/dagger_v0.21.8_linux_amd64.tar.gz"
+url_api = "https://api.github.com/repos/dagger/dagger/releases/assets/494303910"
+
+[tools.dagger."platforms.macos-arm64"]
+checksum = "sha256:f3f37a831afd53d09bf9c9a9df63492c16ad43622e5c197d9815e82f334ef1c4"
+url = "https://github.com/dagger/dagger/releases/download/v0.21.8/dagger_v0.21.8_darwin_arm64.tar.gz"
+url_api = "https://api.github.com/repos/dagger/dagger/releases/assets/494303909"
+
+[tools.dagger."platforms.macos-x64"]
+checksum = "sha256:4759befe3fa951fd2ba05551306023df7e8c7fc9eff57bb823481803cb44b215"
+url = "https://github.com/dagger/dagger/releases/download/v0.21.8/dagger_v0.21.8_darwin_amd64.tar.gz"
+url_api = "https://api.github.com/repos/dagger/dagger/releases/assets/494303906"
+
+[tools.dagger."platforms.windows-x64"]
+checksum = "sha256:7452d17f7f6b01d409fe27b8fd1655162b5b4d2cd531c704f2373e62eba512d5"
+url = "https://github.com/dagger/dagger/releases/download/v0.21.8/dagger_v0.21.8_windows_amd64.zip"
+url_api = "https://api.github.com/repos/dagger/dagger/releases/assets/494303907"
+
 [[tools.gh]]
 version = "2.96.0"
 backend = "aqua:cli/cli"

@@ -169,6 +169,264 @@ let test_dynamic_foreach_is_residual () =
       Alcotest.(check string) "source retained" source capsule.source
   | _ -> Alcotest.fail "dynamic iteration space must remain residual"
 
+let test_strict_script_dataflow () =
+  let source =
+    "#!/bin/sh\n\
+     set -eu\n\
+     destination=${1:-target/oracle}\n\
+     archive=\"$destination/ncurses.tar.gz\"\n\
+     mkdir -p \"$destination\"\n\
+     printf '%s\\n' \"$archive\"\n"
+  in
+  let result = Posix_frontend.lower ~path:"fetch.sh" source in
+  Alcotest.(check (list string))
+    "no diagnostics" []
+    (List.map
+       (fun diagnostic -> diagnostic.Posix_frontend.message)
+       result.diagnostics);
+  match result.root.operation with
+  | Ir.Condition { predicate; if_true; if_false = None } ->
+      expect_exec predicate [ "mkdir"; "-p"; "${1:-target/oracle}" ];
+      expect_exec if_true
+        [ "printf"; "%s\\n"; "${1:-target/oracle}/ncurses.tar.gz" ];
+      begin match (predicate.source, if_true.source) with
+      | Some predicate_span, Some branch_span ->
+          Alcotest.(check int)
+            "predicate source line" 5 predicate_span.start_line;
+          Alcotest.(check int) "branch source line" 6 branch_span.start_line
+      | _ -> Alcotest.fail "strict lowered nodes must retain source maps"
+      end
+  | _ ->
+      Alcotest.fail
+        "set -e script must lower immutable assignments to a fail-fast \
+         condition"
+
+let test_strict_script_command_substitution_is_residual () =
+  let source =
+    "#!/bin/sh\nset -eu\nvalue=$(date)\nprintf '%s\\n' \"$value\"\n"
+  in
+  let result = Posix_frontend.lower ~path:"dynamic-assignment.sh" source in
+  match (result.root.operation, result.root.guarantee) with
+  | Ir.Opaque_capsule capsule, Ir.Residual _ ->
+      Alcotest.(check string) "lossless source" source capsule.source
+  | _ -> Alcotest.fail "command substitution must remain a residual capsule"
+
+let test_strict_multiline_if_from_real_automation () =
+  let source =
+    "#!/bin/sh\n\
+     set -eu\n\
+     destination=${1:-target/oracle}\n\
+     archive=\"$destination/ncurses.tar.gz\"\n\
+     if [ -f \"$archive\" ] &&\n\
+     verify \"$archive\"\n\
+     then\n\
+     printf '%s\\n' \"reuse $archive\"\n\
+     else\n\
+     fetch --output \"$archive\"\n\
+     fi\n\
+     unpack \"$archive\" \"$destination\"\n"
+  in
+  let result = Posix_frontend.lower ~path:"fetch-real.sh" source in
+  Alcotest.(check bool)
+    "real strict automation is non-residual" false
+    (Posix_frontend.has_residual result.root);
+  begin match
+    Ir.validate_plan
+      (Ir.plan ~entrypoint:"main" [ Ir.task ~name:"main" ~body:result.root () ])
+  with
+  | Ok () -> ()
+  | Error errors ->
+      Alcotest.fail
+        ("strict automation produced invalid IR: " ^ String.concat "; " errors)
+  end;
+  match result.root.operation with
+  | Ir.Condition
+      {
+        predicate =
+          {
+            operation =
+              Ir.Condition
+                {
+                  predicate = { operation = Ir.Condition _; _ };
+                  if_false = Some _;
+                  _;
+                };
+            _;
+          };
+        if_true = { operation = Ir.Exec _; _ };
+        if_false = None;
+      } ->
+      ()
+  | _ ->
+      Alcotest.fail
+        "strict script must preserve top-level fail-fast and multiline if \
+         control"
+
+let test_strict_fail_fast_node_ids_are_unique () =
+  let result =
+    Posix_frontend.lower ~path:"strict-sequence.sh"
+      "#!/bin/sh\nset -eu\nprintf one\nprintf two\nprintf three\nprintf four\n"
+  in
+  match
+    Ir.validate_plan
+      (Ir.plan ~entrypoint:"main" [ Ir.task ~name:"main" ~body:result.root () ])
+  with
+  | Ok () -> ()
+  | Error errors ->
+      Alcotest.fail
+        ("strict sequence produced invalid IR: " ^ String.concat "; " errors)
+
+let test_strict_fail_fast_execution () =
+  let result =
+    Posix_frontend.lower ~path:"strict-failure.sh"
+      "#!/bin/sh\nset -eu\nfail-now\nmust-not-run\n"
+  in
+  let calls = ref [] in
+  let backend : Runner.backend =
+    {
+      execute =
+        (fun request ->
+          calls := request.argv :: !calls;
+          Ok
+            Runner.
+              {
+                exit_code = (if request.argv = [ "fail-now" ] then 9 else 0);
+                stdout = "";
+                stderr = "";
+              });
+      read_file = (fun _ -> Error "unused");
+      write_file = (fun ~path:_ ~contents:_ ~append:_ -> Error "unused");
+      remove_file = (fun _ -> Error "unused");
+      network_request = (fun ~method_:_ ~uri:_ -> Error "unused");
+    }
+  in
+  let plan =
+    Ir.plan ~entrypoint:"main" [ Ir.task ~name:"main" ~body:result.root () ]
+  in
+  begin match Runner.run_plan ~backend ~policy:Runner.default_policy plan with
+  | Error message -> Alcotest.fail message
+  | Ok observation ->
+      Alcotest.(check int) "first failure returned" 9 observation.exit_code
+  end;
+  Alcotest.(check (list (list string)))
+    "later command skipped" [ [ "fail-now" ] ] (List.rev !calls)
+
+let test_strict_unsafe_state_stays_residual () =
+  let cases =
+    [
+      ("unquoted expansion", "#!/bin/sh\nset -eu\nvalue=ok\nprintf %s $value\n");
+      ( "late assignment",
+        "#!/bin/sh\n\
+         set -eu\n\
+         printf first\n\
+         value=second\n\
+         printf '%s' \"$value\"\n" );
+      ( "mutating parameter operator",
+        "#!/bin/sh\nset -eu\nprintf '%s' \"${MODE:=default}\"\n" );
+      ("unsupported option", "#!/bin/sh\nset -eux\nprintf traced\n");
+    ]
+  in
+  List.iter
+    (fun (label, source) ->
+      let result = Posix_frontend.lower ~path:(label ^ ".sh") source in
+      Alcotest.(check bool)
+        (label ^ " remains residual")
+        true
+        (Posix_frontend.has_residual result.root);
+      match result.root.operation with
+      | Ir.Opaque_capsule capsule ->
+          Alcotest.(check string) (label ^ " source") source capsule.source
+      | _ -> Alcotest.fail (label ^ " was partially lowered unsafely"))
+    cases
+
+let test_bracket_command_and_glob_boundary () =
+  let condition =
+    Posix_frontend.lower ~path:"bracket.sh" "[ -f ready ] && printf ready\n"
+  in
+  begin match condition.root.operation with
+  | Ir.Condition { predicate; _ } ->
+      expect_exec predicate [ "["; "-f"; "ready"; "]" ]
+  | _ -> Alcotest.fail "standalone [ command must lower as a condition"
+  end;
+  let glob = Posix_frontend.lower ~path:"glob.sh" "printf '%s\\n' [ab]\n" in
+  Alcotest.(check bool)
+    "bracket glob remains dynamic" true
+    (Posix_frontend.has_residual glob.root)
+
+let test_single_quoted_template_is_literal () =
+  let result =
+    Posix_frontend.lower ~path:"literal-template.sh"
+      "printf '%s\\n' '${HOME}'\n"
+  in
+  expect_exec result.root [ "printf"; "%s\\n"; "$${HOME}" ]
+
+let test_strict_literal_dollars_survive_dataflow () =
+  let result =
+    Posix_frontend.lower ~path:"literal-dataflow.sh"
+      "#!/bin/sh\n\
+       set -eu\n\
+       literal='${HOME}'\n\
+       printf '%s:%s\\n' \"$literal\" \"\\${HOME}\"\n"
+  in
+  expect_exec result.root [ "printf"; "%s:%s\\n"; "$${HOME}"; "$${HOME}" ]
+
+let test_strict_or_short_circuit_execution () =
+  let lowered =
+    Posix_frontend.lower ~path:"or.sh"
+      "#!/bin/sh\nset -eu\nprobe || fallback\nafter\n"
+  in
+  Alcotest.(check bool)
+    "static OR is non-residual" false
+    (Posix_frontend.has_residual lowered.root);
+  let run probe_status =
+    let calls = ref [] in
+    let backend : Runner.backend =
+      {
+        execute =
+          (fun request ->
+            calls := request.argv :: !calls;
+            Ok
+              Runner.
+                {
+                  exit_code =
+                    (if request.argv = [ "probe" ] then probe_status else 0);
+                  stdout = "";
+                  stderr = "";
+                });
+        read_file = (fun _ -> Error "unused");
+        write_file = (fun ~path:_ ~contents:_ ~append:_ -> Error "unused");
+        remove_file = (fun _ -> Error "unused");
+        network_request = (fun ~method_:_ ~uri:_ -> Error "unused");
+      }
+    in
+    let plan =
+      Ir.plan ~entrypoint:"main" [ Ir.task ~name:"main" ~body:lowered.root () ]
+    in
+    begin match Runner.run_plan ~backend ~policy:Runner.default_policy plan with
+    | Error message -> Alcotest.fail message
+    | Ok observation ->
+        Alcotest.(check int) "final status" 0 observation.exit_code
+    end;
+    List.rev !calls
+  in
+  Alcotest.(check (list (list string)))
+    "failure runs fallback"
+    [ [ "probe" ]; [ "fallback" ]; [ "after" ] ]
+    (run 7);
+  Alcotest.(check (list (list string)))
+    "success skips fallback"
+    [ [ "probe" ]; [ "after" ] ]
+    (run 0)
+
+let test_strict_mixed_and_or_stays_residual () =
+  let result =
+    Posix_frontend.lower ~path:"mixed-boolean.sh"
+      "#!/bin/sh\nset -eu\nfirst && second || third\n"
+  in
+  Alcotest.(check bool)
+    "mixed associativity is not guessed" true
+    (Posix_frontend.has_residual result.root)
+
 let () =
   Alcotest.run "POSIX frontend"
     [
@@ -194,5 +452,27 @@ let () =
           Alcotest.test_case "static foreach" `Quick test_static_foreach;
           Alcotest.test_case "dynamic foreach" `Quick
             test_dynamic_foreach_is_residual;
+          Alcotest.test_case "strict script dataflow" `Quick
+            test_strict_script_dataflow;
+          Alcotest.test_case "strict dynamic assignment" `Quick
+            test_strict_script_command_substitution_is_residual;
+          Alcotest.test_case "strict multiline if" `Quick
+            test_strict_multiline_if_from_real_automation;
+          Alcotest.test_case "strict unique node IDs" `Quick
+            test_strict_fail_fast_node_ids_are_unique;
+          Alcotest.test_case "strict fail-fast execution" `Quick
+            test_strict_fail_fast_execution;
+          Alcotest.test_case "strict unsafe state" `Quick
+            test_strict_unsafe_state_stays_residual;
+          Alcotest.test_case "bracket command boundary" `Quick
+            test_bracket_command_and_glob_boundary;
+          Alcotest.test_case "single-quoted template literal" `Quick
+            test_single_quoted_template_is_literal;
+          Alcotest.test_case "strict literal dollar dataflow" `Quick
+            test_strict_literal_dollars_survive_dataflow;
+          Alcotest.test_case "strict OR execution" `Quick
+            test_strict_or_short_circuit_execution;
+          Alcotest.test_case "strict mixed boolean residual" `Quick
+            test_strict_mixed_and_or_stays_residual;
         ] );
     ]

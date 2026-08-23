@@ -4,6 +4,7 @@ actionlint = "1.7.12"
 rust = "1.98.0"
 powershell = "7.6.5"
 gh = "2.96.0"
+dagger = "0.21.8"
 
 [env]
 CARGO_BUILD_JOBS = "1"
@@ -64,6 +65,10 @@ run = [
 [tasks."test:adapters"]
 description = "Run official parser adapter contracts"
 run = "cargo test --locked --manifest-path adapters/nushell/Cargo.toml"
+
+[tasks."test:official-exporters"]
+description = "Validate a representative export with mise-pinned official tools"
+run = "pwsh -NoLogo -NoProfile -File scripts/validate-official-exporters.ps1"
 
 [tasks."test:platform"]
 description = "Run platform-facing tests"

@@ -465,13 +465,14 @@ let select_node plan node_id =
                   (fun found node ->
                     match found with
                     | Some _ -> found
-                    | None -> if node.Ir.id = id then Some node else None)
+                    | None ->
+                        if node.Ir.id = id then Some (task, node) else None)
                   None task.Ir.body)
           None plan.Ir.tasks
       in
       begin match found with
       | None -> Error ("node not found: " ^ id)
-      | Some body ->
+      | Some (owner, body) ->
           let task_names = List.map (fun task -> task.Ir.name) plan.Ir.tasks in
           let rec fresh_task_name index =
             let candidate = Printf.sprintf "__deshell_selected_%d" index in
@@ -497,7 +498,13 @@ let select_node plan node_id =
             if conflict then fresh_prefix (index + 1) else prefix
           in
           let selected_body = clone_node_ids ~prefix:(fresh_prefix 0) body in
-          let wrapper = Ir.task ~name:selected_task ~body:selected_body () in
+          let wrapper =
+            Ir.task ~name:selected_task ~inputs:owner.inputs
+              ~outputs:owner.outputs ~environment:owner.environment
+              ~secrets:owner.secrets
+              ~platform_capabilities:owner.platform_capabilities
+              ~cacheable:false ~body:selected_body ()
+          in
           Ok
             {
               plan with
@@ -524,8 +531,15 @@ let run root node_id allow_residual allow_file_read allow_file_write
           in
           begin try
             let backend = Process_backend.create ~root in
+            let inputs =
+              plan.tasks
+              |> List.concat_map (fun task -> task.Ir.environment)
+              |> List.sort_uniq String.compare
+              |> List.filter_map (fun name ->
+                  Option.map (fun value -> (name, value)) (Sys.getenv_opt name))
+            in
             match
-              Runner.run_plan_with_inputs ~backend ~policy ~inputs:[] ~arguments
+              Runner.run_plan_with_inputs ~backend ~policy ~inputs ~arguments
                 plan
             with
             | Error message -> Error message

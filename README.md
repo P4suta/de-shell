@@ -23,14 +23,16 @@ covered by the repository's test gates:
   workflows and composite actions, GitLab CI, Azure Pipelines, CircleCI,
   `package.json`, and VS Code shell tasks;
 - conservative embedded-shell detection across JVM, .NET, native, BEAM, and
-  scripting-language source families, with candidate fallback for dynamic host
+  scripting-language source families, including multiple callsites on one line,
+  import-aware JavaScript APIs, and candidate fallback for dynamic host
   expressions;
 - executable-field candidate reporting for unrecognized YAML, JSON, and TOML
   hosts without treating lockfiles and descriptive metadata as commands;
 - a call graph and content-hash-guarded, all-or-nothing callsite migration for
   exact standalone calls;
-- POSIX sh/Bash lowering for literal commands, pipelines, sequences, `&&`,
-  simple conditions, and static loops;
+- POSIX sh/Bash lowering for literal commands, immutable assignment dataflow,
+  pipelines, sequences, `&&`, homogeneous `||`, simple conditions, and static
+  loops;
 - conservative literal subsets for zsh, fish, PowerShell, cmd, and Nushell,
   with trace-only residual fallback for unknown or dynamic behavior;
 - versioned Effect IR, JSON schemas, v0-to-v1 migration, and `formal`,
@@ -38,8 +40,9 @@ covered by the repository's test gates:
 - official PowerShell AST and pinned `nu-parser` JSON-RPC adapter contracts;
 - equivalent rewrites, separate modernization proposals, concolic scenario
   generation, command-effect models, and differential comparison;
-- a policy-gated internal runner, project-scoped filesystem backend, secret
-  redaction in traces and failure diagnostics, and deterministic replay tapes;
+- a policy-gated internal runner with declared environment inheritance,
+  project-scoped filesystem backend, secret redaction in traces and failure
+  diagnostics, fail-fast template validation, and deterministic replay tapes;
 - rootless OCI launch specifications, a Windows Sandbox launcher, a portable
   observer agent, and Hyper-V/Virtualization.framework agent protocols;
 - strict Internal, Dagger, Nushell, and CWL 1.2 exporters, with explicit
@@ -62,6 +65,11 @@ Zig, and Crystal. It recognizes explicit shell APIs or explicit `sh -c`,
 `pwsh -Command`, and `cmd /c` launcher shapes. Host-language interpolation,
 concatenation, dynamic command expressions, and extra command arguments are
 reported as candidates rather than being presented as static shell.
+
+Each detected callsite carries a line-and-column-stable locator. Multiple direct
+or argv-shaped shell calls on the same source line are inventoried separately,
+and JavaScript's unqualified `exec`/`execSync` forms require an explicit
+`child_process` import or binding.
 
 This is conservative lexical inventory, not a claim that de-shell contains a
 complete parser for every host language. Commented examples, string literals
@@ -86,17 +94,22 @@ signed platform launcher helpers and a published lab image are release
 artifacts, not files fabricated by this repository.
 
 The repository validates generated artifacts structurally and exercises the
-Nushell output with the pinned official parser. Final 1.0 certification still
-requires official Dagger/CWL runner validation, signed binaries/installers, and
-the complete physical 21-cell OS/shell matrix.
+Nushell output with the pinned official parser. The optional
+`mise run test:official-exporters` gate additionally validates a representative
+CWL artifact with a digest-pinned official `cwltool` image and executes the
+corresponding module with Dagger v0.21.8. Final 1.0 certification still requires
+that official-tool evidence across the release corpus, signed
+binaries/installers and platform launchers, and the complete physical 21-cell
+OS/shell matrix.
 
 ## Toolchain with mise
 
 The development toolchain is managed by
 [mise](https://mise.jdx.dev/). `mise.toml` and `mise.lock` pin opam 2.5.2,
-Rust 1.98.0, PowerShell 7.6.5, and actionlint 1.7.12. Opam creates the local
-`_opam` switch with OCaml 5.5.0 and Dune 3.24.2; no global OCaml installation is
-used. Rust builds are limited to one job for predictable memory use.
+Rust 1.98.0, PowerShell 7.6.5, actionlint 1.7.12, and Dagger 0.21.8. Opam
+creates the local `_opam` switch with OCaml 5.5.0 and Dune 3.24.2; no global
+OCaml installation is used. Rust builds are limited to one job for predictable
+memory use.
 
 ```console
 mise trust
@@ -118,6 +131,7 @@ builds the Rust adapter through Dune and verifies every required installed file.
 | `mise run test:fast` | Deterministic unit and property tests |
 | `mise run test:contract` | CLI, schema, adapter, and exporter contracts |
 | `mise run test:adapters` | Pinned parser-adapter contracts |
+| `mise run test:official-exporters` | Validate and execute representative CWL/Dagger exports with pinned official tools |
 | `mise run test:platform` | Scanner, filesystem, process, and lab contracts |
 | `mise run test:differential` | Lowering and observation comparisons |
 | `mise run test:security` | Traversal, protocol, secret, and transaction regressions |
@@ -125,6 +139,12 @@ builds the Rust adapter through Dune and verifies every required installed file.
 | `mise run fmt` | Format OCaml and Dune sources |
 | `mise run fmt:check` | Check formatting without accepting changes |
 | `mise run package` | Build and verify the installable package payload |
+
+The official-exporter gate is intentionally separate from `mise run test`
+because it requires a running Docker engine. `mise install` supplies the pinned
+Dagger CLI; `DESHELL_DAGGER_EXE` can override it for controlled validation. The
+validator uses a digest-pinned `cwltool` image without mounting the Docker socket
+and removes its isolated temporary project after the run.
 
 ## First migration
 

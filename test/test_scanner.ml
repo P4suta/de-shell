@@ -506,7 +506,12 @@ execSync(`echo typescript`);|},
       ("comment.kt", "// ProcessBuilder(\"sh\", \"-c\", \"echo comment\")\n");
       ("literal.py", "example = 'os.system(\"echo string-literal\")'\n");
       ("method.js", "const match = regex.exec(command);\n");
+      ( "local.ts",
+        "function execSync(value: string) { return value; }\n\
+         execSync(\"echo local-function\");\n" );
       ("comment.c", "/*\nsystem(\"echo block-comment\");\n*/\n");
+      ("member.cpp", "int run() { return client.system(\"echo member\"); }\n");
+      ("member.php", "<?php $client->exec(\"echo member\");\n");
       ( "direct.java",
         "class Direct { void run() throws Exception { \
          Runtime.getRuntime().exec(\"git status\"); } }\n" );
@@ -567,6 +572,49 @@ execSync(`echo typescript`);|},
            findings))
     negative_cases
 
+let test_multiple_host_shell_calls_on_one_line () =
+  Test_support.with_temp_dir @@ fun root ->
+  Test_support.write_file
+    (Filename.concat root "multiple.js")
+    {|child_process.exec("echo first"); child_process.exec("echo second");|};
+  Test_support.write_file
+    (Filename.concat root "Multiple.java")
+    {|new ProcessBuilder("sh", "-c", "echo java-one").start(); new ProcessBuilder("bash", "-c", "echo java-two").start();|};
+  Test_support.write_file
+    (Filename.concat root "multiple.exs")
+    {|System.shell("echo direct"); System.cmd("sh", ["-c", "echo argv"])|};
+  Test_support.write_file
+    (Filename.concat root "mixed.js")
+    {|child_process.exec("echo fixed"); child_process.exec("echo " + name);|};
+  let inventory = Scanner.scan ~root in
+  let findings path =
+    List.filter
+      (fun (finding : Scanner.finding) -> finding.path = path)
+      inventory
+  in
+  let check path expected =
+    let findings = findings path in
+    Alcotest.(check (list string))
+      (path ^ " commands") expected
+      (List.map (fun finding -> finding.Scanner.source) findings);
+    let locators =
+      List.filter_map (fun finding -> finding.Scanner.locator) findings
+    in
+    Alcotest.(check int)
+      (path ^ " distinct callsites")
+      (List.length expected)
+      (List.sort_uniq String.compare locators |> List.length)
+  in
+  check "multiple.js" [ "echo first"; "echo second" ];
+  check "Multiple.java" [ "echo java-one"; "echo java-two" ];
+  check "multiple.exs" [ "echo direct"; "echo argv" ];
+  let mixed = findings "mixed.js" in
+  Alcotest.(check (list bool))
+    "later interpolation does not taint earlier call" [ true; false ]
+    (List.map
+       (fun finding -> finding.Scanner.kind = Scanner.Embedded_shell)
+       mixed)
+
 let () =
   Alcotest.run "Repository scanner"
     [
@@ -584,5 +632,7 @@ let () =
             test_vcs_ignored_artifacts_and_lockfiles_are_ignored;
           Alcotest.test_case "host-language shell contracts" `Quick
             test_host_language_shell_contracts;
+          Alcotest.test_case "multiple host calls per line" `Quick
+            test_multiple_host_shell_calls_on_one_line;
         ] );
     ]

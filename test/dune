@@ -16,6 +16,7 @@
   test_adapter_process
   test_powershell_adapter
   test_properties
+  test_template
   test_runner
   test_exporter
   test_security
@@ -81,6 +82,7 @@
    (run %{exe:test_scenario.bc})
    (run %{exe:test_observation.bc})
    (run %{exe:test_replay.bc})
+   (run %{exe:test_template.bc})
    (run %{exe:test_runner.bc})
    (run %{exe:test_properties.bc}))))
 
@@ -96,6 +98,7 @@
   ../CHANGELOG.md
   ../CODE_OF_CONDUCT.md
   ../GOVERNANCE.md
+  ../mise.lock
   ../mise.toml
   ../SECURITY.md
   ../SUPPORT.md
@@ -123,6 +126,7 @@
   ../adapters/nushell/dune
   ../scripts/github-repository.ps1
   ../scripts/repository-guardrails.ps1
+  ../scripts/validate-official-exporters.ps1
   test_repository_guardrails.ps1
   ../schema/effect-ir.schema.json
   ../schema/evidence.schema.json

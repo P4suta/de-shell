@@ -249,6 +249,17 @@ let test_host_language_callsite_requires_syntax_aware_patcher () =
     "source untouched" source
     (Test_support.read_file path)
 
+let test_source_locator_reports_line_not_column () =
+  Alcotest.(check (option int))
+    "source line" (Some 12)
+    (Discoverer.locator_line "source:python:00000012:00000034");
+  Alcotest.(check (option int))
+    "legacy line" (Some 7)
+    (Discoverer.locator_line "recipe:7");
+  Alcotest.(check (option int))
+    "malformed source locator" None
+    (Discoverer.locator_line "source:python:line:column")
+
 let () =
   Alcotest.run "Repository discoverer"
     [
@@ -264,5 +275,7 @@ let () =
             test_migration_refuses_non_equivalent_callsite_replacement;
           Alcotest.test_case "host-language patch safety" `Quick
             test_host_language_callsite_requires_syntax_aware_patcher;
+          Alcotest.test_case "source locator line/column" `Quick
+            test_source_locator_reports_line_not_column;
         ] );
     ]

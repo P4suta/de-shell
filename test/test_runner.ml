@@ -139,6 +139,99 @@ let test_residual_file_receives_original_arguments () =
     [ "sh"; "script.sh"; "hello world" ]
     (List.hd !calls)
 
+let test_residual_source_is_not_template_expanded () =
+  let calls = ref [] in
+  let source = "printf '%s' '${HOME}'" in
+  let capsule =
+    Ir.opaque ~interpreter:"sh" ~source ~reason:"quoted shell expansion"
+  in
+  let body =
+    Ir.node ~id:"literal-source-capsule"
+      ~guarantee:(Ir.Residual { reason = capsule.reason })
+      (Ir.Opaque_capsule capsule)
+  in
+  let residual_plan =
+    Ir.plan ~entrypoint:"main"
+      [ Ir.task ~name:"main" ~environment:[ "HOME" ] ~body () ]
+  in
+  let result =
+    Runner.run_plan_with_inputs ~backend:(backend calls)
+      ~policy:Runner.permissive_policy
+      ~inputs:[ ("HOME", "must-not-expand") ]
+      residual_plan
+    |> get
+  in
+  Alcotest.(check int) "exit" 0 result.exit_code;
+  Alcotest.(check (list string))
+    "capsule source bytes" [ "sh"; "-c"; source ] (List.hd !calls)
+
+let test_positional_default_expansion () =
+  let run_with arguments =
+    let calls = ref [] in
+    let body = node 40 (Ir.Exec (Ir.exec [ "emit"; "${1:-fallback}" ])) in
+    let result =
+      Runner.run_plan_with_inputs ~backend:(backend calls)
+        ~policy:Runner.default_policy ~inputs:[] ~arguments (plan body)
+      |> get
+    in
+    (result, List.rev !calls)
+  in
+  let absent, absent_calls = run_with [] in
+  Alcotest.(check string) "absent uses default" "fallback" absent.stdout;
+  Alcotest.(check (list (list string)))
+    "absent argv"
+    [ [ "emit"; "fallback" ] ]
+    absent_calls;
+  let present, present_calls = run_with [ "chosen" ] in
+  Alcotest.(check string) "present uses argument" "chosen" present.stdout;
+  Alcotest.(check (list (list string)))
+    "present argv"
+    [ [ "emit"; "chosen" ] ]
+    present_calls;
+  let empty, empty_calls = run_with [ "" ] in
+  Alcotest.(check string) "empty uses default" "fallback" empty.stdout;
+  Alcotest.(check (list (list string)))
+    "empty argv"
+    [ [ "emit"; "fallback" ] ]
+    empty_calls
+
+let test_template_dollar_escape () =
+  let calls = ref [] in
+  let body = node 41 (Ir.Exec (Ir.exec [ "emit"; "$${HOME}" ])) in
+  let literal_plan =
+    Ir.plan ~entrypoint:"main"
+      [ Ir.task ~name:"main" ~environment:[ "HOME" ] ~body () ]
+  in
+  let result =
+    Runner.run_plan_with_inputs ~backend:(backend calls)
+      ~policy:Runner.default_policy
+      ~inputs:[ ("HOME", "must-not-expand") ]
+      literal_plan
+    |> get
+  in
+  Alcotest.(check string) "literal template" "${HOME}" result.stdout;
+  Alcotest.(check (list (list string)))
+    "literal argv"
+    [ [ "emit"; "${HOME}" ] ]
+    (List.rev !calls)
+
+let test_invalid_parameter_templates_are_rejected () =
+  let expect_error ~needle template =
+    let calls = ref [] in
+    let body = node 42 (Ir.Exec (Ir.exec [ "emit"; template ])) in
+    match run calls body with
+    | Ok _ -> Alcotest.fail ("invalid template was executed: " ^ template)
+    | Error message ->
+        Alcotest.(check bool)
+          ("diagnostic for " ^ template)
+          true
+          (Test_support.contains ~needle message);
+        Alcotest.(check int) "no execution" 0 (List.length !calls)
+  in
+  expect_error ~needle:"unsupported parameter expression" "${MODE:=fallback}";
+  expect_error ~needle:"invalid positional parameter"
+    "${999999999999999999999999999999999999999999999999999999}"
+
 let test_exec_capabilities_obey_policy () =
   let calls = ref [] in
   let run_command ?(policy = Runner.default_policy) argv =
@@ -269,6 +362,65 @@ let test_task_arguments_and_environment () =
     [ ("VALUE", "bound") ]
     (List.hd !environments)
 
+let test_nested_task_inherits_global_environment () =
+  let calls = ref [] in
+  let helper =
+    Ir.task ~name:"helper" ~environment:[ "HELPER_MODE" ]
+      ~body:(node 51 (Ir.Exec (Ir.exec [ "emit"; "${HELPER_MODE}" ])))
+      ()
+  in
+  let main =
+    Ir.task ~name:"main"
+      ~body:(node 52 (Ir.Task_call { task = "helper"; arguments = [] }))
+      ()
+  in
+  let result =
+    Runner.run_plan_with_inputs ~backend:(backend calls)
+      ~policy:Runner.default_policy
+      ~inputs:[ ("HELPER_MODE", "nested") ]
+      (Ir.plan ~entrypoint:"main" [ main; helper ])
+    |> get
+  in
+  Alcotest.(check string) "nested environment" "nested" result.stdout;
+  Alcotest.(check (list (list string)))
+    "nested argv"
+    [ [ "emit"; "nested" ] ]
+    (List.rev !calls)
+
+let test_global_inputs_are_validated () =
+  let calls = ref [] in
+  let body = node 53 (Ir.Exec (Ir.exec [ "emit"; "ok" ])) in
+  let simple_plan = plan body in
+  begin match
+    Runner.run_plan_with_inputs ~backend:(backend calls)
+      ~policy:Runner.default_policy
+      ~inputs:[ ("TYPO", "value") ]
+      simple_plan
+  with
+  | Ok _ -> Alcotest.fail "unknown global input was ignored"
+  | Error message ->
+      Alcotest.(check bool)
+        "unknown diagnostic" true
+        (Test_support.contains ~needle:"unknown plan input TYPO" message)
+  end;
+  let environment_plan =
+    Ir.plan ~entrypoint:"main"
+      [ Ir.task ~name:"main" ~environment:[ "MODE" ] ~body () ]
+  in
+  begin match
+    Runner.run_plan_with_inputs ~backend:(backend calls)
+      ~policy:Runner.default_policy
+      ~inputs:[ ("MODE", "one"); ("MODE", "two") ]
+      environment_plan
+  with
+  | Ok _ -> Alcotest.fail "duplicate global input was accepted"
+  | Error message ->
+      Alcotest.(check bool)
+        "duplicate diagnostic" true
+        (Test_support.contains ~needle:"duplicate plan input MODE" message)
+  end;
+  Alcotest.(check int) "no execution" 0 (List.length !calls)
+
 let test_missing_task_argument_fails_before_execution () =
   let calls = ref [] in
   let helper =
@@ -381,6 +533,10 @@ let () =
             test_foreach_binds_variable;
           Alcotest.test_case "task arguments" `Quick
             test_task_arguments_and_environment;
+          Alcotest.test_case "nested task environment" `Quick
+            test_nested_task_inherits_global_environment;
+          Alcotest.test_case "global input validation" `Quick
+            test_global_inputs_are_validated;
           Alcotest.test_case "missing input" `Quick
             test_missing_task_argument_fails_before_execution;
           Alcotest.test_case "secret redaction" `Quick
@@ -389,6 +545,14 @@ let () =
             test_secret_is_redacted_from_backend_errors;
           Alcotest.test_case "residual arguments" `Quick
             test_residual_file_receives_original_arguments;
+          Alcotest.test_case "residual source bytes" `Quick
+            test_residual_source_is_not_template_expanded;
+          Alcotest.test_case "positional default" `Quick
+            test_positional_default_expansion;
+          Alcotest.test_case "template dollar escape" `Quick
+            test_template_dollar_escape;
+          Alcotest.test_case "invalid parameter templates" `Quick
+            test_invalid_parameter_templates_are_rejected;
           Alcotest.test_case "Exec capability policy" `Quick
             test_exec_capabilities_obey_policy;
         ] );

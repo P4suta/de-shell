@@ -197,21 +197,85 @@ let expand_text context text =
   in
   let rec loop index =
     if index >= length then Ok (Buffer.contents actual, Buffer.contents redacted)
+    else if index + 1 < length && text.[index] = '$' && text.[index + 1] = '$'
+    then begin
+      Buffer.add_char actual '$';
+      Buffer.add_char redacted '$';
+      loop (index + 2)
+    end
     else if index + 1 < length && text.[index] = '$' && text.[index + 1] = '{'
     then
       match find_close (index + 2) with
       | None -> Error ("unterminated variable reference in " ^ text)
       | Some close ->
-          let name = String.sub text (index + 2) (close - index - 2) in
-          begin match List.assoc_opt name context.variables with
-          | None -> Error ("unbound variable: " ^ name)
-          | Some value ->
-              Buffer.add_string actual value;
-              Buffer.add_string redacted
-                (if List.mem name context.secret_names then
-                   "<secret:" ^ name ^ ">"
-                 else value);
-              loop (close + 1)
+          let expression = String.sub text (index + 2) (close - index - 2) in
+          let parameter =
+            match String.index_opt expression ':' with
+            | Some separator
+              when separator + 1 < String.length expression
+                   && expression.[separator + 1] = '-' ->
+                Ok
+                  ( String.sub expression 0 separator,
+                    Some
+                      (String.sub expression (separator + 2)
+                         (String.length expression - separator - 2)) )
+            | Some _ ->
+                Error ("unsupported parameter expression: ${" ^ expression ^ "}")
+            | None -> Ok (expression, None)
+          in
+          begin match parameter with
+          | Error _ as error -> error
+          | Ok (name, default) ->
+              let is_positional =
+                name <> ""
+                && String.for_all
+                     (function '0' .. '9' -> true | _ -> false)
+                     name
+              in
+              let valid_named =
+                name <> ""
+                &&
+                match name.[0] with
+                | 'A' .. 'Z' | 'a' .. 'z' | '_' ->
+                    String.for_all
+                      (function
+                        | 'A' .. 'Z' | 'a' .. 'z' | '0' .. '9' | '_' -> true
+                        | _ -> false)
+                      name
+                | _ -> false
+              in
+              let value =
+                if is_positional then
+                  match int_of_string_opt name with
+                  | None -> Error ("invalid positional parameter: " ^ name)
+                  | Some 0 -> Ok None
+                  | Some position ->
+                      Ok (List.nth_opt context.script_arguments (position - 1))
+                else if valid_named then
+                  Ok (List.assoc_opt name context.variables)
+                else
+                  Error
+                    ("unsupported parameter expression: ${" ^ expression ^ "}")
+              in
+              begin match value with
+              | Error _ as error -> error
+              | Ok value ->
+                  let value =
+                    match (value, default) with
+                    | (None | Some ""), Some fallback -> Some fallback
+                    | value, _ -> value
+                  in
+                  begin match value with
+                  | None -> Error ("unbound variable: " ^ name)
+                  | Some value ->
+                      Buffer.add_string actual value;
+                      Buffer.add_string redacted
+                        (if List.mem name context.secret_names then
+                           "<secret:" ^ name ^ ">"
+                         else value);
+                      loop (close + 1)
+                  end
+              end
           end
     else begin
       Buffer.add_char actual text.[index];
@@ -549,36 +613,60 @@ let run_plan_with_inputs ~backend ~policy ~inputs ?(arguments = []) plan =
         if not policy.allow_opaque then
           Error ("opaque capsule execution denied by policy: " ^ node.id)
         else
-          begin match expand_text context capsule.source with
+          let argv = capsule_argv capsule context.script_arguments in
+          begin match
+            backend.execute
+              { argv; environment = []; working_directory = None; stdin }
+            |> redact_backend_error context
+          with
           | Error _ as error -> error
-          | Ok (source, trace_source) ->
-              let argv =
-                capsule_argv { capsule with source } context.script_arguments
-              in
-              let trace_argv =
-                capsule_argv
-                  { capsule with source = trace_source }
-                  context.script_arguments
-              in
-              begin match
-                backend.execute
-                  { argv; environment = []; working_directory = None; stdin }
-                |> redact_backend_error context
-              with
-              | Error _ as error -> error
-              | Ok result ->
-                  let observation = process_observation ~trace_argv result in
-                  Ok
-                    {
-                      observation with
-                      trace = Capsule node.id :: observation.trace;
-                    }
-              end
+          | Ok result ->
+              let observation = process_observation ~trace_argv:argv result in
+              Ok
+                {
+                  observation with
+                  trace = Capsule node.id :: observation.trace;
+                }
           end
   in
   match Ir.validate_plan plan with
   | Error errors -> Error (String.concat "; " errors)
-  | Ok () -> run_task [] "" inputs plan.entrypoint
+  | Ok () ->
+      let entry_input_names =
+        match Hashtbl.find_opt tasks plan.entrypoint with
+        | None -> []
+        | Some task ->
+            List.map (fun (binding : Ir.binding) -> binding.name) task.inputs
+      in
+      let environment_names =
+        List.concat_map (fun task -> task.Ir.environment) plan.tasks
+      in
+      let accepted = entry_input_names @ environment_names in
+      let rec first_duplicate seen = function
+        | [] -> None
+        | (name, _) :: rest ->
+            if List.mem name seen then Some name
+            else first_duplicate (name :: seen) rest
+      in
+      begin match first_duplicate [] inputs with
+      | Some name -> Error ("duplicate plan input " ^ name)
+      | None ->
+          let unknown =
+            List.filter_map
+              (fun (name, _) ->
+                if List.mem name accepted then None else Some name)
+              inputs
+          in
+          if unknown <> [] then
+            Error ("unknown plan input " ^ String.concat ", " unknown)
+          else
+            let entry_arguments =
+              List.filter
+                (fun (name, _) -> List.mem name entry_input_names)
+                inputs
+            in
+            run_task [] "" entry_arguments plan.entrypoint
+      end
 
 let run_plan ~backend ~policy plan =
   run_plan_with_inputs ~backend ~policy ~inputs:[] plan

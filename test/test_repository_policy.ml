@@ -54,6 +54,7 @@ let required_files () =
     "adapters/nushell/dune";
     "scripts/github-repository.ps1";
     "scripts/repository-guardrails.ps1";
+    "scripts/validate-official-exporters.ps1";
     "SECURITY.md";
     "SUPPORT.md";
     "CODE_OF_CONDUCT.md";
@@ -259,6 +260,41 @@ let rust_adapter_package_rule_is_hermetic () =
   check bool "generated Cargo artifact is not a static copy dependency" false
     (contains dune "(copy target/release")
 
+let official_exporter_validation_is_hermetic () =
+  let script = read "scripts/validate-official-exporters.ps1" in
+  let mise = read "mise.toml" in
+  let mise_lock = read "mise.lock" in
+  check bool "official exporter validation task" true
+    (contains mise "[tasks.\"test:official-exporters\"]"
+    && contains mise "scripts/validate-official-exporters.ps1");
+  check bool "Dagger CLI is mise-pinned" true
+    (contains mise "dagger = \"0.21.8\"");
+  check bool "Dagger downloads are checksum-locked for every CI platform" true
+    (contains mise_lock "[[tools.dagger]]"
+    && contains mise_lock "version = \"0.21.8\""
+    && List.for_all
+         (fun platform ->
+           contains mise_lock
+             (Printf.sprintf "[tools.dagger.\"platforms.%s\"]" platform))
+         [ "linux-x64"; "macos-arm64"; "macos-x64"; "windows-x64" ]);
+  check bool "CWL validator image is immutable" true
+    (contains script
+       "quay.io/commonwl/cwltool@sha256:05e2065d9aa0391e9cb8ed0085a80e419a031ae731b9c6aa52a2c00e554f3e51");
+  check bool "CWL validation never exposes the Docker socket" false
+    (contains script "/var/run/docker.sock");
+  check bool "Dagger module matches generated class" true
+    (contains script "--name=deshell");
+  check bool "CLI exports are materialized for official tools" true
+    (contains script
+       "Set-Content -LiteralPath (Join-Path $validationRoot 'deshell.cwl')"
+    && contains script
+         "Set-Content -LiteralPath (Join-Path $validationRoot \
+          'deshell.dagger.ts')");
+  check bool "artifact stdout is isolated from diagnostics" false
+    (contains script "2>&1");
+  check bool "official validator executes generated Dagger output" true
+    (contains script "@('call', 'main')")
+
 let ownership_and_ci () =
   let owners = read ".github/CODEOWNERS" in
   check bool "global code owner" true (contains owners "* @P4suta");
@@ -285,6 +321,8 @@ let suite =
       ci_bootstraps_platform_dependencies;
     test_case "hermetic Rust adapter package" `Quick
       rust_adapter_package_rule_is_hermetic;
+    test_case "hermetic official exporter validation" `Quick
+      official_exporter_validation_is_hermetic;
     test_case "ownership and stable CI" `Quick ownership_and_ci;
   ]
 
