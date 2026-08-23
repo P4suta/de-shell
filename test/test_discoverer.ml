@@ -215,6 +215,40 @@ let test_migration_refuses_non_equivalent_callsite_replacement () =
         (Test_support.contains ~needle:"manual" message
         && Test_support.contains ~needle:"Makefile" message)
 
+let test_host_language_callsite_requires_syntax_aware_patcher () =
+  Test_support.with_temp_dir @@ fun root ->
+  let path = Filename.concat root "build.py" in
+  let source = "import os\nos.system(\"echo build\")\n" in
+  Test_support.write_file path source;
+  let inventory = Discoverer.discover ~root in
+  let location =
+    match
+      List.find_opt
+        (fun (location : Discoverer.location) ->
+          location.path = "build.py"
+          && Option.fold ~none:false
+               ~some:(String.starts_with ~prefix:"source:python:")
+               location.locator)
+        inventory.locations
+    with
+    | Some location -> location
+    | None -> Alcotest.fail "Python shell callsite missing"
+  in
+  begin match
+    Discoverer.patch ~root ~inventory
+      ~replacements:[ (location.id, "deshell run --node build") ]
+      ~apply:false
+  with
+  | Ok _ -> Alcotest.fail "host-language source was patched as YAML"
+  | Error message ->
+      Alcotest.(check bool)
+        "syntax-aware patch diagnostic" true
+        (Test_support.contains ~needle:"syntax-aware" message)
+  end;
+  Alcotest.(check string)
+    "source untouched" source
+    (Test_support.read_file path)
+
 let () =
   Alcotest.run "Repository discoverer"
     [
@@ -228,5 +262,7 @@ let () =
             test_drift_rejects_every_file;
           Alcotest.test_case "composite callsite rejection" `Quick
             test_migration_refuses_non_equivalent_callsite_replacement;
+          Alcotest.test_case "host-language patch safety" `Quick
+            test_host_language_callsite_requires_syntax_aware_patcher;
         ] );
     ]

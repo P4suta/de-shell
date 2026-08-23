@@ -19,9 +19,14 @@ This repository is an experimental 0.1.0 implementation, not a certified 1.0
 release. The following compiler and runtime foundations are implemented and
 covered by the repository's test gates:
 
-- recursive inventory of shell files plus Make, Dockerfile, GitHub Actions,
-  GitLab CI, Azure Pipelines, CircleCI, `package.json`, and VS Code shell tasks;
-- candidate-only reporting for unrecognized YAML, JSON, and TOML string hosts;
+- Git-aware recursive inventory of shell files plus Make, Dockerfile, GitHub
+  workflows and composite actions, GitLab CI, Azure Pipelines, CircleCI,
+  `package.json`, and VS Code shell tasks;
+- conservative embedded-shell detection across JVM, .NET, native, BEAM, and
+  scripting-language source families, with candidate fallback for dynamic host
+  expressions;
+- executable-field candidate reporting for unrecognized YAML, JSON, and TOML
+  hosts without treating lockfiles and descriptive metadata as commands;
 - a call graph and content-hash-guarded, all-or-nothing callsite migration for
   exact standalone calls;
 - POSIX sh/Bash lowering for literal commands, pipelines, sequences, `&&`,
@@ -47,6 +52,23 @@ covered by the repository's test gates:
 Unsupported input is never silently discarded. It is either rejected by policy
 or represented as a residual capsule with its interpreter, source, reason, and
 source map.
+
+### Host-language inventory boundaries
+
+The source scanner has contract fixtures for Java, Kotlin, Scala, Groovy,
+Python, JavaScript/TypeScript, Go, Rust, C/C++/Objective-C, C#, F#, VB, OCaml,
+Haskell, Elixir, Erlang, Lua, Perl, Ruby, PHP, R, Nim, D, Clojure, Dart, Julia,
+Zig, and Crystal. It recognizes explicit shell APIs or explicit `sh -c`,
+`pwsh -Command`, and `cmd /c` launcher shapes. Host-language interpolation,
+concatenation, dynamic command expressions, and extra command arguments are
+reported as candidates rather than being presented as static shell.
+
+This is conservative lexical inventory, not a claim that de-shell contains a
+complete parser for every host language. Commented examples, string literals
+containing API names, non-shell shebangs, and direct process APIs without a
+shell launcher are excluded by contract. Source-language callsites are not
+automatically rewritten yet: `--apply` refuses them until that language has a
+syntax-aware patcher.
 
 ### Honest runtime boundaries
 
