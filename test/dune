@@ -120,6 +120,7 @@
   ../.github/settings/fork-approval.json
   ../.github/settings/features.json
   ../.github/settings/labels.json
+  ../adapters/nushell/dune
   ../scripts/github-repository.ps1
   ../scripts/repository-guardrails.ps1
   test_repository_guardrails.ps1

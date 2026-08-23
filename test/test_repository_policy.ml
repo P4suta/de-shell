@@ -51,6 +51,7 @@ let required_files () =
     ".github/settings/fork-approval.json";
     ".github/settings/features.json";
     ".github/settings/labels.json";
+    "adapters/nushell/dune";
     "scripts/github-repository.ps1";
     "scripts/repository-guardrails.ps1";
     "SECURITY.md";
@@ -238,6 +239,15 @@ let ci_bootstraps_platform_dependencies () =
          "--with-dev-setup --locked --yes || opam install . --cli=2.5 \
           --switch=.")
 
+let rust_adapter_package_rule_is_hermetic () =
+  let dune = read "adapters/nushell/dune" in
+  check bool "Cargo output is a declared directory target" true
+    (contains dune "(dir cargo-target)");
+  check bool "Cargo uses an explicit target directory" true
+    (contains dune "--target-dir");
+  check bool "generated Cargo artifact is not a static copy dependency" false
+    (contains dune "(copy target/release")
+
 let ownership_and_ci () =
   let owners = read ".github/CODEOWNERS" in
   check bool "global code owner" true (contains owners "* @P4suta");
@@ -262,6 +272,8 @@ let suite =
       github_reconciliation_handles_unordered_topics;
     test_case "platform dependency bootstrap" `Quick
       ci_bootstraps_platform_dependencies;
+    test_case "hermetic Rust adapter package" `Quick
+      rust_adapter_package_rule_is_hermetic;
     test_case "ownership and stable CI" `Quick ownership_and_ci;
   ]
 
