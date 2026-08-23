@@ -505,6 +505,11 @@ let transform_file content locations replacements =
             begin match (location.classification, location.locator) with
             | Shell, None -> Ok replacement
             | Embedded, Some locator
+              when String.starts_with ~prefix:"source:" locator ->
+                Error
+                  ("host-language callsite requires a syntax-aware patcher: "
+                 ^ location.id)
+            | Embedded, Some locator
               when String.starts_with ~prefix:"recipe:" locator
                    || String.starts_with ~prefix:"RUN:" locator ->
                 replace_make_or_docker content locator replacement

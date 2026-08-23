@@ -45,6 +45,14 @@ let interpreter_for_extension = function
 let shell_extensions =
   [ ".sh"; ".bash"; ".zsh"; ".fish"; ".ps1"; ".psm1"; ".cmd"; ".bat"; ".nu" ]
 
+let ignored_structured_filenames =
+  [
+    "package-lock.json";
+    "npm-shrinkwrap.json";
+    "pnpm-lock.yaml";
+    "pnpm-lock.yml";
+  ]
+
 let split_words value =
   value |> String.split_on_char ' '
   |> List.concat_map (String.split_on_char '\t')
@@ -67,6 +75,7 @@ let interpreter_for_shebang content =
         String.sub first 2 (String.length first - 2) |> String.trim
       in
       begin match split_words command with
+      | executable :: _ when String.starts_with ~prefix:"[" executable -> None
       | [] -> None
       | executable :: rest when basename executable = "env" ->
           let rec program = function
@@ -81,6 +90,32 @@ let interpreter_for_shebang content =
       | executable :: _ -> Some (basename executable)
       end
   | _ -> None
+
+let is_shell_interpreter interpreter =
+  List.mem
+    (String.lowercase_ascii interpreter)
+    [
+      "ash";
+      "bash";
+      "csh";
+      "cmd";
+      "dash";
+      "elvish";
+      "fish";
+      "ksh";
+      "mksh";
+      "nu";
+      "nushell";
+      "oil";
+      "osh";
+      "powershell";
+      "pwsh";
+      "sh";
+      "tcsh";
+      "xonsh";
+      "yash";
+      "zsh";
+    ]
 
 let strip_quotes value =
   let value = String.trim value in
@@ -132,7 +167,28 @@ let looks_like_shell value =
               || search (index + 1))
          in
          marker_length > 0 && search 0)
-       [ "&&"; "||"; "$("; "${"; " | "; ">" ]
+       [ "&&"; "||"; "$("; "${"; " | "; " > " ]
+
+let executable_field_name name =
+  let name = String.trim name |> String.lowercase_ascii in
+  List.mem name
+    [
+      "automation";
+      "cmd";
+      "command";
+      "commands";
+      "exec";
+      "execute";
+      "hook";
+      "hooks";
+      "run";
+      "script";
+      "scripts";
+      "shell";
+    ]
+  || String.ends_with ~suffix:"command" name
+  || String.ends_with ~suffix:"script" name
+  || String.ends_with ~suffix:"hook" name
 
 let finding ~path ~kind ?interpreter ?locator content =
   {
@@ -266,28 +322,33 @@ let package_findings ~path content =
   with Yojson.Json_error _ -> []
 
 let json_candidate_findings ~path content =
-  let rec collect locator accumulator = function
+  let rec collect locator executable_context accumulator = function
     | `Assoc fields ->
         List.fold_left
           (fun accumulator (name, value) ->
             let child = String.concat "" [ locator; "."; name ] in
-            collect child accumulator value)
+            collect child
+              (executable_context || executable_field_name name)
+              accumulator value)
           accumulator fields
     | `List values ->
         List.fold_left
           (fun accumulator (index, value) ->
             let child = Printf.sprintf "%s[%d]" locator index in
-            collect child accumulator value)
+            collect child executable_context accumulator value)
           accumulator
           (List.mapi (fun index value -> (index, value)) values)
-    | `String value when looks_like_shell value ->
+    | `String value when executable_context && looks_like_shell value ->
         finding ~path ~kind:Candidate ~locator value :: accumulator
     | `String _ | `Int _ | `Intlit _ | `Float _ | `Bool _ | `Null -> accumulator
-    | `Tuple values -> collect locator accumulator (`List values)
+    | `Tuple values ->
+        collect locator executable_context accumulator (`List values)
     | `Variant (_, value) ->
-        Option.fold ~none:accumulator ~some:(collect locator accumulator) value
+        Option.fold ~none:accumulator
+          ~some:(collect locator executable_context accumulator)
+          value
   in
-  try parse_json_relaxed content |> collect "$" [] |> List.rev
+  try parse_json_relaxed content |> collect "$" false [] |> List.rev
   with Yojson.Json_error _ -> []
 
 let vscode_task_findings ~path content =
@@ -433,13 +494,21 @@ let toml_candidate_findings ~path content =
       match String.index_opt line '=' with
       | None -> None
       | Some separator ->
+          let key =
+            String.sub line 0 separator
+            |> String.trim |> String.split_on_char '.' |> List.rev
+            |> function
+            | name :: _ -> strip_quotes name
+            | [] -> ""
+          in
           let value =
             String.sub line (separator + 1) (String.length line - separator - 1)
             |> String.trim
           in
           let value = strip_comment value in
           begin match decode_string value with
-          | Some value when looks_like_shell value ->
+          | Some value when executable_field_name key && looks_like_shell value
+            ->
               Some
                 (finding ~path ~kind:Candidate
                    ~locator:(Printf.sprintf "line:%d" line_number)
@@ -447,13 +516,23 @@ let toml_candidate_findings ~path content =
           | _ -> None
           end)
 
-let is_known_pipeline path =
+type pipeline = Github_actions | Gitlab_ci | Azure_pipelines | Circle_ci
+
+let pipeline_for_path path =
   let lower = String.lowercase_ascii (normalize_relative path) in
-  lower = ".gitlab-ci.yml" || lower = ".gitlab-ci.yaml"
-  || lower = "azure-pipelines.yml"
-  || lower = "azure-pipelines.yaml"
-  || String.starts_with ~prefix:".github/workflows/" lower
-  || String.starts_with ~prefix:".circleci/" lower
+  if String.starts_with ~prefix:".github/workflows/" lower then
+    Some Github_actions
+  else if
+    String.starts_with ~prefix:".github/actions/" lower
+    && (String.ends_with ~suffix:"/action.yml" lower
+       || String.ends_with ~suffix:"/action.yaml" lower)
+  then Some Github_actions
+  else if lower = ".gitlab-ci.yml" || lower = ".gitlab-ci.yaml" then
+    Some Gitlab_ci
+  else if lower = "azure-pipelines.yml" || lower = "azure-pipelines.yaml" then
+    Some Azure_pipelines
+  else if String.starts_with ~prefix:".circleci/" lower then Some Circle_ci
+  else None
 
 let indentation line =
   let rec loop index =
@@ -474,25 +553,81 @@ let yaml_key value =
 let yaml_block_marker value =
   List.mem (String.trim value) [ "|"; "|-"; "|+"; ">"; ">-"; ">+" ]
 
-let yaml_findings ~path ~known content =
+let yaml_findings ~path ~pipeline content =
   let lines = indexed_lines content |> Array.of_list in
+  let known = Option.is_some pipeline in
   let known_keys =
-    [
-      "run";
-      "command";
-      "script";
-      "before_script";
-      "after_script";
-      "bash";
-      "pwsh";
-      "powershell";
-    ]
+    match pipeline with
+    | Some Github_actions -> [ "run" ]
+    | Some Gitlab_ci -> [ "script"; "before_script"; "after_script" ]
+    | Some Azure_pipelines -> [ "script"; "bash"; "pwsh"; "powershell" ]
+    | Some Circle_ci -> [ "run"; "command" ]
+    | None -> []
   in
-  let sequence_keys = [ "script"; "before_script"; "after_script" ] in
+  let sequence_keys =
+    match pipeline with
+    | Some Gitlab_ci -> [ "script"; "before_script"; "after_script" ]
+    | _ -> []
+  in
   let interpreter_for_key = function
     | "pwsh" | "powershell" -> "powershell"
     | "bash" -> "bash"
     | _ -> "sh"
+  in
+  let key_and_value line =
+    match String.index_opt line ':' with
+    | None -> None
+    | Some separator ->
+        let key = String.sub line 0 separator |> yaml_key in
+        let value =
+          String.sub line (separator + 1) (String.length line - separator - 1)
+          |> strip_quotes
+        in
+        Some (key, value)
+  in
+  let semantic_indentation line =
+    let trimmed = String.trim line in
+    indentation line + if String.starts_with ~prefix:"-" trimmed then 2 else 0
+  in
+  let interpreter_for_shell value =
+    match split_words (strip_quotes value) with
+    | [] -> None
+    | executable :: _ ->
+        begin match basename executable with
+        | "pwsh" | "pwsh.exe" | "powershell" | "powershell.exe" ->
+            Some "powershell"
+        | "cmd" | "cmd.exe" -> Some "cmd"
+        | interpreter -> Some interpreter
+        end
+  in
+  let github_shell_for index =
+    let _, run_line = lines.(index) in
+    let target_indentation = semantic_indentation run_line in
+    let rec search direction cursor =
+      if cursor < 0 || cursor >= Array.length lines then None
+      else
+        let _, line = lines.(cursor) in
+        let trimmed = String.trim line in
+        if trimmed = "" then search direction (cursor + direction)
+        else
+          let current_indentation = semantic_indentation line in
+          if current_indentation < target_indentation then None
+          else if current_indentation > target_indentation then
+            search direction (cursor + direction)
+          else
+            match key_and_value line with
+            | Some ("shell", value) -> interpreter_for_shell value
+            | _ when String.starts_with ~prefix:"-" trimmed -> None
+            | _ -> search direction (cursor + direction)
+    in
+    match search (-1) (index - 1) with
+    | Some interpreter -> Some interpreter
+    | None -> search 1 (index + 1)
+  in
+  let interpreter_for_location index key =
+    match pipeline with
+    | Some Github_actions -> Option.value ~default:"sh" (github_shell_for index)
+    | _ -> interpreter_for_key key
   in
   let collect_block start base_indentation =
     let finish = ref start in
@@ -599,7 +734,7 @@ let yaml_findings ~path ~known content =
               if block = "" then accumulator
               else
                 finding ~path ~kind:Embedded_shell
-                  ~interpreter:(interpreter_for_key key)
+                  ~interpreter:(interpreter_for_location index key)
                   ~locator:(Printf.sprintf "%s:%d" key line_number)
                   block
                 :: accumulator
@@ -609,11 +744,14 @@ let yaml_findings ~path ~known content =
           else if known && List.mem key known_keys then
             loop (index + 1)
               (finding ~path ~kind:Embedded_shell
-                 ~interpreter:(interpreter_for_key key)
+                 ~interpreter:(interpreter_for_location index key)
                  ~locator:(Printf.sprintf "%s:%d" key line_number)
                  value
               :: accumulator)
-          else if not (looks_like_shell value) then loop (index + 1) accumulator
+          else if known then loop (index + 1) accumulator
+          else if
+            (not (executable_field_name key)) || not (looks_like_shell value)
+          then loop (index + 1) accumulator
           else
             loop (index + 1)
               (finding ~path ~kind:Candidate
@@ -635,14 +773,21 @@ let findings_for_file ~relative ~absolute =
       let extension = lowercase_extension relative in
       let filename = Filename.basename relative |> String.lowercase_ascii in
       let normalized = normalize_relative relative |> String.lowercase_ascii in
-      if List.mem extension shell_extensions then
+      if List.mem filename ignored_structured_filenames then []
+      else if List.mem extension shell_extensions then
         [
           finding ~path:relative ~kind:Shell_file
             ?interpreter:(interpreter_for_extension extension)
             content;
         ]
       else
-        match interpreter_for_shebang content with
+        let shell_shebang =
+          match interpreter_for_shebang content with
+          | Some interpreter when is_shell_interpreter interpreter ->
+              Some interpreter
+          | Some _ | None -> None
+        in
+        match shell_shebang with
         | Some interpreter ->
             [ finding ~path:relative ~kind:Shell_file ~interpreter content ]
         | None when filename = "package.json" ->
@@ -660,19 +805,83 @@ let findings_for_file ~relative ~absolute =
             dockerfile_findings ~path:relative content
         | None when extension = ".yaml" || extension = ".yml" ->
             yaml_findings ~path:relative
-              ~known:(is_known_pipeline relative)
+              ~pipeline:(pipeline_for_path relative)
               content
         | None when extension = ".json" ->
             json_candidate_findings ~path:relative content
         | None when extension = ".toml" ->
             toml_candidate_findings ~path:relative content
-        | None -> []
+        | None ->
+            Host_source.detect ~path:relative content
+            |> List.map (fun (detection : Host_source.detection) ->
+                finding ~path:relative
+                  ~kind:
+                    (match detection.kind with
+                    | Host_source.Embedded -> Embedded_shell
+                    | Host_source.Candidate -> Candidate)
+                  ~interpreter:detection.interpreter ~locator:detection.locator
+                  detection.source)
   with Sys_error _ | Unix.Unix_error _ -> []
 
 let compare_findings left right =
   match String.compare left.path right.path with
   | 0 -> compare left.locator right.locator
   | value -> value
+
+let read_channel channel =
+  let buffer = Buffer.create 4096 in
+  let chunk = Bytes.create 4096 in
+  let rec loop () =
+    match input channel chunk 0 (Bytes.length chunk) with
+    | 0 -> Buffer.contents buffer
+    | count ->
+        Buffer.add_subbytes buffer chunk 0 count;
+        loop ()
+  in
+  loop ()
+
+let git_marker_is_valid root =
+  let marker = Filename.concat root ".git" in
+  try
+    if Sys.is_directory marker then
+      Sys.file_exists (Filename.concat marker "HEAD")
+    else Sys.file_exists marker
+  with Sys_error _ -> false
+
+let contains_ignored_directory relative =
+  normalize_relative relative
+  |> String.split_on_char '/'
+  |> List.exists (fun component -> List.mem component ignored_directories)
+
+let git_inventory root =
+  if not (git_marker_is_valid root) then None
+  else
+    try
+      let arguments =
+        [|
+          "git";
+          "-C";
+          root;
+          "ls-files";
+          "--cached";
+          "--others";
+          "--exclude-standard";
+          "-z";
+          "--";
+        |]
+      in
+      let channel = Unix.open_process_args_in "git" arguments in
+      let output = read_channel channel in
+      match Unix.close_process_in channel with
+      | Unix.WEXITED 0 ->
+          Some
+            (output
+            |> String.split_on_char '\000'
+            |> List.filter (fun relative ->
+                relative <> "" && not (contains_ignored_directory relative))
+            |> List.sort String.compare)
+      | Unix.WEXITED _ | Unix.WSIGNALED _ | Unix.WSTOPPED _ -> None
+    with Sys_error _ | Unix.Unix_error _ -> None
 
 let scan ~root =
   let rec walk relative absolute accumulator =
@@ -701,7 +910,19 @@ let scan ~root =
         with Unix.Unix_error _ -> current)
       accumulator entries
   in
-  walk "" root [] |> List.sort compare_findings
+  let findings =
+    match git_inventory root with
+    | Some files ->
+        List.fold_left
+          (fun accumulator relative ->
+            List.rev_append
+              (findings_for_file ~relative
+                 ~absolute:(Filename.concat root relative))
+              accumulator)
+          [] files
+    | None -> walk "" root []
+  in
+  List.sort compare_findings findings
 
 let kind_to_string = function
   | Shell_file -> "shell_file"

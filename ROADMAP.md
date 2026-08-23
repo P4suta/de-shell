@@ -31,6 +31,8 @@ guess.
 ## 0.3 Repository and Windows migration — implemented core
 
 - syntax-aware embedded-shell inventory and call graph
+- conservative host-language callsite inventory across major JVM, .NET,
+  native, BEAM, and scripting-language families
 - exact-call-only transactional callsite replacement
 - official PowerShell AST oracle contract and conservative cmd frontend
 - Windows Sandbox hardening, agent mapping, lifecycle, and result decoding
@@ -39,6 +41,10 @@ guess.
 
 The signed Hyper-V launcher and official CWL runner certification remain release
 artifacts/gates.
+
+Host-language inventory is deliberately broader than host-language rewriting.
+Each syntax family needs a CST-aware patcher before its source callsites can be
+changed automatically; until then, transactional apply rejects those locations.
 
 ## 0.4 Breadth — implemented core
 
