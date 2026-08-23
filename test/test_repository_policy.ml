@@ -13,15 +13,17 @@ let read relative =
     ~finally:(fun () -> close_in_noerr channel)
     (fun () -> really_input_string channel (in_channel_length channel))
 
-let contains haystack needle =
+let substring_index haystack needle =
   let haystack_length = String.length haystack in
   let needle_length = String.length needle in
   let rec loop index =
-    if index + needle_length > haystack_length then false
-    else if String.sub haystack index needle_length = needle then true
+    if index + needle_length > haystack_length then None
+    else if String.sub haystack index needle_length = needle then Some index
     else loop (index + 1)
   in
-  needle_length = 0 || loop 0
+  if needle_length = 0 then Some 0 else loop 0
+
+let contains haystack needle = Option.is_some (substring_index haystack needle)
 
 let required_files () =
   [
@@ -213,6 +215,12 @@ let github_reconciliation_handles_unordered_topics () =
 
 let ci_bootstraps_platform_dependencies () =
   let ci = read ".github/workflows/ci.yml" in
+  check bool "mise Rust is materialized before opam" true
+    (contains ci "rustc --version"
+    && contains ci "cargo --version"
+    && Option.value ~default:max_int (substring_index ci "cargo --version")
+       < Option.value ~default:max_int
+           (substring_index ci "run: mise run setup"));
   check bool "Linux installs the opam sandbox dependency" true
     (contains ci "sudo apt-get install --yes apparmor bubblewrap");
   check bool "Linux-only package installation" true

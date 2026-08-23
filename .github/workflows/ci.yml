@@ -38,6 +38,11 @@ jobs:
           version: 2026.8.6
           cache: true
 
+      - name: Materialize mise Rust toolchain
+        run: |
+          rustc --version
+          cargo --version
+
       - name: Install Linux opam sandbox dependency
         if: runner.os == 'Linux'
         run: |
