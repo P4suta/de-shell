@@ -135,6 +135,17 @@ let default_branch_ruleset () =
   in
   check bool "default branch selected" true
     (List.mem "~DEFAULT_BRANCH" includes);
+  let bypass_actors =
+    member "bypass_actors" ruleset |> Yojson.Safe.Util.to_list
+  in
+  check int "one pull-request-only bypass actor" 1 (List.length bypass_actors);
+  let bypass_actor = List.hd bypass_actors in
+  check string "repository admin bypass role" "RepositoryRole"
+    (member "actor_type" bypass_actor |> Yojson.Safe.Util.to_string);
+  check int "repository admin role id" 5
+    (member "actor_id" bypass_actor |> Yojson.Safe.Util.to_int);
+  check string "bypass requires a pull request" "pull_request"
+    (member "bypass_mode" bypass_actor |> Yojson.Safe.Util.to_string);
   let types = rule_types ruleset in
   [
     "deletion";
