@@ -39,11 +39,14 @@ try {
   Push-Location $fixtureRoot
   try {
     [IO.File]::WriteAllText((Join-Path $fixtureRoot 'ok.txt'), 'ok')
+    $hiddenPath = Join-Path $fixtureRoot '.hidden'
+    [IO.File]::WriteAllText($hiddenPath, 'hidden')
+    [IO.File]::SetAttributes($hiddenPath, [IO.FileAttributes]::Hidden)
     [IO.File]::WriteAllBytes(
       (Join-Path $fixtureRoot 'boundary.bin'),
       [byte[]]::new(1MB)
     )
-    & git add -- ok.txt boundary.bin
+    & git add -- ok.txt .hidden boundary.bin
     if ($LASTEXITCODE -ne 0) {
       throw 'Unable to stage the passing guardrail fixtures'
     }

@@ -38,7 +38,7 @@ foreach ($trackedPath in $trackedPaths) {
   $platformPath = $trackedPath.Replace('/', [IO.Path]::DirectorySeparatorChar)
   $absolutePath = Join-Path $repositoryRoot $platformPath
   if (Test-Path -LiteralPath $absolutePath -PathType Leaf) {
-    $fileSize = (Get-Item -LiteralPath $absolutePath).Length
+    $fileSize = (Get-Item -LiteralPath $absolutePath -Force).Length
     if ($fileSize -gt $maximumBytes) {
       $violations.Add(
         "$trackedPath is $fileSize bytes; maximum is $maximumBytes bytes"

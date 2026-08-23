@@ -11,8 +11,12 @@ CARGO_BUILD_JOBS = "1"
 [tasks.setup]
 description = "Create the project-local OCaml 5.5 switch and install dependencies"
 run = [
-  "opam init --cli=2.5 --bare --no-setup --yes",
+  "opam init --cli=2.5 --bare --no-setup --no",
   "opam switch create . 5.5.0 --cli=2.5 --deps-only --with-test --with-dev-setup --locked --assume-depexts --yes || opam install . --cli=2.5 --switch=. --deps-only --with-test --with-dev-setup --locked --assume-depexts --yes",
+]
+run_windows = [
+  "opam init --cli=2.5 --bare --no-setup --yes",
+  "opam switch create . 5.5.0 --cli=2.5 --deps-only --with-test --with-dev-setup --locked --yes || opam install . --cli=2.5 --switch=. --deps-only --with-test --with-dev-setup --locked --yes",
 ]
 
 [tasks.build]
