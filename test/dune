@@ -122,6 +122,7 @@
   ../.github/settings/labels.json
   ../scripts/github-repository.ps1
   ../scripts/repository-guardrails.ps1
+  test_repository_guardrails.ps1
   ../schema/effect-ir.schema.json
   ../schema/evidence.schema.json
   ../schema/adapter.schema.json)
@@ -149,6 +150,14 @@
     DESHELL_REPOSITORY_ROOT
     %{workspace_root}
     (run %{exe:test_repository_policy.bc}))
+   (run
+    pwsh
+    -NoLogo
+    -NoProfile
+    -File
+    %{dep:test_repository_guardrails.ps1}
+    -GuardrailScript
+    %{dep:../scripts/repository-guardrails.ps1})
    (run %{exe:test_exporter.bc})
    (setenv
     DESHELL_PROCESS_AGENT
