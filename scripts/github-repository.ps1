@@ -16,8 +16,7 @@ $repositoryRoot = Split-Path -Parent $PSScriptRoot
 $apiVersion = '2026-03-10'
 $rulesetFiles = @(
   '.github/rulesets/default-branch.json',
-  '.github/rulesets/release-tags.json',
-  '.github/rulesets/push-guardrails.json'
+  '.github/rulesets/release-tags.json'
 )
 
 function Resolve-RepositoryFile {
@@ -144,6 +143,25 @@ function Assert-JsonSubset {
 
   if ($Expected -ne $Actual) {
     throw "$Context differs: expected '$Expected', received '$Actual'"
+  }
+}
+
+function Assert-StringSetEqual {
+  param(
+    [Parameter(Mandatory)][string[]] $Expected,
+    [Parameter(Mandatory)][string[]] $Actual,
+    [Parameter(Mandatory)][string] $Context
+  )
+
+  $expectedSorted = @($Expected | Sort-Object -CaseSensitive)
+  $actualSorted = @($Actual | Sort-Object -CaseSensitive)
+  if ($expectedSorted.Count -ne $actualSorted.Count) {
+    throw "$Context differs: expected $($expectedSorted.Count) entries, received $($actualSorted.Count)"
+  }
+  for ($index = 0; $index -lt $expectedSorted.Count; $index += 1) {
+    if ($expectedSorted[$index] -cne $actualSorted[$index]) {
+      throw "$Context differs: expected '$($expectedSorted -join ', ')', received '$($actualSorted -join ', ')'"
+    }
   }
 }
 
@@ -283,9 +301,10 @@ $repositoryState = Invoke-GitHubJson -Method GET -Endpoint "repos/$Repository"
 $expectedRepository = Read-RepositoryJson '.github/settings/repository.json'
 Assert-JsonSubset -Expected $expectedRepository -Actual $repositoryState -Context 'repository'
 
+$expectedTopics = Read-RepositoryJson '.github/settings/topics.json'
 $topicsState = Invoke-GitHubJson -Method GET -Endpoint "repos/$Repository/topics"
-Assert-JsonSubset -Expected (Read-RepositoryJson '.github/settings/topics.json') `
-  -Actual $topicsState -Context 'topics'
+Assert-StringSetEqual -Expected $expectedTopics.names -Actual $topicsState.names `
+  -Context 'topics.names'
 
 $actionsState = Invoke-GitHubJson -Method GET -Endpoint "repos/$Repository/actions/permissions"
 Assert-JsonSubset -Expected (Read-RepositoryJson '.github/settings/actions.json') `

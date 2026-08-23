@@ -29,9 +29,14 @@ run = "opam exec --switch=. -- dune exec deshell --"
 [tasks.lint]
 description = "Lint package metadata and GitHub Actions"
 run = [
+  "mise run repository:guardrails",
   "opam lint de-shell.opam de-shell.opam.locked",
   "actionlint .github/workflows/ci.yml .github/workflows/dependency-review.yml .github/workflows/scorecard.yml",
 ]
+
+[tasks."repository:guardrails"]
+description = "Reject tracked files over 10 MiB or paths over 240 characters"
+run = "pwsh -NoLogo -NoProfile -File scripts/repository-guardrails.ps1"
 
 [tasks."github:apply"]
 description = "Apply the canonical GitHub repository settings and Rulesets"

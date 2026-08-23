@@ -40,8 +40,8 @@ let required_files () =
     ".github/workflows/scorecard.yml";
     ".github/rulesets/default-branch.json";
     ".github/rulesets/release-tags.json";
-    ".github/rulesets/push-guardrails.json";
     ".github/settings/repository.json";
+    ".github/settings/capabilities.json";
     ".github/settings/topics.json";
     ".github/settings/actions.json";
     ".github/settings/selected-actions.json";
@@ -50,6 +50,7 @@ let required_files () =
     ".github/settings/features.json";
     ".github/settings/labels.json";
     "scripts/github-repository.ps1";
+    "scripts/repository-guardrails.ps1";
     "SECURITY.md";
     "SUPPORT.md";
     "CODE_OF_CONDUCT.md";
@@ -156,6 +157,37 @@ let default_branch_ruleset () =
   in
   check bool "stable required CI gate" true (List.mem "Required gate" contexts)
 
+let release_tag_ruleset () =
+  let ruleset = json ".github/rulesets/release-tags.json" in
+  check string "tag target" "tag"
+    (member "target" ruleset |> Yojson.Safe.Util.to_string);
+  check string "tag enforcement" "active"
+    (member "enforcement" ruleset |> Yojson.Safe.Util.to_string);
+  let includes =
+    member "conditions" ruleset
+    |> member "ref_name" |> member "include" |> strings
+  in
+  check (list string) "release tag namespace" [ "refs/tags/v*" ] includes;
+  let types = rule_types ruleset in
+  [ "deletion"; "non_fast_forward"; "required_signatures" ]
+  |> List.iter (fun rule ->
+      check bool ("release tag rule " ^ rule) true (List.mem rule types))
+
+let push_guardrail_fallback () =
+  let capabilities = json ".github/settings/capabilities.json" in
+  let push_ruleset = member "push_ruleset" capabilities in
+  check string "push Ruleset capability" "unavailable"
+    (member "status" push_ruleset |> Yojson.Safe.Util.to_string);
+  check int "fallback maximum file size" 10
+    (member "max_file_size_mib" push_ruleset |> Yojson.Safe.Util.to_int);
+  check int "fallback maximum path length" 240
+    (member "max_file_path_length" push_ruleset |> Yojson.Safe.Util.to_int);
+  let mise = read "mise.toml" in
+  check bool "mise exposes repository guardrail task" true
+    (contains mise "[tasks.\"repository:guardrails\"]");
+  check bool "lint executes repository guardrails" true
+    (contains mise "mise run repository:guardrails")
+
 let repository_security_settings () =
   let actions = json ".github/settings/actions.json" in
   check bool "Actions enabled" true
@@ -171,6 +203,13 @@ let repository_security_settings () =
       check string setting "enabled"
         (member setting security |> member "status"
        |> Yojson.Safe.Util.to_string))
+
+let github_reconciliation_handles_unordered_topics () =
+  let script = read "scripts/github-repository.ps1" in
+  check bool "topics are compared as an unordered string set" true
+    (contains script
+       "Assert-StringSetEqual -Expected $expectedTopics.names -Actual \
+        $topicsState.names")
 
 let ownership_and_ci () =
   let owners = read ".github/CODEOWNERS" in
@@ -189,7 +228,11 @@ let suite =
     test_case "workflow actions use immutable SHAs" `Quick
       workflow_actions_are_pinned;
     test_case "default branch ruleset" `Quick default_branch_ruleset;
+    test_case "release tag ruleset" `Quick release_tag_ruleset;
+    test_case "push guardrail fallback" `Quick push_guardrail_fallback;
     test_case "repository security settings" `Quick repository_security_settings;
+    test_case "unordered GitHub topics" `Quick
+      github_reconciliation_handles_unordered_topics;
     test_case "ownership and stable CI" `Quick ownership_and_ci;
   ]
 

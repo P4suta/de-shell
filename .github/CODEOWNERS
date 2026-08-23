@@ -6,6 +6,7 @@
 /.github/workflows/ @P4suta
 /.github/rulesets/ @P4suta
 /scripts/github-repository.ps1 @P4suta
+/scripts/repository-guardrails.ps1 @P4suta
 /mise.toml @P4suta
 /mise.lock @P4suta
 /de-shell.opam @P4suta

@@ -96,6 +96,7 @@
   ../CHANGELOG.md
   ../CODE_OF_CONDUCT.md
   ../GOVERNANCE.md
+  ../mise.toml
   ../SECURITY.md
   ../SUPPORT.md
   ../.github/CODEOWNERS
@@ -110,8 +111,8 @@
   ../.github/workflows/scorecard.yml
   ../.github/rulesets/default-branch.json
   ../.github/rulesets/release-tags.json
-  ../.github/rulesets/push-guardrails.json
   ../.github/settings/repository.json
+  ../.github/settings/capabilities.json
   ../.github/settings/topics.json
   ../.github/settings/actions.json
   ../.github/settings/selected-actions.json
@@ -120,6 +121,7 @@
   ../.github/settings/features.json
   ../.github/settings/labels.json
   ../scripts/github-repository.ps1
+  ../scripts/repository-guardrails.ps1
   ../schema/effect-ir.schema.json
   ../schema/evidence.schema.json
   ../schema/adapter.schema.json)
