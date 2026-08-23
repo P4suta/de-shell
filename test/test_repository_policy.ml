@@ -211,6 +211,16 @@ let github_reconciliation_handles_unordered_topics () =
        "Assert-StringSetEqual -Expected $expectedTopics.names -Actual \
         $topicsState.names")
 
+let ci_bootstraps_platform_dependencies () =
+  let ci = read ".github/workflows/ci.yml" in
+  check bool "Linux installs the opam sandbox dependency" true
+    (contains ci "sudo apt-get install --yes bubblewrap");
+  check bool "Linux-only package installation" true
+    (contains ci "if: runner.os == 'Linux'");
+  let mise = read "mise.toml" in
+  check bool "mise-owned depexts are explicit to opam" true
+    (contains mise "--assume-depexts")
+
 let ownership_and_ci () =
   let owners = read ".github/CODEOWNERS" in
   check bool "global code owner" true (contains owners "* @P4suta");
@@ -233,6 +243,8 @@ let suite =
     test_case "repository security settings" `Quick repository_security_settings;
     test_case "unordered GitHub topics" `Quick
       github_reconciliation_handles_unordered_topics;
+    test_case "platform dependency bootstrap" `Quick
+      ci_bootstraps_platform_dependencies;
     test_case "ownership and stable CI" `Quick ownership_and_ci;
   ]
 

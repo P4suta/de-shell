@@ -38,6 +38,12 @@ jobs:
           version: 2026.8.6
           cache: true
 
+      - name: Install Linux opam sandbox dependency
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes bubblewrap
+
       - name: Create project-local OCaml switch
         run: mise run setup
 
