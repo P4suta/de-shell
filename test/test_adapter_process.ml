@@ -51,7 +51,11 @@ let test_timeout_terminates_adapter () =
         "timeout diagnostic" true
         (Test_support.contains ~needle:"timed out" message)
   end;
-  Alcotest.(check bool) "bounded wait" true (elapsed < 2.0)
+  Alcotest.(check bool) "bounded wait" true (elapsed < 2.0);
+  let follow_up = connect () in
+  Fun.protect
+    ~finally:(fun () -> Adapter_client.close follow_up)
+    (fun () -> ignore (handshake follow_up))
 
 let test_early_exit_is_attributed () =
   let client = connect ~arguments:[ "--exit-immediately" ] () in
