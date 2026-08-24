@@ -34,7 +34,7 @@ let test_init_analyze_check executable () =
   Alcotest.(check bool) "evidence" true (Sys.file_exists evidence_path);
   let plan = Yojson.Safe.from_file plan_path in
   Alcotest.(check int)
-    "canonical schema" 1
+    "canonical schema" 2
     Yojson.Safe.Util.(plan |> member "schema_version" |> to_int);
   let checked =
     Test_support.run_process executable [ "check"; "--root"; root ]
@@ -139,6 +139,71 @@ let initialize_and_analyze executable root entry source =
       [ "analyze"; "--root"; root; "--entry"; entry ]
   in
   Alcotest.(check int) "analyze" 0 analyzed.status
+
+let test_analyze_persists_typed_powershell_inputs executable () =
+  Test_support.with_temp_dir @@ fun root ->
+  let command =
+    if Sys.win32 then "& 'cmd.exe' '/d' '/s' '/c' 'echo' $Name $Count\n"
+    else "& '/bin/echo' $Name $Count\n"
+  in
+  let source =
+    "[CmdletBinding()]\n\
+     param(\n\
+    \  [Parameter(Mandatory = $true, Position = 0)]\n\
+    \  [string] $Name,\n\
+    \  [int] $Count = 2\n\
+     )\n" ^ command
+  in
+  initialize_and_analyze executable root "typed.ps1" source;
+  let plan =
+    Yojson.Safe.from_file (Filename.concat root ".deshell/plan.json")
+  in
+  let task = Yojson.Safe.Util.(plan |> member "tasks" |> to_list |> List.hd) in
+  let inputs = Yojson.Safe.Util.(task |> member "inputs" |> to_list) in
+  Alcotest.(check (list string))
+    "persisted typed inputs" [ "Name"; "Count" ]
+    (List.map
+       Yojson.Safe.Util.(fun input -> input |> member "name" |> to_string)
+       inputs);
+  Alcotest.(check string)
+    "PowerShell invocation style" "powershell"
+    Yojson.Safe.Util.(
+      task |> member "invocation" |> member "style" |> to_string);
+  Alcotest.(check bool)
+    "PowerShell common parameters persisted" true
+    Yojson.Safe.Util.(
+      task |> member "invocation"
+      |> member "accepts_common_parameters"
+      |> to_bool);
+  Alcotest.(check (list string))
+    "task inputs are not host environment" []
+    (Yojson.Safe.Util.(task |> member "environment" |> to_list)
+    |> List.map Yojson.Safe.Util.to_string);
+  let ran =
+    Test_support.run_process executable
+      [
+        "run";
+        "--root";
+        root;
+        "--";
+        "artifact";
+        "-Count";
+        "3";
+        "-Verbose:$false";
+      ]
+  in
+  if ran.status <> 0 then
+    Alcotest.failf "typed PowerShell CLI run failed: %s"
+      (String.trim ran.stderr);
+  Alcotest.(check bool)
+    "typed PowerShell CLI output" true
+    (Test_support.contains ~needle:"artifact 3" ran.stdout);
+  let missing = Test_support.run_process executable [ "run"; "--root"; root ] in
+  Alcotest.(check bool)
+    "missing mandatory input rejected" true (missing.status <> 0);
+  Alcotest.(check bool)
+    "mandatory diagnostic" true
+    (Test_support.contains ~needle:"missing mandatory" missing.stderr)
 
 let test_check_rejects_tampered_evidence executable () =
   Test_support.with_temp_dir @@ fun root ->
@@ -583,6 +648,8 @@ let () =
             (test_init_analyze_check executable);
           Alcotest.test_case "configured entrypoint" `Quick
             (test_configured_entrypoint_is_used executable);
+          Alcotest.test_case "typed PowerShell inputs" `Quick
+            (test_analyze_persists_typed_powershell_inputs executable);
           Alcotest.test_case "unknown interpreter policy" `Quick
             (test_unknown_interpreter_reject_policy executable);
           Alcotest.test_case "tampered evidence" `Quick

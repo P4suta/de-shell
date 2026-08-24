@@ -32,6 +32,66 @@ let test_round_trip () =
         "same typed plan" true
         (Ir.equal_plan original decoded)
 
+let test_invocation_round_trip () =
+  let body =
+    Ir.node ~id:"typed-invocation"
+      ~guarantee:(Ir.Formal { basis = "powershell-parameter-binding-v1" })
+      (Ir.Exec (Ir.exec [ "tool.exe"; "${Name}"; "${Count}"; "${Force}" ]))
+  in
+  let invocation =
+    Ir.
+      {
+        style = Powershell;
+        accepts_common_parameters = true;
+        parameters =
+          [
+            {
+              input = "Name";
+              position = Some 0;
+              required = true;
+              is_switch = false;
+              default = None;
+              validations = [];
+            };
+            {
+              input = "Count";
+              position = Some 1;
+              required = false;
+              is_switch = false;
+              default = Some "2";
+              validations = [ Int_range { minimum = 1; maximum = 10 } ];
+            };
+            {
+              input = "Force";
+              position = None;
+              required = false;
+              is_switch = true;
+              default = Some "false";
+              validations = [];
+            };
+          ];
+      }
+  in
+  let task =
+    Ir.task ~name:"main"
+      ~inputs:
+        [
+          Ir.{ name = "Name"; value_type = Text };
+          Ir.{ name = "Count"; value_type = Int };
+          Ir.{ name = "Force"; value_type = Bool };
+        ]
+      ~invocation ~body ()
+  in
+  let original = Ir.plan ~entrypoint:"main" [ task ] in
+  let encoded = Ir_codec.encode_string original in
+  match Ir_codec.decode_string encoded with
+  | Error errors ->
+      Alcotest.failf "invocation decode failed: %s" (String.concat "; " errors)
+  | Ok decoded ->
+      Alcotest.(check bool)
+        "same typed invocation" true
+        (Ir.equal_plan original decoded)
+
 let test_unknown_fields_are_ignored () =
   let json = Ir_codec.encode_yojson (sample_plan ()) in
   let with_unknown =
@@ -43,7 +103,7 @@ let test_unknown_fields_are_ignored () =
   match Ir_codec.decode_yojson with_unknown with
   | Error errors ->
       Alcotest.failf "unknown field rejected: %s" (String.concat "; " errors)
-  | Ok decoded -> Alcotest.(check int) "schema version" 1 decoded.schema_version
+  | Ok decoded -> Alcotest.(check int) "schema version" 2 decoded.schema_version
 
 let test_residual_requires_reason () =
   let capsule = Ir.opaque ~interpreter:"sh" ~source:"eval \"$x\"" ~reason:"" in
@@ -70,11 +130,44 @@ let test_v0_migration () =
   | Error errors ->
       Alcotest.failf "migration failed: %s" (String.concat "; " errors)
   | Ok plan -> (
-      Alcotest.(check int) "migrated schema" 1 plan.schema_version;
+      Alcotest.(check int) "migrated schema" 2 plan.schema_version;
       match (List.hd plan.tasks).body.operation with
       | Ir.Exec command ->
           Alcotest.(check (list string)) "argv" [ "echo"; "hello" ] command.argv
       | _ -> Alcotest.fail "legacy command was not migrated to Exec")
+
+let test_v1_migration () =
+  let legacy =
+    match Ir_codec.encode_yojson (sample_plan ()) with
+    | `Assoc fields ->
+        let tasks =
+          match List.assoc "tasks" fields with
+          | `List tasks ->
+              `List
+                (List.map
+                   (function
+                     | `Assoc task_fields ->
+                         `Assoc (List.remove_assoc "invocation" task_fields)
+                     | value -> value)
+                   tasks)
+          | value -> value
+        in
+        `Assoc
+          (("schema_version", `Int 1)
+          :: ("tasks", tasks)
+          :: (fields
+             |> List.remove_assoc "schema_version"
+             |> List.remove_assoc "tasks"))
+    | _ -> Alcotest.fail "encoded plan must be an object"
+  in
+  match Ir_codec.decode_yojson legacy with
+  | Error errors ->
+      Alcotest.failf "v1 migration failed: %s" (String.concat "; " errors)
+  | Ok plan ->
+      Alcotest.(check int) "migrated schema" 2 plan.schema_version;
+      Alcotest.(check bool)
+        "missing invocation migrated to none" true
+        ((List.hd plan.tasks).invocation = None)
 
 let test_node_ids_are_globally_unique () =
   let make_task name =
@@ -324,15 +417,142 @@ let test_task_capabilities_are_unambiguous () =
   has_error "duplicate platform capability" errors;
   has_error "platform capability" errors
 
+let test_invocation_contract_is_validated () =
+  let body =
+    Ir.node ~id:"body"
+      ~guarantee:(Ir.Formal { basis = "test" })
+      (Ir.Exec (Ir.exec [ "true" ]))
+  in
+  let invocation =
+    Ir.
+      {
+        style = Powershell;
+        accepts_common_parameters = true;
+        parameters =
+          [
+            {
+              input = "missing";
+              position = Some (-1);
+              required = true;
+              is_switch = true;
+              default = Some "also-invalid";
+              validations =
+                [
+                  Allow_empty_string;
+                  Allow_empty_string;
+                  Not_null_or_empty;
+                  String_set { values = []; ignore_case = true };
+                  Int_range { minimum = 2; maximum = 1 };
+                ];
+            };
+            {
+              input = "MISSING";
+              position = Some (-1);
+              required = false;
+              is_switch = false;
+              default = None;
+              validations = [];
+            };
+            {
+              input = "Verbose";
+              position = Some 2;
+              required = false;
+              is_switch = false;
+              default = None;
+              validations = [];
+            };
+          ];
+      }
+  in
+  let task =
+    Ir.task ~name:"main"
+      ~inputs:
+        [
+          Ir.{ name = "Verbose"; value_type = Text };
+          Ir.{ name = "verbose"; value_type = Text };
+        ]
+      ~invocation ~body ()
+  in
+  let errors = invalid_errors (Ir.plan ~entrypoint:"main" [ task ]) in
+  has_error "unknown task input" errors;
+  has_error "duplicate invocation parameter" errors;
+  has_error "non-negative" errors;
+  has_error "switch invocation parameter" errors;
+  has_error "duplicate invocation validation" errors;
+  has_error "conflicting empty-string validations" errors;
+  has_error "string set" errors;
+  has_error "minimum greater than maximum" errors;
+  has_error "case-insensitive PowerShell input" errors;
+  has_error "conflicts with a PowerShell common parameter" errors
+
+let test_invocation_default_types_are_validated_before_execution () =
+  let body =
+    Ir.node ~id:"body"
+      ~guarantee:(Ir.Formal { basis = "test" })
+      (Ir.Exec (Ir.exec [ "true" ]))
+  in
+  let parameter input default validations =
+    Ir.
+      {
+        input;
+        position = None;
+        required = false;
+        is_switch = false;
+        default = Some default;
+        validations;
+      }
+  in
+  let invocation =
+    Ir.
+      {
+        style = Powershell;
+        accepts_common_parameters = false;
+        parameters =
+          [
+            parameter "Count" "many" [];
+            parameter "Retry" "9" [ Int_range { minimum = 1; maximum = 5 } ];
+            parameter "Mode" "Nightly"
+              [
+                String_set
+                  { values = [ "Debug"; "Release" ]; ignore_case = true };
+              ];
+            parameter "Enabled" "perhaps" [];
+          ];
+      }
+  in
+  let task =
+    Ir.task ~name:"main"
+      ~inputs:
+        [
+          Ir.{ name = "Count"; value_type = Int };
+          Ir.{ name = "Retry"; value_type = Int };
+          Ir.{ name = "Mode"; value_type = Text };
+          Ir.{ name = "Enabled"; value_type = Bool };
+        ]
+      ~invocation ~body ()
+  in
+  let errors = invalid_errors (Ir.plan ~entrypoint:"main" [ task ]) in
+  has_error "default for Count" errors;
+  has_error "default for Enabled" errors;
+  Alcotest.(check bool)
+    "ValidateRange does not apply to a default" false
+    (List.exists (Test_support.contains ~needle:"default for Retry") errors);
+  Alcotest.(check bool)
+    "ValidateSet does not apply to a default" false
+    (List.exists (Test_support.contains ~needle:"default for Mode") errors)
+
 let () =
   Alcotest.run "Effect IR"
     [
       ( "codec",
         [
           Alcotest.test_case "round trip" `Quick test_round_trip;
+          Alcotest.test_case "invocation round trip" `Quick
+            test_invocation_round_trip;
           Alcotest.test_case "unknown fields" `Quick
             test_unknown_fields_are_ignored;
           Alcotest.test_case "v0 migration" `Quick test_v0_migration;
+          Alcotest.test_case "v1 migration" `Quick test_v1_migration;
         ] );
       ( "validation",
         [
@@ -360,5 +580,9 @@ let () =
             test_capsule_requires_matching_residual_guarantee;
           Alcotest.test_case "task capabilities" `Quick
             test_task_capabilities_are_unambiguous;
+          Alcotest.test_case "invocation contract" `Quick
+            test_invocation_contract_is_validated;
+          Alcotest.test_case "invocation default types" `Quick
+            test_invocation_default_types_are_validated_before_execution;
         ] );
     ]

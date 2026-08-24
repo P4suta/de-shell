@@ -26,6 +26,14 @@ let entry_task plan =
   | Some task -> Ok task
   | None -> Error ("entrypoint task not found: " ^ plan.entrypoint)
 
+let unsupported_task_interface (task : Ir.task) =
+  if Option.is_some task.invocation then Some "task.invocation"
+  else if task.inputs <> [] then Some "task.inputs"
+  else if task.outputs <> [] then Some "task.outputs"
+  else if task.environment <> [] then Some "task.environment"
+  else if task.secrets <> [] then Some "task.secrets"
+  else None
+
 let rec flatten_exec node =
   match node.Ir.operation with
   | Ir.Exec command when command.environment <> [] ->
@@ -292,26 +300,35 @@ let export ~target ~bridge plan =
       begin match entry_task plan with
       | Error _ as error -> error
       | Ok task ->
-          begin match flatten_exec task.body with
-          | Error _ when bridge -> validated target (bridge_artifact target)
-          | Error unsupported ->
+          begin match unsupported_task_interface task with
+          | Some operation ->
               Error
                 (Printf.sprintf
-                   "strict exporter cannot represent node %s (%s); use \
-                    --bridge explicitly"
-                   unsupported.node_id unsupported.operation)
-          | Ok commands -> (
-              match target with
-              | Dagger -> validated target (dagger commands)
-              | Nu -> validated target (nu commands)
-              | Cwl ->
-                  begin match commands with
-                  | [ command ] -> validated target (cwl_command command)
-                  | _ ->
-                      Error
-                        "strict CWL CommandLineTool export requires exactly \
-                         one Exec node"
-                  end
-              | Internal -> assert false)
+                   "strict exporter cannot represent task %s (%s); bridge \
+                    cannot preserve this task interface yet"
+                   task.name operation)
+          | None ->
+              begin match flatten_exec task.body with
+              | Error _ when bridge -> validated target (bridge_artifact target)
+              | Error unsupported ->
+                  Error
+                    (Printf.sprintf
+                       "strict exporter cannot represent node %s (%s); use \
+                        --bridge explicitly"
+                       unsupported.node_id unsupported.operation)
+              | Ok commands -> (
+                  match target with
+                  | Dagger -> validated target (dagger commands)
+                  | Nu -> validated target (nu commands)
+                  | Cwl ->
+                      begin match commands with
+                      | [ command ] -> validated target (cwl_command command)
+                      | _ ->
+                          Error
+                            "strict CWL CommandLineTool export requires \
+                             exactly one Exec node"
+                      end
+                  | Internal -> assert false)
+              end
           end
       end

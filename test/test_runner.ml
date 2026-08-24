@@ -195,6 +195,390 @@ let test_positional_default_expansion () =
     [ [ "emit"; "fallback" ] ]
     empty_calls
 
+let powershell_invocation_plan ?(accepts_common_parameters = false) body =
+  let invocation =
+    Ir.
+      {
+        style = Powershell;
+        accepts_common_parameters;
+        parameters =
+          [
+            {
+              input = "Name";
+              position = Some 0;
+              required = true;
+              is_switch = false;
+              default = None;
+              validations = [];
+            };
+            {
+              input = "Count";
+              position = Some 1;
+              required = false;
+              is_switch = false;
+              default = Some "2";
+              validations = [];
+            };
+            {
+              input = "Force";
+              position = None;
+              required = false;
+              is_switch = true;
+              default = Some "false";
+              validations = [];
+            };
+          ];
+      }
+  in
+  let task =
+    Ir.task ~name:"main"
+      ~inputs:
+        [
+          Ir.{ name = "Name"; value_type = Text };
+          Ir.{ name = "Count"; value_type = Int };
+          Ir.{ name = "Force"; value_type = Bool };
+        ]
+      ~invocation ~body ()
+  in
+  Ir.plan ~entrypoint:"main" [ task ]
+
+let test_powershell_invocation_binding () =
+  let run_with arguments =
+    let calls = ref [] in
+    let body =
+      node 43 (Ir.Exec (Ir.exec [ "emit"; "${Name}:${Count}:${Force}" ]))
+    in
+    let result =
+      Runner.run_plan_with_inputs ~backend:(backend calls)
+        ~policy:Runner.default_policy ~inputs:[] ~arguments
+        (powershell_invocation_plan body)
+      |> get
+    in
+    (result, List.rev !calls)
+  in
+  let named, named_calls =
+    run_with [ "-n"; "artifact"; "-Count:07"; "-Force" ]
+  in
+  Alcotest.(check string)
+    "named and abbreviated parameters" "artifact:7:True" named.stdout;
+  Alcotest.(check (list (list string)))
+    "named argv"
+    [ [ "emit"; "artifact:7:True" ] ]
+    named_calls;
+  let positional, positional_calls = run_with [ "archive" ] in
+  Alcotest.(check string) "defaults" "archive:2:False" positional.stdout;
+  Alcotest.(check (list (list string)))
+    "positional argv"
+    [ [ "emit"; "archive:2:False" ] ]
+    positional_calls;
+  let disabled, _ = run_with [ "-Name"; "archive"; "-Force:$false" ] in
+  Alcotest.(check string)
+    "explicit false switch" "archive:2:False" disabled.stdout;
+  let input_calls = ref [] in
+  let input_body =
+    node 204 (Ir.Exec (Ir.exec [ "emit"; "${Name}:${Count}:${Force}" ]))
+  in
+  let from_case_insensitive_input =
+    Runner.run_plan_with_inputs ~backend:(backend input_calls)
+      ~policy:Runner.default_policy
+      ~inputs:[ ("name", "artifact") ]
+      ~arguments:[]
+      (powershell_invocation_plan input_body)
+    |> get
+  in
+  Alcotest.(check string)
+    "case-insensitive explicit input" "artifact:2:False"
+    from_case_insensitive_input.stdout;
+  begin match
+    Runner.run_plan_with_inputs ~backend:(backend input_calls)
+      ~policy:Runner.default_policy
+      ~inputs:[ ("Name", "one"); ("name", "two") ]
+      ~arguments:[]
+      (powershell_invocation_plan input_body)
+  with
+  | Ok _ -> Alcotest.fail "case-insensitive duplicate input was accepted"
+  | Error message ->
+      Alcotest.(check bool)
+        "case-insensitive duplicate" true
+        (Test_support.contains ~needle:"duplicate plan input" message)
+  end;
+  begin match
+    Runner.run_plan_with_inputs ~backend:(backend input_calls)
+      ~policy:Runner.default_policy
+      ~inputs:[ ("name", "one") ]
+      ~arguments:[ "-Name"; "two" ]
+      (powershell_invocation_plan input_body)
+  with
+  | Ok _ -> Alcotest.fail "input and argv duplicate was accepted"
+  | Error message ->
+      Alcotest.(check bool)
+        "input and argv duplicate" true
+        (Test_support.contains ~needle:"specified more than once" message)
+  end;
+  let common_calls = ref [] in
+  let with_common_parameters =
+    Runner.run_plan_with_inputs ~backend:(backend common_calls)
+      ~policy:Runner.default_policy ~inputs:[]
+      ~arguments:
+        [
+          "artifact";
+          "-Verbose:$false";
+          "-ErrorAction";
+          "Stop";
+          "-OutBuffer";
+          "2";
+        ]
+      (powershell_invocation_plan ~accepts_common_parameters:true input_body)
+    |> get
+  in
+  Alcotest.(check string)
+    "advanced script common parameters" "artifact:2:False"
+    with_common_parameters.stdout;
+  let expect_common_error arguments needle =
+    match
+      Runner.run_plan_with_inputs ~backend:(backend common_calls)
+        ~policy:Runner.default_policy ~inputs:[] ~arguments
+        (powershell_invocation_plan ~accepts_common_parameters:true input_body)
+    with
+    | Ok _ -> Alcotest.fail "invalid PowerShell common parameter was accepted"
+    | Error message ->
+        Alcotest.(check bool)
+          "common parameter error" true
+          (Test_support.contains ~needle message)
+  in
+  expect_common_error
+    [ "artifact"; "-ErrorAction"; "Explode" ]
+    "ActionPreference";
+  expect_common_error
+    [ "artifact"; "-Verbose"; "-vb:$false" ]
+    "specified more than once";
+  expect_common_error [ "artifact"; "-Verbose:0" ] "boolean switch"
+
+let test_powershell_invocation_rejects_invalid_arguments () =
+  let expect_error ~needle arguments =
+    let calls = ref [] in
+    let body =
+      node 44 (Ir.Exec (Ir.exec [ "emit"; "${Name}:${Count}:${Force}" ]))
+    in
+    match
+      Runner.run_plan_with_inputs ~backend:(backend calls)
+        ~policy:Runner.default_policy ~inputs:[] ~arguments
+        (powershell_invocation_plan body)
+    with
+    | Ok _ -> Alcotest.fail "invalid PowerShell invocation was executed"
+    | Error message ->
+        Alcotest.(check bool)
+          "actionable binding error" true
+          (Test_support.contains ~needle message);
+        Alcotest.(check int) "no execution" 0 (List.length !calls)
+  in
+  expect_error ~needle:"missing mandatory" [];
+  expect_error ~needle:"unknown PowerShell parameter" [ "-Unknown"; "value" ];
+  expect_error ~needle:"unknown PowerShell parameter" [ "-Verbose" ];
+  expect_error ~needle:"specified more than once"
+    [ "-Name"; "one"; "-Name"; "two" ];
+  expect_error ~needle:"Int32" [ "-Name"; "one"; "-Count"; "many" ]
+
+let powershell_scalar_invocation_plan ?(required = true) ?default ~value_type
+    ~is_switch () =
+  let invocation =
+    Ir.
+      {
+        style = Powershell;
+        accepts_common_parameters = false;
+        parameters =
+          [
+            {
+              input = "Value";
+              position = Some 0;
+              required;
+              is_switch;
+              default;
+              validations = [];
+            };
+          ];
+      }
+  in
+  let body = node 205 (Ir.Exec (Ir.exec [ "emit"; "${Value}" ])) in
+  Ir.plan ~entrypoint:"main"
+    [
+      Ir.task ~name:"main"
+        ~inputs:[ Ir.{ name = "Value"; value_type } ]
+        ~invocation ~body ();
+    ]
+
+let test_powershell_boolean_argument_grammar () =
+  let run arguments =
+    let calls = ref [] in
+    let result =
+      Runner.run_plan_with_inputs ~backend:(backend calls)
+        ~policy:Runner.default_policy ~inputs:[] ~arguments
+        (powershell_scalar_invocation_plan ~value_type:Ir.Bool ~is_switch:false
+           ())
+    in
+    (result, List.rev !calls)
+  in
+  let explicit_false, false_calls = run [ "-Value:false" ] in
+  let explicit_false = get explicit_false in
+  Alcotest.(check string) "colon boolean" "False" explicit_false.stdout;
+  Alcotest.(check (list (list string)))
+    "colon boolean argv"
+    [ [ "emit"; "False" ] ]
+    false_calls;
+  let expect_rejected ~needle arguments =
+    match run arguments with
+    | Ok _, _ -> Alcotest.fail "non-PowerShell boolean syntax was accepted"
+    | Error message, calls ->
+        Alcotest.(check bool)
+          "boolean syntax diagnostic" true
+          (Test_support.contains ~needle message);
+        Alcotest.(check int)
+          "boolean failure did not execute" 0 (List.length calls)
+  in
+  expect_rejected ~needle:"colon syntax" [ "-Value"; "false" ];
+  expect_rejected ~needle:"colon syntax" [ "false" ];
+  expect_rejected ~needle:"boolean literal" [ "-Value:0" ];
+  let input_calls = ref [] in
+  let from_typed_input =
+    Runner.run_plan_with_inputs ~backend:(backend input_calls)
+      ~policy:Runner.default_policy
+      ~inputs:[ ("Value", "false") ]
+      ~arguments:[]
+      (powershell_scalar_invocation_plan ~value_type:Ir.Bool ~is_switch:false ())
+    |> get
+  in
+  Alcotest.(check string) "typed input boolean" "False" from_typed_input.stdout;
+  let default_calls = ref [] in
+  let numeric_default =
+    Runner.run_plan_with_inputs ~backend:(backend default_calls)
+      ~policy:Runner.default_policy ~inputs:[] ~arguments:[]
+      (powershell_scalar_invocation_plan ~required:false ~default:"1"
+         ~value_type:Ir.Bool ~is_switch:false ())
+    |> get
+  in
+  Alcotest.(check string)
+    "numeric boolean default" "True" numeric_default.stdout
+
+let test_powershell_int32_conversion () =
+  let run value =
+    let calls = ref [] in
+    let result =
+      Runner.run_plan_with_inputs ~backend:(backend calls)
+        ~policy:Runner.default_policy ~inputs:[] ~arguments:[ "-Value"; value ]
+        (powershell_scalar_invocation_plan ~value_type:Ir.Int ~is_switch:false
+           ())
+    in
+    (result, List.rev !calls)
+  in
+  let expect_value input expected =
+    let result, calls = run input in
+    Alcotest.(check string) input expected (get result).stdout;
+    Alcotest.(check (list (list string)))
+      (input ^ " argv")
+      [ [ "emit"; expected ] ]
+      calls
+  in
+  expect_value "1e2" "100";
+  expect_value "1.5" "2";
+  expect_value "2.5" "2";
+  expect_value "-1.5" "-2";
+  expect_value "0b10" "2";
+  expect_value "0x80000000" "-2147483648";
+  let expect_rejected input =
+    match run input with
+    | Ok _, _ -> Alcotest.fail ("invalid Int32 was accepted: " ^ input)
+    | Error message, calls ->
+        Alcotest.(check bool)
+          "Int32 diagnostic" true
+          (Test_support.contains ~needle:"Int32" message);
+        Alcotest.(check int)
+          "Int32 failure did not execute" 0 (List.length calls)
+  in
+  expect_rejected "1_000";
+  expect_rejected "2147483648"
+
+let test_powershell_invocation_enforces_validations () =
+  let calls = ref [] in
+  let body = node 203 (Ir.Exec (Ir.exec [ "emit"; "${Required}" ])) in
+  let parameter ?(required = false) ?default ?(validations = []) input position
+      =
+    Ir.
+      {
+        input;
+        position = Some position;
+        required;
+        is_switch = false;
+        default;
+        validations;
+      }
+  in
+  let invocation =
+    Ir.
+      {
+        style = Powershell;
+        accepts_common_parameters = false;
+        parameters =
+          [
+            parameter ~required:true "Required" 0;
+            parameter ~default:"Nightly"
+              ~validations:
+                [
+                  String_set
+                    { values = [ "Debug"; "Release" ]; ignore_case = true };
+                ]
+              "Mode" 1;
+            parameter ~default:"9"
+              ~validations:[ Int_range { minimum = 1; maximum = 5 } ]
+              "Retry" 2;
+            parameter ~default:"0"
+              ~validations:[ Int_range { minimum = 0; maximum = 255 } ]
+              "Mask" 3;
+          ];
+      }
+  in
+  let plan =
+    Ir.plan ~entrypoint:"main"
+      [
+        Ir.task ~name:"main"
+          ~inputs:
+            [
+              Ir.{ name = "Required"; value_type = Text };
+              Ir.{ name = "Mode"; value_type = Text };
+              Ir.{ name = "Retry"; value_type = Int };
+              Ir.{ name = "Mask"; value_type = Int };
+            ]
+          ~invocation ~body ();
+      ]
+  in
+  let expect_error arguments fragment =
+    match
+      Runner.run_plan_with_inputs ~backend:(backend calls)
+        ~policy:Runner.default_policy ~inputs:[] ~arguments plan
+    with
+    | Ok _ -> Alcotest.fail "invalid validated argument was executed"
+    | Error message ->
+        Alcotest.(check bool)
+          fragment true
+          (Test_support.contains ~needle:fragment message)
+  in
+  expect_error [ "" ] "empty string";
+  expect_error [ "ok"; "-Mode"; "Nightly" ] "ValidateSet";
+  expect_error [ "ok"; "-Retry"; "6" ] "range";
+  expect_error [ "ok"; "-Mask"; "256" ] "range";
+  Alcotest.(check int)
+    "validation failures were not executed" 0 (List.length !calls);
+  begin match
+    Runner.run_plan_with_inputs ~backend:(backend calls)
+      ~policy:Runner.default_policy ~inputs:[] ~arguments:[ "ok" ] plan
+  with
+  | Error message ->
+      Alcotest.fail
+        ("PowerShell defaults must skip input validation: " ^ message)
+  | Ok _ -> ()
+  end;
+  Alcotest.(check int)
+    "invalid defaults are still executable" 1 (List.length !calls)
+
 let test_template_dollar_escape () =
   let calls = ref [] in
   let body = node 41 (Ir.Exec (Ir.exec [ "emit"; "$${HOME}" ])) in
@@ -301,6 +685,54 @@ let test_selected_node_retains_task_graph () =
     |> get
   in
   Alcotest.(check string) "helper output" "selected-task" observation.stdout
+
+let test_selected_node_retains_invocation_contract () =
+  let calls = ref [] in
+  let body =
+    Ir.node ~id:"selected-parameter"
+      ~guarantee:(Ir.Formal { basis = "runner-test" })
+      (Ir.Exec (Ir.exec [ "emit"; "${Name}" ]))
+  in
+  let invocation =
+    Ir.
+      {
+        style = Powershell;
+        accepts_common_parameters = false;
+        parameters =
+          [
+            {
+              input = "Name";
+              position = Some 0;
+              required = true;
+              is_switch = false;
+              default = None;
+              validations = [];
+            };
+          ];
+      }
+  in
+  let main =
+    Ir.task ~name:"main"
+      ~inputs:[ Ir.{ name = "Name"; value_type = Text } ]
+      ~invocation ~body ()
+  in
+  let original = Ir.plan ~entrypoint:"main" [ main ] in
+  let selected =
+    match Cli.select_node original (Some "selected-parameter") with
+    | Ok plan -> plan
+    | Error message -> Alcotest.fail message
+  in
+  let observation =
+    Runner.run_plan_with_inputs ~backend:(backend calls)
+      ~policy:Runner.default_policy ~inputs:[] ~arguments:[ "artifact" ]
+      selected
+    |> get
+  in
+  Alcotest.(check string) "bound selected input" "artifact" observation.stdout;
+  Alcotest.(check (list (list string)))
+    "selected argv"
+    [ [ "emit"; "artifact" ] ]
+    (List.rev !calls)
 
 let test_foreach_binds_variable () =
   let calls = ref [] in
@@ -529,6 +961,8 @@ let () =
           Alcotest.test_case "task call" `Quick test_task_call;
           Alcotest.test_case "selected task call" `Quick
             test_selected_node_retains_task_graph;
+          Alcotest.test_case "selected invocation contract" `Quick
+            test_selected_node_retains_invocation_contract;
           Alcotest.test_case "foreach binding" `Quick
             test_foreach_binds_variable;
           Alcotest.test_case "task arguments" `Quick
@@ -549,6 +983,16 @@ let () =
             test_residual_source_is_not_template_expanded;
           Alcotest.test_case "positional default" `Quick
             test_positional_default_expansion;
+          Alcotest.test_case "PowerShell invocation binding" `Quick
+            test_powershell_invocation_binding;
+          Alcotest.test_case "PowerShell invocation errors" `Quick
+            test_powershell_invocation_rejects_invalid_arguments;
+          Alcotest.test_case "PowerShell boolean argument grammar" `Quick
+            test_powershell_boolean_argument_grammar;
+          Alcotest.test_case "PowerShell Int32 conversion" `Quick
+            test_powershell_int32_conversion;
+          Alcotest.test_case "PowerShell invocation validations" `Quick
+            test_powershell_invocation_enforces_validations;
           Alcotest.test_case "template dollar escape" `Quick
             test_template_dollar_escape;
           Alcotest.test_case "invalid parameter templates" `Quick

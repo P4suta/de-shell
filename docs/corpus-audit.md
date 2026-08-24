@@ -35,7 +35,7 @@ The auditor:
 - omits source bodies from the report and removes only a verified audit temp
   directory.
 
-## Local snapshot: 2026-08-24
+## Local snapshot: 2026-08-25
 
 The command above was run on the current Windows development machine, excluding
 the actively changing `workflow-verifier` and `beamtrace` repositories and the
@@ -59,16 +59,20 @@ The two fully non-residual files were:
 - `film-frame/package.sh` (27 formal nodes)
 - `terminfokit/scripts/fetch-ncurses-oracle.sh` (20 formal nodes)
 
-The 45 residual files were grouped by their first atomic residual reason:
+The 45 residual files were grouped by their first atomic residual reason after
+typed PowerShell parameters, validation metadata, common parameters, and
+top-level post-control POSIX constants were implemented:
 
 | Files | Interpreter | Reason |
 | ---: | --- | --- |
-| 16 | PowerShell | typed parameter blocks need typed input lowering |
-| 6 | PowerShell | assignment expressions exceed the immutable literal subset |
-| 6 | POSIX sh | assignment after control flow needs chronological shell state |
+| 11 | PowerShell | expression/state assignments exceed the immutable scalar subset |
+| 6 | POSIX sh | assignments inside control flow need chronological shell state |
 | 5 | cmd | dynamic expansion in generated Gradle launchers |
-| 5 | POSIX sh | redirection/control effects in generated Gradle launchers |
-| 7 | Bash/cmd/fish/sh/zsh | seven distinct singleton syntax or runtime boundaries |
+| 6 | POSIX sh / Bash | redirection and asynchronous-process semantics |
+| 3 | PowerShell | effectful `ValidateScript(Test-Path …)` input contracts |
+| 2 | PowerShell | parameter-set selection semantics |
+| 2 | PowerShell | non-literal text defaults |
+| 10 | Bash/cmd/fish/PowerShell/sh/zsh | ten distinct singleton syntax or runtime boundaries |
 
 This is deliberately a raw shell-file audit. Its denominator includes five
 copies each of the generated `gradlew` and `gradlew.bat` launchers and four
@@ -80,7 +84,10 @@ differential evidence.
 Consequently, this snapshot does not certify de-shell 1.0 and is not the
 release-gate corpus. A release corpus must explicitly declare non-interactive
 entrypoints and scenarios, then pass differential observation on the required
-OS/shell matrix. The current result is useful local evidence: it demonstrates
-safe inventory and two end-to-end static slices while identifying typed
-PowerShell inputs, expression/state lowering, POSIX chronological state, and
-generated launcher semantics as the highest-impact remaining work.
+OS/shell matrix. The unchanged whole-file count does not mean the compiler made
+no progress: the former 16-file typed-parameter blocker is gone, and those files
+now reach later function, state, validation, or redirection boundaries. The
+current result demonstrates safe inventory and two complete static slices while
+identifying expression/state lowering, parameter sets, effectful validation,
+POSIX chronological state, and generated launcher semantics as the next major
+compiler work.

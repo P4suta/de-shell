@@ -554,6 +554,39 @@ let test_strict_late_immutable_assignment () =
     "late binding is applied only to subsequent argv" true
     (Option.is_some command)
 
+let test_strict_top_level_assignment_after_closed_control_flow () =
+  let source =
+    "#!/bin/sh\n\
+     set -eu\n\
+     if probe\n\
+     then\n\
+     prepare-one\n\
+     else\n\
+     prepare-two\n\
+     fi\n\
+     MODE=release\n\
+     tool.exe build \"$MODE\"\n"
+  in
+  let result = Posix_frontend.lower ~path:"post-control-constant.sh" source in
+  begin if Posix_frontend.has_residual result.root then
+    match result.root.guarantee with
+    | Ir.Residual evidence ->
+        Alcotest.fail
+          ("top-level post-control constant is safe: " ^ evidence.reason)
+    | _ -> Alcotest.fail "post-control constant contains a nested residual"
+  end;
+  let found =
+    Ir.fold_nodes
+      (fun found node ->
+        found
+        ||
+        match node.Ir.operation with
+        | Ir.Exec command -> command.argv = [ "tool.exe"; "build"; "release" ]
+        | _ -> false)
+      false result.root
+  in
+  Alcotest.(check bool) "subsequent argv uses the constant" true found
+
 let test_pipefail_pipeline_stays_residual () =
   let source =
     "#!/usr/bin/env bash\nset -euo pipefail\nproduce | consume\nprintf after\n"
@@ -760,6 +793,8 @@ let () =
             test_strict_late_command_environment_is_not_mutable_state;
           Alcotest.test_case "strict late immutable assignment" `Quick
             test_strict_late_immutable_assignment;
+          Alcotest.test_case "strict post-control immutable assignment" `Quick
+            test_strict_top_level_assignment_after_closed_control_flow;
           Alcotest.test_case "pipefail pipeline residual" `Quick
             test_pipefail_pipeline_stays_residual;
           Alcotest.test_case "strict packaging effects" `Quick

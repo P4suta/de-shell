@@ -27,6 +27,11 @@ before 1.0 may change with explicit migration notes.
 - A schema-backed, non-executing corpus auditor that records its repository
   selection, verifies post-scan content hashes, analyzes isolated copies, and
   groups inventory and residual evidence deterministically.
+- Effect IR v2 typed PowerShell invocation contracts, including positions,
+  mandatory/switch/default behavior, scalar types, validation metadata, and
+  explicit `CmdletBinding` common-parameter capability.
+- `deshell run -- SCRIPT_ARG...` pass-through for original arguments that begin
+  with a dash, while retaining `--arg=VALUE` compatibility.
 
 ### Changed
 
@@ -36,8 +41,12 @@ before 1.0 may change with explicit migration notes.
   expansion-safe literal heredoc writes while preserving mixed or unsupported
   forms as residual capsules.
 - Expanded PowerShell, fish, and cmd literal frontends with static
-  multi-statement files, immutable PowerShell string/environment dataflow,
-  help/header handling, quote-aware boundaries, and honest cmd echo semantics.
+  multi-statement files, immutable PowerShell scalar/environment dataflow,
+  typed parameters, static `ValidateSet`/`ValidateRange`/empty-string
+  contracts, help/header handling, quote-aware boundaries, and honest cmd echo
+  semantics.
+- Allowed immutable top-level POSIX assignments after a closed control-flow
+  construct while continuing to reject assignments inside active branches.
 - Made canonical template escaping, environment/secret declaration, nested-task
   inheritance, and input rejection explicit in the internal runner.
 - Inventoried multiple embedded-shell callsites on one line with stable columns,
@@ -57,6 +66,13 @@ before 1.0 may change with explicit migration notes.
 - Preserved PowerShell doubled single quotes and normal `.ps1` completion status,
   and rejected native expression/escape syntax that the literal subsets cannot
   model soundly.
+- Matched official PowerShell boolean/switch process-argument grammar and
+  native-argv rendering (`True`/`False`), including colon-only boolean values;
+  reproduced Int32 decimal/exponent, binary/hex, midpoint rounding, and overflow
+  behavior; rejected case-insensitive input collisions; and type-checked
+  invocation defaults before execution.
+- Prevented strict exporters from rejecting non-behavioral command-model
+  annotations while continuing to reject task interfaces they cannot preserve.
 - Bounded every official-exporter subprocess and terminate its process tree on
   timeout instead of allowing a stalled Docker or Dagger engine to hang the
   validation gate indefinitely.

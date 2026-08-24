@@ -1,4 +1,4 @@
-let current_schema_version = 1
+let current_schema_version = 2
 
 type value_type =
   | Bytes
@@ -72,6 +72,28 @@ and operation =
   | Opaque_capsule of opaque_capsule
 
 type binding = { name : string; value_type : value_type }
+type invocation_style = Powershell
+
+type invocation_validation =
+  | Allow_empty_string
+  | Not_null_or_empty
+  | String_set of { values : string list; ignore_case : bool }
+  | Int_range of { minimum : int; maximum : int }
+
+type invocation_parameter = {
+  input : string;
+  position : int option;
+  required : bool;
+  is_switch : bool;
+  default : string option;
+  validations : invocation_validation list;
+}
+
+type invocation = {
+  style : invocation_style;
+  accepts_common_parameters : bool;
+  parameters : invocation_parameter list;
+}
 
 type task = {
   name : string;
@@ -81,6 +103,7 @@ type task = {
   secrets : string list;
   platform_capabilities : string list;
   cacheable : bool;
+  invocation : invocation option;
   body : node;
 }
 
@@ -103,7 +126,8 @@ let opaque_file ~path ~interpreter ~source ~reason =
 let node ?source ~id ~guarantee operation = { id; operation; guarantee; source }
 
 let task ?(inputs = []) ?(outputs = []) ?(environment = []) ?(secrets = [])
-    ?(platform_capabilities = []) ?(cacheable = false) ~name ~body () =
+    ?(platform_capabilities = []) ?(cacheable = false) ?invocation ~name ~body
+    () =
   {
     name;
     inputs;
@@ -112,6 +136,7 @@ let task ?(inputs = []) ?(outputs = []) ?(environment = []) ?(secrets = [])
     secrets;
     platform_capabilities;
     cacheable;
+    invocation;
     body;
   }
 
@@ -315,6 +340,267 @@ let rec validate_node task_table seen node errors =
             ("capsule path must be safely project-relative: " ^ path) :: errors
       end
 
+let rec unsecret_value_type = function
+  | Secret inner -> unsecret_value_type inner
+  | value_type -> value_type
+
+let invocation_validation_name = function
+  | Allow_empty_string -> "allow_empty_string"
+  | Not_null_or_empty -> "not_null_or_empty"
+  | String_set _ -> "string_set"
+  | Int_range _ -> "int_range"
+
+let powershell_common_parameter_names =
+  [
+    "verbose";
+    "vb";
+    "debug";
+    "db";
+    "erroraction";
+    "ea";
+    "warningaction";
+    "wa";
+    "informationaction";
+    "infa";
+    "progressaction";
+    "proga";
+    "errorvariable";
+    "ev";
+    "warningvariable";
+    "wv";
+    "informationvariable";
+    "iv";
+    "outvariable";
+    "ov";
+    "outbuffer";
+    "ob";
+    "pipelinevariable";
+    "pv";
+  ]
+
+let normalize_powershell_int32 value =
+  let value = String.trim value in
+  let error () = Error "must be a PowerShell Int32" in
+  let int32_min = -2_147_483_648L in
+  let int32_max = 2_147_483_647L in
+  let uint32_modulus = 4_294_967_296L in
+  let decimal_digit = function '0' .. '9' -> true | _ -> false in
+  let digit_value radix = function
+    | '0' .. '9' as character ->
+        let value = Char.code character - Char.code '0' in
+        if value < radix then Some value else None
+    | ('a' .. 'f' | 'A' .. 'F') as character when radix = 16 ->
+        Some (10 + Char.code (Char.lowercase_ascii character) - Char.code 'a')
+    | _ -> None
+  in
+  let parse_unsigned radix digits =
+    if digits = "" then None
+    else
+      let rec loop index accumulator =
+        if index = String.length digits then Some accumulator
+        else
+          match digit_value radix digits.[index] with
+          | None -> None
+          | Some digit ->
+              let radix = Int64.of_int radix in
+              let digit = Int64.of_int digit in
+              if
+                Int64.compare accumulator
+                  (Int64.div (Int64.sub Int64.max_int digit) radix)
+                > 0
+              then None
+              else
+                loop (index + 1) (Int64.add (Int64.mul accumulator radix) digit)
+      in
+      loop 0 0L
+  in
+  let signed_prefix value =
+    if value = "" then (1, value)
+    else
+      match value.[0] with
+      | '+' -> (1, String.sub value 1 (String.length value - 1))
+      | '-' -> (-1, String.sub value 1 (String.length value - 1))
+      | _ -> (1, value)
+  in
+  let sign, unsigned = signed_prefix value in
+  let base_literal =
+    if
+      String.length unsigned > 2
+      && unsigned.[0] = '0'
+      && (unsigned.[1] = 'x' || unsigned.[1] = 'X')
+    then Some (16, String.sub unsigned 2 (String.length unsigned - 2))
+    else if
+      String.length unsigned > 2
+      && unsigned.[0] = '0'
+      && (unsigned.[1] = 'b' || unsigned.[1] = 'B')
+    then Some (2, String.sub unsigned 2 (String.length unsigned - 2))
+    else None
+  in
+  match base_literal with
+  | Some (radix, digits) ->
+      begin match parse_unsigned radix digits with
+      | Some magnitude when Int64.compare magnitude 0xffff_ffffL <= 0 ->
+          let signed =
+            if Int64.compare magnitude int32_max <= 0 then magnitude
+            else Int64.sub magnitude uint32_modulus
+          in
+          let signed = if sign < 0 then Int64.neg signed else signed in
+          if
+            Int64.compare signed int32_min < 0
+            || Int64.compare signed int32_max > 0
+          then error ()
+          else Ok (Int64.to_string signed)
+      | Some _ | None -> error ()
+      end
+  | None -> (
+      let valid_decimal =
+        let length = String.length value in
+        let rec digits index =
+          if index < length && decimal_digit value.[index] then
+            digits (index + 1)
+          else index
+        in
+        let start =
+          if length > 0 && (value.[0] = '+' || value.[0] = '-') then 1 else 0
+        in
+        let integer_end = digits start in
+        let has_integer = integer_end > start in
+        let fraction_end, has_fraction =
+          if integer_end < length && value.[integer_end] = '.' then
+            let finish = digits (integer_end + 1) in
+            (finish, finish > integer_end + 1)
+          else (integer_end, false)
+        in
+        let mantissa = has_integer || has_fraction in
+        let exponent_end =
+          if
+            fraction_end < length
+            && (value.[fraction_end] = 'e' || value.[fraction_end] = 'E')
+          then
+            let exponent_start =
+              if
+                fraction_end + 1 < length
+                && (value.[fraction_end + 1] = '+'
+                   || value.[fraction_end + 1] = '-')
+              then fraction_end + 2
+              else fraction_end + 1
+            in
+            let finish = digits exponent_start in
+            if finish = exponent_start then -1 else finish
+          else fraction_end
+        in
+        mantissa && exponent_end = length
+      in
+      if not valid_decimal then error ()
+      else
+        match float_of_string_opt value with
+        | None -> error ()
+        | Some number
+          when Float.is_nan number || Float.is_infinite number
+               || number < -2_147_483_648.5 || number > 2_147_483_647.5 ->
+            error ()
+        | Some number ->
+            let floor = Float.floor number in
+            let fraction = number -. floor in
+            let rounded =
+              if fraction < 0.5 then floor
+              else if fraction > 0.5 then floor +. 1.
+              else
+                let floor_int = Int64.of_float floor in
+                if Int64.rem floor_int 2L = 0L then floor else floor +. 1.
+            in
+            let normalized = Int64.of_float rounded in
+            if
+              Int64.compare normalized int32_min < 0
+              || Int64.compare normalized int32_max > 0
+            then error ()
+            else Ok (Int64.to_string normalized))
+
+let validate_invocation_validation task_name parameter input validation errors =
+  let type_error expected errors =
+    Printf.sprintf
+      "task %s invocation validation %s for %s requires %s input type" task_name
+      (invocation_validation_name validation)
+      parameter.input expected
+    :: errors
+  in
+  let input_type =
+    Option.map
+      (fun (binding : binding) -> unsecret_value_type binding.value_type)
+      input
+  in
+  match validation with
+  | Allow_empty_string | Not_null_or_empty ->
+      begin match input_type with
+      | Some Text -> errors
+      | Some _ | None -> type_error "text" errors
+      end
+  | String_set { values; ignore_case } ->
+      let normalized =
+        if ignore_case then List.map String.lowercase_ascii values else values
+      in
+      let errors =
+        if values = [] then
+          Printf.sprintf
+            "task %s invocation string set for %s must not be empty" task_name
+            parameter.input
+          :: errors
+        else errors
+      in
+      let errors =
+        duplicate_values
+          ("invocation string set value for " ^ parameter.input)
+          normalized errors
+      in
+      begin match input_type with
+      | Some Text -> errors
+      | Some _ | None -> type_error "text" errors
+      end
+  | Int_range { minimum; maximum } ->
+      let errors =
+        if minimum > maximum then
+          Printf.sprintf
+            "task %s invocation integer range for %s has minimum greater than \
+             maximum"
+            task_name parameter.input
+          :: errors
+        else errors
+      in
+      begin match input_type with
+      | Some Int -> errors
+      | Some _ | None -> type_error "int" errors
+      end
+
+let normalize_invocation_default value_type value =
+  let rec normalize = function
+    | Text | Path | Bytes -> Ok value
+    | Int -> normalize_powershell_int32 value
+    | Bool ->
+        begin match String.lowercase_ascii value with
+        | "true" | "$true" | "1" -> Ok "true"
+        | "false" | "$false" | "0" -> Ok "false"
+        | _ -> Error "must be a boolean"
+        end
+    | Secret inner -> normalize inner
+    | List _ | Record _ | Byte_stream | Object_stream _ ->
+        Error "uses an input type unsupported by PowerShell invocation"
+  in
+  normalize value_type
+
+let validate_invocation_default task_name parameter input errors =
+  match (parameter.default, input) with
+  | None, _ | Some _, None -> errors
+  | Some default, Some (binding : binding) ->
+      let invalid detail errors =
+        Printf.sprintf "task %s invocation default for %s %s" task_name
+          parameter.input detail
+        :: errors
+      in
+      begin match normalize_invocation_default binding.value_type default with
+      | Error detail -> invalid detail errors
+      | Ok _ -> errors
+      end
+
 let validate_plan plan =
   let errors = ref [] in
   if plan.schema_version <> current_schema_version then
@@ -387,7 +673,101 @@ let validate_plan plan =
                   task.name binding.name
                 :: !errors
           | _ -> ())
-        task.inputs)
+        task.inputs;
+      begin match task.invocation with
+      | None -> ()
+      | Some invocation ->
+          let powershell_input_names =
+            List.map String.lowercase_ascii input_names
+          in
+          errors :=
+            duplicate_values "case-insensitive PowerShell input"
+              powershell_input_names !errors;
+          let parameter_names =
+            List.map
+              (fun parameter -> String.lowercase_ascii parameter.input)
+              invocation.parameters
+          in
+          errors :=
+            duplicate_values "invocation parameter" parameter_names !errors;
+          let positions =
+            List.filter_map
+              (fun parameter -> Option.map string_of_int parameter.position)
+              invocation.parameters
+          in
+          errors := duplicate_values "invocation position" positions !errors;
+          List.iter
+            (fun parameter ->
+              let input =
+                List.find_opt
+                  (fun (binding : binding) -> binding.name = parameter.input)
+                  task.inputs
+              in
+              if Option.is_none input then
+                errors :=
+                  Printf.sprintf
+                    "task %s invocation parameter %s refers to an unknown task \
+                     input"
+                    task.name parameter.input
+                  :: !errors;
+              if
+                invocation.accepts_common_parameters
+                && List.mem
+                     (String.lowercase_ascii parameter.input)
+                     powershell_common_parameter_names
+              then
+                errors :=
+                  Printf.sprintf
+                    "task %s invocation parameter %s conflicts with a \
+                     PowerShell common parameter"
+                    task.name parameter.input
+                  :: !errors;
+              begin match parameter.position with
+              | Some position when position < 0 ->
+                  errors :=
+                    Printf.sprintf
+                      "task %s invocation position for %s must be non-negative"
+                      task.name parameter.input
+                    :: !errors
+              | Some _ | None -> ()
+              end;
+              let validation_names =
+                List.map invocation_validation_name parameter.validations
+              in
+              errors :=
+                duplicate_values
+                  ("invocation validation for " ^ parameter.input)
+                  validation_names !errors;
+              if
+                List.mem Allow_empty_string parameter.validations
+                && List.mem Not_null_or_empty parameter.validations
+              then
+                errors :=
+                  Printf.sprintf
+                    "task %s invocation parameter %s has conflicting \
+                     empty-string validations"
+                    task.name parameter.input
+                  :: !errors;
+              List.iter
+                (fun validation ->
+                  errors :=
+                    validate_invocation_validation task.name parameter input
+                      validation !errors)
+                parameter.validations;
+              errors :=
+                validate_invocation_default task.name parameter input !errors;
+              if parameter.is_switch then
+                match input with
+                | Some { value_type = Bool; _ } -> ()
+                | Some _ | None ->
+                    errors :=
+                      Printf.sprintf
+                        "task %s switch invocation parameter %s must use bool \
+                         input type"
+                        task.name parameter.input
+                      :: !errors)
+            invocation.parameters
+      end)
     plan.tasks;
   let node_ids = Hashtbl.create 32 in
   List.iter

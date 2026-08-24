@@ -2,6 +2,9 @@ type family = Fish | Powershell | Cmd | Nu
 type token = { text : string; start_byte : int; end_byte : int }
 type statement = { tokens : token list; source_start : int; source_end : int }
 
+let ( let* ) result continuation =
+  match result with Ok value -> continuation value | Error _ as error -> error
+
 let interpreter = function
   | Fish -> "fish"
   | Powershell -> "powershell"
@@ -131,8 +134,10 @@ let lex_statement family source ~start_byte ~end_byte =
         then
           failure :=
             Some "quoted escape syntax is outside the literal argv subset"
-        else if dynamic family character then
-          failure := Some "dynamic expansion is outside the static subset"
+        else if
+          dynamic family character
+          && not (family = Powershell && delimiter = '\'')
+        then failure := Some "dynamic expansion is outside the static subset"
         else add !index character
     | `Normal ->
         if is_space character then flush !index
@@ -358,18 +363,27 @@ let powershell_assignment bindings line =
           else if length >= 2 && right.[0] = '"' && right.[length - 1] = '"'
           then
             String.sub right 1 (length - 2) |> expand_powershell_string bindings
-          else if String.starts_with ~prefix:"$" right then
-            begin match
-              parse_powershell_reference bindings right 0 (String.length right)
-            with
-            | Ok (finish, value) when finish = String.length right -> Ok value
-            | Ok _ ->
-                Error
-                  "PowerShell assignment expression has unsupported trailing \
-                   syntax"
-            | Error _ as error -> error
+          else if String.lowercase_ascii right = "$true" then Ok "True"
+          else if String.lowercase_ascii right = "$false" then Ok "False"
+          else
+            begin match int_of_string_opt right with
+            | Some number -> Ok (string_of_int number)
+            | None when String.starts_with ~prefix:"$" right ->
+                begin match
+                  parse_powershell_reference bindings right 0
+                    (String.length right)
+                with
+                | Ok (finish, value) when finish = String.length right ->
+                    Ok value
+                | Ok _ ->
+                    Error
+                      "PowerShell assignment expression has unsupported \
+                       trailing syntax"
+                | Error _ as error -> error
+                end
+            | None ->
+                Error "PowerShell assignment value is outside the static subset"
             end
-          else Error "PowerShell assignment value is outside the static subset"
         in
         Result.map (fun value -> (key, name, value)) value
 
@@ -518,83 +532,663 @@ let compact_powershell_header value =
   |> Seq.filter (function ' ' | '\t' | '\r' -> false | _ -> true)
   |> String.of_seq
 
+type powershell_parameter_block = {
+  start_byte : int;
+  end_byte : int;
+  bindings : (string * string) list;
+  inputs : Ir.binding list;
+  invocation : Ir.invocation;
+}
+
+let split_powershell_top_level_commas value =
+  let parts = ref [] in
+  let buffer = Buffer.create (String.length value) in
+  let parentheses = ref 0 in
+  let brackets = ref 0 in
+  let braces = ref 0 in
+  let state = ref `Normal in
+  let index = ref 0 in
+  let flush () =
+    parts := (Buffer.contents buffer |> String.trim) :: !parts;
+    Buffer.clear buffer
+  in
+  while !index < String.length value do
+    let character = value.[!index] in
+    begin match !state with
+    | `Line_comment ->
+        if character = '\n' then begin
+          state := `Normal;
+          Buffer.add_char buffer ' '
+        end
+    | `Single ->
+        Buffer.add_char buffer character;
+        if character = '\'' then
+          if !index + 1 < String.length value && value.[!index + 1] = '\'' then begin
+            incr index;
+            Buffer.add_char buffer '\''
+          end
+          else state := `Normal
+    | `Double ->
+        Buffer.add_char buffer character;
+        if character = '`' && !index + 1 < String.length value then begin
+          incr index;
+          Buffer.add_char buffer value.[!index]
+        end
+        else if character = '"' then state := `Normal
+    | `Normal ->
+        begin match character with
+        | '#' -> state := `Line_comment
+        | '\'' ->
+            state := `Single;
+            Buffer.add_char buffer character
+        | '"' ->
+            state := `Double;
+            Buffer.add_char buffer character
+        | '(' ->
+            incr parentheses;
+            Buffer.add_char buffer character
+        | ')' ->
+            decr parentheses;
+            Buffer.add_char buffer character
+        | '[' ->
+            incr brackets;
+            Buffer.add_char buffer character
+        | ']' ->
+            decr brackets;
+            Buffer.add_char buffer character
+        | '{' ->
+            incr braces;
+            Buffer.add_char buffer character
+        | '}' ->
+            decr braces;
+            Buffer.add_char buffer character
+        | ',' when !parentheses = 0 && !brackets = 0 && !braces = 0 -> flush ()
+        | character -> Buffer.add_char buffer character
+        end
+    end;
+    incr index
+  done;
+  flush ();
+  List.rev !parts |> List.filter (fun part -> part <> "")
+
+let powershell_matching_delimiter source ~open_byte ~opening ~closing =
+  let depth = ref 0 in
+  let state = ref `Normal in
+  let result = ref None in
+  let index = ref open_byte in
+  while !index < String.length source && !result = None do
+    let character = source.[!index] in
+    begin match !state with
+    | `Line_comment -> if character = '\n' then state := `Normal
+    | `Single ->
+        if character = '\'' then
+          if !index + 1 < String.length source && source.[!index + 1] = '\''
+          then incr index
+          else state := `Normal
+    | `Double ->
+        if character = '`' && !index + 1 < String.length source then incr index
+        else if character = '"' then state := `Normal
+    | `Normal ->
+        if character = '#' then state := `Line_comment
+        else if character = '\'' then state := `Single
+        else if character = '"' then state := `Double
+        else if character = opening then incr depth
+        else if character = closing then begin
+          decr depth;
+          if !depth = 0 then result := Some !index
+        end
+    end;
+    incr index
+  done;
+  !result
+
+let powershell_validation_string value =
+  let value = String.trim value in
+  let length = String.length value in
+  if length < 2 then
+    Error "PowerShell validation value must be a string literal"
+  else if value.[0] = '\'' && value.[length - 1] = '\'' then
+    decode_powershell_single_quoted (String.sub value 1 (length - 2))
+  else if value.[0] = '"' && value.[length - 1] = '"' then
+    let inner = String.sub value 1 (length - 2) in
+    if
+      String.contains inner '$' || String.contains inner '`'
+      || String.contains inner '"'
+    then Error "PowerShell validation value must be a static string literal"
+    else Ok inner
+  else Error "PowerShell validation value must be a string literal"
+
+let powershell_attribute_arguments value =
+  match String.index_opt value '(' with
+  | Some opening when String.ends_with ~suffix:")" value ->
+      Ok (String.sub value (opening + 1) (String.length value - opening - 2))
+  | Some _ | None -> Error "PowerShell validation attribute is malformed"
+
+let powershell_parameter_attribute value =
+  let trimmed = String.trim value in
+  let lower = String.lowercase_ascii trimmed in
+  let compact = compact_powershell_header trimmed in
+  if lower = "parameter" then Ok (`Parameter [])
+  else if
+    String.starts_with ~prefix:"parameter(" lower
+    && String.ends_with ~suffix:")" lower
+  then
+    let options =
+      String.sub trimmed 10 (String.length trimmed - 11)
+      |> split_powershell_top_level_commas
+    in
+    Ok (`Parameter options)
+  else
+    match compact with
+    | "string" | "system.string" -> Ok (`Type (Ir.Text, []))
+    | "int" | "int32" | "system.int32" -> Ok (`Type (Ir.Int, []))
+    | "byte" | "uint8" | "system.byte" ->
+        Ok (`Type (Ir.Int, [ Ir.Int_range { minimum = 0; maximum = 255 } ]))
+    | "bool" | "boolean" | "system.boolean" -> Ok (`Type (Ir.Bool, []))
+    | "switch" | "switchparameter"
+    | "system.management.automation.switchparameter" ->
+        Ok `Switch
+    | "allowemptystring" | "allowemptystring()" ->
+        Ok (`Validation Ir.Allow_empty_string)
+    | "validatenotnullorempty" | "validatenotnullorempty()" ->
+        Ok (`Validation Ir.Not_null_or_empty)
+    | _ when String.starts_with ~prefix:"validateset(" compact ->
+        let* arguments = powershell_attribute_arguments trimmed in
+        let arguments = split_powershell_top_level_commas arguments in
+        if arguments = [] then Error "PowerShell ValidateSet must not be empty"
+        else
+          let rec decode values = function
+            | [] -> Ok (List.rev values)
+            | argument :: rest ->
+                let* value = powershell_validation_string argument in
+                decode (value :: values) rest
+          in
+          let* values = decode [] arguments in
+          Ok (`Validation (Ir.String_set { values; ignore_case = true }))
+    | _ when String.starts_with ~prefix:"validaterange(" compact ->
+        let* arguments = powershell_attribute_arguments trimmed in
+        begin match split_powershell_top_level_commas arguments with
+        | [ minimum; maximum ] ->
+            begin match
+              ( int_of_string_opt (String.trim minimum),
+                int_of_string_opt (String.trim maximum) )
+            with
+            | Some minimum, Some maximum when minimum <= maximum ->
+                Ok (`Validation (Ir.Int_range { minimum; maximum }))
+            | Some _, Some _ ->
+                Error "PowerShell ValidateRange minimum exceeds maximum"
+            | _ ->
+                Error "PowerShell ValidateRange bounds must be integer literals"
+            end
+        | _ -> Error "PowerShell ValidateRange requires two bounds"
+        end
+    | _
+      when String.starts_with ~prefix:"validate" compact
+           || String.starts_with ~prefix:"allow" compact ->
+        Error
+          ("PowerShell validation attribute is outside the typed input subset: \
+            [" ^ trimmed ^ "]")
+    | _ ->
+        Error
+          ("PowerShell parameter type or attribute is outside the typed input \
+            subset: [" ^ trimmed ^ "]")
+
+let powershell_parameter_options options =
+  let mandatory = ref false in
+  let position = ref None in
+  let failure = ref None in
+  List.iter
+    (fun option ->
+      if !failure = None then
+        let compact = compact_powershell_header option in
+        match String.split_on_char '=' compact with
+        | [ "mandatory" ] -> mandatory := true
+        | [ "mandatory"; value ] ->
+            begin match value with
+            | "$true" | "true" -> mandatory := true
+            | "$false" | "false" -> mandatory := false
+            | _ ->
+                failure := Some "PowerShell Mandatory must be a static boolean"
+            end
+        | [ "position"; value ] ->
+            begin match int_of_string_opt value with
+            | Some value when value >= 0 -> position := Some value
+            | Some _ | None ->
+                failure :=
+                  Some "PowerShell parameter Position must be non-negative"
+            end
+        | key :: _ when String.starts_with ~prefix:"parametersetname" key ->
+            failure :=
+              Some
+                "PowerShell parameter set semantics require a dedicated IR \
+                 contract"
+        | _ ->
+            failure :=
+              Some
+                ("PowerShell parameter binding option is outside the typed \
+                  input subset: " ^ option))
+    options;
+  match !failure with
+  | Some message -> Error message
+  | None -> Ok (!mandatory, !position)
+
+let powershell_static_parameter_default value_type value =
+  let value = String.trim value in
+  match value_type with
+  | Ir.Int ->
+      begin match Ir.normalize_powershell_int32 value with
+      | Ok value -> Ok value
+      | Error _ ->
+          Error "PowerShell integer parameter default must be a literal"
+      end
+  | Ir.Bool ->
+      begin match String.lowercase_ascii value with
+      | "$true" | "true" | "1" -> Ok "true"
+      | "$false" | "false" | "0" -> Ok "false"
+      | _ -> Error "PowerShell boolean parameter default must be a literal"
+      end
+  | Ir.Text | Ir.Path ->
+      begin match powershell_assignment [] ("$value = " ^ value) with
+      | Ok (_, _, value) ->
+          if Posix_frontend.contains value "${" then
+            Error
+              "PowerShell parameter defaults cannot reference runtime state yet"
+          else Ok value
+      | Error _ -> Error "PowerShell text parameter default must be a literal"
+      end
+  | Ir.Bytes | Ir.List _ | Ir.Record _ | Ir.Secret _ | Ir.Byte_stream
+  | Ir.Object_stream _ ->
+      Error
+        "PowerShell parameter default type is outside the typed input subset"
+
+let validate_powershell_parameter_validations value_type validations =
+  let kind = function
+    | Ir.Allow_empty_string -> "AllowEmptyString"
+    | Ir.Not_null_or_empty -> "ValidateNotNullOrEmpty"
+    | Ir.String_set _ -> "ValidateSet"
+    | Ir.Int_range _ -> "ValidateRange"
+  in
+  let kinds = List.map kind validations in
+  let duplicate =
+    List.find_opt
+      (fun name -> List.length (List.filter (String.equal name) kinds) > 1)
+      kinds
+  in
+  match duplicate with
+  | Some name -> Error ("PowerShell parameter repeats " ^ name)
+  | None
+    when List.mem Ir.Allow_empty_string validations
+         && List.mem Ir.Not_null_or_empty validations ->
+      Error "PowerShell parameter has conflicting empty-string validations"
+  | None ->
+      let rec validate = function
+        | [] -> Ok ()
+        | (Ir.Allow_empty_string | Ir.Not_null_or_empty) :: _
+          when value_type <> Ir.Text ->
+            Error "PowerShell empty-string validation requires text input"
+        | Ir.String_set _ :: _ when value_type <> Ir.Text ->
+            Error "PowerShell ValidateSet requires text input"
+        | Ir.String_set { values; ignore_case } :: rest ->
+            let values =
+              if ignore_case then List.map String.lowercase_ascii values
+              else values
+            in
+            if
+              List.sort_uniq String.compare values
+              |> List.length <> List.length values
+            then Error "PowerShell ValidateSet contains duplicate values"
+            else validate rest
+        | Ir.Int_range _ :: _ when value_type <> Ir.Int ->
+            Error "PowerShell ValidateRange requires int input"
+        | Ir.Int_range { minimum; maximum } :: _ when minimum > maximum ->
+            Error "PowerShell ValidateRange minimum exceeds maximum"
+        | _ :: rest -> validate rest
+      in
+      validate validations
+
+let parse_powershell_parameter_declaration implicit_position declaration =
+  let rest = ref (String.trim declaration) in
+  let value_type = ref None in
+  let is_switch = ref false in
+  let validations = ref [] in
+  let mandatory = ref false in
+  let explicit_position = ref None in
+  let saw_parameter_attribute = ref false in
+  let failure = ref None in
+  while !failure = None && String.length !rest > 0 && !rest.[0] = '[' do
+    match
+      powershell_matching_delimiter !rest ~open_byte:0 ~opening:'[' ~closing:']'
+    with
+    | None -> failure := Some "unterminated PowerShell parameter attribute"
+    | Some close ->
+        let attribute = String.sub !rest 1 (close - 1) in
+        rest :=
+          String.sub !rest (close + 1) (String.length !rest - close - 1)
+          |> String.trim;
+        begin match powershell_parameter_attribute attribute with
+        | Error message -> failure := Some message
+        | Ok (`Type (parameter_type, implicit_validations)) ->
+            if Option.is_some !value_type then
+              failure :=
+                Some "PowerShell parameter has multiple type declarations"
+            else begin
+              value_type := Some parameter_type;
+              validations := List.rev_append implicit_validations !validations
+            end
+        | Ok `Switch ->
+            if Option.is_some !value_type then
+              failure :=
+                Some "PowerShell parameter has multiple type declarations"
+            else begin
+              value_type := Some Ir.Bool;
+              is_switch := true
+            end
+        | Ok (`Validation validation) ->
+            validations := validation :: !validations
+        | Ok (`Parameter options) ->
+            if !saw_parameter_attribute then
+              failure :=
+                Some
+                  "multiple Parameter attributes require parameter-set \
+                   semantics"
+            else begin
+              saw_parameter_attribute := true;
+              match powershell_parameter_options options with
+              | Error message -> failure := Some message
+              | Ok (required, position) ->
+                  mandatory := required;
+                  Option.iter
+                    (fun value -> explicit_position := Some value)
+                    position
+            end
+        end
+  done;
+  match !failure with
+  | Some message -> Error message
+  | None ->
+      let* value_type =
+        match !value_type with
+        | Some value_type -> Ok value_type
+        | None ->
+            Error
+              "PowerShell parameter requires an explicit supported scalar type"
+      in
+      let validations = List.rev !validations in
+      let* () =
+        validate_powershell_parameter_validations value_type validations
+      in
+      if !rest = "" || !rest.[0] <> '$' then
+        Error "PowerShell parameter declaration is missing a variable name"
+      else
+        let rec name_end index =
+          if index >= String.length !rest then index
+          else
+            match !rest.[index] with
+            | 'A' .. 'Z' | 'a' .. 'z' | '0' .. '9' | '_' -> name_end (index + 1)
+            | _ -> index
+        in
+        let finish = name_end 1 in
+        let name = String.sub !rest 1 (finish - 1) in
+        if not (valid_powershell_name name) then
+          Error "PowerShell parameter has an invalid variable name"
+        else
+          let suffix =
+            String.sub !rest finish (String.length !rest - finish)
+            |> String.trim
+          in
+          let* default =
+            if suffix = "" then Ok None
+            else if suffix.[0] <> '=' then
+              Error
+                "PowerShell parameter declaration has unsupported trailing \
+                 syntax"
+            else
+              let expression =
+                String.sub suffix 1 (String.length suffix - 1) |> String.trim
+              in
+              Result.map
+                (fun value -> Some value)
+                (powershell_static_parameter_default value_type expression)
+          in
+          let position =
+            Option.value ~default:implicit_position !explicit_position
+          in
+          Ok
+            ( Ir.{ name; value_type },
+              Ir.
+                {
+                  input = name;
+                  position = Some position;
+                  required = !mandatory;
+                  is_switch = !is_switch;
+                  default;
+                  validations;
+                },
+              (String.lowercase_ascii name, "${" ^ name ^ "}") )
+
+let find_powershell_parameter_block source =
+  let candidate = ref None in
+  let failure = ref None in
+  let header_open = ref true in
+  let accepts_common_parameters = ref false in
+  List.iter
+    (fun (start_byte, end_byte) ->
+      if !failure = None && !candidate = None && !header_open then
+        let line =
+          String.sub source start_byte (end_byte - start_byte) |> String.trim
+        in
+        let compact = compact_powershell_header line in
+        if line = "" || String.starts_with ~prefix:"#" line then ()
+        else if String.starts_with ~prefix:"[cmdletbinding(" compact then
+          begin if compact <> "[cmdletbinding()]" then
+            failure :=
+              Some
+                "PowerShell parameter set or CmdletBinding options require a \
+                 dedicated IR contract"
+          else accepts_common_parameters := true
+          end
+        else if String.starts_with ~prefix:"param(" compact then
+          match String.index_from_opt source start_byte '(' with
+          | None -> failure := Some "PowerShell parameter block is missing ("
+          | Some open_byte ->
+              begin match
+                powershell_matching_delimiter source ~open_byte ~opening:'('
+                  ~closing:')'
+              with
+              | None ->
+                  failure := Some "unterminated PowerShell parameter block"
+              | Some close_byte ->
+                  let line_end =
+                    match
+                      String.index_from_opt source (close_byte + 1) '\n'
+                    with
+                    | Some index -> index
+                    | None -> String.length source
+                  in
+                  let trailing =
+                    String.sub source (close_byte + 1)
+                      (line_end - close_byte - 1)
+                    |> String.trim
+                  in
+                  if
+                    trailing <> ""
+                    && not (String.starts_with ~prefix:"#" trailing)
+                  then
+                    failure :=
+                      Some
+                        "PowerShell code after a parameter block on the same \
+                         line is outside the typed input subset"
+                  else candidate := Some (start_byte, open_byte, close_byte)
+              end
+        else header_open := false)
+    (line_ranges source);
+  match (!failure, !candidate) with
+  | Some message, _ -> Error message
+  | None, None -> Ok None
+  | None, Some (start_byte, open_byte, close_byte) ->
+      let body =
+        String.sub source (open_byte + 1) (close_byte - open_byte - 1)
+      in
+      let declarations = split_powershell_top_level_commas body in
+      let rec parse index inputs parameters bindings = function
+        | [] ->
+            Ok
+              (Some
+                 {
+                   start_byte;
+                   end_byte = close_byte + 1;
+                   bindings = List.rev bindings;
+                   inputs = List.rev inputs;
+                   invocation =
+                     Ir.
+                       {
+                         style = Powershell;
+                         accepts_common_parameters = !accepts_common_parameters;
+                         parameters = List.rev parameters;
+                       };
+                 })
+        | declaration :: rest ->
+            let* input, parameter, binding =
+              parse_powershell_parameter_declaration index declaration
+            in
+            if
+              List.exists
+                (fun (existing : Ir.binding) ->
+                  String.lowercase_ascii existing.name
+                  = String.lowercase_ascii input.Ir.name)
+                inputs
+            then Error ("duplicate PowerShell parameter: " ^ input.name)
+            else if
+              !accepts_common_parameters
+              && List.mem
+                   (String.lowercase_ascii input.Ir.name)
+                   Ir.powershell_common_parameter_names
+            then
+              Error
+                ("PowerShell parameter conflicts with a common parameter: "
+               ^ input.name)
+            else if
+              List.exists
+                (fun (existing : Ir.invocation_parameter) ->
+                  existing.position = parameter.Ir.position)
+                parameters
+            then
+              begin match parameter.position with
+              | Some position ->
+                  Error
+                    (Printf.sprintf "duplicate PowerShell parameter position %d"
+                       position)
+              | None -> assert false
+              end
+            else
+              parse (index + 1) (input :: inputs) (parameter :: parameters)
+                (binding :: bindings) rest
+      in
+      parse 0 [] [] [] declarations
+
 let preprocess_powershell source =
   match mask_powershell_block_comments source with
   | Error _ as error -> error
   | Ok masked_source -> (
+      let* parameter_block = find_powershell_parameter_block masked_source in
       let rewritten = Bytes.of_string masked_source in
-      let bindings = ref [] in
+      let inputs, invocation, initial_bindings, parameter_range =
+        match parameter_block with
+        | None -> ([], None, [], None)
+        | Some block ->
+            blank_range rewritten block.start_byte block.end_byte;
+            ( block.inputs,
+              Some block.invocation,
+              block.bindings,
+              Some (block.start_byte, block.end_byte) )
+      in
+      let parameter_names = List.map fst initial_bindings in
+      let bindings = ref initial_bindings in
       let in_header = ref true in
       let failure = ref None in
       List.iter
         (fun (start_byte, end_byte) ->
           if !failure = None then
-            let line =
-              String.sub masked_source start_byte (end_byte - start_byte)
-              |> String.trim
+            let inside_parameter_block =
+              match parameter_range with
+              | None -> false
+              | Some (parameter_start, parameter_end) ->
+                  start_byte < parameter_end && end_byte > parameter_start
             in
-            let compact_header = compact_powershell_header line in
-            if line = "" || String.starts_with ~prefix:"#" line then ()
-            else if !in_header && compact_header = "[cmdletbinding()]" then
-              blank_range rewritten start_byte end_byte
-            else if !in_header && compact_header = "param()" then
-              blank_range rewritten start_byte end_byte
-            else if
-              compact_header <> "param()"
-              && String.starts_with ~prefix:"param(" compact_header
-            then
-              failure :=
-                Some "PowerShell parameter blocks require typed input lowering"
-            else if
-              !in_header && compact_header = "set-strictmode-versionlatest"
-            then blank_range rewritten start_byte end_byte
-            else if
-              String.starts_with ~prefix:"$" line && String.contains line '='
-            then
-              begin match powershell_assignment !bindings line with
-              | Error message -> failure := Some message
-              | Ok (key, name, value) ->
-                  if key = "psnativecommanduseerroractionpreference" then
-                    failure :=
-                      Some
-                        "$PSNativeCommandUseErrorActionPreference changes \
-                         native failure semantics"
-                  else if key = "erroractionpreference" then
-                    if not !in_header then
+            if inside_parameter_block then ()
+            else
+              let line =
+                String.sub masked_source start_byte (end_byte - start_byte)
+                |> String.trim
+              in
+              let compact_header = compact_powershell_header line in
+              if line = "" || String.starts_with ~prefix:"#" line then ()
+              else if !in_header && compact_header = "[cmdletbinding()]" then
+                blank_range rewritten start_byte end_byte
+              else if !in_header && compact_header = "param()" then
+                blank_range rewritten start_byte end_byte
+              else if
+                !in_header && compact_header = "set-strictmode-versionlatest"
+              then blank_range rewritten start_byte end_byte
+              else if
+                String.starts_with ~prefix:"$" line && String.contains line '='
+              then
+                begin match powershell_assignment !bindings line with
+                | Error message -> failure := Some message
+                | Ok (key, name, value) ->
+                    if key = "psnativecommanduseerroractionpreference" then
                       failure :=
                         Some
-                          "$ErrorActionPreference after execution changes \
-                           error semantics"
-                    else if String.lowercase_ascii value = "stop" then
-                      blank_range rewritten start_byte end_byte
-                    else
+                          "$PSNativeCommandUseErrorActionPreference changes \
+                           native failure semantics"
+                    else if key = "erroractionpreference" then
+                      if not !in_header then
+                        failure :=
+                          Some
+                            "$ErrorActionPreference after execution changes \
+                             error semantics"
+                      else if String.lowercase_ascii value = "stop" then
+                        blank_range rewritten start_byte end_byte
+                      else
+                        failure :=
+                          Some
+                            "$ErrorActionPreference must be the literal 'Stop'"
+                    else if List.mem key parameter_names then
                       failure :=
-                        Some "$ErrorActionPreference must be the literal 'Stop'"
-                  else if (not !in_header) && List.mem_assoc key !bindings then
-                    failure :=
-                      Some
-                        "PowerShell assignment after execution would mutate an \
-                         existing binding"
-                  else if
-                    (not !in_header)
-                    && powershell_parameter_mentioned_before source start_byte
-                         name
-                  then
-                    failure :=
-                      Some
-                        "PowerShell assignment after a prior reference \
-                         requires chronological state"
-                  else begin
-                    bindings := (key, value) :: List.remove_assoc key !bindings;
-                    blank_range rewritten start_byte end_byte
-                  end
-              end
-            else in_header := false)
+                        Some
+                          "PowerShell assignment would mutate a typed task \
+                           input"
+                    else if (not !in_header) && List.mem_assoc key !bindings
+                    then
+                      failure :=
+                        Some
+                          "PowerShell assignment after execution would mutate \
+                           an existing binding"
+                    else if
+                      (not !in_header)
+                      && powershell_parameter_mentioned_before source start_byte
+                           name
+                    then
+                      failure :=
+                        Some
+                          "PowerShell assignment after a prior reference \
+                           requires chronological state"
+                    else begin
+                      bindings :=
+                        (key, value) :: List.remove_assoc key !bindings;
+                      blank_range rewritten start_byte end_byte
+                    end
+                end
+              else in_header := false)
         (line_ranges masked_source);
       match !failure with
       | Some message -> Error message
       | None ->
-          rewrite_powershell_variables !bindings (Bytes.to_string rewritten))
+          Result.map
+            (fun (rewritten, mappings) ->
+              (rewritten, mappings, inputs, invocation))
+            (rewrite_powershell_variables !bindings (Bytes.to_string rewritten))
+      )
 
 let basename executable =
   executable
@@ -642,7 +1236,7 @@ let lower family ~path source =
   let preprocessed =
     match family with
     | Powershell -> preprocess_powershell source
-    | Fish | Cmd | Nu -> Ok (source, [])
+    | Fish | Cmd | Nu -> Ok (source, [], [], None)
   in
   let rec lower_statements index accumulator = function
     | [] when accumulator = [] ->
@@ -672,7 +1266,7 @@ let lower family ~path source =
   in
   match preprocessed with
   | Error reason -> residual reason
-  | Ok (lowered_source, mappings) ->
+  | Ok (lowered_source, mappings, inputs, invocation) ->
       begin match statements family lowered_source with
       | Error reason -> residual reason
       | Ok (_ :: _ :: _) when family = Nu ->
@@ -736,6 +1330,6 @@ let lower family ~path source =
                          { basis = "powershell-file-normal-completion-v1" })
                     (Ir.Sequence (commands @ [ completion ]))
               in
-              Posix_frontend.{ root; diagnostics = [] }
+              Posix_frontend.{ root; diagnostics = []; inputs; invocation }
           end
       end

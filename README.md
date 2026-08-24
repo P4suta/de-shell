@@ -15,9 +15,12 @@ reproducibility changes are emitted as proposals and require an explicit
 
 ## Status
 
-This repository is an experimental 0.1.0 implementation, not a certified 1.0
-release. The following compiler and runtime foundations are implemented and
-covered by the repository's test gates:
+This repository is a production-oriented 0.1.0 pre-release, not a certified
+1.0 release. Its implemented subset is intended for real migrations: accepted
+behavior carries an explicit guarantee, unsupported behavior remains an exact
+executable capsule, and behavior-changing improvements require approval. The
+following compiler and runtime foundations are implemented and covered by the
+repository's test gates:
 
 - Git-aware recursive inventory of shell files plus Make, Dockerfile, GitHub
   workflows and composite actions, GitLab CI, Azure Pipelines, CircleCI,
@@ -35,10 +38,11 @@ covered by the repository's test gates:
   simple conditions, static loops, script-relative working directories,
   literal heredoc writes, and static subshell working directories;
 - conservative literal subsets for zsh, fish, PowerShell, cmd, and Nushell,
-  including immutable PowerShell string/environment dataflow and static
-  multi-statement files, with trace-only residual fallback for unknown or
-  dynamic behavior;
-- versioned Effect IR, JSON schemas, v0-to-v1 migration, and `formal`,
+  including immutable PowerShell scalar/environment dataflow, typed script
+  parameters, validation attributes, `CmdletBinding` common parameters, and
+  static multi-statement files, with trace-only residual fallback for unknown
+  or dynamic behavior;
+- versioned Effect IR, JSON schemas, v0/v1-to-v2 migration, and `formal`,
   `exhaustive`, `differential`, and `residual` evidence;
 - official PowerShell AST and pinned `nu-parser` JSON-RPC adapter contracts;
 - equivalent rewrites, separate modernization proposals, concolic scenario
@@ -157,7 +161,7 @@ executing source automation. It records the selected immediate-child
 repositories and exclusions, inventories embedded shell, verifies each shell
 file hash, and analyzes an isolated temporary copy. See
 [docs/corpus-audit.md](docs/corpus-audit.md) for the exact safe command and the
-2026-08-24 snapshot: 48 repositories, 1,457 inventory locations, zero analysis
+2026-08-25 snapshot: 48 repositories, 1,457 inventory locations, zero analysis
 failures, and 2 of 47 raw shell files fully non-residual. That measurement is
 local evidence, not 1.0 certification; the document explains the denominator
 and the remaining residual groups.
@@ -171,7 +175,7 @@ mise run deshell -- analyze --entry scripts/build.sh
 mise run deshell -- verify
 mise run deshell -- rewrite --equivalent --entry scripts/build.sh
 mise run deshell -- migrate --target nu --entry scripts/build.sh
-mise run deshell -- run
+mise run deshell -- run -- --original-script-argument
 mise run deshell -- export --target dagger
 ```
 
