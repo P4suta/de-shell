@@ -83,11 +83,12 @@ The `Release_gate` evaluator encodes these quantitative criteria and refuses an
 empty corpus or an incomplete matrix. A release is not 1.0 until real evidence,
 not placeholder values, makes that evaluator pass.
 
-The 2026-08-24 local audit currently reports 2 of 47 raw shell files as fully
+The 2026-08-25 local audit currently reports 2 of 47 raw shell files as fully
 non-residual, with 47 formal and 45 residual nodes across 48 repositories. The
-largest residual groups are typed PowerShell parameter blocks, PowerShell
-expression/state assignments, POSIX chronological state after control flow, and
-generated Gradle launchers. Completion definitions and generated launchers are
+previous 16-file typed PowerShell parameter-block group has been eliminated;
+the largest remaining groups are PowerShell expression/state assignments,
+assignments inside POSIX control flow, generated Gradle launchers, and
+redirection semantics. Completion definitions and generated launchers are
 included in that raw denominator; the declared non-interactive release corpus
 will be a separate, scenario-backed gate. See
 [docs/corpus-audit.md](docs/corpus-audit.md) for the reproducible selection and

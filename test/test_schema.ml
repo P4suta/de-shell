@@ -27,7 +27,7 @@ let () =
         [
           Alcotest.test_case "Effect IR" `Quick
             (test_schema "effect-ir.schema.json"
-               "https://deshell.dev/schema/effect-ir/v1");
+               "https://deshell.dev/schema/effect-ir/v2");
           Alcotest.test_case "evidence" `Quick
             (test_schema "evidence.schema.json"
                "https://deshell.dev/schema/evidence/v1");

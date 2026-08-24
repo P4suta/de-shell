@@ -141,6 +141,8 @@ let decode_string source =
             (String "provided-by-lab-image"))
         [ "posix_sh"; "bash"; "zsh"; "fish"; "powershell"; "cmd"; "nushell" ];
       add_if_missing "lab.image" (String "unconfigured");
+      Hashtbl.replace values "protocol.effect_ir"
+        (Integer Ir.current_schema_version);
       Some 1
     end
     else None
@@ -241,7 +243,7 @@ opam = "2.5.2"
 
 [protocol]
 adapter = 1
-effect_ir = 1
+effect_ir = %d
 
 [artifacts]
 command_model = "sha256:%s"
@@ -263,7 +265,7 @@ nushell = "provided-by-lab-image"
 [lab]
 image = "unconfigured"
 |}
-    (Command_model.digest ())
+    Ir.current_schema_version (Command_model.digest ())
 
 let observation_image lock =
   if lock.lab_image = "unconfigured" then

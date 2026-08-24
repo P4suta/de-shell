@@ -38,6 +38,9 @@ type observation = {
   trace : trace_event list;
 }
 
+let ( let* ) result continuation =
+  match result with Ok value -> continuation value | Error _ as error -> error
+
 let default_policy =
   {
     allow_file_read = false;
@@ -311,6 +314,434 @@ let expand_pairs context pairs =
         end
   in
   loop [] [] pairs
+
+let lowercase = String.lowercase_ascii
+
+type powershell_argument_origin =
+  | Typed_input
+  | Default_value
+  | Positional_argument
+  | Separate_named_argument
+  | Inline_named_argument
+  | Switch_presence
+
+let rec normalize_invocation_value name value_type origin value =
+  let type_error expected =
+    Error (Printf.sprintf "PowerShell parameter -%s expects %s" name expected)
+  in
+  match value_type with
+  | Ir.Text | Ir.Path | Ir.Bytes -> Ok value
+  | Ir.Int ->
+      begin match Ir.normalize_powershell_int32 value with
+      | Ok value -> Ok value
+      | Error _ -> type_error "a PowerShell Int32"
+      end
+  | Ir.Bool ->
+      begin match (origin, lowercase value) with
+      | ( (Inline_named_argument | Switch_presence | Default_value),
+          ("true" | "$true") ) ->
+          Ok "True"
+      | ( (Inline_named_argument | Switch_presence | Default_value),
+          ("false" | "$false") ) ->
+          Ok "False"
+      | Default_value, "1" -> Ok "True"
+      | Default_value, "0" -> Ok "False"
+      | Typed_input, ("true" | "$true" | "1") -> Ok "True"
+      | Typed_input, ("false" | "$false" | "0") -> Ok "False"
+      | (Positional_argument | Separate_named_argument), _ ->
+          Error
+            (Printf.sprintf
+               "PowerShell parameter -%s boolean values from process arguments \
+                require -%s:true or -%s:false colon syntax"
+               name name name)
+      | (Inline_named_argument | Switch_presence | Default_value), _ ->
+          type_error "a boolean literal true or false"
+      | Typed_input, _ -> type_error "a boolean"
+      end
+  | Ir.Secret inner -> normalize_invocation_value name inner origin value
+  | Ir.List _ | Ir.Record _ | Ir.Byte_stream | Ir.Object_stream _ ->
+      type_error "a scalar value supported by the internal runner"
+
+let rec invocation_base_type = function
+  | Ir.Secret inner -> invocation_base_type inner
+  | value_type -> value_type
+
+let validate_invocation_value parameter value_type value =
+  let fail detail =
+    Error
+      (Printf.sprintf "PowerShell parameter -%s %s" parameter.Ir.input detail)
+  in
+  let allows_empty = List.mem Ir.Allow_empty_string parameter.Ir.validations in
+  let* () =
+    if
+      parameter.required && value = ""
+      && invocation_base_type value_type = Ir.Text
+      && not allows_empty
+    then fail "cannot be an empty string"
+    else Ok ()
+  in
+  let rec validate = function
+    | [] -> Ok ()
+    | Ir.Allow_empty_string :: rest -> validate rest
+    | Ir.Not_null_or_empty :: _ when value = "" ->
+        fail "failed ValidateNotNullOrEmpty"
+    | Ir.Not_null_or_empty :: rest -> validate rest
+    | Ir.String_set { values; ignore_case } :: rest ->
+        let equal left right =
+          if ignore_case then String.equal (lowercase left) (lowercase right)
+          else String.equal left right
+        in
+        if List.exists (equal value) values then validate rest
+        else
+          fail
+            (Printf.sprintf "failed ValidateSet(%s)"
+               (String.concat ", " values))
+    | Ir.Int_range { minimum; maximum } :: rest ->
+        begin match int_of_string_opt value with
+        | Some number when number >= minimum && number <= maximum ->
+            validate rest
+        | Some _ | None ->
+            fail (Printf.sprintf "is outside range %d..%d" minimum maximum)
+        end
+  in
+  validate parameter.validations
+
+let rec default_invocation_value value_type =
+  match value_type with
+  | Ir.Int -> Some "0"
+  | Ir.Bool -> Some "False"
+  | Ir.Text | Ir.Path | Ir.Bytes -> Some ""
+  | Ir.Secret inner -> default_invocation_value inner
+  | Ir.List _ | Ir.Record _ | Ir.Byte_stream | Ir.Object_stream _ -> None
+
+type powershell_common_parameter_kind =
+  | Common_switch
+  | Common_action_preference
+  | Common_nonnegative_integer
+  | Common_variable
+
+type powershell_common_parameter = {
+  common_name : string;
+  aliases : string list;
+  common_kind : powershell_common_parameter_kind;
+}
+
+type powershell_named_parameter =
+  | Task_parameter of Ir.invocation_parameter
+  | Common_parameter of powershell_common_parameter
+
+let powershell_common_parameters =
+  [
+    { common_name = "Verbose"; aliases = [ "vb" ]; common_kind = Common_switch };
+    { common_name = "Debug"; aliases = [ "db" ]; common_kind = Common_switch };
+    {
+      common_name = "ErrorAction";
+      aliases = [ "ea" ];
+      common_kind = Common_action_preference;
+    };
+    {
+      common_name = "WarningAction";
+      aliases = [ "wa" ];
+      common_kind = Common_action_preference;
+    };
+    {
+      common_name = "InformationAction";
+      aliases = [ "infa" ];
+      common_kind = Common_action_preference;
+    };
+    {
+      common_name = "ProgressAction";
+      aliases = [ "proga" ];
+      common_kind = Common_action_preference;
+    };
+    {
+      common_name = "ErrorVariable";
+      aliases = [ "ev" ];
+      common_kind = Common_variable;
+    };
+    {
+      common_name = "WarningVariable";
+      aliases = [ "wv" ];
+      common_kind = Common_variable;
+    };
+    {
+      common_name = "InformationVariable";
+      aliases = [ "iv" ];
+      common_kind = Common_variable;
+    };
+    {
+      common_name = "OutVariable";
+      aliases = [ "ov" ];
+      common_kind = Common_variable;
+    };
+    {
+      common_name = "OutBuffer";
+      aliases = [ "ob" ];
+      common_kind = Common_nonnegative_integer;
+    };
+    {
+      common_name = "PipelineVariable";
+      aliases = [ "pv" ];
+      common_kind = Common_variable;
+    };
+  ]
+
+let validate_powershell_common_parameter parameter value =
+  let fail detail =
+    Error
+      (Printf.sprintf "PowerShell common parameter -%s %s" parameter.common_name
+         detail)
+  in
+  match parameter.common_kind with
+  | Common_switch ->
+      begin match lowercase value with
+      | "true" | "$true" | "false" | "$false" -> Ok ()
+      | _ -> fail "expects a boolean switch value"
+      end
+  | Common_action_preference ->
+      let accepted =
+        [
+          "silentlycontinue";
+          "stop";
+          "continue";
+          "inquire";
+          "ignore";
+          "suspend";
+          "break";
+        ]
+      in
+      if List.mem (lowercase value) accepted then Ok ()
+      else fail "expects a valid ActionPreference value"
+  | Common_nonnegative_integer ->
+      begin match int_of_string_opt value with
+      | Some number when number >= 0 -> Ok ()
+      | Some _ | None -> fail "expects a non-negative integer"
+      end
+  | Common_variable ->
+      if value = "" then fail "expects a variable name" else Ok ()
+
+let bind_powershell_invocation (task : Ir.task) invocation ~provided arguments =
+  let parameters = invocation.Ir.parameters in
+  let binding parameter =
+    List.find_opt
+      (fun (binding : Ir.binding) -> binding.name = parameter.Ir.input)
+      task.inputs
+  in
+  let find_parameter name =
+    let normalized = lowercase name in
+    let common_parameters =
+      if invocation.Ir.accepts_common_parameters then
+        powershell_common_parameters
+      else []
+    in
+    let task_exact =
+      parameters
+      |> List.filter (fun parameter ->
+          lowercase parameter.Ir.input = normalized)
+      |> List.map (fun parameter -> Task_parameter parameter)
+    in
+    let common_exact =
+      common_parameters
+      |> List.filter (fun parameter ->
+          lowercase parameter.common_name = normalized
+          || List.mem normalized (List.map lowercase parameter.aliases))
+      |> List.map (fun parameter -> Common_parameter parameter)
+    in
+    let exact = task_exact @ common_exact in
+    match exact with
+    | [ parameter ] -> Ok parameter
+    | _ :: _ :: _ -> Error ("ambiguous PowerShell parameter: -" ^ name)
+    | [] ->
+        let task_candidates =
+          parameters
+          |> List.filter (fun parameter ->
+              String.starts_with ~prefix:normalized
+                (lowercase parameter.Ir.input))
+          |> List.map (fun parameter -> Task_parameter parameter)
+        in
+        let common_candidates =
+          common_parameters
+          |> List.filter (fun parameter ->
+              String.starts_with ~prefix:normalized
+                (lowercase parameter.common_name))
+          |> List.map (fun parameter -> Common_parameter parameter)
+        in
+        begin match task_candidates @ common_candidates with
+        | [ parameter ] -> Ok parameter
+        | [] -> Error ("unknown PowerShell parameter: -" ^ name)
+        | _ -> Error ("ambiguous PowerShell parameter: -" ^ name)
+        end
+  in
+  let split_named_argument value =
+    if
+      String.length value < 2
+      || value.[0] <> '-'
+      || match value.[1] with '0' .. '9' -> true | _ -> false
+    then None
+    else
+      let body = String.sub value 1 (String.length value - 1) in
+      match String.index_opt body ':' with
+      | None -> Some (body, None)
+      | Some separator ->
+          Some
+            ( String.sub body 0 separator,
+              Some
+                (String.sub body (separator + 1)
+                   (String.length body - separator - 1)) )
+  in
+  let bound =
+    ref (List.map (fun (name, value) -> (name, (value, Typed_input))) provided)
+  in
+  let bound_common = ref [] in
+  let bind parameter value origin =
+    if List.mem_assoc parameter.Ir.input !bound then
+      Error
+        (Printf.sprintf "PowerShell parameter -%s was specified more than once"
+           parameter.input)
+    else begin
+      bound := (parameter.input, (value, origin)) :: !bound;
+      Ok ()
+    end
+  in
+  let bind_common parameter value =
+    let normalized = lowercase parameter.common_name in
+    if List.mem normalized !bound_common then
+      Error
+        (Printf.sprintf
+           "PowerShell common parameter -%s was specified more than once"
+           parameter.common_name)
+    else
+      let* () = validate_powershell_common_parameter parameter value in
+      bound_common := normalized :: !bound_common;
+      Ok ()
+  in
+  let next_positional () =
+    parameters
+    |> List.filter_map (fun parameter ->
+        Option.map (fun position -> (position, parameter)) parameter.Ir.position)
+    |> List.sort (fun (left, _) (right, _) -> Int.compare left right)
+    |> List.find_opt (fun (_, parameter) ->
+        not (List.mem_assoc parameter.Ir.input !bound))
+    |> Option.map snd
+  in
+  let rec parse = function
+    | [] -> Ok ()
+    | argument :: rest ->
+        begin match split_named_argument argument with
+        | None ->
+            begin match next_positional () with
+            | None ->
+                Error ("unexpected positional PowerShell argument: " ^ argument)
+            | Some parameter ->
+                let* () = bind parameter argument Positional_argument in
+                parse rest
+            end
+        | Some (name, inline_value) ->
+            let* named_parameter = find_parameter name in
+            begin match named_parameter with
+            | Task_parameter parameter when parameter.is_switch ->
+                let value = Option.value ~default:"true" inline_value in
+                let origin =
+                  if Option.is_some inline_value then Inline_named_argument
+                  else Switch_presence
+                in
+                let* () = bind parameter value origin in
+                parse rest
+            | Task_parameter parameter ->
+                begin match (inline_value, rest) with
+                | Some value, _ ->
+                    let* () = bind parameter value Inline_named_argument in
+                    parse rest
+                | None, value :: remaining ->
+                    let* () = bind parameter value Separate_named_argument in
+                    parse remaining
+                | None, [] ->
+                    Error
+                      (Printf.sprintf
+                         "PowerShell parameter -%s requires a value"
+                         parameter.input)
+                end
+            | Common_parameter parameter
+              when parameter.common_kind = Common_switch ->
+                let value = Option.value ~default:"true" inline_value in
+                let* () = bind_common parameter value in
+                parse rest
+            | Common_parameter parameter ->
+                begin match (inline_value, rest) with
+                | Some value, _ ->
+                    let* () = bind_common parameter value in
+                    parse rest
+                | None, value :: remaining ->
+                    let* () = bind_common parameter value in
+                    parse remaining
+                | None, [] ->
+                    Error
+                      (Printf.sprintf
+                         "PowerShell common parameter -%s requires a value"
+                         parameter.common_name)
+                end
+            end
+        end
+  in
+  let* () = parse arguments in
+  let rec finalize accumulator = function
+    | [] -> Ok (List.rev accumulator)
+    | parameter :: rest ->
+        let raw = List.assoc_opt parameter.Ir.input !bound in
+        let* raw, origin, validate_input =
+          match raw with
+          | Some (value, origin) -> Ok (value, origin, true)
+          | None when parameter.required ->
+              Error
+                (Printf.sprintf "missing mandatory PowerShell parameter -%s"
+                   parameter.input)
+          | None ->
+              begin match (parameter.default, binding parameter) with
+              | Some value, _ -> Ok (value, Default_value, false)
+              | None, Some binding ->
+                  begin match default_invocation_value binding.value_type with
+                  | Some value -> Ok (value, Default_value, false)
+                  | None ->
+                      Error
+                        (Printf.sprintf
+                           "PowerShell parameter -%s has no representable \
+                            default"
+                           parameter.input)
+                  end
+              | None, None ->
+                  Error
+                    (Printf.sprintf
+                       "PowerShell parameter -%s refers to an unknown task \
+                        input"
+                       parameter.input)
+              end
+        in
+        begin match binding parameter with
+        | None ->
+            Error
+              (Printf.sprintf
+                 "PowerShell parameter -%s refers to an unknown task input"
+                 parameter.input)
+        | Some binding ->
+            let* value =
+              normalize_invocation_value parameter.input binding.value_type
+                origin raw
+            in
+            let* () =
+              if validate_input then
+                validate_invocation_value parameter binding.value_type value
+              else Ok ()
+            in
+            finalize ((parameter.input, value) :: accumulator) rest
+        end
+  in
+  finalize [] parameters
+
+let bind_task_invocation task ~provided arguments =
+  match task.Ir.invocation with
+  | None -> Ok provided
+  | Some ({ style = Ir.Powershell; _ } as invocation) ->
+      bind_powershell_invocation task invocation ~provided arguments
 
 let run_plan_with_inputs ~backend ~policy ~inputs ?(arguments = []) plan =
   let script_arguments = arguments in
@@ -632,11 +1063,30 @@ let run_plan_with_inputs ~backend ~policy ~inputs ?(arguments = []) plan =
   match Ir.validate_plan plan with
   | Error errors -> Error (String.concat "; " errors)
   | Ok () ->
+      let entry_task = Hashtbl.find_opt tasks plan.entrypoint in
       let entry_input_names =
-        match Hashtbl.find_opt tasks plan.entrypoint with
+        match entry_task with
         | None -> []
         | Some task ->
             List.map (fun (binding : Ir.binding) -> binding.name) task.inputs
+      in
+      let case_insensitive_entry_inputs =
+        match entry_task with
+        | Some { Ir.invocation = Some { style = Ir.Powershell; _ }; _ } -> true
+        | Some _ | None -> false
+      in
+      let canonical_input_name name =
+        if not case_insensitive_entry_inputs then name
+        else
+          entry_input_names
+          |> List.find_opt (fun candidate ->
+              String.equal (lowercase candidate) (lowercase name))
+          |> Option.value ~default:name
+      in
+      let inputs =
+        List.map
+          (fun (name, value) -> (canonical_input_name name, value))
+          inputs
       in
       let environment_names =
         List.concat_map (fun task -> task.Ir.environment) plan.tasks
@@ -660,12 +1110,20 @@ let run_plan_with_inputs ~backend ~policy ~inputs ?(arguments = []) plan =
           if unknown <> [] then
             Error ("unknown plan input " ^ String.concat ", " unknown)
           else
-            let entry_arguments =
+            let provided_entry_arguments =
               List.filter
                 (fun (name, _) -> List.mem name entry_input_names)
                 inputs
             in
-            run_task [] "" entry_arguments plan.entrypoint
+            begin match entry_task with
+            | None -> Error ("task not found: " ^ plan.entrypoint)
+            | Some entry_task ->
+                let* entry_arguments =
+                  bind_task_invocation entry_task
+                    ~provided:provided_entry_arguments arguments
+                in
+                run_task [] "" entry_arguments plan.entrypoint
+            end
       end
 
 let run_plan ~backend ~policy plan =

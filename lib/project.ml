@@ -221,9 +221,23 @@ let analyze ~root ~entry =
     failwith
       ("unknown interpreter rejected by project policy for entrypoint: " ^ entry);
   let lowered = Frontend_registry.lower ~path:entry source in
-  let environment = Template.environment_variables lowered.root in
+  let is_task_input name =
+    List.exists
+      (fun (input : Ir.binding) ->
+        String.equal
+          (String.lowercase_ascii input.name)
+          (String.lowercase_ascii name))
+      lowered.inputs
+  in
+  let environment =
+    Template.environment_variables lowered.root
+    |> List.filter (fun name -> not (is_task_input name))
+  in
   let secrets = List.filter Concolic.secret_name environment in
-  let task = Ir.task ~name:"main" ~environment ~secrets ~body:lowered.root () in
+  let task =
+    Ir.task ~name:"main" ~inputs:lowered.inputs ?invocation:lowered.invocation
+      ~environment ~secrets ~body:lowered.root ()
+  in
   let plan =
     Ir.plan ~entrypoint:"main" [ task ] |> Command_model.annotate_plan
   in

@@ -502,6 +502,147 @@ let decode_binding context json =
   let* value_type = decode_value_type (context ^ ".type") type_json in
   Ok Ir.{ name; value_type }
 
+let encode_invocation_style = function Ir.Powershell -> `String "powershell"
+
+let decode_invocation_style context json =
+  let* value = as_string context json in
+  match value with
+  | "powershell" -> Ok Ir.Powershell
+  | other -> errorf "%s has unknown invocation style %S" context other
+
+let encode_invocation_validation = function
+  | Ir.Allow_empty_string -> `Assoc [ ("kind", `String "allow_empty_string") ]
+  | Ir.Not_null_or_empty -> `Assoc [ ("kind", `String "not_null_or_empty") ]
+  | Ir.String_set { values; ignore_case } ->
+      `Assoc
+        [
+          ("kind", `String "string_set");
+          ("values", `List (List.map (fun value -> `String value) values));
+          ("ignore_case", `Bool ignore_case);
+        ]
+  | Ir.Int_range { minimum; maximum } ->
+      `Assoc
+        [
+          ("kind", `String "int_range");
+          ("minimum", `Int minimum);
+          ("maximum", `Int maximum);
+        ]
+
+let decode_invocation_validation context json =
+  let* fields = as_object context json in
+  let* kind_json = required "kind" fields in
+  let* kind = as_string (context ^ ".kind") kind_json in
+  match kind with
+  | "allow_empty_string" -> Ok Ir.Allow_empty_string
+  | "not_null_or_empty" -> Ok Ir.Not_null_or_empty
+  | "string_set" ->
+      let* values_json = required "values" fields in
+      let* values = decode_string_list (context ^ ".values") values_json in
+      let* ignore_case =
+        match optional "ignore_case" fields with
+        | None -> Ok true
+        | Some value -> as_bool (context ^ ".ignore_case") value
+      in
+      Ok (Ir.String_set { values; ignore_case })
+  | "int_range" ->
+      let* minimum_json = required "minimum" fields in
+      let* maximum_json = required "maximum" fields in
+      let* minimum = as_int (context ^ ".minimum") minimum_json in
+      let* maximum = as_int (context ^ ".maximum") maximum_json in
+      Ok (Ir.Int_range { minimum; maximum })
+  | other -> errorf "%s has unknown invocation validation %S" context other
+
+let encode_invocation_parameter (parameter : Ir.invocation_parameter) =
+  `Assoc
+    [
+      ("input", `String parameter.input);
+      ( "position",
+        Option.fold ~none:`Null
+          ~some:(fun value -> `Int value)
+          parameter.position );
+      ("required", `Bool parameter.required);
+      ("switch", `Bool parameter.is_switch);
+      ( "default",
+        Option.fold ~none:`Null
+          ~some:(fun value -> `String value)
+          parameter.default );
+      ( "validations",
+        `List (List.map encode_invocation_validation parameter.validations) );
+    ]
+
+let decode_invocation_parameter context json =
+  let* fields = as_object context json in
+  let* input_json = required "input" fields in
+  let* input = as_string (context ^ ".input") input_json in
+  let* position =
+    match optional "position" fields with
+    | None | Some `Null -> Ok None
+    | Some value ->
+        Result.map
+          (fun position -> Some position)
+          (as_int (context ^ ".position") value)
+  in
+  let* required_value =
+    match optional "required" fields with
+    | None -> Ok false
+    | Some value -> as_bool (context ^ ".required") value
+  in
+  let* is_switch =
+    match optional "switch" fields with
+    | None -> Ok false
+    | Some value -> as_bool (context ^ ".switch") value
+  in
+  let* default =
+    match optional "default" fields with
+    | None | Some `Null -> Ok None
+    | Some value ->
+        Result.map
+          (fun default -> Some default)
+          (as_string (context ^ ".default") value)
+  in
+  let* validations =
+    match optional "validations" fields with
+    | None -> Ok []
+    | Some value ->
+        decode_list (context ^ ".validations") decode_invocation_validation
+          value
+  in
+  Ok
+    Ir.
+      {
+        input;
+        position;
+        required = required_value;
+        is_switch;
+        default;
+        validations;
+      }
+
+let encode_invocation (invocation : Ir.invocation) =
+  `Assoc
+    [
+      ("style", encode_invocation_style invocation.style);
+      ("accepts_common_parameters", `Bool invocation.accepts_common_parameters);
+      ( "parameters",
+        `List (List.map encode_invocation_parameter invocation.parameters) );
+    ]
+
+let decode_invocation context json =
+  let* fields = as_object context json in
+  let* style_json = required "style" fields in
+  let* style = decode_invocation_style (context ^ ".style") style_json in
+  let* accepts_common_parameters =
+    match optional "accepts_common_parameters" fields with
+    | None -> Ok false
+    | Some value -> as_bool (context ^ ".accepts_common_parameters") value
+  in
+  let* parameters_json = required "parameters" fields in
+  let* parameters =
+    decode_list (context ^ ".parameters") decode_invocation_parameter
+      parameters_json
+  in
+  Ok Ir.{ style; accepts_common_parameters; parameters }
+
 let encode_task (task : Ir.task) =
   `Assoc
     [
@@ -515,6 +656,8 @@ let encode_task (task : Ir.task) =
         `List (List.map (fun value -> `String value) task.platform_capabilities)
       );
       ("cacheable", `Bool task.cacheable);
+      ( "invocation",
+        Option.fold ~none:`Null ~some:encode_invocation task.invocation );
       ("body", encode_node task.body);
     ]
 
@@ -550,6 +693,14 @@ let decode_task context json =
     | None -> Ok false
     | Some value -> as_bool (context ^ ".cacheable") value
   in
+  let* invocation =
+    match optional "invocation" fields with
+    | None | Some `Null -> Ok None
+    | Some value ->
+        Result.map
+          (fun invocation -> Some invocation)
+          (decode_invocation (context ^ ".invocation") value)
+  in
   let* body_json = required "body" fields in
   let* body = decode_node (context ^ ".body") body_json in
   Ok
@@ -562,6 +713,7 @@ let decode_task context json =
         secrets;
         platform_capabilities;
         cacheable;
+        invocation;
         body;
       }
 
@@ -605,7 +757,7 @@ let decode_v0 fields =
   in
   Ok (Ir.plan ~entrypoint [ Ir.task ~name:entrypoint ~body () ])
 
-let decode_v1 fields =
+let decode_current fields =
   let* generator =
     match optional "generator" fields with
     | None -> Ok "unknown"
@@ -615,7 +767,15 @@ let decode_v1 fields =
   let* entrypoint = as_string "entrypoint" entrypoint_json in
   let* tasks_json = required "tasks" fields in
   let* tasks = decode_list "tasks" decode_task tasks_json in
-  let plan = Ir.{ schema_version = 1; generator; entrypoint; tasks } in
+  let plan =
+    Ir.
+      {
+        schema_version = Ir.current_schema_version;
+        generator;
+        entrypoint;
+        tasks;
+      }
+  in
   match Ir.validate_plan plan with
   | Ok () -> Ok plan
   | Error errors -> Error errors
@@ -625,7 +785,8 @@ let decode_yojson json =
   match (optional "schema_version" fields, optional "version" fields) with
   | Some value, _ ->
       let* version = as_int "schema_version" value in
-      if version = 1 then decode_v1 fields
+      if version = 1 || version = Ir.current_schema_version then
+        decode_current fields
       else errorf "unsupported schema_version: %d" version
   | None, Some value ->
       let* version = as_int "version" value in

@@ -186,6 +186,26 @@ let test_powershell_late_immutable_dataflow () =
       end
   | _ -> Alcotest.fail "new late PowerShell constant must lower atomically"
 
+let test_powershell_static_scalar_dataflow () =
+  let source =
+    "$count = 7\n\
+     $enabled = $true\n\
+     $disabled = $false\n\
+     & 'tool.exe' $count $enabled $disabled\n"
+  in
+  let result = Frontend_registry.lower ~path:"scalars.ps1" source in
+  match result.root.operation with
+  | Ir.Sequence
+      [ { operation = Ir.Exec command; _ }; { operation = Ir.Sequence []; _ } ]
+    ->
+      Alcotest.(check (list string))
+        "PowerShell scalar argv"
+        [ "tool.exe"; "7"; "True"; "False" ]
+        command.argv
+  | Ir.Opaque_capsule _ ->
+      Alcotest.fail "static PowerShell int/bool values remained residual"
+  | _ -> Alcotest.fail "static PowerShell scalar dataflow shape changed"
+
 let test_powershell_help_comments_and_header_spelling () =
   let source =
     "<#\n\
@@ -213,16 +233,247 @@ let test_powershell_help_comments_and_header_spelling () =
   | _ ->
       Alcotest.fail "documented static PowerShell must lower with a source map"
 
+let test_powershell_typed_parameters_lower_to_task_inputs () =
+  let source =
+    "[CmdletBinding()]\n\
+     param(\n\
+    \  [Parameter(Mandatory = $true, Position = 0)]\n\
+    \  [string] $Name,\n\
+    \  [int] $Count = 1e2,\n\
+    \  [switch] $Force\n\
+     )\n\
+     $ErrorActionPreference = 'Stop'\n\
+     & 'tool.exe' '--name' $Name '--count' $Count '--force' $Force\n"
+  in
+  begin match Literal_frontend.find_powershell_parameter_block source with
+  | Error message -> Alcotest.fail ("parameter parse failed: " ^ message)
+  | Ok None ->
+      let lines =
+        Literal_frontend.line_ranges source
+        |> List.map (fun (start_byte, end_byte) ->
+            String.sub source start_byte (end_byte - start_byte)
+            |> Literal_frontend.compact_powershell_header)
+      in
+      Alcotest.fail
+        ("parameter block was not detected: " ^ String.concat " | " lines)
+  | Ok (Some block) ->
+      Alcotest.(check int) "parsed typed inputs" 3 (List.length block.inputs)
+  end;
+  let result = Frontend_registry.lower ~path:"typed.ps1" source in
+  begin if Posix_frontend.has_residual result.root then
+    match result.root.guarantee with
+    | Ir.Residual evidence ->
+        Alcotest.failf
+          "typed parameter lowering remained residual with %d inputs: %s"
+          (List.length result.inputs)
+          evidence.reason
+    | _ -> Alcotest.fail "typed parameter lowering contains a nested residual"
+  end;
+  Alcotest.(check bool)
+    "typed script is non-residual" false
+    (Posix_frontend.has_residual result.root);
+  Alcotest.(check (list string))
+    "typed inputs"
+    [ "Name"; "Count"; "Force" ]
+    (List.map (fun (binding : Ir.binding) -> binding.name) result.inputs);
+  begin match result.invocation with
+  | Some { style = Ir.Powershell; accepts_common_parameters; parameters } ->
+      Alcotest.(check bool)
+        "CmdletBinding common parameters" true accepts_common_parameters;
+      Alcotest.(check int) "parameter count" 3 (List.length parameters)
+  | None -> Alcotest.fail "PowerShell invocation metadata is missing"
+  end;
+  begin match result.root.operation with
+  | Ir.Sequence
+      [
+        { operation = Ir.Exec command; source = Some span; _ };
+        { operation = Ir.Sequence []; _ };
+      ] ->
+      Alcotest.(check (list string))
+        "typed argv templates"
+        [
+          "tool.exe";
+          "--name";
+          "${Name}";
+          "--count";
+          "${Count}";
+          "--force";
+          "${Force}";
+        ]
+        command.argv;
+      Alcotest.(check int) "command source line" 9 span.start_line
+  | _ -> Alcotest.fail "typed PowerShell did not lower to one Exec"
+  end;
+  let calls = ref [] in
+  let backend : Runner.backend =
+    {
+      execute =
+        (fun request ->
+          calls := request.argv :: !calls;
+          Ok Runner.{ exit_code = 0; stdout = ""; stderr = "" });
+      read_file = (fun _ -> Error "unused");
+      write_file = (fun ~path:_ ~contents:_ ~append:_ -> Error "unused");
+      remove_file = (fun _ -> Error "unused");
+      network_request = (fun ~method_:_ ~uri:_ -> Error "unused");
+    }
+  in
+  let plan =
+    Ir.plan ~entrypoint:"main"
+      [
+        Ir.task ~name:"main" ~inputs:result.inputs ?invocation:result.invocation
+          ~body:result.root ();
+      ]
+  in
+  begin match
+    Runner.run_plan_with_inputs ~backend ~policy:Runner.default_policy
+      ~inputs:[] ~arguments:[ "artifact"; "-Force" ] plan
+  with
+  | Error message -> Alcotest.fail message
+  | Ok _ -> ()
+  end;
+  Alcotest.(check (list (list string)))
+    "bound typed argv"
+    [
+      [ "tool.exe"; "--name"; "artifact"; "--count"; "100"; "--force"; "True" ];
+    ]
+    (List.rev !calls)
+
+let test_powershell_parameter_validations_are_executable_contracts () =
+  let source =
+    "param(\n\
+    \  [Parameter(Mandatory = $true, Position = 0)]\n\
+    \  [AllowEmptyString()]\n\
+    \  [string] $Label,\n\
+    \  [ValidateSet('Debug', 'Release')]\n\
+    \  [string] $Configuration = 'Debug',\n\
+    \  [ValidateRange(1, 5)]\n\
+    \  [int] $Retries = 3,\n\
+    \  [byte] $Mask = 255\n\
+     )\n\
+     & 'tool.exe' $Label $Configuration $Retries $Mask\n"
+  in
+  let result = Frontend_registry.lower ~path:"validated.ps1" source in
+  begin if Posix_frontend.has_residual result.root then
+    match result.root.guarantee with
+    | Ir.Residual evidence -> Alcotest.fail evidence.reason
+    | _ -> Alcotest.fail "validated parameter script contains residual behavior"
+  end;
+  let parameters =
+    match result.invocation with
+    | Some { style = Ir.Powershell; parameters; _ } -> parameters
+    | None -> Alcotest.fail "validated invocation metadata is missing"
+  in
+  let find name =
+    match
+      List.find_opt
+        (fun (parameter : Ir.invocation_parameter) -> parameter.input = name)
+        parameters
+    with
+    | Some parameter -> parameter
+    | None -> Alcotest.fail ("missing parameter " ^ name)
+  in
+  Alcotest.(check bool)
+    "empty string contract" true
+    (List.mem Ir.Allow_empty_string (find "Label").validations);
+  Alcotest.(check bool)
+    "set contract" true
+    (List.exists
+       (function
+         | Ir.String_set { values = [ "Debug"; "Release" ]; ignore_case = true }
+           ->
+             true
+         | _ -> false)
+       (find "Configuration").validations);
+  Alcotest.(check bool)
+    "range contract" true
+    (List.mem
+       (Ir.Int_range { minimum = 1; maximum = 5 })
+       (find "Retries").validations);
+  Alcotest.(check bool)
+    "byte contract" true
+    (List.mem
+       (Ir.Int_range { minimum = 0; maximum = 255 })
+       (find "Mask").validations)
+
+let test_powershell_mandatory_default_is_unreachable_metadata () =
+  let source =
+    "param(\n\
+    \  [Parameter(Mandatory)]\n\
+    \  [string] $Name = 'unreachable'\n\
+     )\n\
+     & 'tool.exe' $Name\n"
+  in
+  let result = Frontend_registry.lower ~path:"mandatory-default.ps1" source in
+  if Posix_frontend.has_residual result.root then
+    Alcotest.fail "PowerShell permits an unreachable mandatory default";
+  let invocation =
+    match result.invocation with
+    | Some invocation -> invocation
+    | None -> Alcotest.fail "mandatory parameter invocation metadata is missing"
+  in
+  begin match invocation.parameters with
+  | [ parameter ] ->
+      Alcotest.(check bool) "still mandatory" true parameter.required;
+      Alcotest.(check (option string))
+        "default retained for round trip" (Some "unreachable") parameter.default
+  | _ -> Alcotest.fail "expected one mandatory parameter"
+  end;
+  let plan =
+    Ir.plan ~entrypoint:"main"
+      [
+        Ir.task ~name:"main" ~inputs:result.inputs ~invocation ~body:result.root
+          ();
+      ]
+  in
+  begin match Ir.validate_plan plan with
+  | Ok () -> ()
+  | Error errors ->
+      Alcotest.fail
+        ("valid mandatory/default contract was rejected: "
+       ^ String.concat "; " errors)
+  end
+
 let test_powershell_parameter_and_comment_boundaries () =
   [
-    ( "typed parameter block",
+    ( "parameter sets",
       "[CmdletBinding(DefaultParameterSetName = 'Main')]\n\
        param(\n\
       \  [string] $Name = 'default'\n\
        )\n\
        $ErrorActionPreference = 'Stop'\n\
        & 'tool.exe' $Name\n",
-      "parameter block" );
+      "parameter set" );
+    ( "common parameter collision",
+      "[CmdletBinding()]\nparam([string] $Verbose)\n& 'tool.exe' $Verbose\n",
+      "common parameter" );
+    ( "validation attribute",
+      "param(\n\
+      \  [ValidatePattern('^[a-z]+$')]\n\
+      \  [string] $Name\n\
+       )\n\
+       & 'tool.exe' $Name\n",
+      "validation attribute" );
+    ( "same-line code after parameter block",
+      "param([string] $Name); & 'tool.exe' $Name\n",
+      "same line" );
+    ( "multiple Parameter attributes",
+      "param(\n\
+      \  [Parameter()]\n\
+      \  [Parameter()]\n\
+      \  [string] $Name\n\
+       )\n\
+       & 'tool.exe' $Name\n",
+      "multiple Parameter" );
+    ( "duplicate positions",
+      "param(\n\
+      \  [Parameter(Position = 0)] [string] $First,\n\
+      \  [Parameter(Position = 0)] [string] $Second\n\
+       )\n\
+       & 'tool.exe' $First $Second\n",
+      "position" );
+    ( "validation type mismatch",
+      "param([AllowEmptyString()] [int] $Count)\n& 'tool.exe' $Count\n",
+      "requires text" );
     ( "unterminated help comment",
       "<# documentation\n& 'tool.exe' 'must-not-run'\n",
       "unterminated" );
@@ -248,6 +499,8 @@ let test_powershell_mutable_or_unknown_state_is_residual () =
     ( "native error semantics",
       "$PSNativeCommandUseErrorActionPreference = $true\n& 'tool.exe' value\n"
     );
+    ("null value", "$value = $null\n& 'tool.exe' $value\n");
+    ("computed integer", "$value = 1 + 1\n& 'tool.exe' $value\n");
     ( "member access",
       "$metadata = 'value'\n& 'tool.exe' $metadata.archive_name\n" );
   ]
@@ -404,8 +657,16 @@ let () =
             test_powershell_strict_immutable_dataflow;
           Alcotest.test_case "PowerShell late immutable dataflow" `Quick
             test_powershell_late_immutable_dataflow;
+          Alcotest.test_case "PowerShell static scalar dataflow" `Quick
+            test_powershell_static_scalar_dataflow;
           Alcotest.test_case "PowerShell help comments and headers" `Quick
             test_powershell_help_comments_and_header_spelling;
+          Alcotest.test_case "PowerShell typed task inputs" `Quick
+            test_powershell_typed_parameters_lower_to_task_inputs;
+          Alcotest.test_case "PowerShell executable validation contracts" `Quick
+            test_powershell_parameter_validations_are_executable_contracts;
+          Alcotest.test_case "PowerShell unreachable mandatory default" `Quick
+            test_powershell_mandatory_default_is_unreachable_metadata;
           Alcotest.test_case "PowerShell parameter and comment boundaries"
             `Quick test_powershell_parameter_and_comment_boundaries;
           Alcotest.test_case "PowerShell state boundaries" `Quick

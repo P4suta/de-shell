@@ -27,6 +27,37 @@ let environment_plan () =
   in
   Ir.plan ~entrypoint:"main" [ Ir.task ~name:"main" ~body:node () ]
 
+let typed_invocation_plan () =
+  let node =
+    Ir.node ~id:"typed-input"
+      ~guarantee:(Ir.Formal { basis = "export-test" })
+      (Ir.Exec (Ir.exec [ "build"; "${Name}" ]))
+  in
+  let invocation =
+    Ir.
+      {
+        style = Powershell;
+        accepts_common_parameters = false;
+        parameters =
+          [
+            {
+              input = "Name";
+              position = Some 0;
+              required = true;
+              is_switch = false;
+              default = None;
+              validations = [];
+            };
+          ];
+      }
+  in
+  Ir.plan ~entrypoint:"main"
+    [
+      Ir.task ~name:"main"
+        ~inputs:[ Ir.{ name = "Name"; value_type = Text } ]
+        ~invocation ~body:node ();
+    ]
+
 let mixed_plan () =
   let literal =
     Ir.node ~id:"exec-before"
@@ -190,6 +221,29 @@ let test_strict_export_rejects_dropped_environment () =
         (Test_support.contains ~needle:"env-1" message
         && Test_support.contains ~needle:"environment" message)
 
+let test_strict_export_rejects_dropped_task_interface () =
+  List.iter
+    (fun target ->
+      match
+        Exporter.export ~target ~bridge:false (typed_invocation_plan ())
+      with
+      | Ok _ -> Alcotest.fail "strict exporter silently dropped task inputs"
+      | Error message ->
+          Alcotest.(check bool)
+            "task interface identified" true
+            (Test_support.contains ~needle:"main" message
+            && Test_support.contains ~needle:"invocation" message))
+    [ Exporter.Dagger; Exporter.Nu; Exporter.Cwl ];
+  match
+    Exporter.export ~target:Exporter.Nu ~bridge:true (typed_invocation_plan ())
+  with
+  | Ok _ ->
+      Alcotest.fail "bridge claimed to preserve an invocation it cannot forward"
+  | Error message ->
+      Alcotest.(check bool)
+        "bridge limitation is explicit" true
+        (Test_support.contains ~needle:"invocation" message)
+
 let test_cwl_empty_arguments_are_an_array () =
   let node =
     Ir.node ~id:"no-args"
@@ -230,6 +284,8 @@ let () =
             test_bridge_preserves_composite_plan;
           Alcotest.test_case "environment capability" `Quick
             test_strict_export_rejects_dropped_environment;
+          Alcotest.test_case "task invocation capability" `Quick
+            test_strict_export_rejects_dropped_task_interface;
           Alcotest.test_case "CWL empty arguments" `Quick
             test_cwl_empty_arguments_are_an_array;
         ] );

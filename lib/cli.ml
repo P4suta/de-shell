@@ -407,10 +407,23 @@ let allow_network_argument =
           "Allow network nodes (requires a configured record/replay backend).")
 
 let script_arguments_argument =
-  Arg.(
-    value & opt_all string []
-    & info [ "arg" ] ~docv:"VALUE"
-        ~doc:"Pass one original script argument to residual file capsules.")
+  let options =
+    Arg.(
+      value & opt_all string []
+      & info [ "arg" ] ~docv:"VALUE"
+          ~doc:
+            "Pass one original script argument. Use --arg=VALUE when VALUE \
+             begins with a dash.")
+  in
+  let positional =
+    Arg.(
+      value & pos_all string []
+      & info [] ~docv:"SCRIPT_ARG"
+          ~doc:"Arguments after -- are passed to the original script.")
+  in
+  Term.(
+    const (fun options positional -> options @ positional)
+    $ options $ positional)
 
 let run_node_argument =
   Arg.(value & opt (some string) None & info [ "node" ] ~docv:"NODE_ID")
@@ -503,7 +516,8 @@ let select_node plan node_id =
               ~outputs:owner.outputs ~environment:owner.environment
               ~secrets:owner.secrets
               ~platform_capabilities:owner.platform_capabilities
-              ~cacheable:false ~body:selected_body ()
+              ~cacheable:false ?invocation:owner.invocation ~body:selected_body
+              ()
           in
           Ok
             {

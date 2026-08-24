@@ -6,7 +6,13 @@ type diagnostic = {
   span : Ir.source_span option;
 }
 
-type result = { root : Ir.node; diagnostics : diagnostic list }
+type result = {
+  root : Ir.node;
+  diagnostics : diagnostic list;
+  inputs : Ir.binding list;
+  invocation : Ir.invocation option;
+}
+
 type token = { text : string; dynamic : bool; start_byte : int; end_byte : int }
 type item = Word of token | Pipe of int | Separator of int
 
@@ -391,6 +397,8 @@ let residual ?interpreter ~path ~source ~reason () =
   {
     root;
     diagnostics = [ { severity = Warning; message = reason; span = Some span } ];
+    inputs = [];
+    invocation = None;
   }
 
 let lower_basic ~path source =
@@ -503,7 +511,7 @@ let lower_basic ~path source =
                         ~source:(cover_spans first_span last_span)
                         (Ir.Sequence nodes)
                 in
-                { root; diagnostics = [] }
+                { root; diagnostics = []; inputs = []; invocation = None }
             end
         end
 
@@ -629,6 +637,8 @@ let control_result ~path ~source ~start_byte ~end_byte ~basis operation =
         ~guarantee:(Ir.Formal { basis })
         ~source:span operation;
     diagnostics = [];
+    inputs = [];
+    invocation = None;
   }
 
 let parse_and ~path source start_byte end_byte =
@@ -1985,16 +1995,22 @@ let parameter_mentioned_before source end_byte name =
   let prefix = String.sub source 0 end_byte in
   contains prefix ("$" ^ name) || contains prefix ("${" ^ name)
 
-let strict_control_flow_line line =
+let strict_control_depth_delta line =
   let trimmed = String.trim line in
-  line_is_if line
-  || List.exists
-       (fun keyword -> line_is_keyword keyword line)
-       [ "then"; "else"; "elif"; "fi"; "do"; "done"; "esac" ]
-  || List.exists
-       (fun prefix -> String.starts_with ~prefix trimmed)
-       [ "for "; "while "; "until "; "case "; "select "; "function "; "("; "{" ]
-  || List.exists (contains trimmed) [ "&&"; "||"; "|"; "()" ]
+  if
+    List.exists
+      (fun keyword -> line_is_keyword keyword trimmed)
+      [ "fi"; "done"; "esac"; ")"; "}" ]
+  then -1
+  else if
+    line_is_if trimmed
+    || List.exists
+         (fun prefix -> String.starts_with ~prefix trimmed)
+         [ "for "; "while "; "until "; "case "; "select "; "function " ]
+    || List.mem trimmed [ "("; "{" ]
+    || contains trimmed "() {"
+  then 1
+  else 0
 
 let lower_strict_script ~path source =
   let rewritten = Bytes.of_string source in
@@ -2002,7 +2018,7 @@ let lower_strict_script ~path source =
   let in_header = ref true in
   let working_directory = ref None in
   let active_heredoc = ref None in
-  let saw_control_flow = ref false in
+  let control_depth = ref 0 in
   let saw_shell_options = ref false in
   let shell_options = ref no_strict_options in
   let failure = ref None in
@@ -2058,17 +2074,14 @@ let lower_strict_script ~path source =
                           (name, value) :: List.remove_assoc name !bindings;
                         blank_range rewritten start_byte end_byte
                     end
-                | None ->
-                    in_header := false;
-                    if strict_control_flow_line trimmed then
-                      saw_control_flow := true
+                | None -> in_header := false
               end
             else
               begin match standalone_assignment semantic_line with
-              | Some _ when !saw_control_flow ->
+              | Some _ when !control_depth > 0 ->
                   failure :=
                     Some
-                      "assignment after control flow requires chronological \
+                      "assignment inside control flow requires chronological \
                        shell state"
               | Some (name, word) ->
                   if List.mem_assoc name !bindings then
@@ -2088,10 +2101,16 @@ let lower_strict_script ~path source =
                         bindings := (name, value) :: !bindings;
                         blank_range rewritten start_byte end_byte
                     end
-              | None ->
-                  if strict_control_flow_line trimmed then
-                    saw_control_flow := true
+              | None -> ()
               end;
+            if !failure = None then begin
+              let next_depth =
+                !control_depth + strict_control_depth_delta trimmed
+              in
+              if next_depth < 0 then
+                failure := Some "unmatched shell control-flow terminator"
+              else control_depth := next_depth
+            end;
             if !failure = None then
               match opened_heredoc with
               | Some heredoc -> active_heredoc := Some heredoc.delimiter
@@ -2149,7 +2168,13 @@ let lower_strict_script ~path source =
                             "pipefail rightmost-nonzero pipeline status is \
                              outside the current Effect IR"
                           ()
-                      else { root; diagnostics = [] }
+                      else
+                        {
+                          root;
+                          diagnostics = [];
+                          inputs = [];
+                          invocation = None;
+                        }
                   end
               end
           end)
