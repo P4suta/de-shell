@@ -14,7 +14,7 @@ type classification = {
   deterministic : bool;
 }
 
-let version = 1
+let version = 2
 
 let capability_to_string = function
   | Process -> "process"
@@ -47,6 +47,34 @@ let normalize_command executable =
 let has_any options argv =
   List.exists (fun option -> List.mem option argv) options
 
+let test_reads_files arguments =
+  has_any
+    [
+      "-a";
+      "-b";
+      "-c";
+      "-d";
+      "-e";
+      "-ef";
+      "-f";
+      "-g";
+      "-G";
+      "-h";
+      "-k";
+      "-L";
+      "-nt";
+      "-O";
+      "-ot";
+      "-p";
+      "-r";
+      "-S";
+      "-s";
+      "-u";
+      "-w";
+      "-x";
+    ]
+    arguments
+
 let known_commands =
   [
     ("printf", [ Process ], true);
@@ -64,7 +92,8 @@ let known_commands =
     ("cat", [ Process; Filesystem_read ], true);
     ("find", [ Process; Filesystem_read ], true);
     ("ls", [ Process; Filesystem_read ], true);
-    ("test", [ Process; Filesystem_read ], true);
+    ("test", [ Process ], true);
+    ("[", [ Process ], true);
     ("cp", [ Process; Filesystem_read; Filesystem_write ], true);
     ("mv", [ Process; Filesystem_read; Filesystem_write ], true);
     ("rm", [ Process; Filesystem_write ], true);
@@ -104,7 +133,9 @@ let classify argv =
           }
       | Some (_, base_capabilities, deterministic) ->
           let capabilities =
-            if
+            if List.mem command [ "test"; "[" ] && test_reads_files arguments
+            then Filesystem_read :: base_capabilities
+            else if
               command = "curl"
               && has_any [ "-o"; "--output"; "-O"; "--remote-name" ] arguments
             then Filesystem_write :: base_capabilities
@@ -135,7 +166,8 @@ let capabilities_of_node node =
         | Ir.Network_request _ -> [ Network ]
         | Ir.Opaque_capsule _ -> [ Process; Unknown_command ]
         | Ir.Pipeline _ | Ir.Sequence _ | Ir.Parallel _ | Ir.Condition _
-        | Ir.Match _ | Ir.For_each _ | Ir.Try_finally _ | Ir.Task_call _ ->
+        | Ir.Match _ | Ir.For_each _ | Ir.Try_finally _ | Ir.Task_call _
+        | Ir.Set_variable _ | Ir.Capture_stdout _ ->
             []
       in
       List.rev_append additions capabilities)
@@ -152,7 +184,8 @@ let deterministic_node node =
       | Ir.Network_request _ | Ir.Opaque_capsule _ -> false
       | Ir.File_read _ | Ir.File_write _ | Ir.File_remove _ | Ir.Pipeline _
       | Ir.Sequence _ | Ir.Parallel _ | Ir.Condition _ | Ir.Match _
-      | Ir.For_each _ | Ir.Try_finally _ | Ir.Task_call _ ->
+      | Ir.For_each _ | Ir.Try_finally _ | Ir.Task_call _ | Ir.Set_variable _
+      | Ir.Capture_stdout _ ->
           true)
     true node
 

@@ -8,7 +8,8 @@ required to call a release 1.0.
 ## 0.1 Foundation — implemented
 
 - black-box CLI acceptance tests and versioned JSON schemas
-- hierarchical typed Effect IR, validation, canonical codec, and schema migration
+- hierarchical typed Effect IR v3, validation, canonical codec, v0/v1/v2 schema
+  migration, typed scalar state, and ordered stdout capture
 - content hashing and atomic multi-file create/patch transactions
 - JSON-RPC handshake, malformed/disconnect/timeout/size contracts
 - internal runner, project-scoped process agent, and strict capability policy
@@ -20,6 +21,9 @@ required to call a release 1.0.
 - conservative POSIX sh/Bash lowering with precise source maps
 - literal commands, immutable assignments, pipelines, sequences, `&&`,
   homogeneous `||`, simple `if`, and static `for`
+- typed assignments across control-flow branches, expansion-safe static
+  unquoted fields, and whole-RHS stdout capture with quoted runtime parameters
+  and quoted nested command substitutions
 - command-local environments, strict option parsing, script-relative and
   static-subshell working directories, and expansion-safe literal heredoc writes
 - declared environment and secret propagation through nested runtime tasks
@@ -86,10 +90,15 @@ not placeholder values, makes that evaluator pass.
 The 2026-08-25 local audit currently reports 2 of 47 raw shell files as fully
 non-residual, with 47 formal and 45 residual nodes across 48 repositories. The
 previous 16-file typed PowerShell parameter-block group has been eliminated;
-the largest remaining groups are PowerShell expression/state assignments,
-assignments inside POSIX control flow, generated Gradle launchers, and
-redirection semantics. Completion definitions and generated launchers are
-included in that raw denominator; the declared non-interactive release corpus
-will be a separate, scenario-backed gate. See
+typed POSIX branch assignments eliminated the former six-file control-state
+group, safe unquoted expansion reduced that first-boundary group from four files
+to one, and stdout capture eliminated the five-file command-substitution
+first-boundary group. Those files now reach later special-parameter or redirect
+semantics. The largest remaining groups are 11 PowerShell expression/state
+assignments, eight POSIX redirect/asynchronous cases, five generated cmd Gradle
+launchers, and three each of effectful PowerShell validation and POSIX special
+parameters. Completion definitions and generated launchers are included in that
+raw denominator; the declared non-interactive release corpus will be a separate,
+scenario-backed gate. See
 [docs/corpus-audit.md](docs/corpus-audit.md) for the reproducible selection and
 interpretation.

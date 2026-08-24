@@ -33,17 +33,20 @@ repository's test gates:
   hosts without treating lockfiles and descriptive metadata as commands;
 - a call graph and content-hash-guarded, all-or-nothing callsite migration for
   exact standalone calls;
-- POSIX sh/Bash lowering for literal commands, immutable assignment dataflow,
-  command-local environments, pipelines, sequences, `&&`, homogeneous `||`,
-  simple conditions, static loops, script-relative working directories,
-  literal heredoc writes, and static subshell working directories;
+- POSIX sh/Bash lowering for literal commands, immutable and typed runtime
+  assignment dataflow, command-local environments, pipelines, sequences, `&&`,
+  homogeneous `||`, simple conditions, static loops, script-relative working
+  directories, literal heredoc writes, static subshell working directories,
+  expansion-safe static unquoted fields, and ordered stdout capture for whole-RHS
+  and quoted nested command substitutions;
 - conservative literal subsets for zsh, fish, PowerShell, cmd, and Nushell,
   including immutable PowerShell scalar/environment dataflow, typed script
   parameters, validation attributes, `CmdletBinding` common parameters, and
   static multi-statement files, with trace-only residual fallback for unknown
   or dynamic behavior;
-- versioned Effect IR, JSON schemas, v0/v1-to-v2 migration, and `formal`,
-  `exhaustive`, `differential`, and `residual` evidence;
+- versioned Effect IR v3, JSON schemas, v0/v1/v2-to-v3 migration, typed scalar
+  runtime state and stdout-capture effects, and `formal`, `exhaustive`,
+  `differential`, and `residual` evidence;
 - official PowerShell AST and pinned `nu-parser` JSON-RPC adapter contracts;
 - equivalent rewrites, separate modernization proposals, concolic scenario
   generation, command-effect models, and differential comparison;
@@ -143,7 +146,7 @@ builds the Rust adapter through Dune and verifies every required installed file.
 | `mise run test:differential` | Lowering and observation comparisons |
 | `mise run test:security` | Traversal, protocol, secret, and transaction regressions |
 | `mise run test` | Every repository test gate |
-| `mise run corpus:audit -- ARGS` | Inventory repositories and analyze hash-verified temporary shell copies without executing source scripts |
+| `mise run corpus:audit -- ARGS` | Rebuild the compiler, then inventory repositories and analyze hash-verified temporary shell copies without executing source scripts |
 | `mise run fmt` | Format OCaml and Dune sources |
 | `mise run fmt:check` | Check formatting without accepting changes |
 | `mise run package` | Build and verify the installable package payload |
@@ -164,7 +167,10 @@ file hash, and analyzes an isolated temporary copy. See
 2026-08-25 snapshot: 48 repositories, 1,457 inventory locations, zero analysis
 failures, and 2 of 47 raw shell files fully non-residual. That measurement is
 local evidence, not 1.0 certification; the document explains the denominator
-and the remaining residual groups.
+and the remaining residual groups. Typed branch state, safe static unquoted
+expansion, and simple/quoted-nested stdout capture moved every former
+command-substitution-first file to a later, explicitly reported boundary even
+though the whole-file numerator remains unchanged.
 
 ## First migration
 

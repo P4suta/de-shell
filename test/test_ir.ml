@@ -92,6 +92,64 @@ let test_invocation_round_trip () =
         "same typed invocation" true
         (Ir.equal_plan original decoded)
 
+let test_typed_runtime_state_round_trip () =
+  let assign =
+    Ir.node ~id:"set-mode"
+      ~guarantee:(Ir.Formal { basis = "typed-runtime-state-v1" })
+      (Ir.Set_variable
+         { name = "mode"; value_type = Ir.Text; value = "${requested:-debug}" })
+  in
+  let use =
+    Ir.node ~id:"use-mode"
+      ~guarantee:(Ir.Formal { basis = "typed-runtime-state-v1" })
+      (Ir.Exec (Ir.exec [ "tool.exe"; "--mode"; "${mode}" ]))
+  in
+  let original =
+    Ir.plan ~entrypoint:"main"
+      [
+        Ir.task ~name:"main" ~environment:[ "requested" ]
+          ~body:
+            (Ir.node ~id:"state-sequence"
+               ~guarantee:(Ir.Formal { basis = "typed-runtime-state-v1" })
+               (Ir.Sequence [ assign; use ]))
+          ();
+      ]
+  in
+  let encoded = Ir_codec.encode_string original in
+  match Ir_codec.decode_string encoded with
+  | Error errors ->
+      Alcotest.failf "runtime-state decode failed: %s"
+        (String.concat "; " errors)
+  | Ok decoded ->
+      Alcotest.(check bool)
+        "same typed runtime state" true
+        (Ir.equal_plan original decoded)
+
+let test_stdout_capture_round_trip () =
+  let capture_body =
+    Ir.node ~id:"capture-command"
+      ~guarantee:(Ir.Formal { basis = "posix-literal-command-v1" })
+      (Ir.Exec (Ir.exec [ "git"; "rev-parse"; "HEAD" ]))
+  in
+  let capture =
+    Ir.node ~id:"capture-revision"
+      ~guarantee:(Ir.Formal { basis = "posix-command-substitution-v1" })
+      (Ir.Capture_stdout
+         { name = "revision"; value_type = Ir.Text; body = capture_body })
+  in
+  let original =
+    Ir.plan ~entrypoint:"main" [ Ir.task ~name:"main" ~body:capture () ]
+  in
+  let encoded = Ir_codec.encode_string original in
+  match Ir_codec.decode_string encoded with
+  | Error errors ->
+      Alcotest.failf "stdout-capture decode failed: %s"
+        (String.concat "; " errors)
+  | Ok decoded ->
+      Alcotest.(check bool)
+        "same typed stdout capture" true
+        (Ir.equal_plan original decoded)
+
 let test_unknown_fields_are_ignored () =
   let json = Ir_codec.encode_yojson (sample_plan ()) in
   let with_unknown =
@@ -103,7 +161,7 @@ let test_unknown_fields_are_ignored () =
   match Ir_codec.decode_yojson with_unknown with
   | Error errors ->
       Alcotest.failf "unknown field rejected: %s" (String.concat "; " errors)
-  | Ok decoded -> Alcotest.(check int) "schema version" 2 decoded.schema_version
+  | Ok decoded -> Alcotest.(check int) "schema version" 3 decoded.schema_version
 
 let test_residual_requires_reason () =
   let capsule = Ir.opaque ~interpreter:"sh" ~source:"eval \"$x\"" ~reason:"" in
@@ -130,7 +188,7 @@ let test_v0_migration () =
   | Error errors ->
       Alcotest.failf "migration failed: %s" (String.concat "; " errors)
   | Ok plan -> (
-      Alcotest.(check int) "migrated schema" 2 plan.schema_version;
+      Alcotest.(check int) "migrated schema" 3 plan.schema_version;
       match (List.hd plan.tasks).body.operation with
       | Ir.Exec command ->
           Alcotest.(check (list string)) "argv" [ "echo"; "hello" ] command.argv
@@ -164,10 +222,24 @@ let test_v1_migration () =
   | Error errors ->
       Alcotest.failf "v1 migration failed: %s" (String.concat "; " errors)
   | Ok plan ->
-      Alcotest.(check int) "migrated schema" 2 plan.schema_version;
+      Alcotest.(check int) "migrated schema" 3 plan.schema_version;
       Alcotest.(check bool)
         "missing invocation migrated to none" true
         ((List.hd plan.tasks).invocation = None)
+
+let test_v2_migration () =
+  let legacy =
+    match Ir_codec.encode_yojson (sample_plan ()) with
+    | `Assoc fields ->
+        `Assoc
+          (("schema_version", `Int 2)
+          :: List.remove_assoc "schema_version" fields)
+    | _ -> Alcotest.fail "encoded plan must be an object"
+  in
+  match Ir_codec.decode_yojson legacy with
+  | Error errors ->
+      Alcotest.failf "v2 migration failed: %s" (String.concat "; " errors)
+  | Ok plan -> Alcotest.(check int) "migrated schema" 3 plan.schema_version
 
 let test_node_ids_are_globally_unique () =
   let make_task name =
@@ -541,6 +613,87 @@ let test_invocation_default_types_are_validated_before_execution () =
     "ValidateSet does not apply to a default" false
     (List.exists (Test_support.contains ~needle:"default for Mode") errors)
 
+let test_runtime_state_contract_is_validated () =
+  let set id name value_type =
+    Ir.node ~id
+      ~guarantee:(Ir.Formal { basis = "typed-runtime-state-v1" })
+      (Ir.Set_variable { name; value_type; value = "value" })
+  in
+  let invalid_scalar = set "invalid-name" "" (Ir.List Ir.Text) in
+  let concurrent =
+    Ir.node ~id:"parallel-state"
+      ~guarantee:(Ir.Formal { basis = "typed-runtime-state-v1" })
+      (Ir.Parallel [ set "parallel-child" "mode" Ir.Text ])
+  in
+  let piped =
+    Ir.node ~id:"pipeline-state"
+      ~guarantee:(Ir.Formal { basis = "typed-runtime-state-v1" })
+      (Ir.Pipeline
+         [
+           set "pipeline-child" "mode" Ir.Text;
+           Ir.node ~id:"pipeline-exec"
+             ~guarantee:(Ir.Formal { basis = "test" })
+             (Ir.Exec (Ir.exec [ "consume" ]));
+         ])
+  in
+  let cleanup =
+    Ir.node ~id:"cleanup-state"
+      ~guarantee:(Ir.Formal { basis = "typed-runtime-state-v1" })
+      (Ir.Try_finally
+         {
+           body = set "cleanup-body" "mode" Ir.Text;
+           finalizer =
+             Ir.node ~id:"cleanup-finalizer"
+               ~guarantee:(Ir.Formal { basis = "test" })
+               (Ir.Exec (Ir.exec [ "cleanup" ]));
+         })
+  in
+  let body =
+    Ir.node ~id:"invalid-state-sequence"
+      ~guarantee:(Ir.Formal { basis = "test" })
+      (Ir.Sequence [ invalid_scalar; concurrent; piped; cleanup ])
+  in
+  let errors =
+    invalid_errors
+      (Ir.plan ~entrypoint:"main" [ Ir.task ~name:"main" ~body () ])
+  in
+  has_error "variable name" errors;
+  has_error "scalar value type" errors;
+  has_error "parallel state mutation" errors;
+  has_error "pipeline state mutation" errors;
+  has_error "try/finally state mutation" errors
+
+let test_stdout_capture_contract_is_validated () =
+  let command =
+    Ir.node ~id:"capture-command"
+      ~guarantee:(Ir.Formal { basis = "test" })
+      (Ir.Exec (Ir.exec [ "probe" ]))
+  in
+  let capture id name value_type =
+    Ir.node ~id
+      ~guarantee:(Ir.Formal { basis = "test" })
+      (Ir.Capture_stdout { name; value_type; body = command })
+  in
+  let invalid_name = capture "invalid-capture-name" "not-valid!" Ir.Text in
+  let invalid_type = capture "invalid-capture-type" "revision" Ir.Int in
+  let concurrent =
+    Ir.node ~id:"parallel-capture"
+      ~guarantee:(Ir.Formal { basis = "test" })
+      (Ir.Parallel [ capture "parallel-capture-child" "revision" Ir.Text ])
+  in
+  let body =
+    Ir.node ~id:"invalid-capture-sequence"
+      ~guarantee:(Ir.Formal { basis = "test" })
+      (Ir.Sequence [ invalid_name; invalid_type; concurrent ])
+  in
+  let errors =
+    invalid_errors
+      (Ir.plan ~entrypoint:"main" [ Ir.task ~name:"main" ~body () ])
+  in
+  has_error "variable name" errors;
+  has_error "must use text type" errors;
+  has_error "parallel state mutation" errors
+
 let () =
   Alcotest.run "Effect IR"
     [
@@ -549,10 +702,15 @@ let () =
           Alcotest.test_case "round trip" `Quick test_round_trip;
           Alcotest.test_case "invocation round trip" `Quick
             test_invocation_round_trip;
+          Alcotest.test_case "typed runtime state round trip" `Quick
+            test_typed_runtime_state_round_trip;
+          Alcotest.test_case "stdout capture round trip" `Quick
+            test_stdout_capture_round_trip;
           Alcotest.test_case "unknown fields" `Quick
             test_unknown_fields_are_ignored;
           Alcotest.test_case "v0 migration" `Quick test_v0_migration;
           Alcotest.test_case "v1 migration" `Quick test_v1_migration;
+          Alcotest.test_case "v2 migration" `Quick test_v2_migration;
         ] );
       ( "validation",
         [
@@ -584,5 +742,9 @@ let () =
             test_invocation_contract_is_validated;
           Alcotest.test_case "invocation default types" `Quick
             test_invocation_default_types_are_validated_before_execution;
+          Alcotest.test_case "typed runtime state" `Quick
+            test_runtime_state_contract_is_validated;
+          Alcotest.test_case "stdout capture" `Quick
+            test_stdout_capture_contract_is_validated;
         ] );
     ]

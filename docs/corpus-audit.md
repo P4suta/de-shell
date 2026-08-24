@@ -7,12 +7,12 @@ copies. The report conforms to `schema/corpus-audit.schema.json`.
 
 ## Run it
 
-Build the local CLI first, then run the audit through the mise-managed
-PowerShell. Quote the complete comma-separated exclusion value: an unquoted
-list can be split by the caller before it reaches the script.
+Run the audit through the mise-managed PowerShell. The task depends on `build`,
+so it cannot analyze with a stale compiler binary. Quote the complete
+comma-separated exclusion value: an unquoted list can be split by the caller
+before it reaches the script.
 
 ```console
-mise run build
 mise run corpus:audit -- -CorpusRoot .. -ExcludeRepository 'de-shell,workflow-verifier,beamtrace' -ExcludePattern 'cargo-mutants-wt-*' -DeshellExecutable _build/default/bin/main.exe -Format Json -OutputPath _build/local-corpus-audit.json
 ```
 
@@ -60,19 +60,19 @@ The two fully non-residual files were:
 - `terminfokit/scripts/fetch-ncurses-oracle.sh` (20 formal nodes)
 
 The 45 residual files were grouped by their first atomic residual reason after
-typed PowerShell parameters, validation metadata, common parameters, and
-top-level post-control POSIX constants were implemented:
+typed PowerShell parameters, typed POSIX branch state, safe static unquoted
+fields, and simple/quoted-nested command capture were implemented:
 
 | Files | Interpreter | Reason |
 | ---: | --- | --- |
 | 11 | PowerShell | expression/state assignments exceed the immutable scalar subset |
-| 6 | POSIX sh | assignments inside control flow need chronological shell state |
+| 8 | POSIX sh / Bash | redirection and asynchronous-process semantics |
 | 5 | cmd | dynamic expansion in generated Gradle launchers |
-| 6 | POSIX sh / Bash | redirection and asynchronous-process semantics |
 | 3 | PowerShell | effectful `ValidateScript(Test-Path …)` input contracts |
+| 3 | POSIX sh | special parameters such as `$?`/`$@` need explicit typed semantics |
 | 2 | PowerShell | parameter-set selection semantics |
 | 2 | PowerShell | non-literal text defaults |
-| 10 | Bash/cmd/fish/PowerShell/sh/zsh | ten distinct singleton syntax or runtime boundaries |
+| 11 | Bash/cmd/fish/PowerShell/sh/zsh | eleven distinct singleton syntax or runtime boundaries |
 
 This is deliberately a raw shell-file audit. Its denominator includes five
 copies each of the generated `gradlew` and `gradlew.bat` launchers and four
@@ -85,9 +85,11 @@ Consequently, this snapshot does not certify de-shell 1.0 and is not the
 release-gate corpus. A release corpus must explicitly declare non-interactive
 entrypoints and scenarios, then pass differential observation on the required
 OS/shell matrix. The unchanged whole-file count does not mean the compiler made
-no progress: the former 16-file typed-parameter blocker is gone, and those files
-now reach later function, state, validation, or redirection boundaries. The
-current result demonstrates safe inventory and two complete static slices while
-identifying expression/state lowering, parameter sets, effectful validation,
-POSIX chronological state, and generated launcher semantics as the next major
-compiler work.
+no progress. The former 16-file typed-parameter blocker and six-file POSIX
+control-assignment blocker are gone; the unquoted-expansion first-boundary group
+fell from four to one; and the five files formerly stopped at command
+substitution now reach special-parameter or redirect semantics. The current
+result demonstrates safe inventory and two complete static slices while
+identifying PowerShell expression/object state, redirects, special shell
+parameters, parameter sets, effectful validation, and generated launcher
+semantics as the next major compiler work.

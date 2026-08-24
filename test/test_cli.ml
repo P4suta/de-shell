@@ -34,7 +34,7 @@ let test_init_analyze_check executable () =
   Alcotest.(check bool) "evidence" true (Sys.file_exists evidence_path);
   let plan = Yojson.Safe.from_file plan_path in
   Alcotest.(check int)
-    "canonical schema" 2
+    "canonical schema" 3
     Yojson.Safe.Util.(plan |> member "schema_version" |> to_int);
   let checked =
     Test_support.run_process executable [ "check"; "--root"; root ]

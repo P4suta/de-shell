@@ -189,6 +189,11 @@ let redact_backend_error context = Result.map_error (redact_error context)
 let add_variable variables (name, value) =
   (name, value) :: List.remove_assoc name variables
 
+let restore_variable variables name previous =
+  match previous with
+  | None -> List.remove_assoc name variables
+  | Some value -> add_variable variables (name, value)
+
 let expand_text context text =
   let length = String.length text in
   let actual = Buffer.create length in
@@ -743,6 +748,41 @@ let bind_task_invocation task ~provided arguments =
   | Some ({ style = Ir.Powershell; _ } as invocation) ->
       bind_powershell_invocation task invocation ~provided arguments
 
+let rec normalize_runtime_state_value name value_type value =
+  let invalid expected =
+    Error
+      (Printf.sprintf "runtime variable %s must be a valid %s" name expected)
+  in
+  match value_type with
+  | Ir.Text | Ir.Path | Ir.Bytes -> Ok value
+  | Ir.Int ->
+      begin match int_of_string_opt (String.trim value) with
+      | Some value -> Ok (string_of_int value)
+      | None -> invalid "integer"
+      end
+  | Ir.Bool ->
+      begin match String.lowercase_ascii (String.trim value) with
+      | "true" | "1" -> Ok "true"
+      | "false" | "0" -> Ok "false"
+      | _ -> invalid "boolean"
+      end
+  | Ir.Secret inner -> normalize_runtime_state_value name inner value
+  | Ir.List _ | Ir.Record _ | Ir.Byte_stream | Ir.Object_stream _ ->
+      invalid "scalar value"
+
+let rec runtime_state_is_secret = function
+  | Ir.Secret _ -> true
+  | Ir.Bytes | Ir.Text | Ir.Bool | Ir.Int | Ir.Path | Ir.List _ | Ir.Record _
+  | Ir.Byte_stream | Ir.Object_stream _ ->
+      false
+
+let trim_trailing_newlines value =
+  let finish = ref (String.length value) in
+  while !finish > 0 && value.[!finish - 1] = '\n' do
+    decr finish
+  done;
+  if !finish = String.length value then value else String.sub value 0 !finish
+
 let run_plan_with_inputs ~backend ~policy ~inputs ?(arguments = []) plan =
   let script_arguments = arguments in
   let tasks = Hashtbl.create (List.length plan.Ir.tasks) in
@@ -794,38 +834,41 @@ let run_plan_with_inputs ~backend ~policy ~inputs ?(arguments = []) plan =
               run_node (name :: stack)
                 { variables; secret_names = task.secrets; script_arguments }
                 stdin task.body
+              |> Result.map fst
   and run_nodes_sequence stack context stdin nodes =
-    let rec loop input accumulator = function
-      | [] -> Ok accumulator
+    let rec loop context input accumulator = function
+      | [] -> Ok (accumulator, context)
       | node :: rest ->
           begin match run_node stack context input node with
           | Error _ as error -> error
-          | Ok current ->
+          | Ok (current, context) ->
               let combined =
                 combine ~exit_code:current.exit_code accumulator current
               in
-              loop "" combined rest
+              loop context "" combined rest
           end
     in
-    loop stdin empty nodes
+    loop context stdin empty nodes
   and run_nodes_pipeline stack context stdin nodes =
     let rec loop input stderr trace last = function
       | [] ->
-          Ok { exit_code = last.exit_code; stdout = last.stdout; stderr; trace }
+          Ok
+            ( { exit_code = last.exit_code; stdout = last.stdout; stderr; trace },
+              context )
       | node :: rest ->
           begin match run_node stack context input node with
           | Error _ as error -> error
-          | Ok current ->
+          | Ok (current, _) ->
               loop current.stdout (stderr ^ current.stderr)
                 (trace @ current.trace) current rest
           end
     in
     match nodes with
-    | [] -> Ok empty
+    | [] -> Ok (empty, context)
     | first :: rest ->
         begin match run_node stack context stdin first with
         | Error _ as error -> error
-        | Ok current ->
+        | Ok (current, _) ->
             loop current.stdout current.stderr current.trace current rest
         end
   and run_parallel stack context stdin nodes =
@@ -836,9 +879,9 @@ let run_plan_with_inputs ~backend ~policy ~inputs ?(arguments = []) plan =
     in
     let results = List.map Domain.join domains in
     let rec merge accumulator = function
-      | [] -> Ok accumulator
+      | [] -> Ok (accumulator, context)
       | Error message :: _ -> Error message
-      | Ok current :: rest ->
+      | Ok (current, _) :: rest ->
           merge (combine ~exit_code:current.exit_code accumulator current) rest
     in
     merge empty results
@@ -871,7 +914,7 @@ let run_plan_with_inputs ~backend ~policy ~inputs ?(arguments = []) plan =
                         with
                         | Error _ as error -> error
                         | Ok result ->
-                            Ok (process_observation ~trace_argv result)
+                            Ok (process_observation ~trace_argv result, context)
                         end
                     end
                 end
@@ -883,17 +926,19 @@ let run_plan_with_inputs ~backend ~policy ~inputs ?(arguments = []) plan =
     | Ir.Condition { predicate; if_true; if_false } ->
         begin match run_node stack context stdin predicate with
         | Error _ as error -> error
-        | Ok condition ->
+        | Ok (condition, predicate_context) ->
             let branch =
               if condition.exit_code = 0 then Some if_true else if_false
             in
             begin match branch with
-            | None -> Ok condition
+            | None -> Ok (condition, predicate_context)
             | Some branch ->
-                begin match run_node stack context "" branch with
+                begin match run_node stack predicate_context "" branch with
                 | Error _ as error -> error
-                | Ok result ->
-                    Ok (combine ~exit_code:result.exit_code condition result)
+                | Ok (result, branch_context) ->
+                    Ok
+                      ( combine ~exit_code:result.exit_code condition result,
+                        branch_context )
                 end
             end
         end
@@ -906,7 +951,8 @@ let run_plan_with_inputs ~backend ~policy ~inputs ?(arguments = []) plan =
               | Some branch -> Some branch
               | None -> default
             in
-            Option.fold ~none:(Ok empty)
+            Option.fold
+              ~none:(Ok (empty, context))
               ~some:(run_node stack context stdin)
               branch
         end
@@ -914,25 +960,33 @@ let run_plan_with_inputs ~backend ~policy ~inputs ?(arguments = []) plan =
         begin match expand_list context items with
         | Error _ as error -> error
         | Ok (items, _) ->
-            let rec loop accumulator = function
-              | [] -> Ok accumulator
+            let previous = List.assoc_opt variable context.variables in
+            let rec loop context accumulator = function
+              | [] ->
+                  Ok
+                    ( accumulator,
+                      {
+                        context with
+                        variables =
+                          restore_variable context.variables variable previous;
+                      } )
               | item :: rest ->
-                  let context =
+                  let iteration_context =
                     {
                       context with
                       variables = add_variable context.variables (variable, item);
                     }
                   in
-                  begin match run_node stack context stdin body with
+                  begin match run_node stack iteration_context stdin body with
                   | Error _ as error -> error
-                  | Ok current ->
-                      loop
+                  | Ok (current, next_context) ->
+                      loop next_context
                         (combine ~exit_code:current.exit_code accumulator
                            current)
                         rest
                   end
             in
-            loop empty items
+            loop context empty items
         end
     | Ir.Try_finally { body; finalizer } ->
         begin match run_node stack context stdin body with
@@ -943,22 +997,75 @@ let run_plan_with_inputs ~backend ~policy ~inputs ?(arguments = []) plan =
                 Error
                   (body_error ^ "; finalizer also failed: " ^ finalizer_error)
             end
-        | Ok body_result ->
-            begin match run_node stack context "" finalizer with
+        | Ok (body_result, body_context) ->
+            begin match run_node stack body_context "" finalizer with
             | Error _ as error -> error
-            | Ok finalizer_result ->
+            | Ok (finalizer_result, finalizer_context) ->
                 let exit_code =
                   if finalizer_result.exit_code <> 0 then
                     finalizer_result.exit_code
                   else body_result.exit_code
                 in
-                Ok (combine ~exit_code body_result finalizer_result)
+                Ok
+                  ( combine ~exit_code body_result finalizer_result,
+                    finalizer_context )
             end
         end
     | Ir.Task_call { task; arguments } ->
         begin match expand_pairs context arguments with
         | Error _ as error -> error
-        | Ok (arguments, _) -> run_task stack stdin arguments task
+        | Ok (arguments, _) ->
+            Result.map
+              (fun observation -> (observation, context))
+              (run_task stack stdin arguments task)
+        end
+    | Ir.Set_variable assignment ->
+        begin match expand_text context assignment.value with
+        | Error _ as error -> error
+        | Ok (value, _) ->
+            begin match
+              normalize_runtime_state_value assignment.name
+                assignment.value_type value
+            with
+            | Error _ as error -> error
+            | Ok value ->
+                let secret_names =
+                  if runtime_state_is_secret assignment.value_type then
+                    assignment.name
+                    :: List.filter
+                         (fun name -> name <> assignment.name)
+                         context.secret_names
+                  else context.secret_names
+                in
+                Ok
+                  ( empty,
+                    {
+                      context with
+                      variables =
+                        add_variable context.variables (assignment.name, value);
+                      secret_names;
+                    } )
+            end
+        end
+    | Ir.Capture_stdout capture ->
+        begin match run_node stack context stdin capture.body with
+        | Error _ as error -> error
+        | Ok (captured, _) ->
+            let value = trim_trailing_newlines captured.stdout in
+            begin match
+              normalize_runtime_state_value capture.name capture.value_type
+                value
+            with
+            | Error _ as error -> error
+            | Ok value ->
+                Ok
+                  ( { captured with stdout = "" },
+                    {
+                      context with
+                      variables =
+                        add_variable context.variables (capture.name, value);
+                    } )
+            end
         end
     | Ir.File_read path ->
         if not policy.allow_file_read then
@@ -973,12 +1080,13 @@ let run_plan_with_inputs ~backend ~policy ~inputs ?(arguments = []) plan =
               | Error _ as error -> error
               | Ok contents ->
                   Ok
-                    {
-                      exit_code = 0;
-                      stdout = contents;
-                      stderr = "";
-                      trace = [ File_read trace_path ];
-                    }
+                    ( {
+                        exit_code = 0;
+                        stdout = contents;
+                        stderr = "";
+                        trace = [ File_read trace_path ];
+                      },
+                      context )
               end
           end
     | Ir.File_write write ->
@@ -996,7 +1104,10 @@ let run_plan_with_inputs ~backend ~policy ~inputs ?(arguments = []) plan =
                     |> redact_backend_error context
                   with
                   | Error _ as error -> error
-                  | Ok () -> Ok { empty with trace = [ File_write trace_path ] }
+                  | Ok () ->
+                      Ok
+                        ( { empty with trace = [ File_write trace_path ] },
+                          context )
                   end
               end
           end
@@ -1011,7 +1122,8 @@ let run_plan_with_inputs ~backend ~policy ~inputs ?(arguments = []) plan =
                 backend.remove_file path |> redact_backend_error context
               with
               | Error _ as error -> error
-              | Ok () -> Ok { empty with trace = [ File_remove trace_path ] }
+              | Ok () ->
+                  Ok ({ empty with trace = [ File_remove trace_path ] }, context)
               end
           end
     | Ir.Network_request request ->
@@ -1031,12 +1143,13 @@ let run_plan_with_inputs ~backend ~policy ~inputs ?(arguments = []) plan =
                   | Error _ as error -> error
                   | Ok body ->
                       Ok
-                        {
-                          exit_code = 0;
-                          stdout = body;
-                          stderr = "";
-                          trace = [ Network (trace_method, trace_uri) ];
-                        }
+                        ( {
+                            exit_code = 0;
+                            stdout = body;
+                            stderr = "";
+                            trace = [ Network (trace_method, trace_uri) ];
+                          },
+                          context )
                   end
               end
           end
@@ -1054,10 +1167,11 @@ let run_plan_with_inputs ~backend ~policy ~inputs ?(arguments = []) plan =
           | Ok result ->
               let observation = process_observation ~trace_argv:argv result in
               Ok
-                {
-                  observation with
-                  trace = Capsule node.id :: observation.trace;
-                }
+                ( {
+                    observation with
+                    trace = Capsule node.id :: observation.trace;
+                  },
+                  context )
           end
   in
   match Ir.validate_plan plan with

@@ -1,11 +1,11 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://deshell.dev/schema/effect-ir/v2",
+  "$id": "https://deshell.dev/schema/effect-ir/v3",
   "title": "de-shell Effect IR",
   "type": "object",
   "required": ["schema_version", "generator", "entrypoint", "tasks"],
   "properties": {
-    "schema_version": { "const": 2 },
+    "schema_version": { "const": 3 },
     "generator": { "type": "string", "minLength": 1 },
     "entrypoint": { "type": "string", "minLength": 1 },
     "tasks": {
@@ -49,6 +49,21 @@
           "required": ["object_stream"],
           "properties": {
             "object_stream": { "$ref": "#/$defs/valueType" }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "scalarValueType": {
+      "oneOf": [
+        {
+          "enum": ["bytes", "text", "bool", "int", "path"]
+        },
+        {
+          "type": "object",
+          "required": ["secret"],
+          "properties": {
+            "secret": { "$ref": "#/$defs/scalarValueType" }
           },
           "additionalProperties": false
         }
@@ -249,6 +264,34 @@
               "type": "object",
               "additionalProperties": { "type": "string" }
             }
+          },
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "required": ["type", "name", "value_type", "value"],
+          "properties": {
+            "type": { "const": "set_variable" },
+            "name": {
+              "type": "string",
+              "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+            },
+            "value_type": { "$ref": "#/$defs/scalarValueType" },
+            "value": { "type": "string" }
+          },
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "required": ["type", "name", "value_type", "body"],
+          "properties": {
+            "type": { "const": "capture_stdout" },
+            "name": {
+              "type": "string",
+              "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+            },
+            "value_type": { "const": "text" },
+            "body": { "$ref": "#/$defs/node" }
           },
           "additionalProperties": true
         },

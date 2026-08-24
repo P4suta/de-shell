@@ -456,6 +456,9 @@ let rec clone_node_ids ~prefix (node : Ir.node) =
     | Ir.Try_finally { body; finalizer } ->
         Ir.Try_finally { body = clone body; finalizer = clone finalizer }
     | Ir.Task_call call -> Ir.Task_call call
+    | Ir.Set_variable assignment -> Ir.Set_variable assignment
+    | Ir.Capture_stdout capture ->
+        Ir.Capture_stdout { capture with body = clone capture.body }
     | Ir.File_read path -> Ir.File_read path
     | Ir.File_write write -> Ir.File_write write
     | Ir.File_remove path -> Ir.File_remove path

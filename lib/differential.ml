@@ -125,6 +125,9 @@ let rec map_node_guarantees f (node : Ir.node) =
     | Ir.Try_finally { body; finalizer } ->
         Ir.Try_finally { body = map body; finalizer = map finalizer }
     | Ir.Task_call call -> Ir.Task_call call
+    | Ir.Set_variable assignment -> Ir.Set_variable assignment
+    | Ir.Capture_stdout capture ->
+        Ir.Capture_stdout { capture with body = map capture.body }
     | Ir.File_read path -> Ir.File_read path
     | Ir.File_write write -> Ir.File_write write
     | Ir.File_remove path -> Ir.File_remove path

@@ -174,6 +174,8 @@ let operation_name (node : Ir.node) =
   | Ir.For_each _ -> "foreach"
   | Ir.Try_finally _ -> "try_finally"
   | Ir.Task_call _ -> "task_call"
+  | Ir.Set_variable _ -> "set_variable"
+  | Ir.Capture_stdout _ -> "capture_stdout"
   | Ir.File_read _ -> "file_read"
   | Ir.File_write _ -> "file_write"
   | Ir.File_remove _ -> "file_remove"

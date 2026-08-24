@@ -276,6 +276,22 @@ let rec encode_node (node : Ir.node) =
             ("task", `String task);
             ("arguments", encode_pairs arguments);
           ]
+    | Ir.Set_variable assignment ->
+        `Assoc
+          [
+            ("type", `String "set_variable");
+            ("name", `String assignment.name);
+            ("value_type", encode_value_type assignment.value_type);
+            ("value", `String assignment.value);
+          ]
+    | Ir.Capture_stdout capture ->
+        `Assoc
+          [
+            ("type", `String "capture_stdout");
+            ("name", `String capture.name);
+            ("value_type", encode_value_type capture.value_type);
+            ("body", encode_node capture.body);
+          ]
     | Ir.File_read path ->
         `Assoc [ ("type", `String "file_read"); ("path", `String path) ]
     | Ir.File_write write ->
@@ -435,6 +451,26 @@ let rec decode_node context json =
           | Some value -> decode_pairs (context ^ ".operation.arguments") value
         in
         Ok (Ir.Task_call { task; arguments })
+    | "set_variable" ->
+        let* name_json = required "name" operation_fields in
+        let* name = as_string (context ^ ".operation.name") name_json in
+        let* value_type_json = required "value_type" operation_fields in
+        let* value_type =
+          decode_value_type (context ^ ".operation.value_type") value_type_json
+        in
+        let* value_json = required "value" operation_fields in
+        let* value = as_string (context ^ ".operation.value") value_json in
+        Ok (Ir.Set_variable { name; value_type; value })
+    | "capture_stdout" ->
+        let* name_json = required "name" operation_fields in
+        let* name = as_string (context ^ ".operation.name") name_json in
+        let* value_type_json = required "value_type" operation_fields in
+        let* value_type =
+          decode_value_type (context ^ ".operation.value_type") value_type_json
+        in
+        let* body_json = required "body" operation_fields in
+        let* body = decode_node (context ^ ".operation.body") body_json in
+        Ok (Ir.Capture_stdout { name; value_type; body })
     | "file_read" ->
         let* path_json = required "path" operation_fields in
         let* path = as_string (context ^ ".operation.path") path_json in
@@ -785,7 +821,7 @@ let decode_yojson json =
   match (optional "schema_version" fields, optional "version" fields) with
   | Some value, _ ->
       let* version = as_int "schema_version" value in
-      if version = 1 || version = Ir.current_schema_version then
+      if version = 1 || version = 2 || version = Ir.current_schema_version then
         decode_current fields
       else errorf "unsupported schema_version: %d" version
   | None, Some value ->
