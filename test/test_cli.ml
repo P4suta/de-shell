@@ -274,7 +274,7 @@ let test_run_and_export executable () =
 
 let test_run_uses_project_root_as_process_cwd executable () =
   Test_support.with_temp_dir @@ fun root ->
-  let source = if Sys.win32 then "cmd.exe /d /s /c cd\n" else "/bin/pwd\n" in
+  let source = if Sys.win32 then "@cmd.exe /d /s /c cd\n" else "/bin/pwd\n" in
   initialize_and_analyze executable root
     (if Sys.win32 then "cwd.cmd" else "cwd.sh")
     source;

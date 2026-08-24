@@ -20,6 +20,8 @@ required to call a release 1.0.
 - conservative POSIX sh/Bash lowering with precise source maps
 - literal commands, immutable assignments, pipelines, sequences, `&&`,
   homogeneous `||`, simple `if`, and static `for`
+- command-local environments, strict option parsing, script-relative and
+  static-subshell working directories, and expansion-safe literal heredoc writes
 - declared environment and secret propagation through nested runtime tasks
 - equivalent rewrite rules and separate modernization profiles
 - command-effect model, bounded concolic scenarios, and differential engine
@@ -64,6 +66,7 @@ macOS guest execution remain release gates.
 
 ## 0.9–1.0 Hardening — release gates
 
+- keep the non-executing, hash-verified corpus audit and its JSON schema stable
 - collect and minimize failures from real automation projects before each fix
 - validate the complete release artifact corpus with official Dagger and CWL
   tools (the representative pinned local gate is implemented)
@@ -79,3 +82,13 @@ macOS guest execution remain release gates.
 The `Release_gate` evaluator encodes these quantitative criteria and refuses an
 empty corpus or an incomplete matrix. A release is not 1.0 until real evidence,
 not placeholder values, makes that evaluator pass.
+
+The 2026-08-24 local audit currently reports 2 of 47 raw shell files as fully
+non-residual, with 47 formal and 45 residual nodes across 48 repositories. The
+largest residual groups are typed PowerShell parameter blocks, PowerShell
+expression/state assignments, POSIX chronological state after control flow, and
+generated Gradle launchers. Completion definitions and generated launchers are
+included in that raw denominator; the declared non-interactive release corpus
+will be a separate, scenario-backed gate. See
+[docs/corpus-audit.md](docs/corpus-audit.md) for the reproducible selection and
+interpretation.

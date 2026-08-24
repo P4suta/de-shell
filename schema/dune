@@ -1,4 +1,8 @@
 (install
  (package de-shell)
  (section share)
- (files effect-ir.schema.json evidence.schema.json adapter.schema.json))
+ (files
+  effect-ir.schema.json
+  evidence.schema.json
+  adapter.schema.json
+  corpus-audit.schema.json))

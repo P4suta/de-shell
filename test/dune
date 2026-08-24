@@ -98,6 +98,9 @@
   ../CHANGELOG.md
   ../CODE_OF_CONDUCT.md
   ../GOVERNANCE.md
+  ../README.md
+  ../ROADMAP.md
+  ../docs/corpus-audit.md
   ../mise.lock
   ../mise.toml
   ../SECURITY.md
@@ -126,11 +129,15 @@
   ../adapters/nushell/dune
   ../scripts/github-repository.ps1
   ../scripts/repository-guardrails.ps1
+  ../scripts/audit-corpus.ps1
+  ../scripts/dune
   ../scripts/validate-official-exporters.ps1
+  test_corpus_audit.ps1
   test_repository_guardrails.ps1
   ../schema/effect-ir.schema.json
   ../schema/evidence.schema.json
-  ../schema/adapter.schema.json)
+  ../schema/adapter.schema.json
+  ../schema/corpus-audit.schema.json)
  (action
   (progn
    (run %{exe:test_protocol.bc})
@@ -163,6 +170,16 @@
     %{dep:test_repository_guardrails.ps1}
     -GuardrailScript
     %{dep:../scripts/repository-guardrails.ps1})
+   (run
+    pwsh
+    -NoLogo
+    -NoProfile
+    -File
+    %{dep:test_corpus_audit.ps1}
+    -AuditScript
+    %{dep:../scripts/audit-corpus.ps1}
+    -DeshellExecutable
+    %{bin:deshell})
    (run %{exe:test_exporter.bc})
    (setenv
     DESHELL_PROCESS_AGENT

@@ -221,6 +221,17 @@ let lex source =
                        source.[!index + 1]
                        [ ' '; '\t'; '\r'; '\n'; ';'; '|'; '&' ]) ->
             add character
+        | '{'
+          when (not !started)
+               && !index + 1 < length
+               && source.[!index + 1] = '}'
+               && (!index + 2 = length
+                  || List.mem
+                       source.[!index + 2]
+                       [ ' '; '\t'; '\r'; '\n'; ';'; '|'; '&' ]) ->
+            add character;
+            incr index;
+            add source.[!index]
         | '$' | '`' | '*' | '?' | '[' | ']' | '{' | '}' ->
             dynamic := true;
             add character
@@ -601,7 +612,12 @@ let lower_fragment ~path ~source start_byte end_byte =
     let fragment = String.sub source start_byte (end_byte - start_byte) in
     let lowered = lower_basic ~path fragment in
     if lowered.diagnostics <> [] || has_residual lowered.root then
-      Error "control-flow command is outside the static literal subset"
+      let reason =
+        match lowered.root.guarantee with
+        | Ir.Residual evidence -> evidence.reason
+        | _ -> "control-flow command is outside the static literal subset"
+      in
+      Error reason
     else Ok (relocate_node ~path ~source ~offset:start_byte lowered.root)
 
 let control_result ~path ~source ~start_byte ~end_byte ~basis operation =
@@ -987,36 +1003,156 @@ let expand_assignment_word bindings source =
   | None, `Normal -> Ok (Buffer.contents output)
 
 let standalone_assignment line =
-  match String.index_opt line '=' with
-  | None -> None
-  | Some separator ->
-      let name = String.sub line 0 separator |> String.trim in
-      if not (valid_environment_name name) then None
-      else
-        let prefix = String.sub line 0 separator in
-        if String.trim prefix <> prefix then None
+  match lex line with
+  | Ok [ Word token ] when Option.is_some (assignment token) ->
+      begin match String.index_opt line '=' with
+      | None -> None
+      | Some separator ->
+          let name = String.sub line 0 separator |> String.trim in
+          if not (valid_environment_name name) then None
+          else
+            let prefix = String.sub line 0 separator in
+            if String.trim prefix <> prefix then None
+            else
+              Some
+                ( name,
+                  String.sub line (separator + 1)
+                    (String.length line - separator - 1) )
+      end
+  | Ok _ | Error _ -> None
+
+let strip_shell_comment line =
+  let length = String.length line in
+  let rec loop index state escaped =
+    if index >= length then line
+    else
+      let character = line.[index] in
+      match state with
+      | `Single ->
+          if character = '\'' then loop (index + 1) `Normal false
+          else loop (index + 1) `Single false
+      | `Double ->
+          if escaped then loop (index + 1) `Double false
+          else if character = '\\' then loop (index + 1) `Double true
+          else if character = '"' then loop (index + 1) `Normal false
+          else loop (index + 1) `Double false
+      | `Normal ->
+          if escaped then loop (index + 1) `Normal false
+          else if character = '\\' then loop (index + 1) `Normal true
+          else if character = '\'' then loop (index + 1) `Single false
+          else if character = '"' then loop (index + 1) `Double false
+          else if
+            character = '#'
+            && (index = 0 || List.mem line.[index - 1] [ ' '; '\t'; '\r' ])
+          then String.sub line 0 index
+          else loop (index + 1) `Normal false
+  in
+  loop 0 `Normal false |> String.trim
+
+type strict_options = { errexit : bool; nounset : bool; pipefail : bool }
+
+let no_strict_options = { errexit = false; nounset = false; pipefail = false }
+
+let merge_strict_options left right =
+  {
+    errexit = left.errexit || right.errexit;
+    nounset = left.nounset || right.nounset;
+    pipefail = left.pipefail || right.pipefail;
+  }
+
+let parse_strict_option_words words =
+  let options = ref no_strict_options in
+  let expects_named_option = ref false in
+  let failure = ref None in
+  let enable_named value =
+    match value with
+    | "errexit" ->
+        options := { !options with errexit = true };
+        Ok ()
+    | "nounset" ->
+        options := { !options with nounset = true };
+        Ok ()
+    | "pipefail" ->
+        options := { !options with pipefail = true };
+        Ok ()
+    | _ -> Error ("shell option is outside the strict static subset: " ^ value)
+  in
+  List.iter
+    (fun word ->
+      if !failure = None then
+        if !expects_named_option then begin
+          expects_named_option := false;
+          match enable_named word with
+          | Ok () -> ()
+          | Error message -> failure := Some message
+        end
+        else if String.length word > 1 && word.[0] = '-' then
+          let flags =
+            String.sub word 1 (String.length word - 1)
+            |> String.to_seq |> List.of_seq
+          in
+          List.iter
+            (fun flag ->
+              if !failure = None then
+                match flag with
+                | 'e' -> options := { !options with errexit = true }
+                | 'u' -> options := { !options with nounset = true }
+                | 'o' -> expects_named_option := true
+                | _ ->
+                    failure :=
+                      Some
+                        (Printf.sprintf
+                           "shell option -%c is outside the strict static \
+                            subset"
+                           flag))
+            flags
         else
-          Some
-            ( name,
-              String.sub line (separator + 1)
-                (String.length line - separator - 1) )
+          failure :=
+            Some ("shell option argument is outside the static subset: " ^ word))
+    words;
+  match !failure with
+  | Some _ as error -> Error (Option.get error)
+  | None when !expects_named_option ->
+      Error "set -o requires a named shell option"
+  | None -> Ok !options
 
 let strict_set line =
   match split_words line with
-  | "set" :: options ->
-      let flags =
-        List.concat_map
-          (fun option ->
-            if String.length option > 1 && option.[0] = '-' then
-              String.sub option 1 (String.length option - 1)
-              |> String.to_seq |> List.of_seq
-            else [ '?' ])
-          options
-      in
-      options <> []
-      && List.for_all (fun flag -> flag = 'e' || flag = 'u') flags
-      && List.mem 'e' flags && List.mem 'u' flags
-  | _ -> false
+  | "set" :: (_ :: _ as words) -> parse_strict_option_words words
+  | _ -> Error "not a shell option declaration"
+
+let shebang_strict_options source =
+  let first_line =
+    match String.split_on_char '\n' source with line :: _ -> line | [] -> ""
+  in
+  if not (String.starts_with ~prefix:"#!" first_line) then
+    Ok (false, no_strict_options)
+  else
+    let words =
+      String.sub first_line 2 (String.length first_line - 2)
+      |> String.trim |> split_words
+    in
+    let option_words =
+      match words with
+      | [] -> []
+      | executable :: rest when normalize_interpreter executable = "env" ->
+          let rec after_program = function
+            | [] -> []
+            | "-S" :: remaining -> after_program remaining
+            | option :: remaining
+              when String.length option > 0 && option.[0] = '-' ->
+                after_program remaining
+            | _program :: remaining -> remaining
+          in
+          after_program rest
+      | _executable :: rest -> rest
+    in
+    match option_words with
+    | [] -> Ok (false, no_strict_options)
+    | words ->
+        Result.map
+          (fun options -> (true, options))
+          (parse_strict_option_words words)
 
 let marker_for source used index length =
   let alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ" in
@@ -1254,6 +1390,143 @@ let line_continues value =
     (fun suffix -> String.ends_with ~suffix value)
     [ "\\"; "&&"; "||"; "|" ]
 
+type static_heredoc = {
+  operator_start : int;
+  marker_end : int;
+  delimiter : string;
+  quoted : bool;
+}
+
+let valid_heredoc_delimiter delimiter =
+  delimiter <> ""
+  && String.for_all
+       (function
+         | 'A' .. 'Z' | 'a' .. 'z' | '0' .. '9' | '_' -> true | _ -> false)
+       delimiter
+
+let static_heredoc_delimiter value =
+  let rec search index =
+    if index + 2 > String.length value then None
+    else if
+      starts_at value ~offset:index "<<"
+      && (index = 0 || value.[index - 1] <> '<')
+    then
+      let rec skip_space cursor =
+        if cursor < String.length value then
+          match value.[cursor] with
+          | ' ' | '\t' -> skip_space (cursor + 1)
+          | _ -> cursor
+        else cursor
+      in
+      let marker_start = skip_space (index + 2) in
+      if marker_start >= String.length value then None
+      else
+        match value.[marker_start] with
+        | '-' | '<' -> search (index + 2)
+        | ('\'' | '"') as quote ->
+            begin match
+              String.index_from_opt value (marker_start + 1) quote
+            with
+            | Some close when close > marker_start + 1 ->
+                let delimiter =
+                  String.sub value (marker_start + 1) (close - marker_start - 1)
+                in
+                if valid_heredoc_delimiter delimiter then
+                  Some
+                    {
+                      operator_start = index;
+                      marker_end = close + 1;
+                      delimiter;
+                      quoted = true;
+                    }
+                else None
+            | Some _ | None -> None
+            end
+        | _ ->
+            let rec finish cursor =
+              if cursor < String.length value then
+                match value.[cursor] with
+                | 'A' .. 'Z' | 'a' .. 'z' | '0' .. '9' | '_' ->
+                    finish (cursor + 1)
+                | _ -> cursor
+              else cursor
+            in
+            let marker_end = finish marker_start in
+            let delimiter =
+              String.sub value marker_start (marker_end - marker_start)
+            in
+            if valid_heredoc_delimiter delimiter then
+              Some
+                {
+                  operator_start = index;
+                  marker_end;
+                  delimiter;
+                  quoted = false;
+                }
+            else search (index + 2)
+    else search (index + 1)
+  in
+  search 0
+
+let line_without_carriage_return value =
+  if String.ends_with ~suffix:"\r" value then
+    String.sub value 0 (String.length value - 1)
+  else value
+
+let join_working_directory parent child =
+  if not (Filename.is_relative child) then child
+  else if parent = "." || parent = "" then child
+  else if child = "." || child = "" then parent
+  else parent ^ "/" ^ child
+
+let prefix_effect_path directory path =
+  if directory = "." || not (Filename.is_relative path) then path
+  else join_working_directory directory path
+
+let rec apply_working_directory directory (node : Ir.node) =
+  let apply = apply_working_directory directory in
+  let operation =
+    match node.operation with
+    | Ir.Exec command ->
+        let working_directory =
+          match command.working_directory with
+          | None -> Some directory
+          | Some child -> Some (join_working_directory directory child)
+        in
+        Ir.Exec { command with working_directory }
+    | Ir.Pipeline nodes -> Ir.Pipeline (List.map apply nodes)
+    | Ir.Sequence nodes -> Ir.Sequence (List.map apply nodes)
+    | Ir.Parallel nodes -> Ir.Parallel (List.map apply nodes)
+    | Ir.Condition { predicate; if_true; if_false } ->
+        Ir.Condition
+          {
+            predicate = apply predicate;
+            if_true = apply if_true;
+            if_false = Option.map apply if_false;
+          }
+    | Ir.Match { value; cases; default } ->
+        Ir.Match
+          {
+            value;
+            cases =
+              List.map (fun (pattern, body) -> (pattern, apply body)) cases;
+            default = Option.map apply default;
+          }
+    | Ir.For_each { variable; items; body } ->
+        Ir.For_each { variable; items; body = apply body }
+    | Ir.Try_finally { body; finalizer } ->
+        Ir.Try_finally { body = apply body; finalizer = apply finalizer }
+    | Ir.Task_call call -> Ir.Task_call call
+    | Ir.File_read path -> Ir.File_read (prefix_effect_path directory path)
+    | Ir.File_write write ->
+        Ir.File_write
+          { write with path = prefix_effect_path directory write.path }
+    | Ir.File_remove path -> Ir.File_remove (prefix_effect_path directory path)
+    | Ir.Network_request request -> Ir.Network_request request
+    | Ir.Opaque_capsule capsule -> Ir.Opaque_capsule capsule
+  in
+  { node with operation }
+
 let strict_statement_ranges source start_byte end_byte =
   let lines =
     line_ranges source
@@ -1281,6 +1554,13 @@ let strict_statement_ranges source start_byte end_byte =
           let text = line_text source line in
           take_continuation line_end text rest
   in
+  let rec take_heredoc delimiter = function
+    | [] -> Error ("literal heredoc is missing delimiter " ^ delimiter)
+    | ((_, line_end) as line) :: rest ->
+        let text = line_text source line |> line_without_carriage_return in
+        if text = delimiter then Ok (line_end, rest)
+        else take_heredoc delimiter rest
+  in
   let rec collect accumulator = function
     | [] -> Ok (List.rev accumulator)
     | ((line_start, line_end) as line) :: rest ->
@@ -1288,6 +1568,15 @@ let strict_statement_ranges source start_byte end_byte =
         let trimmed = String.trim text in
         if trimmed = "" || String.starts_with ~prefix:"#" trimmed then
           collect accumulator rest
+        else if contains trimmed "<<-" then
+          Error "tab-stripping heredoc syntax is outside the static subset"
+        else if Option.is_some (static_heredoc_delimiter trimmed) then
+          let heredoc = Option.get (static_heredoc_delimiter trimmed) in
+          begin match take_heredoc heredoc.delimiter rest with
+          | Error _ as error -> error
+          | Ok (finish, remaining) ->
+              collect ((line_start, finish) :: accumulator) remaining
+          end
         else if line_is_if text && not (contains trimmed "; fi") then
           begin match take_if 1 line_end rest with
           | Error _ as error -> error
@@ -1318,9 +1607,134 @@ let first_non_space source start_byte end_byte =
   in
   loop start_byte
 
+let literal_word source =
+  match lex source with
+  | Ok [ Word token ] when not token.dynamic -> Ok token.text
+  | Ok _ -> Error "file path must be one static shell word"
+  | Error message -> Error message
+
+let lower_literal_heredoc ~path ~source start_byte end_byte =
+  let opener_end =
+    match String.index_from_opt source start_byte '\n' with
+    | Some value when value < end_byte -> value
+    | Some _ | None -> end_byte
+  in
+  let opener =
+    String.sub source start_byte (opener_end - start_byte) |> String.trim
+  in
+  match static_heredoc_delimiter opener with
+  | None -> Error "literal heredoc marker is invalid"
+  | Some heredoc ->
+      let suffix =
+        String.sub opener heredoc.marker_end
+          (String.length opener - heredoc.marker_end)
+        |> String.trim
+      in
+      if suffix <> "" then
+        Error "tokens after a literal heredoc marker are outside the subset"
+      else
+        begin match String.index_opt opener '>' with
+        | None -> Error "literal heredoc requires an output redirection"
+        | Some redirect
+          when redirect + 1 < String.length opener
+               && opener.[redirect + 1] = '>' ->
+            Error "append heredoc redirection is outside the static subset"
+        | Some redirect ->
+            let command = String.sub opener 0 redirect |> String.trim in
+            if command <> "cat" then
+              Error "only a literal cat heredoc can lower to FileWrite"
+            else
+              let path_source =
+                String.sub opener (redirect + 1)
+                  (heredoc.operator_start - redirect - 1)
+                |> String.trim
+              in
+              let* output_path = literal_word path_source in
+              let content_start =
+                if opener_end < end_byte then opener_end + 1 else opener_end
+              in
+              let delimiter_start =
+                line_ranges source
+                |> List.find_map (fun (line_start, line_end) ->
+                    if line_start < content_start || line_end > end_byte then
+                      None
+                    else
+                      let line =
+                        line_text source (line_start, line_end)
+                        |> line_without_carriage_return
+                      in
+                      if line = heredoc.delimiter then Some line_start else None)
+              in
+              begin match delimiter_start with
+              | None ->
+                  Error
+                    ("literal heredoc is missing delimiter " ^ heredoc.delimiter)
+              | Some delimiter_start ->
+                  let contents =
+                    String.sub source content_start
+                      (delimiter_start - content_start)
+                    |> replace_all ~pattern:"$" ~replacement:"$$"
+                  in
+                  Ok
+                    (Ir.node
+                       ~id:(make_id ~path ~index:(65_000 + start_byte) source)
+                       ~guarantee:
+                         (Ir.Formal
+                            { basis = "posix-literal-heredoc-file-write-v1" })
+                       ~source:
+                         (span_for_range ~path source ~start_byte ~end_byte)
+                       (Ir.File_write
+                          { path = output_path; contents; append = false }))
+              end
+        end
+
+let static_cd_directory source =
+  match lex source with
+  | Ok [ Word command; Word directory ]
+    when command.text = "cd" && not directory.dynamic ->
+      Ok directory.text
+  | Ok _ -> Error "subshell must begin with one static cd"
+  | Error message -> Error message
+
+let lower_static_subshell_cwd ~path ~source start_byte end_byte =
+  let start_byte, end_byte = trim_bounds source start_byte end_byte in
+  if
+    end_byte - start_byte < 5
+    || source.[start_byte] <> '('
+    || source.[end_byte - 1] <> ')'
+  then Error "not a static cwd subshell"
+  else
+    let inner_start, inner_end =
+      trim_bounds source (start_byte + 1) (end_byte - 1)
+    in
+    match find_top_level source ~from:inner_start "&&" with
+    | None -> Error "cwd subshell requires &&"
+    | Some separator when separator >= inner_end ->
+        Error "cwd subshell requires a command after &&"
+    | Some separator ->
+        let cd_source =
+          String.sub source inner_start (separator - inner_start) |> String.trim
+        in
+        let* directory = static_cd_directory cd_source in
+        let* command = lower_fragment ~path ~source (separator + 2) inner_end in
+        let command = apply_working_directory directory command in
+        Ok
+          {
+            command with
+            id = make_id ~path ~index:(67_000 + start_byte) source;
+            guarantee = Ir.Formal { basis = "posix-static-subshell-cwd-v1" };
+            source = Some (span_for_range ~path source ~start_byte ~end_byte);
+          }
+
 let rec lower_strict_range ~path ~source start_byte end_byte =
   let start_byte, end_byte = trim_bounds source start_byte end_byte in
   if start_byte = end_byte then Error "strict command is empty"
+  else if
+    Option.is_some
+      (static_heredoc_delimiter (line_text source (start_byte, end_byte)))
+  then lower_literal_heredoc ~path ~source start_byte end_byte
+  else if source.[start_byte] = '(' && source.[end_byte - 1] = ')' then
+    lower_static_subshell_cwd ~path ~source start_byte end_byte
   else if starts_at source ~offset:start_byte "if " then
     begin match parse_if ~path source start_byte end_byte with
     | Some result when result.diagnostics = [] && not (has_residual result.root)
@@ -1483,67 +1897,260 @@ and lower_strict_multiline_if ~path ~source start_byte end_byte =
                  (Ir.Condition { predicate; if_true; if_false }))
         end
 
+let normalize_directory value =
+  String.map
+    (fun character -> if character = '\\' then '/' else character)
+    value
+
+let script_directory_change ~path line =
+  let script_directory = Filename.dirname path |> normalize_directory in
+  let script_directory =
+    if script_directory = "" then "." else script_directory
+  in
+  match String.trim line with
+  | "cd \"$(dirname \"$0\")\"" | "cd -- \"$(dirname -- \"$0\")\"" ->
+      Some script_directory
+  | "cd \"$(dirname \"$0\")/..\"" | "cd -- \"$(dirname -- \"$0\")/..\"" ->
+      Some (join_working_directory script_directory "..")
+  | _ -> None
+
+let protect_literal_heredoc_dollars source rewritten =
+  let markers = ref [] in
+  let marker_for original =
+    match List.assoc_opt original !markers with
+    | Some marker -> Some marker
+    | None ->
+        let rec choose code =
+          if code >= 32 then None
+          else
+            let character = Char.chr code in
+            if
+              List.mem character [ '\t'; '\n'; '\r' ]
+              || String.contains source character
+              || List.exists (fun (_, used) -> used = character) !markers
+            then choose (code + 1)
+            else Some character
+        in
+        begin match choose 1 with
+        | None -> None
+        | Some marker ->
+            markers := (original, marker) :: !markers;
+            Some marker
+        end
+  in
+  let active_delimiter = ref None in
+  let failure = ref None in
+  List.iter
+    (fun ((start_byte, end_byte) as range) ->
+      if !failure = None then
+        let line = line_text source range |> line_without_carriage_return in
+        match !active_delimiter with
+        | None ->
+            begin match static_heredoc_delimiter (String.trim line) with
+            | None -> ()
+            | Some heredoc -> active_delimiter := Some heredoc
+            end
+        | Some heredoc when line = heredoc.delimiter -> active_delimiter := None
+        | Some heredoc ->
+            for index = start_byte to end_byte - 1 do
+              let character = source.[index] in
+              if heredoc.quoted && List.mem character [ '$'; '`' ] then
+                begin match marker_for character with
+                | None ->
+                    failure :=
+                      Some "no collision-free marker for literal heredoc data"
+                | Some marker -> Bytes.set rewritten index marker
+                end
+              else if
+                (not heredoc.quoted) && List.mem character [ '$'; '`'; '\\' ]
+              then
+                failure :=
+                  Some
+                    "unquoted heredoc body requires shell expansion semantics"
+            done)
+    (line_ranges source);
+  match (!failure, !active_delimiter) with
+  | Some message, _ -> Error message
+  | None, Some heredoc ->
+      Error ("literal heredoc is missing delimiter " ^ heredoc.delimiter)
+  | None, None ->
+      Ok
+        (List.rev_map
+           (fun (original, marker) ->
+             ( String.make 1 marker,
+               if original = '$' then "$$" else String.make 1 original ))
+           !markers)
+
+let parameter_mentioned_before source end_byte name =
+  let prefix = String.sub source 0 end_byte in
+  contains prefix ("$" ^ name) || contains prefix ("${" ^ name)
+
+let strict_control_flow_line line =
+  let trimmed = String.trim line in
+  line_is_if line
+  || List.exists
+       (fun keyword -> line_is_keyword keyword line)
+       [ "then"; "else"; "elif"; "fi"; "do"; "done"; "esac" ]
+  || List.exists
+       (fun prefix -> String.starts_with ~prefix trimmed)
+       [ "for "; "while "; "until "; "case "; "select "; "function "; "("; "{" ]
+  || List.exists (contains trimmed) [ "&&"; "||"; "|"; "()" ]
+
 let lower_strict_script ~path source =
   let rewritten = Bytes.of_string source in
   let bindings = ref [] in
   let in_header = ref true in
-  let found_strict_set = ref false in
+  let working_directory = ref None in
+  let active_heredoc = ref None in
+  let saw_control_flow = ref false in
+  let saw_shell_options = ref false in
+  let shell_options = ref no_strict_options in
   let failure = ref None in
+  begin match shebang_strict_options source with
+  | Ok (saw_options, options) ->
+      saw_shell_options := saw_options;
+      shell_options := options
+  | Error message ->
+      saw_shell_options := true;
+      failure := Some message
+  end;
   List.iter
     (fun (start_byte, end_byte) ->
       if !failure = None then
         let line = String.sub source start_byte (end_byte - start_byte) in
-        let trimmed = String.trim line in
-        if !in_header then
-          if trimmed = "" || String.starts_with ~prefix:"#" trimmed then ()
-          else if String.starts_with ~prefix:"set " trimmed then
-            if strict_set trimmed then begin
-              found_strict_set := true;
-              blank_range rewritten start_byte end_byte
-            end
-            else
-              failure :=
-                Some "shell options are outside the strict static subset"
-          else
-            match standalone_assignment line with
-            | Some (name, word) ->
-                begin match expand_assignment_word !bindings word with
+        let physical_line = line_without_carriage_return line in
+        match !active_heredoc with
+        | Some delimiter ->
+            if physical_line = delimiter then active_heredoc := None
+        | None -> (
+            let semantic_line = strip_shell_comment line in
+            let trimmed = String.trim semantic_line in
+            let opened_heredoc = static_heredoc_delimiter trimmed in
+            if !in_header then
+              begin if trimmed = "" || String.starts_with ~prefix:"#" trimmed
+              then ()
+              else if String.starts_with ~prefix:"set " trimmed then
+                begin match strict_set trimmed with
+                | Ok options ->
+                    saw_shell_options := true;
+                    shell_options := merge_strict_options !shell_options options;
+                    blank_range rewritten start_byte end_byte
                 | Error message -> failure := Some message
-                | Ok value ->
-                    bindings :=
-                      (name, value) :: List.remove_assoc name !bindings;
+                end
+              else if Option.is_some (script_directory_change ~path trimmed)
+              then
+                begin match !working_directory with
+                | Some _ ->
+                    failure :=
+                      Some
+                        "multiple script-directory changes require shell state"
+                | None ->
+                    working_directory := script_directory_change ~path trimmed;
                     blank_range rewritten start_byte end_byte
                 end
-            | None -> in_header := false
-        else
-          match standalone_assignment line with
-          | Some _ ->
-              failure :=
-                Some
-                  "assignment after an executable command requires mutable \
-                   shell state"
-          | None -> ())
+              else
+                match standalone_assignment semantic_line with
+                | Some (name, word) ->
+                    begin match expand_assignment_word !bindings word with
+                    | Error message -> failure := Some message
+                    | Ok value ->
+                        bindings :=
+                          (name, value) :: List.remove_assoc name !bindings;
+                        blank_range rewritten start_byte end_byte
+                    end
+                | None ->
+                    in_header := false;
+                    if strict_control_flow_line trimmed then
+                      saw_control_flow := true
+              end
+            else
+              begin match standalone_assignment semantic_line with
+              | Some _ when !saw_control_flow ->
+                  failure :=
+                    Some
+                      "assignment after control flow requires chronological \
+                       shell state"
+              | Some (name, word) ->
+                  if List.mem_assoc name !bindings then
+                    failure :=
+                      Some
+                        "assignment after an executable command would mutate \
+                         an existing shell binding"
+                  else if parameter_mentioned_before source start_byte name then
+                    failure :=
+                      Some
+                        "assignment after a prior parameter reference requires \
+                         chronological shell state"
+                  else
+                    begin match expand_assignment_word !bindings word with
+                    | Error message -> failure := Some message
+                    | Ok value ->
+                        bindings := (name, value) :: !bindings;
+                        blank_range rewritten start_byte end_byte
+                    end
+              | None ->
+                  if strict_control_flow_line trimmed then
+                    saw_control_flow := true
+              end;
+            if !failure = None then
+              match opened_heredoc with
+              | Some heredoc -> active_heredoc := Some heredoc.delimiter
+              | None -> ()))
     (line_ranges source);
-  if not !found_strict_set then None
+  if not !saw_shell_options then None
   else
     Some
       (match !failure with
       | Some reason -> residual ~path ~source ~reason ()
+      | None when (not !shell_options.errexit) || not !shell_options.nounset ->
+          residual ~path ~source
+            ~reason:
+              "static option lowering requires both errexit (-e) and nounset \
+               (-u)"
+            ()
       | None ->
-          begin match
-            rewrite_command_parameters ~bindings:!bindings
-              (Bytes.to_string rewritten)
-          with
+          begin match protect_literal_heredoc_dollars source rewritten with
           | Error reason -> residual ~path ~source ~reason ()
-          | Ok (rewritten, mappings) ->
+          | Ok literal_mappings ->
               begin match
-                lower_strict_sequence ~path ~source:rewritten 0
-                  (String.length rewritten)
+                rewrite_command_parameters ~bindings:!bindings
+                  (Bytes.to_string rewritten)
               with
               | Error reason -> residual ~path ~source ~reason ()
-              | Ok root ->
-                  let root = map_template_node mappings root in
-                  { root; diagnostics = [] }
+              | Ok (rewritten, mappings) ->
+                  begin match
+                    lower_strict_sequence ~path ~source:rewritten 0
+                      (String.length rewritten)
+                  with
+                  | Error reason -> residual ~path ~source ~reason ()
+                  | Ok root ->
+                      let root =
+                        map_template_node (literal_mappings @ mappings) root
+                      in
+                      let root =
+                        Option.fold ~none:root
+                          ~some:(fun directory ->
+                            apply_working_directory directory root)
+                          !working_directory
+                      in
+                      let contains_pipeline =
+                        Ir.fold_nodes
+                          (fun found node ->
+                            found
+                            ||
+                            match node.Ir.operation with
+                            | Ir.Pipeline _ -> true
+                            | _ -> false)
+                          false root
+                      in
+                      if !shell_options.pipefail && contains_pipeline then
+                        residual ~path ~source
+                          ~reason:
+                            "pipefail rightmost-nonzero pipeline status is \
+                             outside the current Effect IR"
+                          ()
+                      else { root; diagnostics = [] }
+                  end
               end
           end)
 

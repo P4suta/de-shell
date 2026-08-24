@@ -31,6 +31,10 @@ run = [
 description = "Run the project-local deshell CLI"
 run = "opam exec --switch=. -- dune exec deshell --"
 
+[tasks."corpus:audit"]
+description = "Audit sibling or curated repositories without executing source scripts"
+run = "pwsh -NoLogo -NoProfile -File scripts/audit-corpus.ps1"
+
 [tasks.lint]
 description = "Lint package metadata and GitHub Actions"
 run = [
