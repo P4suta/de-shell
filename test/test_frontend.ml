@@ -201,15 +201,235 @@ let test_strict_script_dataflow () =
         "set -e script must lower immutable assignments to a fail-fast \
          condition"
 
-let test_strict_script_command_substitution_is_residual () =
+let test_strict_script_command_substitution_becomes_runtime_state () =
   let source =
-    "#!/bin/sh\nset -eu\nvalue=$(date)\nprintf '%s\\n' \"$value\"\n"
+    "#!/bin/sh\n\
+     set -eu\n\
+     revision=$(probe.exe --revision)\n\
+     tool.exe build \"$revision\"\n"
   in
-  let result = Posix_frontend.lower ~path:"dynamic-assignment.sh" source in
-  match (result.root.operation, result.root.guarantee) with
-  | Ir.Opaque_capsule capsule, Ir.Residual _ ->
-      Alcotest.(check string) "lossless source" source capsule.source
-  | _ -> Alcotest.fail "command substitution must remain a residual capsule"
+  let result = Posix_frontend.lower ~path:"capture-assignment.sh" source in
+  if Posix_frontend.has_residual result.root then
+    begin match result.root.guarantee with
+    | Ir.Residual evidence ->
+        Alcotest.fail
+          ("simple command capture stayed residual: " ^ evidence.reason)
+    | _ -> Alcotest.fail "simple command capture contains a nested residual"
+    end;
+  let captures =
+    Ir.fold_nodes
+      (fun captures node ->
+        match node.Ir.operation with
+        | Ir.Capture_stdout { name; value_type; body } ->
+            (node, name, value_type, body) :: captures
+        | _ -> captures)
+      [] result.root
+  in
+  begin match captures with
+  | [ (capture_node, name, value_type, capture_body) ] ->
+      Alcotest.(check string) "capture binding" "revision" name;
+      Alcotest.(check bool) "capture type" true (value_type = Ir.Text);
+      begin match capture_body.operation with
+      | Ir.Exec command ->
+          Alcotest.(check (list string))
+            "capture command"
+            [ "probe.exe"; "--revision" ]
+            command.argv
+      | _ -> Alcotest.fail "capture body is not a typed Exec"
+      end;
+      begin match (capture_node.source, capture_body.source) with
+      | Some assignment_span, Some command_span ->
+          Alcotest.(check int)
+            "assignment source line" 3 assignment_span.start_line;
+          Alcotest.(check int) "command source line" 3 command_span.start_line
+      | _ -> Alcotest.fail "capture assignment or body lost its source map"
+      end
+  | _ -> Alcotest.fail "expected exactly one Capture_stdout node"
+  end;
+  let calls = ref [] in
+  let backend : Runner.backend =
+    {
+      execute =
+        (fun request ->
+          calls := request.argv :: !calls;
+          match request.argv with
+          | [ "probe.exe"; "--revision" ] ->
+              Ok
+                Runner.
+                  {
+                    exit_code = 0;
+                    stdout = "alpha\nbeta\n\n";
+                    stderr = "probe notice\n";
+                  }
+          | [ "tool.exe"; "build"; "alpha\nbeta" ] ->
+              Ok Runner.{ exit_code = 0; stdout = "built\n"; stderr = "" }
+          | argv -> Error ("unexpected argv: " ^ String.concat " " argv));
+      read_file = (fun _ -> Error "unused");
+      write_file = (fun ~path:_ ~contents:_ ~append:_ -> Error "unused");
+      remove_file = (fun _ -> Error "unused");
+      network_request = (fun ~method_:_ ~uri:_ -> Error "unused");
+    }
+  in
+  let plan =
+    Ir.plan ~entrypoint:"main" [ Ir.task ~name:"main" ~body:result.root () ]
+  in
+  let observation =
+    match Runner.run_plan ~backend ~policy:Runner.default_policy plan with
+    | Ok observation -> observation
+    | Error message -> Alcotest.fail message
+  in
+  Alcotest.(check (list (list string)))
+    "capture executes before consumer"
+    [ [ "probe.exe"; "--revision" ]; [ "tool.exe"; "build"; "alpha\nbeta" ] ]
+    (List.rev !calls);
+  Alcotest.(check string)
+    "captured stdout is not forwarded" "built\n" observation.stdout;
+  Alcotest.(check string)
+    "capture stderr is forwarded" "probe notice\n" observation.stderr
+
+let test_strict_command_substitution_accepts_quoted_runtime_templates () =
+  let source =
+    "#!/bin/sh\n\
+     set -eu\n\
+     channel='stable channel'\n\
+     value=$(probe.exe --channel \"$channel\" --mode \"$MODE\" '(')\n\
+     tool.exe build \"$value\"\n"
+  in
+  let result = Posix_frontend.lower ~path:"capture-template.sh" source in
+  if Posix_frontend.has_residual result.root then
+    begin match result.root.guarantee with
+    | Ir.Residual evidence ->
+        Alcotest.fail
+          ("quoted capture template stayed residual: " ^ evidence.reason)
+    | _ -> Alcotest.fail "quoted capture template contains a nested residual"
+    end;
+  let capture_body =
+    Ir.fold_nodes
+      (fun found node ->
+        match (found, node.Ir.operation) with
+        | Some _, _ -> found
+        | None, Ir.Capture_stdout { body; _ } -> Some body
+        | None, _ -> None)
+      None result.root
+  in
+  match capture_body with
+  | Some body ->
+      expect_exec body
+        [ "probe.exe"; "--channel"; "stable channel"; "--mode"; "${MODE}"; "(" ]
+  | None ->
+      Alcotest.fail "quoted capture template did not lower to Capture_stdout"
+
+let test_strict_nested_command_substitution_becomes_ordered_captures () =
+  let source =
+    "#!/bin/sh\n\
+     set -eu\n\
+     suffix=tail\n\
+     value=$(outer.exe \"$(inner.exe \"$1\")/$suffix\")\n\
+     sink.exe \"$value\"\n"
+  in
+  let result = Posix_frontend.lower ~path:"nested-capture.sh" source in
+  if Posix_frontend.has_residual result.root then
+    begin match result.root.guarantee with
+    | Ir.Residual evidence ->
+        Alcotest.fail ("nested capture stayed residual: " ^ evidence.reason)
+    | _ -> Alcotest.fail "nested capture contains a residual node"
+    end;
+  let captures =
+    Ir.fold_nodes
+      (fun count node ->
+        match node.Ir.operation with
+        | Ir.Capture_stdout _ -> count + 1
+        | _ -> count)
+      0 result.root
+  in
+  Alcotest.(check int) "outer and inner captures" 2 captures;
+  let calls = ref [] in
+  let backend : Runner.backend =
+    {
+      execute =
+        (fun request ->
+          calls := request.argv :: !calls;
+          match request.argv with
+          | [ "inner.exe"; "head value" ] ->
+              Ok Runner.{ exit_code = 0; stdout = "head\n"; stderr = "" }
+          | [ "outer.exe"; "head/tail" ] ->
+              Ok Runner.{ exit_code = 0; stdout = "joined\n"; stderr = "" }
+          | [ "sink.exe"; "joined" ] ->
+              Ok Runner.{ exit_code = 0; stdout = "done\n"; stderr = "" }
+          | argv -> Error ("unexpected argv: " ^ String.concat " " argv));
+      read_file = (fun _ -> Error "unused");
+      write_file = (fun ~path:_ ~contents:_ ~append:_ -> Error "unused");
+      remove_file = (fun _ -> Error "unused");
+      network_request = (fun ~method_:_ ~uri:_ -> Error "unused");
+    }
+  in
+  let plan =
+    Ir.plan ~entrypoint:"main" [ Ir.task ~name:"main" ~body:result.root () ]
+  in
+  let observation =
+    match
+      Runner.run_plan_with_inputs ~backend ~policy:Runner.default_policy
+        ~inputs:[] ~arguments:[ "head value" ] plan
+    with
+    | Ok observation -> observation
+    | Error message -> Alcotest.fail message
+  in
+  Alcotest.(check (list (list string)))
+    "nested capture execution order"
+    [
+      [ "inner.exe"; "head value" ];
+      [ "outer.exe"; "head/tail" ];
+      [ "sink.exe"; "joined" ];
+    ]
+    (List.rev !calls);
+  Alcotest.(check string)
+    "only consumer stdout escapes" "done\n" observation.stdout
+
+let test_nested_capture_balancing_reaches_the_next_real_boundary () =
+  let source =
+    "#!/bin/sh\n\
+     set -eu\n\
+     repo_root=$(CDPATH= cd -- \"$(dirname -- \"$0\")/..\" && pwd -P)\n\
+     tool.exe \"$repo_root\"\n"
+  in
+  let result = Posix_frontend.lower ~path:"scripts/corpus-nested.sh" source in
+  match result.root.guarantee with
+  | Ir.Residual evidence ->
+      Alcotest.(check bool)
+        "balanced nested capture reaches && semantics" true
+        (Test_support.contains ~needle:"redirection" evidence.reason);
+      Alcotest.(check bool)
+        "balanced nested capture is not misdiagnosed" false
+        (Test_support.contains ~needle:"command substitution" evidence.reason)
+  | _ ->
+      Alcotest.fail "cd/&& still requires a dedicated working-directory effect"
+
+let test_strict_embedded_command_substitution_is_residual () =
+  [
+    ( "embedded",
+      "#!/bin/sh\nset -eu\nvalue=prefix$(date)\nprintf '%s\\n' \"$value\"\n" );
+    ( "pipeline",
+      "#!/bin/sh\n\
+       set -eu\n\
+       value=$(produce | consume)\n\
+       printf '%s\\n' \"$value\"\n" );
+    ( "unquoted dynamic body",
+      "#!/bin/sh\nset -eu\nvalue=$(probe $MODE)\nprintf '%s\\n' \"$value\"\n" );
+    ( "unquoted grouping",
+      "#!/bin/sh\n\
+       set -eu\n\
+       value=$(printf (unsafe))\n\
+       printf '%s\\n' \"$value\"\n" );
+    ( "unquoted nested substitution",
+      "#!/bin/sh\nset -eu\nvalue=$(outer $(inner))\nprintf '%s\\n' \"$value\"\n"
+    );
+  ]
+  |> List.iter (fun (label, source) ->
+      let result = Posix_frontend.lower ~path:(label ^ "-capture.sh") source in
+      match (result.root.operation, result.root.guarantee) with
+      | Ir.Opaque_capsule capsule, Ir.Residual _ ->
+          Alcotest.(check string) (label ^ " source") source capsule.source
+      | _ -> Alcotest.fail (label ^ " command substitution must remain residual"))
 
 let test_strict_multiline_if_from_real_automation () =
   let source =
@@ -311,10 +531,49 @@ let test_strict_fail_fast_execution () =
   Alcotest.(check (list (list string)))
     "later command skipped" [ [ "fail-now" ] ] (List.rev !calls)
 
+let test_strict_safe_unquoted_static_expansion () =
+  let source = "#!/bin/sh\nset -eu\nvalue=ok\nprintf '<%s>' $value\n" in
+  let result = Posix_frontend.lower ~path:"static-unquoted.sh" source in
+  let repeated = Posix_frontend.lower ~path:"static-unquoted.sh" source in
+  Alcotest.(check bool)
+    "safe static expansion is non-residual" false
+    (Posix_frontend.has_residual result.root);
+  Alcotest.(check bool)
+    "safe static lowering is deterministic" true
+    (result.root = repeated.root && result.diagnostics = repeated.diagnostics);
+  let command =
+    Ir.fold_nodes
+      (fun found node ->
+        match (found, node.Ir.operation) with
+        | Some _, _ -> found
+        | None, Ir.Exec command -> Some (node, command)
+        | None, _ -> None)
+      None result.root
+  in
+  match command with
+  | Some (node, command) ->
+      Alcotest.(check (list string))
+        "one literal field" [ "printf"; "<%s>"; "ok" ] command.argv;
+      begin match node.source with
+      | Some span -> Alcotest.(check int) "source line" 4 span.start_line
+      | None -> Alcotest.fail "safe expansion lost its source map"
+      end
+  | None -> Alcotest.fail "safe expansion did not lower to Exec"
+
 let test_strict_unsafe_state_stays_residual () =
   let cases =
     [
-      ("unquoted expansion", "#!/bin/sh\nset -eu\nvalue=ok\nprintf %s $value\n");
+      ( "empty unquoted expansion",
+        "#!/bin/sh\nset -eu\nvalue=\nprintf %s $value\n" );
+      ( "IFS-split unquoted expansion",
+        "#!/bin/sh\nset -eu\nvalue='release candidate'\nprintf %s $value\n" );
+      ( "custom IFS unquoted expansion",
+        "#!/bin/sh\nset -eu\nIFS=:\nvalue=release:candidate\nprintf %s $value\n"
+      );
+      ( "pathname unquoted expansion",
+        "#!/bin/sh\nset -eu\nvalue='*.ml'\nprintf %s $value\n" );
+      ( "dynamic unquoted expansion",
+        "#!/bin/sh\nset -eu\nvalue=${1:-ok}\nprintf %s $value\n" );
       ( "late assignment",
         "#!/bin/sh\n\
          set -eu\n\
@@ -587,6 +846,91 @@ let test_strict_top_level_assignment_after_closed_control_flow () =
   in
   Alcotest.(check bool) "subsequent argv uses the constant" true found
 
+let test_strict_branch_assignments_become_typed_runtime_state () =
+  let source =
+    "#!/bin/sh\n\
+     set -eu\n\
+     if probe\n\
+     then\n\
+     mode=release\n\
+     else\n\
+     mode=debug\n\
+     fi\n\
+     tool.exe build \"$mode\"\n"
+  in
+  let lowered = Posix_frontend.lower ~path:"branch-state.sh" source in
+  begin if Posix_frontend.has_residual lowered.root then
+    match lowered.root.guarantee with
+    | Ir.Residual evidence ->
+        Alcotest.fail
+          ("definite branch state stayed residual: " ^ evidence.reason)
+    | _ -> Alcotest.fail "definite branch state contains a nested residual"
+  end;
+  let assignments =
+    Ir.fold_nodes
+      (fun assignments node ->
+        match node.Ir.operation with
+        | Ir.Set_variable assignment -> (node, assignment) :: assignments
+        | _ -> assignments)
+      [] lowered.root
+    |> List.rev
+  in
+  begin match assignments with
+  | [ (release_node, release); (debug_node, debug) ] ->
+      Alcotest.(check string) "release name" "mode" release.name;
+      Alcotest.(check string) "release value" "release" release.value;
+      Alcotest.(check bool) "release type" true (release.value_type = Ir.Text);
+      Alcotest.(check string) "debug value" "debug" debug.value;
+      begin match (release_node.source, debug_node.source) with
+      | Some release_span, Some debug_span ->
+          Alcotest.(check int) "release source line" 5 release_span.start_line;
+          Alcotest.(check int) "debug source line" 7 debug_span.start_line
+      | _ -> Alcotest.fail "branch assignments lost their source maps"
+      end
+  | _ -> Alcotest.fail "expected one typed assignment in each branch"
+  end;
+  let run probe_status =
+    let calls = ref [] in
+    let backend : Runner.backend =
+      {
+        execute =
+          (fun request ->
+            calls := request.argv :: !calls;
+            match request.argv with
+            | [ "probe" ] ->
+                Ok Runner.{ exit_code = probe_status; stdout = ""; stderr = "" }
+            | [ "tool.exe"; "build"; mode ] ->
+                Ok Runner.{ exit_code = 0; stdout = mode; stderr = "" }
+            | argv -> Error ("unexpected argv: " ^ String.concat " " argv));
+        read_file = (fun _ -> Error "unused");
+        write_file = (fun ~path:_ ~contents:_ ~append:_ -> Error "unused");
+        remove_file = (fun _ -> Error "unused");
+        network_request = (fun ~method_:_ ~uri:_ -> Error "unused");
+      }
+    in
+    let plan =
+      Ir.plan ~entrypoint:"main" [ Ir.task ~name:"main" ~body:lowered.root () ]
+    in
+    let observation =
+      match Runner.run_plan ~backend ~policy:Runner.default_policy plan with
+      | Ok observation -> observation
+      | Error message -> Alcotest.fail message
+    in
+    (observation, List.rev !calls)
+  in
+  let release, release_calls = run 0 in
+  Alcotest.(check string) "true branch value" "release" release.stdout;
+  Alcotest.(check (list (list string)))
+    "true branch effects"
+    [ [ "probe" ]; [ "tool.exe"; "build"; "release" ] ]
+    release_calls;
+  let debug, debug_calls = run 1 in
+  Alcotest.(check string) "false branch value" "debug" debug.stdout;
+  Alcotest.(check (list (list string)))
+    "false branch effects"
+    [ [ "probe" ]; [ "tool.exe"; "build"; "debug" ] ]
+    debug_calls
+
 let test_pipefail_pipeline_stays_residual () =
   let source =
     "#!/usr/bin/env bash\nset -euo pipefail\nproduce | consume\nprintf after\n"
@@ -763,14 +1107,24 @@ let () =
             test_dynamic_foreach_is_residual;
           Alcotest.test_case "strict script dataflow" `Quick
             test_strict_script_dataflow;
-          Alcotest.test_case "strict dynamic assignment" `Quick
-            test_strict_script_command_substitution_is_residual;
+          Alcotest.test_case "strict command capture state" `Quick
+            test_strict_script_command_substitution_becomes_runtime_state;
+          Alcotest.test_case "strict command capture templates" `Quick
+            test_strict_command_substitution_accepts_quoted_runtime_templates;
+          Alcotest.test_case "strict nested command captures" `Quick
+            test_strict_nested_command_substitution_becomes_ordered_captures;
+          Alcotest.test_case "strict nested capture balancing" `Quick
+            test_nested_capture_balancing_reaches_the_next_real_boundary;
+          Alcotest.test_case "strict embedded command capture" `Quick
+            test_strict_embedded_command_substitution_is_residual;
           Alcotest.test_case "strict multiline if" `Quick
             test_strict_multiline_if_from_real_automation;
           Alcotest.test_case "strict unique node IDs" `Quick
             test_strict_fail_fast_node_ids_are_unique;
           Alcotest.test_case "strict fail-fast execution" `Quick
             test_strict_fail_fast_execution;
+          Alcotest.test_case "strict safe unquoted static expansion" `Quick
+            test_strict_safe_unquoted_static_expansion;
           Alcotest.test_case "strict unsafe state" `Quick
             test_strict_unsafe_state_stays_residual;
           Alcotest.test_case "bracket command boundary" `Quick
@@ -795,6 +1149,8 @@ let () =
             test_strict_late_immutable_assignment;
           Alcotest.test_case "strict post-control immutable assignment" `Quick
             test_strict_top_level_assignment_after_closed_control_flow;
+          Alcotest.test_case "strict typed branch state" `Quick
+            test_strict_branch_assignments_become_typed_runtime_state;
           Alcotest.test_case "pipefail pipeline residual" `Quick
             test_pipefail_pipeline_stays_residual;
           Alcotest.test_case "strict packaging effects" `Quick

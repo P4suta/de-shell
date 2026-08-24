@@ -616,6 +616,244 @@ let test_invalid_parameter_templates_are_rejected () =
   expect_error ~needle:"invalid positional parameter"
     "${999999999999999999999999999999999999999999999999999999}"
 
+let test_typed_runtime_state_propagates_through_control_flow () =
+  let set index name value =
+    node index (Ir.Set_variable { name; value_type = Ir.Text; value })
+  in
+  let run_branch predicate =
+    let calls = ref [] in
+    let body =
+      node 304
+        (Ir.Sequence
+           [
+             node 302
+               (Ir.Condition
+                  {
+                    predicate;
+                    if_true = set 300 "mode" "release";
+                    if_false = Some (set 301 "mode" "debug");
+                  });
+             set 305 "artifact" "build/${mode}";
+             node 303 (Ir.Exec (Ir.exec [ "emit"; "${artifact}" ]));
+           ])
+    in
+    let observation = run calls body |> get in
+    (observation, List.rev !calls)
+  in
+  let successful, successful_calls =
+    run_branch (node 306 (Ir.Exec (Ir.exec [ "emit"; "predicate" ])))
+  in
+  Alcotest.(check string)
+    "true branch state" "predicatebuild/release" successful.stdout;
+  Alcotest.(check (list (list string)))
+    "true branch argv"
+    [ [ "emit"; "predicate" ]; [ "emit"; "build/release" ] ]
+    successful_calls;
+  let failed, failed_calls =
+    run_branch (node 307 (Ir.Exec (Ir.exec [ "fail"; "1" ])))
+  in
+  Alcotest.(check string) "false branch state" "build/debug" failed.stdout;
+  Alcotest.(check (list (list string)))
+    "false branch argv"
+    [ [ "fail"; "1" ]; [ "emit"; "build/debug" ] ]
+    failed_calls
+
+let test_typed_runtime_state_checks_types_before_effects () =
+  let calls = ref [] in
+  let body =
+    node 310
+      (Ir.Sequence
+         [
+           node 308
+             (Ir.Set_variable
+                { name = "count"; value_type = Ir.Int; value = "not-an-int" });
+           node 309 (Ir.Exec (Ir.exec [ "emit"; "${count}" ]));
+         ])
+  in
+  begin match run calls body with
+  | Ok _ -> Alcotest.fail "invalid typed state reached an external effect"
+  | Error message ->
+      Alcotest.(check bool)
+        "typed state diagnostic" true
+        (Test_support.contains ~needle:"integer" message)
+  end;
+  Alcotest.(check int) "no external effect" 0 (List.length !calls)
+
+let test_stdout_capture_trims_and_isolates_subshell_state () =
+  let calls = ref [] in
+  let capture_body =
+    node 330
+      (Ir.Sequence
+         [
+           node 328
+             (Ir.Set_variable
+                { name = "inner"; value_type = Ir.Text; value = "leaked" });
+           node 329 (Ir.Exec (Ir.exec [ "probe" ]));
+         ])
+  in
+  let capture =
+    node 331
+      (Ir.Capture_stdout
+         { name = "captured"; value_type = Ir.Text; body = capture_body })
+  in
+  let body =
+    node 333
+      (Ir.Sequence
+         [
+           capture;
+           node 332
+             (Ir.Exec (Ir.exec [ "consume"; "${captured}"; "${inner:-outer}" ]));
+         ])
+  in
+  let capture_backend : Runner.backend =
+    {
+      (backend calls) with
+      execute =
+        (fun request ->
+          calls := request.argv :: !calls;
+          match request.argv with
+          | [ "probe" ] ->
+              Ok
+                Runner.
+                  {
+                    exit_code = 7;
+                    stdout = "first\nsecond\n\n";
+                    stderr = "probe warning\n";
+                  }
+          | [ "consume"; "first\nsecond"; "outer" ] ->
+              Ok Runner.{ exit_code = 0; stdout = "consumed\n"; stderr = "" }
+          | argv -> Error ("unexpected argv: " ^ String.concat " " argv));
+    }
+  in
+  let observation =
+    Runner.run_plan ~backend:capture_backend ~policy:Runner.default_policy
+      (plan body)
+    |> get
+  in
+  Alcotest.(check (list (list string)))
+    "capture and consumer argv"
+    [ [ "probe" ]; [ "consume"; "first\nsecond"; "outer" ] ]
+    (List.rev !calls);
+  Alcotest.(check string)
+    "captured stdout suppressed" "consumed\n" observation.stdout;
+  Alcotest.(check string)
+    "capture stderr forwarded" "probe warning\n" observation.stderr;
+  let capture_only_calls = ref [] in
+  let capture_only_backend =
+    {
+      capture_backend with
+      execute =
+        (fun request ->
+          capture_only_calls := request.argv :: !capture_only_calls;
+          Ok
+            Runner.
+              {
+                exit_code = 7;
+                stdout = "captured\n";
+                stderr = "capture failed\n";
+              });
+    }
+  in
+  let captured_failure =
+    Runner.run_plan ~backend:capture_only_backend ~policy:Runner.default_policy
+      (plan capture)
+    |> get
+  in
+  Alcotest.(check int) "capture status" 7 captured_failure.exit_code;
+  Alcotest.(check string)
+    "failed capture stdout suppressed" "" captured_failure.stdout;
+  Alcotest.(check string)
+    "failed capture stderr" "capture failed\n" captured_failure.stderr
+
+let test_typed_runtime_secret_state_is_redacted () =
+  let body =
+    node 323
+      (Ir.Sequence
+         [
+           node 320
+             (Ir.Set_variable
+                {
+                  name = "token";
+                  value_type = Ir.Secret Ir.Text;
+                  value = "runtime-secret";
+                });
+           node 321 (Ir.Exec (Ir.exec [ "emit"; "${token}" ]));
+         ])
+  in
+  let calls = ref [] in
+  let observation = run calls body |> get in
+  Alcotest.(check (list string))
+    "backend receives secret"
+    [ "emit"; "runtime-secret" ]
+    (List.hd !calls);
+  begin match observation.trace with
+  | [ Runner.Process (argv, 0) ] ->
+      Alcotest.(check (list string))
+        "runtime secret trace redacted"
+        [ "emit"; "<secret:token>" ]
+        argv
+  | _ -> Alcotest.fail "expected one runtime-secret process trace"
+  end;
+  let failing_backend =
+    {
+      (backend (ref [])) with
+      execute =
+        (fun request ->
+          Error ("failed with " ^ String.concat " " request.Runner.argv));
+    }
+  in
+  match
+    Runner.run_plan ~backend:failing_backend ~policy:Runner.default_policy
+      (plan body)
+  with
+  | Ok _ -> Alcotest.fail "runtime-secret backend failure was ignored"
+  | Error message ->
+      Alcotest.(check bool)
+        "runtime secret absent from error" false
+        (Test_support.contains ~needle:"runtime-secret" message);
+      Alcotest.(check bool)
+        "runtime secret placeholder in error" true
+        (Test_support.contains ~needle:"<secret:token>" message)
+
+let test_task_runtime_state_is_lexically_scoped () =
+  let calls = ref [] in
+  let set index value =
+    node index (Ir.Set_variable { name = "mode"; value_type = Ir.Text; value })
+  in
+  let helper =
+    Ir.task ~name:"helper"
+      ~body:
+        (node 314
+           (Ir.Sequence
+              [
+                set 311 "helper";
+                node 312 (Ir.Exec (Ir.exec [ "emit"; "${mode}" ]));
+              ]))
+      ()
+  in
+  let main =
+    Ir.task ~name:"main"
+      ~body:
+        (node 318
+           (Ir.Sequence
+              [
+                set 315 "main";
+                node 316 (Ir.Task_call { task = "helper"; arguments = [] });
+                node 317 (Ir.Exec (Ir.exec [ "emit"; "${mode}" ]));
+              ]))
+      ()
+  in
+  let observation =
+    Runner.run_plan ~backend:(backend calls) ~policy:Runner.default_policy
+      (Ir.plan ~entrypoint:"main" [ main; helper ])
+    |> get
+  in
+  Alcotest.(check string) "scoped output" "helpermain" observation.stdout;
+  Alcotest.(check (list (list string)))
+    "scoped argv"
+    [ [ "emit"; "helper" ]; [ "emit"; "main" ] ]
+    (List.rev !calls)
+
 let test_exec_capabilities_obey_policy () =
   let calls = ref [] in
   let run_command ?(policy = Runner.default_policy) argv =
@@ -997,6 +1235,16 @@ let () =
             test_template_dollar_escape;
           Alcotest.test_case "invalid parameter templates" `Quick
             test_invalid_parameter_templates_are_rejected;
+          Alcotest.test_case "typed runtime state control flow" `Quick
+            test_typed_runtime_state_propagates_through_control_flow;
+          Alcotest.test_case "typed runtime state types" `Quick
+            test_typed_runtime_state_checks_types_before_effects;
+          Alcotest.test_case "stdout capture semantics" `Quick
+            test_stdout_capture_trims_and_isolates_subshell_state;
+          Alcotest.test_case "typed runtime state secrets" `Quick
+            test_typed_runtime_secret_state_is_redacted;
+          Alcotest.test_case "typed runtime state scope" `Quick
+            test_task_runtime_state_is_lexically_scoped;
           Alcotest.test_case "Exec capability policy" `Quick
             test_exec_capabilities_obey_policy;
         ] );

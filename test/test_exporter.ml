@@ -92,6 +92,37 @@ let sequence_plan () =
   in
   Ir.plan ~entrypoint:"main" [ Ir.task ~name:"main" ~body:root () ]
 
+let runtime_state_plan () =
+  let root =
+    Ir.node ~id:"state-sequence"
+      ~guarantee:(Ir.Formal { basis = "export-test" })
+      (Ir.Sequence
+         [
+           Ir.node ~id:"state-mode"
+             ~guarantee:(Ir.Formal { basis = "export-test" })
+             (Ir.Set_variable
+                { name = "mode"; value_type = Ir.Text; value = "release" });
+           Ir.node ~id:"state-use"
+             ~guarantee:(Ir.Formal { basis = "export-test" })
+             (Ir.Exec (Ir.exec [ "build"; "${mode}" ]));
+         ])
+  in
+  Ir.plan ~entrypoint:"main" [ Ir.task ~name:"main" ~body:root () ]
+
+let stdout_capture_plan () =
+  let capture_body =
+    Ir.node ~id:"capture-command"
+      ~guarantee:(Ir.Formal { basis = "export-test" })
+      (Ir.Exec (Ir.exec [ "probe" ]))
+  in
+  let root =
+    Ir.node ~id:"capture-revision"
+      ~guarantee:(Ir.Formal { basis = "export-test" })
+      (Ir.Capture_stdout
+         { name = "revision"; value_type = Ir.Text; body = capture_body })
+  in
+  Ir.plan ~entrypoint:"main" [ Ir.task ~name:"main" ~body:root () ]
+
 let export target =
   match Exporter.export ~target ~bridge:false (literal_plan ()) with
   | Ok artifact -> artifact
@@ -244,6 +275,50 @@ let test_strict_export_rejects_dropped_task_interface () =
         "bridge limitation is explicit" true
         (Test_support.contains ~needle:"invocation" message)
 
+let test_runtime_state_requires_explicit_bridge () =
+  [ Exporter.Dagger; Exporter.Nu; Exporter.Cwl ]
+  |> List.iter (fun target ->
+      begin match
+        Exporter.export ~target ~bridge:false (runtime_state_plan ())
+      with
+      | Ok _ -> Alcotest.fail "strict exporter silently dropped runtime state"
+      | Error message ->
+          Alcotest.(check bool)
+            "state node identified" true
+            (Test_support.contains ~needle:"state-mode" message
+            && Test_support.contains ~needle:"set_variable" message)
+      end;
+      match Exporter.export ~target ~bridge:true (runtime_state_plan ()) with
+      | Error message -> Alcotest.fail message
+      | Ok artifact ->
+          Alcotest.(check bool)
+            "state plan delegated whole" true
+            (Test_support.contains ~needle:"deshell" artifact.content
+            && Test_support.contains ~needle:"--allow-residual" artifact.content
+            ))
+
+let test_stdout_capture_requires_explicit_bridge () =
+  [ Exporter.Dagger; Exporter.Nu; Exporter.Cwl ]
+  |> List.iter (fun target ->
+      begin match
+        Exporter.export ~target ~bridge:false (stdout_capture_plan ())
+      with
+      | Ok _ -> Alcotest.fail "strict exporter silently dropped stdout capture"
+      | Error message ->
+          Alcotest.(check bool)
+            "capture node identified" true
+            (Test_support.contains ~needle:"capture-revision" message
+            && Test_support.contains ~needle:"capture_stdout" message)
+      end;
+      match Exporter.export ~target ~bridge:true (stdout_capture_plan ()) with
+      | Error message -> Alcotest.fail message
+      | Ok artifact ->
+          Alcotest.(check bool)
+            "capture plan delegated whole" true
+            (Test_support.contains ~needle:"deshell" artifact.content
+            && Test_support.contains ~needle:"--allow-residual" artifact.content
+            ))
+
 let test_cwl_empty_arguments_are_an_array () =
   let node =
     Ir.node ~id:"no-args"
@@ -286,6 +361,10 @@ let () =
             test_strict_export_rejects_dropped_environment;
           Alcotest.test_case "task invocation capability" `Quick
             test_strict_export_rejects_dropped_task_interface;
+          Alcotest.test_case "runtime state bridge" `Quick
+            test_runtime_state_requires_explicit_bridge;
+          Alcotest.test_case "stdout capture bridge" `Quick
+            test_stdout_capture_requires_explicit_bridge;
           Alcotest.test_case "CWL empty arguments" `Quick
             test_cwl_empty_arguments_are_an_array;
         ] );

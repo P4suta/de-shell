@@ -312,6 +312,12 @@ let corpus_audit_is_reproducible_and_nonexecuting () =
   check bool "mise exposes corpus audit task" true
     (contains mise "[tasks.\"corpus:audit\"]"
     && contains mise "scripts/audit-corpus.ps1");
+  check bool "corpus audit cannot use a stale compiler binary" true
+    (contains mise
+       "[tasks.\"corpus:audit\"]\n\
+        description = \"Audit sibling or curated repositories without \
+        executing source scripts\"\n\
+        depends = [\"build\"]");
   check bool "audit records source non-execution" true
     (contains script "source_execution = $false");
   check bool "audit verifies the post-scan source hash" true

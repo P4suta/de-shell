@@ -28,6 +28,27 @@ let test_unknown_is_conservative () =
     (has Command_model.Unknown_command value);
   Alcotest.(check bool) "not declared deterministic" false value.deterministic
 
+let test_test_predicates_use_least_privilege () =
+  let comparison =
+    Command_model.classify [ "test"; "release"; "="; "release" ]
+  in
+  Alcotest.(check bool) "comparison known" true comparison.known;
+  Alcotest.(check bool)
+    "string comparison is pure" false
+    (has Command_model.Filesystem_read comparison);
+  [
+    [ "test"; "-f"; "artifact" ];
+    [ "test"; "!"; "-d"; "cache" ];
+    [ "test"; "left"; "-nt"; "right" ];
+    [ "["; "-e"; "artifact"; "]" ];
+  ]
+  |> List.iter (fun argv ->
+      let predicate = Command_model.classify argv in
+      Alcotest.(check bool) "file predicate known" true predicate.known;
+      Alcotest.(check bool)
+        "file predicate reads metadata" true
+        (has Command_model.Filesystem_read predicate))
+
 let formal id operation =
   Ir.node ~id ~guarantee:(Ir.Formal { basis = "test" }) operation
 
@@ -60,7 +81,7 @@ let test_model_digest_is_stable () =
   Alcotest.(check int) "sha256" 64 (String.length first);
   Alcotest.(check bool)
     "versioned" true
-    (Test_support.contains ~needle:"command-model/1"
+    (Test_support.contains ~needle:"command-model/2"
        (Command_model.lock_entry ()))
 
 let () =
@@ -70,6 +91,8 @@ let () =
         [
           Alcotest.test_case "known" `Quick test_known_effects;
           Alcotest.test_case "unknown" `Quick test_unknown_is_conservative;
+          Alcotest.test_case "least-privilege test predicates" `Quick
+            test_test_predicates_use_least_privilege;
           Alcotest.test_case "task annotation" `Quick test_plan_annotation;
           Alcotest.test_case "digest" `Quick test_model_digest_is_stable;
         ] );

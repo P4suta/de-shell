@@ -30,6 +30,9 @@ before 1.0 may change with explicit migration notes.
 - Effect IR v2 typed PowerShell invocation contracts, including positions,
   mandatory/switch/default behavior, scalar types, validation metadata, and
   explicit `CmdletBinding` common-parameter capability.
+- Effect IR v3 typed `Set_variable` and `Capture_stdout` operations with
+  canonical v0/v1/v2 migration, schema validation, flow-sensitive templates,
+  secret-safe execution, property tests, and strict exporter bridge contracts.
 - `deshell run -- SCRIPT_ARG...` pass-through for original arguments that begin
   with a dash, while retaining `--arg=VALUE` compatibility.
 
@@ -47,6 +50,14 @@ before 1.0 may change with explicit migration notes.
   semantics.
 - Allowed immutable top-level POSIX assignments after a closed control-flow
   construct while continuing to reject assignments inside active branches.
+- Lowered definitely assigned POSIX branch state, expansion-safe static
+  unquoted parameters, quoted runtime parameters inside stdout captures, and
+  ordered quoted nested command substitutions; verified all three behaviors
+  against an official POSIX shell.
+- Updated command-model v2 to classify `test` and `[` predicates with their
+  least-privilege filesystem requirements and to traverse capture bodies.
+- Made `mise run corpus:audit` depend on the production build so measurements
+  cannot silently use a stale CLI binary.
 - Made canonical template escaping, environment/secret declaration, nested-task
   inheritance, and input rejection explicit in the internal runner.
 - Inventoried multiple embedded-shell callsites on one line with stable columns,
@@ -73,8 +84,10 @@ before 1.0 may change with explicit migration notes.
   invocation defaults before execution.
 - Prevented strict exporters from rejecting non-behavioral command-model
   annotations while continuing to reject task interfaces they cannot preserve.
-- Bounded every official-exporter subprocess and terminate its process tree on
+- Bounded every official-exporter subprocess and terminated its process tree on
   timeout instead of allowing a stalled Docker or Dagger engine to hang the
   validation gate indefinitely.
+- Preserved newline-bearing arguments in Windows-hosted POSIX differential tests
+  by using a quoted `exec` script instead of a lossy shell argument trampoline.
 
 [Unreleased]: https://github.com/P4suta/de-shell/commits/main

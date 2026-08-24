@@ -1,4 +1,4 @@
-let current_schema_version = 2
+let current_schema_version = 3
 
 type value_type =
   | Bytes
@@ -44,6 +44,12 @@ type opaque_capsule = {
 type file_write = { path : string; contents : string; append : bool }
 type network_request = { method_ : string; uri : string }
 
+type variable_assignment = {
+  name : string;
+  value_type : value_type;
+  value : string;
+}
+
 type node = {
   id : string;
   operation : operation;
@@ -65,6 +71,8 @@ and operation =
   | For_each of { variable : string; items : string list; body : node }
   | Try_finally of { body : node; finalizer : node }
   | Task_call of { task : string; arguments : (string * string) list }
+  | Set_variable of variable_assignment
+  | Capture_stdout of { name : string; value_type : value_type; body : node }
   | File_read of string
   | File_write of file_write
   | File_remove of string
@@ -167,6 +175,41 @@ let validate_named_values label values errors =
     (fun errors value -> non_empty label value errors)
     errors values
 
+let valid_variable_name name =
+  name <> ""
+  &&
+  match name.[0] with
+  | 'A' .. 'Z' | 'a' .. 'z' | '_' ->
+      String.for_all
+        (function
+          | 'A' .. 'Z' | 'a' .. 'z' | '0' .. '9' | '_' -> true | _ -> false)
+        name
+  | _ -> false
+
+let rec scalar_runtime_value_type = function
+  | Bytes | Text | Bool | Int | Path -> true
+  | Secret value_type -> scalar_runtime_value_type value_type
+  | List _ | Record _ | Byte_stream | Object_stream _ -> false
+
+let rec contains_state_mutation node =
+  match node.operation with
+  | Set_variable _ | Capture_stdout _ -> true
+  | Exec _ | Task_call _ | File_read _ | File_write _ | File_remove _
+  | Network_request _ | Opaque_capsule _ ->
+      false
+  | Pipeline nodes | Sequence nodes | Parallel nodes ->
+      List.exists contains_state_mutation nodes
+  | Condition { predicate; if_true; if_false } ->
+      contains_state_mutation predicate
+      || contains_state_mutation if_true
+      || Option.exists contains_state_mutation if_false
+  | Match { cases; default; _ } ->
+      List.exists (fun (_, branch) -> contains_state_mutation branch) cases
+      || Option.exists contains_state_mutation default
+  | For_each { body; _ } -> contains_state_mutation body
+  | Try_finally { body; finalizer } ->
+      contains_state_mutation body || contains_state_mutation finalizer
+
 let validate_span span errors =
   let errors = non_empty "source span file" span.file errors in
   let position_reversed =
@@ -247,8 +290,22 @@ let rec validate_node task_table seen node errors =
         if nodes = [] then "Pipeline must contain at least one node" :: errors
         else errors
       in
+      let errors =
+        if List.exists contains_state_mutation nodes then
+          "pipeline state mutation is undefined; use an explicit task boundary"
+          :: errors
+        else errors
+      in
       validate_children nodes errors
-  | Sequence nodes | Parallel nodes -> validate_children nodes errors
+  | Sequence nodes -> validate_children nodes errors
+  | Parallel nodes ->
+      let errors =
+        if List.exists contains_state_mutation nodes then
+          "parallel state mutation is nondeterministic; use isolated task \
+           inputs" :: errors
+        else errors
+      in
+      validate_children nodes errors
   | Condition { predicate; if_true; if_false } ->
       let errors = validate_node task_table seen predicate errors in
       let errors = validate_node task_table seen if_true errors in
@@ -276,6 +333,13 @@ let rec validate_node task_table seen node errors =
       validate_node task_table seen body
         (non_empty "foreach variable" variable errors)
   | Try_finally { body; finalizer } ->
+      let errors =
+        if contains_state_mutation body || contains_state_mutation finalizer
+        then
+          "try/finally state mutation is undefined across failure paths"
+          :: errors
+        else errors
+      in
       validate_node task_table seen finalizer
         (validate_node task_table seen body errors)
   | Task_call { task; arguments } ->
@@ -306,6 +370,28 @@ let rec validate_node task_table seen node errors =
                 :: errors)
             errors expected_names
       end
+  | Set_variable assignment ->
+      let errors =
+        if valid_variable_name assignment.name then errors
+        else
+          ("runtime variable name is not valid: " ^ assignment.name) :: errors
+      in
+      if scalar_runtime_value_type assignment.value_type then errors
+      else
+        ("runtime variable " ^ assignment.name ^ " must use a scalar value type")
+        :: errors
+  | Capture_stdout capture ->
+      let errors =
+        if valid_variable_name capture.name then errors
+        else ("runtime variable name is not valid: " ^ capture.name) :: errors
+      in
+      let errors =
+        if capture.value_type = Text then errors
+        else
+          ("stdout capture variable " ^ capture.name ^ " must use text type")
+          :: errors
+      in
+      validate_node task_table seen capture.body errors
   | File_read path | File_remove path -> non_empty "file path" path errors
   | File_write write -> non_empty "file path" write.path errors
   | Network_request request ->
@@ -780,9 +866,10 @@ let validate_plan plan =
 let rec fold_nodes f accumulator node =
   let accumulator = f accumulator node in
   match node.operation with
-  | Exec _ | Task_call _ | File_read _ | File_write _ | File_remove _
-  | Network_request _ | Opaque_capsule _ ->
+  | Exec _ | Task_call _ | Set_variable _ | File_read _ | File_write _
+  | File_remove _ | Network_request _ | Opaque_capsule _ ->
       accumulator
+  | Capture_stdout { body; _ } -> fold_nodes f accumulator body
   | Pipeline nodes | Sequence nodes | Parallel nodes ->
       List.fold_left (fold_nodes f) accumulator nodes
   | Condition { predicate; if_true; if_false } ->
