@@ -34,5 +34,8 @@ let () =
           Alcotest.test_case "adapter" `Quick
             (test_schema "adapter.schema.json"
                "https://deshell.dev/schema/adapter/v1");
+          Alcotest.test_case "corpus audit" `Quick
+            (test_schema "corpus-audit.schema.json"
+               "https://deshell.dev/schema/corpus-audit/v1");
         ] );
     ]

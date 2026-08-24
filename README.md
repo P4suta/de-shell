@@ -31,10 +31,13 @@ covered by the repository's test gates:
 - a call graph and content-hash-guarded, all-or-nothing callsite migration for
   exact standalone calls;
 - POSIX sh/Bash lowering for literal commands, immutable assignment dataflow,
-  pipelines, sequences, `&&`, homogeneous `||`, simple conditions, and static
-  loops;
+  command-local environments, pipelines, sequences, `&&`, homogeneous `||`,
+  simple conditions, static loops, script-relative working directories,
+  literal heredoc writes, and static subshell working directories;
 - conservative literal subsets for zsh, fish, PowerShell, cmd, and Nushell,
-  with trace-only residual fallback for unknown or dynamic behavior;
+  including immutable PowerShell string/environment dataflow and static
+  multi-statement files, with trace-only residual fallback for unknown or
+  dynamic behavior;
 - versioned Effect IR, JSON schemas, v0-to-v1 migration, and `formal`,
   `exhaustive`, `differential`, and `residual` evidence;
 - official PowerShell AST and pinned `nu-parser` JSON-RPC adapter contracts;
@@ -136,6 +139,7 @@ builds the Rust adapter through Dune and verifies every required installed file.
 | `mise run test:differential` | Lowering and observation comparisons |
 | `mise run test:security` | Traversal, protocol, secret, and transaction regressions |
 | `mise run test` | Every repository test gate |
+| `mise run corpus:audit -- ARGS` | Inventory repositories and analyze hash-verified temporary shell copies without executing source scripts |
 | `mise run fmt` | Format OCaml and Dune sources |
 | `mise run fmt:check` | Check formatting without accepting changes |
 | `mise run package` | Build and verify the installable package payload |
@@ -145,6 +149,18 @@ because it requires a running Docker engine. `mise install` supplies the pinned
 Dagger CLI; `DESHELL_DAGGER_EXE` can override it for controlled validation. The
 validator uses a digest-pinned `cwltool` image without mounting the Docker socket
 and removes its isolated temporary project after the run.
+
+## Auditing a local corpus
+
+The bundled corpus auditor makes broad local measurements reproducible without
+executing source automation. It records the selected immediate-child
+repositories and exclusions, inventories embedded shell, verifies each shell
+file hash, and analyzes an isolated temporary copy. See
+[docs/corpus-audit.md](docs/corpus-audit.md) for the exact safe command and the
+2026-08-24 snapshot: 48 repositories, 1,457 inventory locations, zero analysis
+failures, and 2 of 47 raw shell files fully non-residual. That measurement is
+local evidence, not 1.0 certification; the document explains the denominator
+and the remaining residual groups.
 
 ## First migration
 

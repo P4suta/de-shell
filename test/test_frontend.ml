@@ -318,12 +318,36 @@ let test_strict_unsafe_state_stays_residual () =
       ( "late assignment",
         "#!/bin/sh\n\
          set -eu\n\
+         value=first\n\
+         printf '%s' \"$value\"\n\
          printf first\n\
          value=second\n\
          printf '%s' \"$value\"\n" );
+      ( "assignment after prior reference",
+        "#!/bin/sh\n\
+         set -eu\n\
+         printf '%s' \"${late-default}\"\n\
+         late=second\n\
+         printf '%s' \"$late\"\n" );
+      ( "conditional late assignment",
+        "#!/bin/sh\n\
+         set -eu\n\
+         if test -f ready\n\
+         then\n\
+         mode=release\n\
+         fi\n\
+         tool.exe build \"$mode\"\n" );
       ( "mutating parameter operator",
         "#!/bin/sh\nset -eu\nprintf '%s' \"${MODE:=default}\"\n" );
       ("unsupported option", "#!/bin/sh\nset -eux\nprintf traced\n");
+      ( "dynamic top-level cwd",
+        "#!/bin/sh\nset -eu\ncd \"$TARGET\"\ntool.exe build\n" );
+      ( "multiple script cwd declarations",
+        "#!/bin/sh\n\
+         set -eu\n\
+         cd \"$(dirname \"$0\")\"\n\
+         cd -- \"$(dirname -- \"$0\")\"\n\
+         tool.exe build\n" );
     ]
   in
   List.iter
@@ -352,6 +376,22 @@ let test_bracket_command_and_glob_boundary () =
   Alcotest.(check bool)
     "bracket glob remains dynamic" true
     (Posix_frontend.has_residual glob.root)
+
+let test_find_exec_placeholder_is_literal () =
+  let result =
+    Posix_frontend.lower ~path:"find.sh"
+      "find output -type f -exec tool.exe --check {} +\n"
+  in
+  expect_exec result.root
+    [
+      "find"; "output"; "-type"; "f"; "-exec"; "tool.exe"; "--check"; "{}"; "+";
+    ];
+  [ "printf '%s' {a,b}\n"; "printf '%s' \"${VALUE}\"\n" ]
+  |> List.iter (fun source ->
+      let dynamic = Posix_frontend.lower ~path:"brace.sh" source in
+      Alcotest.(check bool)
+        "actual brace expansion stays residual" true
+        (Posix_frontend.has_residual dynamic.root))
 
 let test_single_quoted_template_is_literal () =
   let result =
@@ -427,6 +467,242 @@ let test_strict_mixed_and_or_stays_residual () =
     "mixed associativity is not guessed" true
     (Posix_frontend.has_residual result.root)
 
+let test_strict_pipefail_without_pipeline_is_static () =
+  [
+    ( "combined",
+      "#!/usr/bin/env bash\nset -euo pipefail\nprintf first\nprintf second\n" );
+    ( "shebang options",
+      "#!/bin/bash -eu\nset -o pipefail\nprintf first\nprintf second\n" );
+  ]
+  |> List.iter (fun (label, source) ->
+      let result = Posix_frontend.lower ~path:(label ^ ".sh") source in
+      Alcotest.(check bool)
+        (label ^ " is non-residual")
+        false
+        (Posix_frontend.has_residual result.root);
+      match result.root.operation with
+      | Ir.Condition _ -> ()
+      | _ ->
+          Alcotest.fail
+            (label ^ " must preserve errexit as a fail-fast condition"))
+
+let test_strict_header_assignment_comments () =
+  let source =
+    "#!/bin/sh\n\
+     set -eu # fail closed\n\
+     TOOL='tool#stable' # executable selected by the build\n\
+     MODE=release # immutable mode\n\
+     \"$TOOL\" build \"$MODE\"\n"
+  in
+  let result = Posix_frontend.lower ~path:"commented-header.sh" source in
+  Alcotest.(check bool)
+    "commented constants are non-residual" false
+    (Posix_frontend.has_residual result.root);
+  expect_exec result.root [ "tool#stable"; "build"; "release" ]
+
+let test_strict_late_command_environment_is_not_mutable_state () =
+  let source =
+    "#!/bin/sh\nset -eu\nprintf first\nLC_ALL=C tool.exe build\nprintf last\n"
+  in
+  let result = Posix_frontend.lower ~path:"command-environment.sh" source in
+  Alcotest.(check bool)
+    "command-local environment is non-residual" false
+    (Posix_frontend.has_residual result.root);
+  let command =
+    Ir.fold_nodes
+      (fun found node ->
+        match (found, node.Ir.operation) with
+        | Some _, _ -> found
+        | None, Ir.Exec command when command.argv = [ "tool.exe"; "build" ] ->
+            Some command
+        | None, _ -> None)
+      None result.root
+    |> Option.get
+  in
+  Alcotest.(check (list (pair string string)))
+    "command environment"
+    [ ("LC_ALL", "C") ]
+    command.environment
+
+let test_strict_late_immutable_assignment () =
+  let source =
+    "#!/bin/sh\n\
+     set -eu\n\
+     printf preparing\n\
+     MODE=release # first declaration after an external command\n\
+     tool.exe build \"$MODE\"\n"
+  in
+  let result = Posix_frontend.lower ~path:"late-constant.sh" source in
+  begin if Posix_frontend.has_residual result.root then
+    match result.root.guarantee with
+    | Ir.Residual evidence ->
+        Alcotest.fail ("new late constant is non-residual: " ^ evidence.reason)
+    | _ -> Alcotest.fail "new late constant contains a nested residual node"
+  end;
+  let command =
+    Ir.fold_nodes
+      (fun found node ->
+        match (found, node.Ir.operation) with
+        | Some _, _ -> found
+        | None, Ir.Exec command
+          when command.argv = [ "tool.exe"; "build"; "release" ] ->
+            Some command
+        | None, _ -> None)
+      None result.root
+  in
+  Alcotest.(check bool)
+    "late binding is applied only to subsequent argv" true
+    (Option.is_some command)
+
+let test_pipefail_pipeline_stays_residual () =
+  let source =
+    "#!/usr/bin/env bash\nset -euo pipefail\nproduce | consume\nprintf after\n"
+  in
+  let result = Posix_frontend.lower ~path:"pipefail.sh" source in
+  match (result.root.operation, result.root.guarantee) with
+  | Ir.Opaque_capsule capsule, Ir.Residual evidence ->
+      Alcotest.(check string) "lossless source" source capsule.source;
+      Alcotest.(check bool)
+        "precise reason" true
+        (Test_support.contains ~needle:"pipefail" evidence.reason)
+  | _ ->
+      Alcotest.fail
+        "pipefail pipeline must remain residual until its rightmost-nonzero \
+         status is represented"
+
+let test_strict_packaging_cwd_heredoc_and_subshell () =
+  let source =
+    "#!/usr/bin/env bash\n\
+     set -euo pipefail\n\
+     cd \"$(dirname \"$0\")\"\n\
+     DIST=dist\n\
+     TOOL=tool.exe\n\
+     \"$TOOL\" build \"$DIST\"\n\
+     cat > \"$DIST/README.txt\" <<'EOF'\n\
+     literal ${HOME}\n\
+     EOF\n\
+     ( cd \"$DIST\" && archive.exe bundle.zip . )\n"
+  in
+  let result = Posix_frontend.lower ~path:"packaging/package.sh" source in
+  let repeated = Posix_frontend.lower ~path:"packaging/package.sh" source in
+  Alcotest.(check bool)
+    "strict lowering is deterministic" true
+    (result.root = repeated.root && result.diagnostics = repeated.diagnostics);
+  let diagnostic =
+    result.diagnostics
+    |> List.map (fun value -> value.Posix_frontend.message)
+    |> String.concat "; "
+  in
+  Alcotest.(check bool)
+    ("packaging subset is non-residual: " ^ diagnostic)
+    false
+    (Posix_frontend.has_residual result.root);
+  let commands, writes =
+    Ir.fold_nodes
+      (fun (commands, writes) node ->
+        match node.Ir.operation with
+        | Ir.Exec command -> (command :: commands, writes)
+        | Ir.File_write write -> (commands, write :: writes)
+        | _ -> (commands, writes))
+      ([], []) result.root
+  in
+  let find_command executable =
+    List.find
+      (fun command ->
+        match command.Ir.argv with
+        | value :: _ -> value = executable
+        | [] -> false)
+      commands
+  in
+  let build = find_command "tool.exe" in
+  Alcotest.(check (option string))
+    "script directory cwd" (Some "packaging") build.working_directory;
+  let archive = find_command "archive.exe" in
+  Alcotest.(check (option string))
+    "subshell cwd" (Some "packaging/dist") archive.working_directory;
+  match writes with
+  | [ write ] ->
+      Alcotest.(check string)
+        "heredoc path" "packaging/dist/README.txt" write.path;
+      Alcotest.(check string)
+        "quoted heredoc is literal" "literal $${HOME}\n" write.contents
+  | _ -> Alcotest.fail "packaging subset must contain one typed file write"
+
+let file_writes root =
+  Ir.fold_nodes
+    (fun writes node ->
+      match node.Ir.operation with
+      | Ir.File_write write -> (node, write) :: writes
+      | _ -> writes)
+    [] root
+  |> List.rev
+
+let test_static_heredoc_quoting_modes () =
+  [
+    ( "double quoted delimiter",
+      "cat > artifact.txt <<\"END\"\n\
+       MODE=value\n\
+       literal $HOME and `date` and \\ data\n\
+       END\n",
+      "MODE=value\nliteral $$HOME and `date` and \\ data\n" );
+    ( "expansion-free unquoted delimiter",
+      "cat > artifact.txt <<END\nplain text and \"quotes\"\nEND\n",
+      "plain text and \"quotes\"\n" );
+  ]
+  |> List.iter (fun (label, heredoc, expected_contents) ->
+      let source = "#!/bin/sh\nset -eu\n" ^ heredoc in
+      let result = Posix_frontend.lower ~path:"heredoc.sh" source in
+      let diagnostic =
+        result.diagnostics
+        |> List.map (fun value -> value.Posix_frontend.message)
+        |> String.concat "; "
+      in
+      Alcotest.(check bool)
+        (label ^ " is non-residual: " ^ diagnostic)
+        false
+        (Posix_frontend.has_residual result.root);
+      match file_writes result.root with
+      | [ (node, write) ] ->
+          Alcotest.(check string)
+            (label ^ " output path") "artifact.txt" write.path;
+          Alcotest.(check string)
+            (label ^ " contents") expected_contents write.contents;
+          begin match node.source with
+          | Some span ->
+              Alcotest.(check int) (label ^ " start line") 3 span.start_line;
+              let expected_end_line =
+                if label = "double quoted delimiter" then 6 else 5
+              in
+              Alcotest.(check int)
+                (label ^ " end line") expected_end_line span.end_line
+          | None -> Alcotest.fail (label ^ " must preserve its source map")
+          end
+      | _ -> Alcotest.fail (label ^ " must lower to one FileWrite"))
+
+let test_heredoc_expansion_boundaries_are_atomic () =
+  [
+    ( "unquoted parameter expansion",
+      "cat > artifact.txt <<END\n$HOME\nEND\n",
+      "expansion" );
+    ( "unquoted command substitution",
+      "cat > artifact.txt <<END\n`date`\nEND\n",
+      "expansion" );
+    ("tab stripping", "cat > artifact.txt <<-'END'\nvalue\nEND\n", "heredoc");
+    ( "missing delimiter",
+      "cat > artifact.txt <<'END'\nvalue\n",
+      "missing delimiter" );
+  ]
+  |> List.iter (fun (label, heredoc, reason_fragment) ->
+      let source = "#!/bin/sh\nset -eu\n" ^ heredoc in
+      let result = Posix_frontend.lower ~path:"heredoc.sh" source in
+      match (result.root.operation, result.root.guarantee) with
+      | Ir.Opaque_capsule capsule, Ir.Residual evidence ->
+          Alcotest.(check string) (label ^ " source") source capsule.source;
+          Alcotest.(check bool)
+            (label ^ " reason") true
+            (Test_support.contains ~needle:reason_fragment evidence.reason)
+      | _ -> Alcotest.fail (label ^ " must remain one lossless capsule"))
+
 let () =
   Alcotest.run "POSIX frontend"
     [
@@ -466,6 +742,8 @@ let () =
             test_strict_unsafe_state_stays_residual;
           Alcotest.test_case "bracket command boundary" `Quick
             test_bracket_command_and_glob_boundary;
+          Alcotest.test_case "find exec placeholder" `Quick
+            test_find_exec_placeholder_is_literal;
           Alcotest.test_case "single-quoted template literal" `Quick
             test_single_quoted_template_is_literal;
           Alcotest.test_case "strict literal dollar dataflow" `Quick
@@ -474,5 +752,21 @@ let () =
             test_strict_or_short_circuit_execution;
           Alcotest.test_case "strict mixed boolean residual" `Quick
             test_strict_mixed_and_or_stays_residual;
+          Alcotest.test_case "strict pipefail without pipeline" `Quick
+            test_strict_pipefail_without_pipeline_is_static;
+          Alcotest.test_case "strict header comments" `Quick
+            test_strict_header_assignment_comments;
+          Alcotest.test_case "strict command environment" `Quick
+            test_strict_late_command_environment_is_not_mutable_state;
+          Alcotest.test_case "strict late immutable assignment" `Quick
+            test_strict_late_immutable_assignment;
+          Alcotest.test_case "pipefail pipeline residual" `Quick
+            test_pipefail_pipeline_stays_residual;
+          Alcotest.test_case "strict packaging effects" `Quick
+            test_strict_packaging_cwd_heredoc_and_subshell;
+          Alcotest.test_case "static heredoc quoting modes" `Quick
+            test_static_heredoc_quoting_modes;
+          Alcotest.test_case "heredoc expansion boundaries" `Quick
+            test_heredoc_expansion_boundaries_are_atomic;
         ] );
     ]

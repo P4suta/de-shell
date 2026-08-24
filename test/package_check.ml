@@ -5,10 +5,12 @@ let required_paths root =
     Filename.concat "bin" (executable "deshell-observer-agent");
     Filename.concat "bin" (executable "deshell-process-agent");
     Filename.concat "lib/de-shell" "deshell-powershell-adapter.ps1";
+    Filename.concat "lib/de-shell" "deshell-audit-corpus.ps1";
     Filename.concat "lib/de-shell" "deshell-nushell-adapter.exe";
     Filename.concat "share/de-shell" "effect-ir.schema.json";
     Filename.concat "share/de-shell" "evidence.schema.json";
     Filename.concat "share/de-shell" "adapter.schema.json";
+    Filename.concat "share/de-shell" "corpus-audit.schema.json";
   ]
   |> List.map (Filename.concat root)
 

@@ -92,6 +92,61 @@ let test_adapter_rejects_oversized_request () =
           if not (Test_support.contains ~needle:"byte limit" message) then
             Alcotest.failf "unexpected size diagnostic: %s" message)
 
+let test_static_file_differential_status () =
+  Test_support.with_temp_dir @@ fun root ->
+  let source =
+    "& 'pwsh' '-NoLogo' '-NoProfile' '-NonInteractive' '-Command' 'exit 7'\n\
+     $word = 'after'\n\
+     & 'pwsh' '-NoLogo' '-NoProfile' '-NonInteractive' '-Command' \
+     \"Write-Output $word; exit 0\"\n"
+  in
+  let script = Filename.concat root "static.ps1" in
+  Test_support.write_file script source;
+  let original =
+    Process_backend.execute
+      Runner.
+        {
+          argv =
+            [
+              powershell_program ();
+              "-NoLogo";
+              "-NoProfile";
+              "-NonInteractive";
+              "-File";
+              script;
+            ];
+          environment = [];
+          working_directory = None;
+          stdin = "";
+        }
+  in
+  let original =
+    match original with
+    | Ok value -> value
+    | Error message -> Alcotest.fail message
+  in
+  let lowered = Frontend_registry.lower ~path:"static.ps1" source in
+  let backend : Runner.backend =
+    {
+      execute = Process_backend.execute;
+      read_file = (fun _ -> Error "unused");
+      write_file = (fun ~path:_ ~contents:_ ~append:_ -> Error "unused");
+      remove_file = (fun _ -> Error "unused");
+      network_request = (fun ~method_:_ ~uri:_ -> Error "unused");
+    }
+  in
+  let plan =
+    Ir.plan ~entrypoint:"main" [ Ir.task ~name:"main" ~body:lowered.root () ]
+  in
+  let migrated =
+    match Runner.run_plan ~backend ~policy:Runner.default_policy plan with
+    | Ok value -> value
+    | Error message -> Alcotest.fail message
+  in
+  Alcotest.(check int) "exit" original.exit_code migrated.exit_code;
+  Alcotest.(check string) "stdout" original.stdout migrated.stdout;
+  Alcotest.(check string) "stderr" original.stderr migrated.stderr
+
 let () =
   Alcotest.run "PowerShell official adapter"
     [
@@ -100,5 +155,7 @@ let () =
           Alcotest.test_case "official AST" `Quick test_official_ast_parser;
           Alcotest.test_case "message limit" `Quick
             test_adapter_rejects_oversized_request;
+          Alcotest.test_case "static file differential status" `Quick
+            test_static_file_differential_status;
         ] );
     ]

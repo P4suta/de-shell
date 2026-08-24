@@ -9,7 +9,11 @@ param(
   [string] $DaggerVersion = 'v0.21.8',
 
   [Parameter()]
-  [string] $CwlImage = 'quay.io/commonwl/cwltool@sha256:05e2065d9aa0391e9cb8ed0085a80e419a031ae731b9c6aa52a2c00e554f3e51'
+  [string] $CwlImage = 'quay.io/commonwl/cwltool@sha256:05e2065d9aa0391e9cb8ed0085a80e419a031ae731b9c6aa52a2c00e554f3e51',
+
+  [Parameter()]
+  [ValidateRange(1, 3600)]
+  [int] $CommandTimeoutSeconds = 180
 )
 
 Set-StrictMode -Version Latest
@@ -58,35 +62,56 @@ function Invoke-Checked {
     [Parameter()][switch] $PassThru
   )
 
-  $previousLocation = Get-Location
-  $errorPath = Join-Path $validationRoot (
-    "stderr-{0}.log" -f [guid]::NewGuid()
-  )
-  try {
-    Set-Location -LiteralPath $WorkingDirectory
-    $output = @(& $FilePath @ArgumentList 2> $errorPath)
-    $exitCode = $LASTEXITCODE
-  }
-  finally {
-    Set-Location -LiteralPath $previousLocation
+  $startInfo = [Diagnostics.ProcessStartInfo]::new()
+  $startInfo.FileName = $FilePath
+  $startInfo.WorkingDirectory = $WorkingDirectory
+  $startInfo.UseShellExecute = $false
+  $startInfo.RedirectStandardOutput = $true
+  $startInfo.RedirectStandardError = $true
+  foreach ($argument in $ArgumentList) {
+    $startInfo.ArgumentList.Add($argument)
   }
 
-  $lines = @($output | ForEach-Object { $_.ToString() })
-  $diagnostics =
-    if (Test-Path -LiteralPath $errorPath) {
-      @(Get-Content -LiteralPath $errorPath | ForEach-Object { $_.ToString() })
+  $process = [Diagnostics.Process]::new()
+  $process.StartInfo = $startInfo
+  $timedOut = $false
+  try {
+    if (-not $process.Start()) {
+      throw "Failed to start $FilePath"
     }
-    else {
-      @()
+    $standardOutput = $process.StandardOutput.ReadToEndAsync()
+    $standardError = $process.StandardError.ReadToEndAsync()
+    if (-not $process.WaitForExit($CommandTimeoutSeconds * 1000)) {
+      $timedOut = $true
+      $process.Kill($true)
+      $process.WaitForExit()
     }
-  if (Test-Path -LiteralPath $errorPath) {
-    Remove-Item -LiteralPath $errorPath -Force
+    $outputText = $standardOutput.GetAwaiter().GetResult()
+    $diagnosticText = $standardError.GetAwaiter().GetResult()
+    $exitCode = $process.ExitCode
   }
+  finally {
+    $process.Dispose()
+  }
+
+  $lines = @(
+    if (-not [string]::IsNullOrEmpty($outputText)) {
+      $outputText.TrimEnd([char[]]@("`r", "`n")) -split "`r?`n"
+    }
+  )
+  $diagnostics = @(
+    if (-not [string]::IsNullOrEmpty($diagnosticText)) {
+      $diagnosticText.TrimEnd([char[]]@("`r", "`n")) -split "`r?`n"
+    }
+  )
   foreach ($line in $lines) {
     Write-Host $line
   }
   foreach ($line in $diagnostics) {
     Write-Host $line
+  }
+  if ($timedOut) {
+    throw "$FilePath timed out after $CommandTimeoutSeconds seconds"
   }
   if ($exitCode -ne 0) {
     throw "$FilePath exited with status $exitCode"

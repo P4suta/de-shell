@@ -52,6 +52,10 @@ let required_files () =
     ".github/settings/features.json";
     ".github/settings/labels.json";
     "adapters/nushell/dune";
+    "docs/corpus-audit.md";
+    "schema/corpus-audit.schema.json";
+    "scripts/audit-corpus.ps1";
+    "scripts/dune";
     "scripts/github-repository.ps1";
     "scripts/repository-guardrails.ps1";
     "scripts/validate-official-exporters.ps1";
@@ -293,7 +297,41 @@ let official_exporter_validation_is_hermetic () =
   check bool "artifact stdout is isolated from diagnostics" false
     (contains script "2>&1");
   check bool "official validator executes generated Dagger output" true
-    (contains script "@('call', 'main')")
+    (contains script "@('call', 'main')");
+  check bool "official tool commands have a bounded timeout" true
+    (contains script "[int] $CommandTimeoutSeconds = 180"
+    && contains script "WaitForExit($CommandTimeoutSeconds * 1000)");
+  check bool "timed out official tools terminate their process tree" true
+    (contains script "$process.Kill($true)")
+
+let corpus_audit_is_reproducible_and_nonexecuting () =
+  let script = read "scripts/audit-corpus.ps1" in
+  let schema = json "schema/corpus-audit.schema.json" in
+  let mise = read "mise.toml" in
+  let documentation = read "docs/corpus-audit.md" in
+  check bool "mise exposes corpus audit task" true
+    (contains mise "[tasks.\"corpus:audit\"]"
+    && contains mise "scripts/audit-corpus.ps1");
+  check bool "audit records source non-execution" true
+    (contains script "source_execution = $false");
+  check bool "audit verifies the post-scan source hash" true
+    (contains script "content changed after scan"
+    && contains script "Get-FileHash -LiteralPath $sourcePath");
+  check bool "audit analyzes isolated copies" true
+    (contains script
+       "Copy-Item -LiteralPath $sourcePath -Destination $destination"
+    && contains script "'deshell-corpus-audit-'");
+  check bool "audit never invokes deshell run" false (contains script "@('run'");
+  check bool "exact exclusions fail closed" true
+    (contains script "Exact repository exclusion");
+  let required = member "required" schema |> strings in
+  check bool "selection is a required report field" true
+    (List.mem "selection" required);
+  check bool "documentation quotes the exact exclusion list" true
+    (contains documentation
+       "-ExcludeRepository 'de-shell,workflow-verifier,beamtrace'");
+  check bool "documentation states the audit does not certify 1.0" true
+    (contains documentation "does not certify de-shell 1.0")
 
 let ownership_and_ci () =
   let owners = read ".github/CODEOWNERS" in
@@ -323,6 +361,8 @@ let suite =
       rust_adapter_package_rule_is_hermetic;
     test_case "hermetic official exporter validation" `Quick
       official_exporter_validation_is_hermetic;
+    test_case "reproducible non-executing corpus audit" `Quick
+      corpus_audit_is_reproducible_and_nonexecuting;
     test_case "ownership and stable CI" `Quick ownership_and_ci;
   ]
 
