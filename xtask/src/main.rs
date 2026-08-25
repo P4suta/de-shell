@@ -437,6 +437,38 @@ mod tests {
     }
 
     #[test]
+    fn solo_repository_ruleset_keeps_pr_checks_without_independent_approval() {
+        let root = repository_root();
+        let ruleset: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(root.join(".github/rulesets/default-branch.json")).unwrap(),
+        )
+        .unwrap();
+        let rules = ruleset["rules"].as_array().unwrap();
+        let pull_request = rules
+            .iter()
+            .find(|rule| rule["type"] == "pull_request")
+            .expect("the default branch must still require pull requests");
+        let review = &pull_request["parameters"];
+        assert_eq!(review["required_approving_review_count"], 0);
+        assert_eq!(review["require_code_owner_review"], false);
+        assert_eq!(review["require_last_push_approval"], false);
+        assert_eq!(review["required_review_thread_resolution"], true);
+
+        let status_checks = rules
+            .iter()
+            .find(|rule| rule["type"] == "required_status_checks")
+            .expect("the default branch must still require status checks");
+        assert_eq!(
+            status_checks["parameters"]["required_status_checks"][0]["context"],
+            "Required gate"
+        );
+        assert_eq!(
+            status_checks["parameters"]["strict_required_status_checks_policy"],
+            true
+        );
+    }
+
+    #[test]
     fn release_workflow_declares_six_archives_checksums_signing_and_provenance() {
         let root = repository_root();
         let workflow = std::fs::read_to_string(root.join(".github/workflows/release.yml")).unwrap();
