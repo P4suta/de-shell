@@ -401,6 +401,22 @@ mod tests {
     }
 
     #[test]
+    fn reference_ci_installs_the_opam_sandbox_dependency_before_setup() {
+        let root = repository_root();
+        let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
+        let install = ci
+            .find("sudo apt-get install --yes bubblewrap")
+            .expect("OCaml reference CI must install opam's bwrap sandbox dependency");
+        let setup = ci
+            .find("mise run reference:setup")
+            .expect("OCaml reference CI must initialize the private switch");
+        assert!(
+            install < setup,
+            "bubblewrap must be installed before opam init"
+        );
+    }
+
+    #[test]
     fn release_workflow_declares_six_archives_checksums_signing_and_provenance() {
         let root = repository_root();
         let workflow = std::fs::read_to_string(root.join(".github/workflows/release.yml")).unwrap();
