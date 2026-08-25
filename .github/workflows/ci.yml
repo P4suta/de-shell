@@ -47,6 +47,9 @@ jobs:
           rustc --version
           cargo --version
 
+      - name: Install Rust lint components
+        run: rustup component add clippy rustfmt
+
       - name: Lint package metadata
         run: mise run lint
 

@@ -417,6 +417,22 @@ mod tests {
     }
 
     #[test]
+    fn rust_ci_installs_lint_components_before_running_lint() {
+        let root = repository_root();
+        let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
+        let install = ci
+            .find("rustup component add clippy rustfmt")
+            .expect("Rust CI must install the clippy and rustfmt components");
+        let lint = ci
+            .find("run: mise run lint")
+            .expect("Rust CI must run the repository lint gate");
+        assert!(
+            install < lint,
+            "clippy and rustfmt must be installed before lint"
+        );
+    }
+
+    #[test]
     fn release_workflow_declares_six_archives_checksums_signing_and_provenance() {
         let root = repository_root();
         let workflow = std::fs::read_to_string(root.join(".github/workflows/release.yml")).unwrap();
