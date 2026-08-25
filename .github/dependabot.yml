@@ -20,7 +20,7 @@ updates:
           - "*"
 
   - package-ecosystem: cargo
-    directory: /adapters/nushell
+    directory: /
     schedule:
       interval: weekly
       day: monday

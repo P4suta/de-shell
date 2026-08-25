@@ -1,93 +1,48 @@
 # Changelog
 
-All notable changes will be documented here. The project follows Semantic
-Versioning once compatibility commitments are published; development versions
-before 1.0 may change with explicit migration notes.
+All notable changes are documented here. No compatibility contract predates
+0.1.0.
 
 ## [Unreleased]
 
 ### Added
 
-- Initial behavioral compiler, typed Effect IR, adapters, observer/runtime
-  boundaries, equivalent rewrite and modernization flows, differential
-  verification, and strict exporters.
-- Reproducible mise toolchain and complete fast, contract, platform,
-  differential, security, packaging, and repository-policy gates.
-- GitHub repository governance, supply-chain workflows, security reporting,
-  immutable Action references, and canonical Ruleset configuration.
-- Git-aware scanning that respects ignored generated artifacts, filters
-  structured metadata noise, and distinguishes language attributes and
-  non-shell shebangs from shell files.
-- Conservative embedded-shell inventory contracts across major JVM, .NET,
-  native, BEAM, and scripting-language families, including dynamic-expression
-  fallback and source-patching safety refusal.
-- A digest-pinned official `cwltool` validation and checksum-locked,
-  mise-managed Dagger v0.21.8 execution gate for representative generated
-  artifacts.
-- A schema-backed, non-executing corpus auditor that records its repository
-  selection, verifies post-scan content hashes, analyzes isolated copies, and
-  groups inventory and residual evidence deterministically.
-- Effect IR v2 typed PowerShell invocation contracts, including positions,
-  mandatory/switch/default behavior, scalar types, validation metadata, and
-  explicit `CmdletBinding` common-parameter capability.
-- Effect IR v3 typed `Set_variable` and `Capture_stdout` operations with
-  canonical v0/v1/v2 migration, schema validation, flow-sensitive templates,
-  secret-safe execution, property tests, and strict exporter bridge contracts.
-- `deshell run -- SCRIPT_ARG...` pass-through for original arguments that begin
-  with a dash, while retaining `--arg=VALUE` compatibility.
+- Rust 1.98 / edition 2024 implementation of the `deshell` multicall CLI and
+  hidden process-agent, observer-agent, and Nushell-adapter modes.
+- Language-neutral Effect IR v1, Evidence v1, diagnostic, project, scenario,
+  lock, replay, corpus-audit, and JSON-RPC schemas.
+- Explicit text expressions, restricted typed values, deterministic node IDs,
+  lossless UTF-8/base64 residual capsules, and strict plan validation.
+- Conservative frontends for POSIX shell, zsh, fish, PowerShell, cmd, Nushell,
+  and unknown interpreters.
+- Bounded scanning and execution, injected filesystem/process/clock/observer
+  boundaries, transactional patches, replay-only networking, and secret
+  redaction.
+- Platform-checked disposable-lab launch contracts for hardened rootless OCI,
+  Windows Sandbox, Hyper-V, and Virtualization.framework providers.
+- Strict internal, Dagger, Nushell, and CWL exporters with an explicit bridge
+  option.
+- Shared golden, CLI, schema, protocol, property, platform, differential, and
+  security contracts plus the private `xtask` conformance runner.
+- Rust-first Linux, macOS, and Windows CI and a six-target release workflow with
+  checksums, keyless signatures, provenance, smoke tests, and protected
+  crates.io publication.
 
 ### Changed
 
-- Expanded strict POSIX lowering with immutable assignment dataflow and
-  homogeneous `||` semantics, strict `pipefail` handling, command-local
-  environments, script-relative/static-subshell working directories, and
-  expansion-safe literal heredoc writes while preserving mixed or unsupported
-  forms as residual capsules.
-- Expanded PowerShell, fish, and cmd literal frontends with static
-  multi-statement files, immutable PowerShell scalar/environment dataflow,
-  typed parameters, static `ValidateSet`/`ValidateRange`/empty-string
-  contracts, help/header handling, quote-aware boundaries, and honest cmd echo
-  semantics.
-- Allowed immutable top-level POSIX assignments after a closed control-flow
-  construct while continuing to reject assignments inside active branches.
-- Lowered definitely assigned POSIX branch state, expansion-safe static
-  unquoted parameters, quoted runtime parameters inside stdout captures, and
-  ordered quoted nested command substitutions; verified all three behaviors
-  against an official POSIX shell.
-- Updated command-model v2 to classify `test` and `[` predicates with their
-  least-privilege filesystem requirements and to traverse capture bodies.
-- Made `mise run corpus:audit` depend on the production build so measurements
-  cannot silently use a stale CLI binary.
-- Made canonical template escaping, environment/secret declaration, nested-task
-  inheritance, and input rejection explicit in the internal runner.
-- Inventoried multiple embedded-shell callsites on one line with stable columns,
-  stronger JavaScript provenance checks, and fewer member-method false
-  positives.
+- Made Rust the default for `deshell`, `mise run deshell`, CI, packaging, and
+  distribution.
+- Restricted the public API to the CLI, generated bytes, JSON Schemas, and
+  JSON-RPC. Rust and OCaml modules are private and unstable.
+- Moved observed comparisons out of node guarantees and into Evidence v1 so
+  observation cannot mutate an analyzed plan.
+- Moved all maintained schemas and golden contracts under `contracts/`.
+- Retained OCaml only as an unpublished, opt-in deterministic reference.
 
-### Fixed
+### Removed
 
-- Kept opaque residual source byte-for-byte outside canonical IR template
-  expansion.
-- Rejected unsupported parameter operators and oversized positional references
-  deterministically instead of mis-expanding or raising an internal exception.
-- Preserved the source line when parsing new line-and-column host callsite
-  locators in downstream discovery logic.
-- Prevented assignments inside POSIX control flow and heredoc data lines from
-  being hoisted as unconditional immutable bindings.
-- Preserved PowerShell doubled single quotes and normal `.ps1` completion status,
-  and rejected native expression/escape syntax that the literal subsets cannot
-  model soundly.
-- Matched official PowerShell boolean/switch process-argument grammar and
-  native-argv rendering (`True`/`False`), including colon-only boolean values;
-  reproduced Int32 decimal/exponent, binary/hex, midpoint rounding, and overflow
-  behavior; rejected case-insensitive input collisions; and type-checked
-  invocation defaults before execution.
-- Prevented strict exporters from rejecting non-behavioral command-model
-  annotations while continuing to reject task interfaces they cannot preserve.
-- Bounded every official-exporter subprocess and terminated its process tree on
-  timeout instead of allowing a stalled Docker or Dagger engine to hang the
-  validation gate indefinitely.
-- Preserved newline-bearing arguments in Windows-hosted POSIX differential tests
-  by using a quoted `exec` script instead of a lossy shell argument trampoline.
+- Pre-v1 Effect IR and lock migration promises.
+- Public OCaml library/runtime/install artifacts and legacy executable-name
+  shims from the 0.1.0 distribution contract.
 
 [Unreleased]: https://github.com/P4suta/de-shell/commits/main

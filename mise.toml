@@ -10,26 +10,16 @@ dagger = "0.21.8"
 CARGO_BUILD_JOBS = "1"
 
 [tasks.setup]
-description = "Create the project-local OCaml 5.5 switch and install dependencies"
-run = [
-  "opam init --cli=2.5 --bare --no-setup --no",
-  "opam switch create . 5.5.0 --cli=2.5 --deps-only --with-test --with-dev-setup --locked --assume-depexts --yes || opam install . --cli=2.5 --switch=. --deps-only --with-test --with-dev-setup --locked --assume-depexts --yes",
-]
-run_windows = [
-  "opam init --cli=2.5 --bare --no-setup --yes",
-  "opam switch create . 5.5.0 --cli=2.5 --deps-only --with-test --with-dev-setup --locked --yes || opam install . --cli=2.5 --switch=. --deps-only --with-test --with-dev-setup --locked --yes",
-]
+description = "Fetch the locked Rust dependency graph"
+run = "cargo fetch --locked"
 
 [tasks.build]
 description = "Build de-shell"
-run = [
-  "opam exec --switch=. -- dune build -j 1",
-  "cargo build --locked --manifest-path adapters/nushell/Cargo.toml",
-]
+run = "cargo build --locked --workspace"
 
 [tasks.deshell]
 description = "Run the project-local deshell CLI"
-run = "opam exec --switch=. -- dune exec deshell --"
+run = "cargo run --locked -p deshell --"
 
 [tasks."corpus:audit"]
 description = "Audit sibling or curated repositories without executing source scripts"
@@ -37,11 +27,11 @@ depends = ["build"]
 run = "pwsh -NoLogo -NoProfile -File scripts/audit-corpus.ps1"
 
 [tasks.lint]
-description = "Lint package metadata and GitHub Actions"
+description = "Lint Rust, repository metadata, and GitHub Actions"
 run = [
+  "cargo clippy --locked --workspace --all-targets -- -D warnings",
   "mise run repository:guardrails",
-  "opam lint de-shell.opam de-shell.opam.locked",
-  "actionlint .github/workflows/ci.yml .github/workflows/dependency-review.yml .github/workflows/scorecard.yml",
+  "actionlint .github/workflows/ci.yml .github/workflows/release.yml .github/workflows/dependency-review.yml .github/workflows/scorecard.yml",
 ]
 
 [tasks."repository:guardrails"]
@@ -58,53 +48,90 @@ run = "pwsh -NoLogo -NoProfile -File scripts/github-repository.ps1 -Mode Verify 
 
 [tasks."test:fast"]
 description = "Run deterministic unit and property tests"
-run = "opam exec --switch=. -- dune build -j 1 @test-fast"
+run = "cargo test --locked -p deshell"
 
 [tasks."test:contract"]
 description = "Run CLI, schema, and adapter contract tests"
 run = [
-  "cargo test --locked --manifest-path adapters/nushell/Cargo.toml",
-  "opam exec --switch=. -- dune build -j 1 @test-contract",
+  "cargo build --locked -p deshell",
+  "cargo run --locked -p xtask -- conformance target/debug/deshell",
 ]
 
 [tasks."test:adapters"]
-description = "Run official parser adapter contracts"
-run = "cargo test --locked --manifest-path adapters/nushell/Cargo.toml"
+description = "Run internal JSON-RPC adapter and agent contracts"
+run = "cargo test --locked -p deshell protocol::tests"
 
 [tasks."test:official-exporters"]
 description = "Validate a representative export with mise-pinned official tools"
+depends = ["build"]
 run = "pwsh -NoLogo -NoProfile -File scripts/validate-official-exporters.ps1"
 
 [tasks."test:platform"]
 description = "Run platform-facing tests"
-run = "opam exec --switch=. -- dune build -j 1 @test-platform"
+run = [
+  "cargo test --locked -p deshell agent_process::tests",
+  "cargo test --locked -p deshell lab::tests",
+  "cargo test --locked -p deshell local_backend::tests",
+  "cargo test --locked -p deshell scanner::tests",
+  "cargo test --locked -p deshell workspace::tests",
+]
 
 [tasks."test:differential"]
 description = "Run differential behavior tests"
-run = "opam exec --switch=. -- dune build -j 1 @test-differential"
+run = "cargo test --locked -p deshell differential::tests"
 
 [tasks."test:security"]
 description = "Run security regression tests"
-run = "opam exec --switch=. -- dune build -j 1 @test-security"
+run = [
+  "cargo test --locked -p deshell patch::tests",
+  "cargo test --locked -p deshell replay::tests",
+  "cargo test --locked -p deshell strict_json::tests",
+  "cargo test --locked -p deshell protocol::tests",
+]
 
 [tasks.test]
 description = "Run the complete test suite"
 run = [
-  "cargo test --locked --manifest-path adapters/nushell/Cargo.toml",
-  "opam exec --switch=. -- dune build -j 1 @test-all",
+  "cargo test --locked --workspace",
+  "cargo build --locked -p deshell",
+  "cargo run --locked -p xtask -- conformance target/debug/deshell",
 ]
 
 [tasks.package]
-description = "Build the installable opam package"
-run = [
-  "opam exec --switch=. -- dune build -j 1 -p de-shell",
-  "opam exec --switch=. -- dune exec ./test/package_check.bc -- _build/install/default",
-]
+description = "Build and verify the crates.io package payload"
+run = "cargo package --locked"
 
 [tasks.fmt]
-description = "Format OCaml and Dune sources"
-run = "opam exec --switch=. -- dune fmt || opam exec --switch=. -- dune fmt"
+description = "Format the Rust implementation"
+run = "cargo fmt --all"
 
 [tasks."fmt:check"]
-description = "Check OCaml and Dune source formatting"
-run = "opam exec --switch=. -- dune build @fmt"
+description = "Check Rust formatting"
+run = "cargo fmt --all --check"
+
+[tasks."reference:setup"]
+description = "Install dependencies for the unpublished OCaml reference implementation"
+run = [
+  "opam init --cli=2.5 --bare --no-setup --no",
+  "opam switch create . 5.5.0 --cli=2.5 --deps-only --with-test --with-dev-setup --locked --assume-depexts --yes || opam install . --cli=2.5 --switch=. --deps-only --with-test --with-dev-setup --locked --assume-depexts --yes",
+]
+run_windows = [
+  "opam init --cli=2.5 --bare --no-setup --yes",
+  "opam switch create . 5.5.0 --cli=2.5 --deps-only --with-test --with-dev-setup --locked --yes || opam install . --cli=2.5 --switch=. --deps-only --with-test --with-dev-setup --locked --yes",
+]
+
+[tasks."reference:build"]
+description = "Build and check the unpublished OCaml Effect IR v1 reference"
+run = "opam exec --switch=. -- dune build @reference-v1 -j 1"
+
+[tasks."reference:test"]
+description = "Compare the OCaml reference with the shared v1 golden corpus"
+run = "opam exec --switch=. -- dune exec bin/reference_conformance.exe -- contracts/golden/frontend-v1.json contracts/golden/transform-export-v1.json"
+
+[tasks."reference:fmt"]
+description = "Format the unpublished OCaml v1 reference"
+run = "opam exec --switch=. -- ocamlformat --inplace lib/reference_v1.ml bin/reference_conformance.ml"
+
+[tasks."reference:fmt:check"]
+description = "Check formatting of the unpublished OCaml v1 reference"
+run = "opam exec --switch=. -- ocamlformat --check lib/reference_v1.ml bin/reference_conformance.ml"

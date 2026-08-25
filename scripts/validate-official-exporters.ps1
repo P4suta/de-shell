@@ -123,9 +123,10 @@ function Invoke-Checked {
 
 Assert-TemporaryChild -Path $validationRoot
 
-$opam = Resolve-Tool -Name 'opam'
 $docker = Resolve-Tool -Name 'docker'
 $git = Resolve-Tool -Name 'git'
+$binaryName = if ($IsWindows) { 'deshell.exe' } else { 'deshell' }
+$deshell = Resolve-Tool -Name (Join-Path $repositoryRoot (Join-Path 'target/debug' $binaryName))
 if ([string]::IsNullOrWhiteSpace($DaggerExecutable)) {
   $DaggerExecutable = Resolve-Tool -Name 'dagger'
 }
@@ -138,25 +139,20 @@ try {
   Copy-Item -LiteralPath (Join-Path $repositoryRoot 'examples/static-printf.sh') `
     -Destination (Join-Path $validationRoot 'static-printf.sh')
 
-  $dune = @('exec', '--switch=.', '--', 'dune', 'exec', 'deshell', '--')
-  Invoke-Checked -FilePath $opam -ArgumentList (
-    $dune + @('init', '--root', $validationRoot)
+  Invoke-Checked -FilePath $deshell -ArgumentList @('init', '--root', $validationRoot)
+  Invoke-Checked -FilePath $deshell -ArgumentList @(
+    'analyze',
+    '--root', $validationRoot,
+    '--entry', 'static-printf.sh'
   )
-  Invoke-Checked -FilePath $opam -ArgumentList (
-    $dune + @(
-      'analyze',
-      '--root', $validationRoot,
-      '--entry', 'static-printf.sh'
-    )
-  )
-  $cwlArtifact = Invoke-Checked -FilePath $opam -ArgumentList (
-    $dune + @('export', '--root', $validationRoot, '--target', 'cwl')
-  ) -PassThru
+  $cwlArtifact = Invoke-Checked -FilePath $deshell `
+    -ArgumentList @('export', '--root', $validationRoot, '--target', 'cwl') `
+    -PassThru
   Set-Content -LiteralPath (Join-Path $validationRoot 'deshell.cwl') `
     -Value ($cwlArtifact -join "`n") -Encoding utf8NoBOM -NoNewline
-  $daggerArtifact = Invoke-Checked -FilePath $opam -ArgumentList (
-    $dune + @('export', '--root', $validationRoot, '--target', 'dagger')
-  ) -PassThru
+  $daggerArtifact = Invoke-Checked -FilePath $deshell `
+    -ArgumentList @('export', '--root', $validationRoot, '--target', 'dagger') `
+    -PassThru
   Set-Content -LiteralPath (Join-Path $validationRoot 'deshell.dagger.ts') `
     -Value ($daggerArtifact -join "`n") -Encoding utf8NoBOM -NoNewline
 

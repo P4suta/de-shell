@@ -131,15 +131,47 @@ function Get-InventoryOrigin {
   return $Locator
 }
 
+function ConvertTo-SortedJsonValue {
+  param([AllowNull()][object] $Value)
+
+  if ($null -eq $Value) {
+    return $null
+  }
+  if ($Value -is [Collections.IDictionary]) {
+    $sorted = [ordered]@{}
+    foreach ($key in @($Value.Keys | Sort-Object -CaseSensitive)) {
+      $sorted[[string]$key] = ConvertTo-SortedJsonValue $Value[$key]
+    }
+    return $sorted
+  }
+  if ($Value -is [Management.Automation.PSCustomObject]) {
+    $sorted = [ordered]@{}
+    foreach ($property in @($Value.PSObject.Properties | Sort-Object Name -CaseSensitive)) {
+      $sorted[$property.Name] = ConvertTo-SortedJsonValue $property.Value
+    }
+    return $sorted
+  }
+  if ($Value -is [Collections.IEnumerable] -and $Value -isnot [string]) {
+    $items = @(
+      foreach ($item in $Value) {
+        ConvertTo-SortedJsonValue $item
+      }
+    )
+    return ,$items
+  }
+  return $Value
+}
+
 $resolvedCorpusRoot = (Resolve-Path -LiteralPath $CorpusRoot).Path
 if (-not (Test-Path -LiteralPath $resolvedCorpusRoot -PathType Container)) {
   throw "CorpusRoot is not a directory: $CorpusRoot"
 }
 
 if ([string]::IsNullOrWhiteSpace($DeshellExecutable)) {
+  $binaryName = if ($IsWindows) { 'deshell.exe' } else { 'deshell' }
   $workspaceExecutable = Join-Path `
     (Split-Path -Parent $PSScriptRoot) `
-    '_build/default/bin/main.exe'
+    (Join-Path 'target/debug' $binaryName)
   if (Test-Path -LiteralPath $workspaceExecutable -PathType Leaf) {
     $DeshellExecutable = $workspaceExecutable
   } else {
@@ -254,7 +286,7 @@ try {
         nodes = [ordered]@{
           formal = 0
           exhaustive = 0
-          differential = 0
+          observations = 0
           residual = 0
         }
         residual_reasons = @()
@@ -284,7 +316,7 @@ try {
         nodes = [ordered]@{
           formal = 0
           exhaustive = 0
-          differential = 0
+          observations = 0
           residual = 0
         }
         residual_reasons = @()
@@ -307,7 +339,7 @@ try {
         nodes = [ordered]@{
           formal = 0
           exhaustive = 0
-          differential = 0
+          observations = 0
           residual = 0
         }
         residual_reasons = @()
@@ -332,7 +364,7 @@ try {
       nodes = [ordered]@{
         formal = @($levels | Where-Object { $_ -eq 'formal' }).Count
         exhaustive = @($levels | Where-Object { $_ -eq 'exhaustive' }).Count
-        differential = @($levels | Where-Object { $_ -eq 'differential' }).Count
+        observations = @($evidence.observations).Count
         residual = $residualReasons.Count
       }
       residual_reasons = $residualReasons
@@ -422,7 +454,7 @@ $formal = ($successfulResults | ForEach-Object { $_.nodes.formal } |
   Measure-Object -Sum).Sum
 $exhaustive = ($successfulResults | ForEach-Object { $_.nodes.exhaustive } |
   Measure-Object -Sum).Sum
-$differential = ($successfulResults | ForEach-Object { $_.nodes.differential } |
+$observations = ($successfulResults | ForEach-Object { $_.nodes.observations } |
   Measure-Object -Sum).Sum
 $residual = ($successfulResults | ForEach-Object { $_.nodes.residual } |
   Measure-Object -Sum).Sum
@@ -432,6 +464,7 @@ $fullyNonResidual = @(
 
 $report = [ordered]@{
   schema_version = 1
+  selection_date = '2026-08-25'
   analysis_scope = 'shell_files'
   selection = [ordered]@{
     repository_scope = 'immediate_children'
@@ -455,7 +488,7 @@ $report = [ordered]@{
     nodes = [ordered]@{
       formal = [int]$formal
       exhaustive = [int]$exhaustive
-      differential = [int]$differential
+      observations = [int]$observations
       residual = [int]$residual
     }
   }
@@ -468,7 +501,7 @@ $report = [ordered]@{
   failures = @($failures)
 }
 
-$json = $report | ConvertTo-Json -Depth 12
+$json = ConvertTo-SortedJsonValue $report | ConvertTo-Json -Depth 12
 if (-not [string]::IsNullOrWhiteSpace($OutputPath)) {
   $outputFullPath = [IO.Path]::GetFullPath($OutputPath)
   $outputDirectory = Split-Path -Parent $outputFullPath
@@ -477,7 +510,7 @@ if (-not [string]::IsNullOrWhiteSpace($OutputPath)) {
   }
   [IO.File]::WriteAllText(
     $outputFullPath,
-    $json + [Environment]::NewLine,
+    $json + "`n",
     [Text.UTF8Encoding]::new($false)
   )
 }
@@ -504,10 +537,10 @@ if ($Format -eq 'Json') {
     )
   [Console]::Out.WriteLine($summaryLine)
   $nodesLine =
-    'nodes formal={0} exhaustive={1} differential={2} residual={3}' -f @(
+    'nodes formal={0} exhaustive={1} observations={2} residual={3}' -f @(
       $report.summary.nodes.formal,
       $report.summary.nodes.exhaustive,
-      $report.summary.nodes.differential,
+      $report.summary.nodes.observations,
       $report.summary.nodes.residual
     )
   [Console]::Out.WriteLine($nodesLine)

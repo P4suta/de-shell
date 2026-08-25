@@ -1,0 +1,58 @@
+{
+  "$id": "https://deshell.dev/contracts/replay/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "entries": { "items": { "$ref": "#/$defs/entry" }, "type": "array" },
+    "schema_version": { "const": 1 }
+  },
+  "required": ["schema_version", "entries"],
+  "title": "de-shell network replay v1",
+  "type": "object",
+  "$defs": {
+    "entry": {
+      "additionalProperties": false,
+      "properties": {
+        "body": { "$ref": "#/$defs/sourceBytes" },
+        "headers": { "items": { "$ref": "#/$defs/header" }, "type": "array" },
+        "method": { "pattern": "^[A-Z-]+$", "type": "string" },
+        "request_body_sha256": { "pattern": "^[0-9a-f]{64}$", "type": "string" },
+        "status": { "maximum": 599, "minimum": 100, "type": "integer" },
+        "uri": { "minLength": 1, "type": "string" }
+      },
+      "required": ["method", "uri", "request_body_sha256", "status", "headers", "body"],
+      "type": "object"
+    },
+    "header": {
+      "additionalProperties": false,
+      "properties": {
+        "name": { "minLength": 1, "type": "string" },
+        "value": { "type": "string" }
+      },
+      "required": ["name", "value"],
+      "type": "object"
+    },
+    "sourceBytes": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "encoding": { "const": "utf8" },
+            "text": { "type": "string" }
+          },
+          "required": ["encoding", "text"],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "base64": { "contentEncoding": "base64", "type": "string" },
+            "encoding": { "const": "base64" }
+          },
+          "required": ["encoding", "base64"],
+          "type": "object"
+        }
+      ]
+    }
+  }
+}

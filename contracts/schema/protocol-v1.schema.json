@@ -1,0 +1,39 @@
+{
+  "$id": "https://deshell.dev/contracts/protocol/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "oneOf": [
+    {
+      "additionalProperties": true,
+      "properties": {
+        "id": { "type": ["integer", "string"] },
+        "jsonrpc": { "const": "2.0" },
+        "method": { "minLength": 1, "type": "string" },
+        "params": { "additionalProperties": true, "type": "object" }
+      },
+      "required": ["jsonrpc", "id", "method", "params"],
+      "type": "object"
+    },
+    {
+      "additionalProperties": true,
+      "oneOf": [{ "required": ["result"] }, { "required": ["error"] }],
+      "properties": {
+        "error": {
+          "additionalProperties": true,
+          "properties": {
+            "code": { "type": "integer" },
+            "data": true,
+            "message": { "type": "string" }
+          },
+          "required": ["code", "message"],
+          "type": "object"
+        },
+        "id": { "type": ["integer", "string", "null"] },
+        "jsonrpc": { "const": "2.0" },
+        "result": { "additionalProperties": true, "type": "object" }
+      },
+      "required": ["jsonrpc", "id"],
+      "type": "object"
+    }
+  ],
+  "title": "de-shell JSON-RPC v1 envelope"
+}

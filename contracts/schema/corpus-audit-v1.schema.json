@@ -1,0 +1,168 @@
+{
+  "$id": "https://deshell.dev/contracts/corpus-audit/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "analysis_scope": { "const": "shell_files" },
+    "failures": {
+      "items": { "minLength": 1, "type": "string" },
+      "type": "array"
+    },
+    "files": { "items": { "$ref": "#/$defs/file" }, "type": "array" },
+    "fully_non_residual_files": {
+      "items": { "minLength": 1, "type": "string" },
+      "type": "array",
+      "uniqueItems": true
+    },
+    "inventory_groups": {
+      "items": { "$ref": "#/$defs/inventoryGroup" },
+      "type": "array"
+    },
+    "repositories": {
+      "items": { "minLength": 1, "type": "string" },
+      "type": "array",
+      "uniqueItems": true
+    },
+    "residual_reason_groups": {
+      "items": { "$ref": "#/$defs/residualReasonGroup" },
+      "type": "array"
+    },
+    "schema_version": { "const": 1 },
+    "selection": {
+      "additionalProperties": false,
+      "properties": {
+        "excluded_patterns": {
+          "items": { "minLength": 1, "type": "string" },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "excluded_repositories": {
+          "items": { "minLength": 1, "type": "string" },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "repository_scope": { "const": "immediate_children" },
+        "source_execution": { "const": false }
+      },
+      "required": [
+        "repository_scope",
+        "excluded_repositories",
+        "excluded_patterns",
+        "source_execution"
+      ],
+      "type": "object"
+    },
+    "selection_date": { "const": "2026-08-25" },
+    "summary": {
+      "additionalProperties": false,
+      "properties": {
+        "analysis_failures": { "$ref": "#/$defs/count" },
+        "fully_non_residual": { "$ref": "#/$defs/count" },
+        "locations": {
+          "additionalProperties": false,
+          "properties": {
+            "candidates": { "$ref": "#/$defs/count" },
+            "embedded_shell": { "$ref": "#/$defs/count" },
+            "shell_files": { "$ref": "#/$defs/count" },
+            "total": { "$ref": "#/$defs/count" }
+          },
+          "required": ["total", "shell_files", "embedded_shell", "candidates"],
+          "type": "object"
+        },
+        "nodes": { "$ref": "#/$defs/nodeCounts" },
+        "repositories_scanned": { "$ref": "#/$defs/count" }
+      },
+      "required": [
+        "repositories_scanned",
+        "locations",
+        "analysis_failures",
+        "fully_non_residual",
+        "nodes"
+      ],
+      "type": "object"
+    }
+  },
+  "required": [
+    "schema_version",
+    "selection_date",
+    "analysis_scope",
+    "selection",
+    "repositories",
+    "summary",
+    "fully_non_residual_files",
+    "inventory_groups",
+    "residual_reason_groups",
+    "files",
+    "failures"
+  ],
+  "title": "de-shell 48-repository audit v1",
+  "type": "object",
+  "$defs": {
+    "count": { "minimum": 0, "type": "integer" },
+    "file": {
+      "additionalProperties": false,
+      "properties": {
+        "content_hash": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "error": {
+          "oneOf": [
+            { "minLength": 1, "type": "string" },
+            { "type": "null" }
+          ]
+        },
+        "fully_non_residual": { "type": "boolean" },
+        "interpreter": { "minLength": 1, "type": "string" },
+        "location": { "minLength": 1, "type": "string" },
+        "nodes": { "$ref": "#/$defs/nodeCounts" },
+        "residual_reasons": {
+          "items": { "minLength": 1, "type": "string" },
+          "type": "array"
+        }
+      },
+      "required": [
+        "location",
+        "interpreter",
+        "content_hash",
+        "fully_non_residual",
+        "nodes",
+        "residual_reasons",
+        "error"
+      ],
+      "type": "object"
+    },
+    "inventoryGroup": {
+      "additionalProperties": false,
+      "properties": {
+        "count": { "$ref": "#/$defs/count" },
+        "interpreter": { "minLength": 1, "type": "string" },
+        "kind": { "minLength": 1, "type": "string" },
+        "origin": { "minLength": 1, "type": "string" }
+      },
+      "required": ["count", "kind", "origin", "interpreter"],
+      "type": "object"
+    },
+    "nodeCounts": {
+      "additionalProperties": false,
+      "properties": {
+        "exhaustive": { "$ref": "#/$defs/count" },
+        "formal": { "$ref": "#/$defs/count" },
+        "observations": { "$ref": "#/$defs/count" },
+        "residual": { "$ref": "#/$defs/count" }
+      },
+      "required": ["formal", "exhaustive", "observations", "residual"],
+      "type": "object"
+    },
+    "residualReasonGroup": {
+      "additionalProperties": false,
+      "properties": {
+        "count": { "$ref": "#/$defs/count" },
+        "interpreter": { "minLength": 1, "type": "string" },
+        "reason": { "minLength": 1, "type": "string" }
+      },
+      "required": ["count", "interpreter", "reason"],
+      "type": "object"
+    }
+  }
+}

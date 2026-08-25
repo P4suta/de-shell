@@ -1,4 +1,5 @@
 (library
- (name deshell)
- (public_name de-shell.lib)
- (libraries cmdliner threads unix yojson))
+ (name deshell_reference_v1)
+ (wrapped false)
+ (modules sha256 reference_v1)
+ (libraries yojson))

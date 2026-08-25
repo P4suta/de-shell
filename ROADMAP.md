@@ -1,104 +1,70 @@
 # Roadmap
 
-The compiler remains executable at every stage through explicit residual
-capsules. “Implemented” below means the code contract exists in this repository;
-it does not substitute for the external hardware, signing, and corpus evidence
-required to call a release 1.0.
+The first public release is the Rust `deshell` 0.1.0 CLI. Work is accepted in
+Red, Green, Refactor increments, and a checked box means the repository contains
+the implementation and deterministic test—not that an external release or
+hardware gate has already run.
 
-## 0.1 Foundation — implemented
+## 0.1.0 contract and compiler — implemented
 
-- black-box CLI acceptance tests and versioned JSON schemas
-- hierarchical typed Effect IR v3, validation, canonical codec, v0/v1/v2 schema
-  migration, typed scalar state, and ordered stdout capture
-- content hashing and atomic multi-file create/patch transactions
-- JSON-RPC handshake, malformed/disconnect/timeout/size contracts
-- internal runner, project-scoped process agent, and strict capability policy
-- mise-pinned OCaml, Rust, PowerShell, and lint toolchains
-- verified package payload for all bundled executables, adapters, and schemas
+- [x] Language-neutral Effect IR v1, Evidence v1, diagnostic, project, lock,
+  replay, audit, and JSON-RPC contracts under `contracts/`.
+- [x] Explicit text expressions and the restricted value model, with duplicate
+  name rejection and normalized project-relative paths.
+- [x] Domain-separated deterministic node IDs and Unicode-scalar source
+  coordinates over half-open byte spans.
+- [x] Strict JSON decoding, deterministic pretty persistence, canonical digest
+  bytes, and no pre-v1 migration surface.
+- [x] Conservative POSIX, zsh, fish, PowerShell, cmd, Nushell, and unknown
+  interpreter frontends with lossless residual source.
+- [x] Bounded scanner, transactional rewrite/modernize, strict export, project
+  lifecycle, replay, runner, disposable-lab launch contracts, and Evidence-only
+  differential observation.
+- [x] Single Rust multicall executable with hidden process, observer, and
+  Nushell adapter modes.
+- [x] Fixed exit categories and stderr-only human/JSONL diagnostics.
+- [x] Shared frontend golden corpus, CLI cases, schema byte checks, agent
+  handshakes, unit/property/security tests, and a private conformance runner.
 
-## 0.2 POSIX vertical slice — implemented core
+## Rust default and distribution — implemented in repository
 
-- conservative POSIX sh/Bash lowering with precise source maps
-- literal commands, immutable assignments, pipelines, sequences, `&&`,
-  homogeneous `||`, simple `if`, and static `for`
-- typed assignments across control-flow branches, expansion-safe static
-  unquoted fields, and whole-RHS stdout capture with quoted runtime parameters
-  and quoted nested command substitutions
-- command-local environments, strict option parsing, script-relative and
-  static-subshell working directories, and expansion-safe literal heredoc writes
-- declared environment and secret propagation through nested runtime tasks
-- equivalent rewrite rules and separate modernization profiles
-- command-effect model, bounded concolic scenarios, and differential engine
-- disposable rootless OCI specification and observer agent
-- strict Dagger export with immutable base-image reference
+- [x] Rust 1.98 / edition 2024 root package and private `xtask` workspace member.
+- [x] Rust-first `mise run deshell`, build, test, lint, conformance, and package
+  tasks; OCaml commands are explicit `reference:*` tasks.
+- [x] Linux, macOS, and Windows CI for the Rust test, conformance, and package
+  gates.
+- [x] A tag workflow defining six release archives across Linux musl, macOS,
+  and Windows on x86_64 and Arm64.
+- [x] SHA-256 manifests, keyless signature bundle, GitHub build provenance, and
+  protected final-tag crates.io publication steps.
+- [x] Embedded v1 schemas and PowerShell adapter in the Cargo package payload.
 
-Broader POSIX grammar coverage is driven by minimized corpus regressions; syntax
-outside the proven subset remains an executable residual rather than an unsafe
-guess.
+## 0.1.0 release evidence — must pass before publication
 
-## 0.3 Repository and Windows migration — implemented core
+- [ ] Run every fast, contract, platform, differential, security, package,
+  official-exporter, and workflow gate from `v0.1.0-rc.1`, including the
+  required three-operating-system matrix.
+- [ ] Run the fixed 2026-08-25 48-repository audit selection through both
+  deterministic implementations and record zero unexplained differences in
+  inventory, IR, guarantees, residual reasons, diagnostics, patches, and
+  exports.
+- [ ] Install and smoke all six archives, including `--version`, every embedded
+  schema, and all three internal-agent handshakes.
+- [ ] Verify SHA-256 checksums, Sigstore bundle, and provenance for every
+  archive.
+- [ ] Confirm crates.io package-name ownership before the irreversible publish
+  operation. If `deshell` is unavailable, publish package `deshell-cli` while
+  retaining binary name `deshell`.
+- [ ] Obtain the release-environment owner approval and publish `v0.1.0`.
 
-- syntax-aware embedded-shell inventory and call graph
-- conservative host-language callsite inventory across major JVM, .NET,
-  native, BEAM, and scripting-language families
-- separate line-and-column locators for same-line callsites and import-aware
-  JavaScript direct-shell APIs
-- exact-call-only transactional callsite replacement
-- official PowerShell AST oracle contract and conservative cmd frontend
-- Windows Sandbox hardening, agent mapping, lifecycle, and result decoding
-- Hyper-V guest-agent protocol
-- Nushell and CWL exporters with strict capability rejection
+## After 0.1.0
 
-The signed Hyper-V launcher and release-corpus-wide official runner
-certification remain release artifacts/gates. A representative CWL/Dagger
-artifact is already validated and executed by the optional pinned local gate.
-
-Host-language inventory is deliberately broader than host-language rewriting.
-Each syntax family needs a CST-aware patcher before its source callsites can be
-changed automatically; until then, transactional apply rejects those locations.
-
-## 0.4 Breadth — implemented core
-
-- contract suites for zsh, fish, PowerShell, cmd, and Nushell literal subsets
-- pinned official Nushell parser adapter and unknown-interpreter trace fallback
-- replay tape codec and network backend, including secret-safe tape recording
-- time/random/network exchange types and isolated replay-network launch contracts
-- Virtualization.framework guest-agent protocol
-
-Full time/random syscall interception, a signed macOS launcher, and physical
-macOS guest execution remain release gates.
-
-## 0.9–1.0 Hardening — release gates
-
-- keep the non-executing, hash-verified corpus audit and its JSON schema stable
-- collect and minimize failures from real automation projects before each fix
-- validate the complete release artifact corpus with official Dagger and CWL
-  tools (the representative pinned local gate is implemented)
-- publish a digest-pinned multi-shell lab image and record its digest in locks
-- build and sign native binaries/installers for Linux, macOS, and Windows
-- supply signed Hyper-V and Virtualization.framework launcher helpers
-- demonstrate zero unexplained differences in the declared scenario corpus
-- demonstrate at least 95% non-residual semantic-node coverage
-- demonstrate 100% executable non-interactive scripts with residuals included
-- demonstrate 100% inventory of the declared embedded formats
-- pass the complete 7-shell x 3-OS release matrix on appropriate hardware
-
-The `Release_gate` evaluator encodes these quantitative criteria and refuses an
-empty corpus or an incomplete matrix. A release is not 1.0 until real evidence,
-not placeholder values, makes that evaluator pass.
-
-The 2026-08-25 local audit currently reports 2 of 47 raw shell files as fully
-non-residual, with 47 formal and 45 residual nodes across 48 repositories. The
-previous 16-file typed PowerShell parameter-block group has been eliminated;
-typed POSIX branch assignments eliminated the former six-file control-state
-group, safe unquoted expansion reduced that first-boundary group from four files
-to one, and stdout capture eliminated the five-file command-substitution
-first-boundary group. Those files now reach later special-parameter or redirect
-semantics. The largest remaining groups are 11 PowerShell expression/state
-assignments, eight POSIX redirect/asynchronous cases, five generated cmd Gradle
-launchers, and three each of effectful PowerShell validation and POSIX special
-parameters. Completion definitions and generated launchers are included in that
-raw denominator; the declared non-interactive release corpus will be a separate,
-scenario-backed gate. See
-[docs/corpus-audit.md](docs/corpus-audit.md) for the reproducible selection and
-interpretation.
+- Keep the unpublished OCaml reference aligned for deterministic IR, analysis,
+  transformation, and export checks; do not add OCaml runtime or distribution
+  work.
+- Expand parser coverage only through minimized corpus reproductions. Unknown
+  behavior remains residual until its semantics are proven.
+- Extend disposable-lab and physical OS integration in Rust.
+- Defer a public Rust SDK, GUI, parser replacement, OS-specific installers, and
+  the complete 1.0 21-cell hardware certification until their own versioned
+  contracts exist.

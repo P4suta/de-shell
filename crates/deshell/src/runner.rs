@@ -1,0 +1,1176 @@
+use crate::ir::{
+    Guarantee, NamedExpression, Node, Operation, Plan, PrimitiveType, Task, TextExpression,
+    ValueType,
+};
+use std::collections::{BTreeMap, BTreeSet};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProcessRequest {
+    pub argv: Vec<String>,
+    pub environment: Vec<(String, String)>,
+    pub working_directory: Option<String>,
+    pub stdin: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CapsuleRequest {
+    pub interpreter: String,
+    pub source: Vec<u8>,
+    pub arguments: Vec<String>,
+    pub environment: Vec<(String, String)>,
+    pub stdin: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProcessResult {
+    pub exit_code: i32,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+pub(crate) trait Backend: Sync {
+    fn execute(&self, request: ProcessRequest) -> Result<ProcessResult, String>;
+    fn execute_capsule(&self, request: CapsuleRequest) -> Result<ProcessResult, String>;
+    fn read_file(&self, path: &str) -> Result<Vec<u8>, String>;
+    fn write_file(&self, path: &str, contents: &[u8], append: bool) -> Result<(), String>;
+    fn remove_file(&self, path: &str) -> Result<(), String>;
+    fn network_request(&self, method: &str, uri: &str) -> Result<Vec<u8>, String>;
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct Policy {
+    pub allow_file_read: bool,
+    pub allow_file_write: bool,
+    pub allow_network: bool,
+    pub allow_opaque: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RunErrorKind {
+    Execution,
+    Invalid,
+    Policy,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RunError {
+    pub kind: RunErrorKind,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum TraceEvent {
+    Process { argv: Vec<String>, exit_code: i32 },
+    FileRead { path: String },
+    FileWrite { path: String },
+    FileRemove { path: String },
+    Network { method: String, uri: String },
+    Opaque { interpreter: String, exit_code: i32 },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RunResult {
+    pub exit_code: i32,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub trace: Vec<TraceEvent>,
+}
+
+pub(crate) fn run_plan(
+    backend: &dyn Backend,
+    policy: Policy,
+    plan: &Plan,
+    host_environment: &BTreeMap<String, String>,
+    named_inputs: &BTreeMap<String, String>,
+    arguments: &[String],
+) -> Result<RunResult, RunError> {
+    plan.validate()
+        .map_err(|errors| invalid(errors.join("; ")))?;
+    let tasks: BTreeMap<&str, &Task> = plan
+        .tasks
+        .iter()
+        .map(|task| (task.name.as_str(), task))
+        .collect();
+    let executor = Executor {
+        backend,
+        policy,
+        tasks,
+        host_environment,
+        script_arguments: arguments,
+    };
+    executor.run_task(&plan.entrypoint, named_inputs, arguments, &[])
+}
+
+#[derive(Clone)]
+struct Context {
+    variables: BTreeMap<String, String>,
+    arguments: BTreeMap<String, String>,
+    process_environment: BTreeMap<String, String>,
+    secret_names: BTreeSet<String>,
+    secret_values: Vec<String>,
+}
+
+struct Executor<'a> {
+    backend: &'a dyn Backend,
+    policy: Policy,
+    tasks: BTreeMap<&'a str, &'a Task>,
+    host_environment: &'a BTreeMap<String, String>,
+    script_arguments: &'a [String],
+}
+
+impl Executor<'_> {
+    fn run_task(
+        &self,
+        name: &str,
+        provided: &BTreeMap<String, String>,
+        positional: &[String],
+        stack: &[String],
+    ) -> Result<RunResult, RunError> {
+        if stack.iter().any(|item| item == name) {
+            return Err(invalid(format!(
+                "recursive task call detected: {} -> {name}",
+                stack.join(" -> ")
+            )));
+        }
+        let task = self
+            .tasks
+            .get(name)
+            .ok_or_else(|| invalid(format!("task not found: {name}")))?;
+        let arguments = bind_task_arguments(task, provided, positional)?;
+        let expected: BTreeSet<&str> = task
+            .inputs
+            .iter()
+            .map(|binding| binding.name.as_str())
+            .collect();
+        for name in provided.keys() {
+            if !expected.contains(name.as_str()) {
+                return Err(invalid(format!(
+                    "task {} received unknown input {name}",
+                    task.name
+                )));
+            }
+        }
+        for binding in &task.inputs {
+            let value = arguments.get(&binding.name).ok_or_else(|| {
+                invalid(format!(
+                    "task {} is missing input {}",
+                    task.name, binding.name
+                ))
+            })?;
+            normalize_value(&binding.name, &binding.value_type, value).map_err(invalid)?;
+        }
+
+        let mut variables = BTreeMap::new();
+        let mut process_environment = BTreeMap::new();
+        for name in &task.environment {
+            if let Some(value) = self.host_environment.get(name) {
+                variables.insert(name.clone(), value.clone());
+                process_environment.insert(name.clone(), value.clone());
+            }
+        }
+        let secret_names: BTreeSet<String> = task.secrets.iter().cloned().collect();
+        let mut secret_values = Vec::new();
+        for secret in &secret_names {
+            if let Some(value) = arguments.get(secret).or_else(|| variables.get(secret))
+                && !value.is_empty()
+            {
+                secret_values.push(value.clone());
+            }
+        }
+        secret_values.sort_by_key(|value| std::cmp::Reverse(value.len()));
+        secret_values.dedup();
+        let context = Context {
+            variables,
+            arguments,
+            process_environment,
+            secret_names,
+            secret_values,
+        };
+        let mut next_stack = stack.to_vec();
+        next_stack.push(name.to_owned());
+        self.run_node(&task.body, context, Vec::new(), &next_stack)
+            .map(|(result, _)| result)
+    }
+
+    fn run_node(
+        &self,
+        node: &Node,
+        context: Context,
+        stdin: Vec<u8>,
+        stack: &[String],
+    ) -> Result<(RunResult, Context), RunError> {
+        match &node.operation {
+            Operation::Exec {
+                argv,
+                environment,
+                working_directory,
+            } => {
+                let argv = evaluate_list(argv, &context)?;
+                if argv.first().is_none_or(String::is_empty) {
+                    return Err(invalid("Exec executable must not be empty"));
+                }
+                let mut process_environment = context.process_environment.clone();
+                for value in environment {
+                    process_environment
+                        .insert(value.name.clone(), evaluate(&value.value, &context)?);
+                }
+                let working_directory = working_directory
+                    .as_ref()
+                    .map(|value| evaluate(value, &context))
+                    .transpose()?;
+                if let Some(directory) = &working_directory {
+                    validate_runtime_path(directory)?;
+                }
+                let request = ProcessRequest {
+                    argv: argv.clone(),
+                    environment: process_environment.into_iter().collect(),
+                    working_directory,
+                    stdin,
+                };
+                let process = self
+                    .backend
+                    .execute(request)
+                    .map_err(|message| execution(redact(&message, &context.secret_values)))?;
+                let trace_argv = argv
+                    .iter()
+                    .map(|value| redact(value, &context.secret_values))
+                    .collect();
+                Ok((
+                    RunResult {
+                        exit_code: process.exit_code,
+                        stdout: process.stdout,
+                        stderr: process.stderr,
+                        trace: vec![TraceEvent::Process {
+                            argv: trace_argv,
+                            exit_code: process.exit_code,
+                        }],
+                    },
+                    context,
+                ))
+            }
+            Operation::Pipeline { nodes } => {
+                let mut input = stdin;
+                let mut stderr = Vec::new();
+                let mut trace = Vec::new();
+                let mut exit_code = 0;
+                let mut stdout = Vec::new();
+                for child in nodes {
+                    let (result, _) = self.run_node(child, context.clone(), input, stack)?;
+                    input = result.stdout.clone();
+                    stdout = result.stdout;
+                    stderr.extend(result.stderr);
+                    trace.extend(result.trace);
+                    exit_code = result.exit_code;
+                }
+                Ok((
+                    RunResult {
+                        exit_code,
+                        stdout,
+                        stderr,
+                        trace,
+                    },
+                    context,
+                ))
+            }
+            Operation::Sequence { nodes } => {
+                let mut aggregate = RunResult::empty();
+                let mut next_context = context;
+                let mut input = stdin;
+                for child in nodes {
+                    let (result, child_context) =
+                        self.run_node(child, next_context, input, stack)?;
+                    aggregate = combine(aggregate, result);
+                    next_context = child_context;
+                    input = Vec::new();
+                }
+                Ok((aggregate, next_context))
+            }
+            Operation::Parallel { nodes } => self.run_parallel(nodes, context, stdin, stack),
+            Operation::Condition {
+                predicate,
+                if_true,
+                if_false,
+            } => {
+                let (condition, predicate_context) =
+                    self.run_node(predicate, context, stdin, stack)?;
+                let branch = if condition.exit_code == 0 {
+                    Some(if_true.as_ref())
+                } else {
+                    if_false.as_deref()
+                };
+                if let Some(branch) = branch {
+                    let (result, branch_context) =
+                        self.run_node(branch, predicate_context, Vec::new(), stack)?;
+                    Ok((combine(condition, result), branch_context))
+                } else {
+                    Ok((condition, predicate_context))
+                }
+            }
+            Operation::Match {
+                value,
+                cases,
+                default,
+            } => {
+                let value = evaluate(value, &context)?;
+                let mut selected = None;
+                for case in cases {
+                    if evaluate(&case.pattern, &context)? == value {
+                        selected = Some(&case.body);
+                        break;
+                    }
+                }
+                if let Some(branch) = selected.or(default.as_deref()) {
+                    self.run_node(branch, context, stdin, stack)
+                } else {
+                    Ok((RunResult::empty(), context))
+                }
+            }
+            Operation::Foreach {
+                variable,
+                items,
+                body,
+            } => {
+                let values = evaluate_list(items, &context)?;
+                let previous = context.variables.get(variable).cloned();
+                let mut next_context = context;
+                let mut aggregate = RunResult::empty();
+                for value in values {
+                    next_context.variables.insert(variable.clone(), value);
+                    let (result, child_context) =
+                        self.run_node(body, next_context, stdin.clone(), stack)?;
+                    aggregate = combine(aggregate, result);
+                    next_context = child_context;
+                }
+                match previous {
+                    Some(value) => {
+                        next_context.variables.insert(variable.clone(), value);
+                    }
+                    None => {
+                        next_context.variables.remove(variable);
+                    }
+                }
+                Ok((aggregate, next_context))
+            }
+            Operation::TryFinally { body, finalizer } => {
+                match self.run_node(body, context.clone(), stdin, stack) {
+                    Err(body_error) => match self.run_node(finalizer, context, Vec::new(), stack) {
+                        Ok(_) => Err(body_error),
+                        Err(finalizer_error) => Err(RunError {
+                            kind: body_error.kind,
+                            message: format!(
+                                "{}; finalizer also failed: {}",
+                                body_error.message, finalizer_error.message
+                            ),
+                        }),
+                    },
+                    Ok((body_result, body_context)) => {
+                        let (finalizer_result, finalizer_context) =
+                            self.run_node(finalizer, body_context, Vec::new(), stack)?;
+                        let exit_code = if finalizer_result.exit_code != 0 {
+                            finalizer_result.exit_code
+                        } else {
+                            body_result.exit_code
+                        };
+                        let mut result = combine(body_result, finalizer_result);
+                        result.exit_code = exit_code;
+                        Ok((result, finalizer_context))
+                    }
+                }
+            }
+            Operation::TaskCall { task, arguments } => {
+                let provided = evaluate_named(arguments, &context)?;
+                let result = self.run_task(task, &provided, &[], stack)?;
+                Ok((result, context))
+            }
+            Operation::SetVariable {
+                name,
+                value_type,
+                value,
+            } => {
+                let value = evaluate(value, &context)?;
+                let normalized = normalize_value(name, value_type, &value).map_err(execution)?;
+                let mut context = context;
+                context.variables.insert(name.clone(), normalized.clone());
+                if value_type_is_secret(value_type) {
+                    context.secret_names.insert(name.clone());
+                    if !normalized.is_empty() {
+                        context.secret_values.push(normalized);
+                        context
+                            .secret_values
+                            .sort_by_key(|value| std::cmp::Reverse(value.len()));
+                        context.secret_values.dedup();
+                    }
+                }
+                Ok((RunResult::empty(), context))
+            }
+            Operation::CaptureStdout {
+                name,
+                value_type,
+                body,
+            } => {
+                let (mut captured, _) = self.run_node(body, context.clone(), stdin, stack)?;
+                while captured.stdout.last() == Some(&b'\n') {
+                    captured.stdout.pop();
+                }
+                let text = std::str::from_utf8(&captured.stdout).map_err(|error| {
+                    execution(format!("stdout capture {name} is not valid UTF-8: {error}"))
+                })?;
+                let typed = ValueType::Primitive(value_type.clone());
+                let normalized = normalize_value(name, &typed, text).map_err(execution)?;
+                let mut context = context;
+                context.variables.insert(name.clone(), normalized);
+                captured.stdout.clear();
+                Ok((captured, context))
+            }
+            Operation::FileRead { path } => {
+                if !self.policy.allow_file_read {
+                    return Err(policy("file read denied by policy"));
+                }
+                let path = evaluate(path, &context)?;
+                validate_runtime_path(&path)?;
+                let contents = self
+                    .backend
+                    .read_file(&path)
+                    .map_err(|message| execution(redact(&message, &context.secret_values)))?;
+                Ok((
+                    RunResult {
+                        exit_code: 0,
+                        stdout: contents,
+                        stderr: vec![],
+                        trace: vec![TraceEvent::FileRead {
+                            path: redact(&path, &context.secret_values),
+                        }],
+                    },
+                    context,
+                ))
+            }
+            Operation::FileWrite {
+                path,
+                contents,
+                append,
+            } => {
+                if !self.policy.allow_file_write {
+                    return Err(policy("file write denied by policy"));
+                }
+                let path = evaluate(path, &context)?;
+                validate_runtime_path(&path)?;
+                let contents = evaluate(contents, &context)?;
+                self.backend
+                    .write_file(&path, contents.as_bytes(), *append)
+                    .map_err(|message| execution(redact(&message, &context.secret_values)))?;
+                Ok((
+                    RunResult {
+                        exit_code: 0,
+                        stdout: vec![],
+                        stderr: vec![],
+                        trace: vec![TraceEvent::FileWrite {
+                            path: redact(&path, &context.secret_values),
+                        }],
+                    },
+                    context,
+                ))
+            }
+            Operation::FileRemove { path } => {
+                if !self.policy.allow_file_write {
+                    return Err(policy("file remove denied by policy"));
+                }
+                let path = evaluate(path, &context)?;
+                validate_runtime_path(&path)?;
+                self.backend
+                    .remove_file(&path)
+                    .map_err(|message| execution(redact(&message, &context.secret_values)))?;
+                Ok((
+                    RunResult {
+                        exit_code: 0,
+                        stdout: vec![],
+                        stderr: vec![],
+                        trace: vec![TraceEvent::FileRemove {
+                            path: redact(&path, &context.secret_values),
+                        }],
+                    },
+                    context,
+                ))
+            }
+            Operation::NetworkRequest { method, uri } => {
+                if !self.policy.allow_network {
+                    return Err(policy("network request denied by policy"));
+                }
+                let method = evaluate(method, &context)?;
+                let uri = evaluate(uri, &context)?;
+                let response = self
+                    .backend
+                    .network_request(&method, &uri)
+                    .map_err(|message| execution(redact(&message, &context.secret_values)))?;
+                Ok((
+                    RunResult {
+                        exit_code: 0,
+                        stdout: response,
+                        stderr: vec![],
+                        trace: vec![TraceEvent::Network {
+                            method,
+                            uri: redact(&uri, &context.secret_values),
+                        }],
+                    },
+                    context,
+                ))
+            }
+            Operation::OpaqueCapsule {
+                interpreter,
+                source,
+                ..
+            } => {
+                if !self.policy.allow_opaque {
+                    return Err(policy("opaque capsule execution denied by policy"));
+                }
+                if !matches!(node.guarantee, Guarantee::Residual { .. }) {
+                    return Err(invalid("opaque capsule lacks a residual guarantee"));
+                }
+                let source = source.to_bytes().map_err(invalid)?;
+                let request = CapsuleRequest {
+                    interpreter: interpreter.clone(),
+                    source,
+                    arguments: self.script_arguments.to_vec(),
+                    environment: context.process_environment.clone().into_iter().collect(),
+                    stdin,
+                };
+                let result = self
+                    .backend
+                    .execute_capsule(request)
+                    .map_err(|message| execution(redact(&message, &context.secret_values)))?;
+                Ok((
+                    RunResult {
+                        exit_code: result.exit_code,
+                        stdout: result.stdout,
+                        stderr: result.stderr,
+                        trace: vec![TraceEvent::Opaque {
+                            interpreter: interpreter.clone(),
+                            exit_code: result.exit_code,
+                        }],
+                    },
+                    context,
+                ))
+            }
+        }
+    }
+
+    fn run_parallel(
+        &self,
+        nodes: &[Node],
+        context: Context,
+        stdin: Vec<u8>,
+        stack: &[String],
+    ) -> Result<(RunResult, Context), RunError> {
+        if nodes.is_empty() {
+            return Ok((RunResult::empty(), context));
+        }
+        let count = nodes.len();
+        let workers = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1)
+            .clamp(1, 8)
+            .min(count);
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let results = std::sync::Mutex::new(vec![None; count]);
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                let next = &next;
+                let results = &results;
+                let context = context.clone();
+                let stdin = stdin.clone();
+                scope.spawn(move || {
+                    loop {
+                        use std::sync::atomic::Ordering;
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(node) = nodes.get(index) else { break };
+                        let result = self.run_node(node, context.clone(), stdin.clone(), stack);
+                        results.lock().expect("parallel result lock poisoned")[index] =
+                            Some(result);
+                    }
+                });
+            }
+        });
+        let mut aggregate = RunResult::empty();
+        for result in results
+            .into_inner()
+            .map_err(|_| execution("parallel result lock poisoned"))?
+        {
+            let (result, _) =
+                result.ok_or_else(|| execution("parallel worker omitted a result"))??;
+            aggregate = combine(aggregate, result);
+        }
+        Ok((aggregate, context))
+    }
+}
+
+impl RunResult {
+    fn empty() -> Self {
+        Self {
+            exit_code: 0,
+            stdout: vec![],
+            stderr: vec![],
+            trace: vec![],
+        }
+    }
+}
+
+fn combine(mut left: RunResult, right: RunResult) -> RunResult {
+    left.exit_code = right.exit_code;
+    left.stdout.extend(right.stdout);
+    left.stderr.extend(right.stderr);
+    left.trace.extend(right.trace);
+    left
+}
+
+fn evaluate(expression: &TextExpression, context: &Context) -> Result<String, RunError> {
+    expression
+        .evaluate(&context.variables, &context.arguments)
+        .map_err(invalid)
+}
+
+fn evaluate_list(
+    expressions: &[TextExpression],
+    context: &Context,
+) -> Result<Vec<String>, RunError> {
+    expressions
+        .iter()
+        .map(|expression| evaluate(expression, context))
+        .collect()
+}
+
+fn evaluate_named(
+    values: &[NamedExpression],
+    context: &Context,
+) -> Result<BTreeMap<String, String>, RunError> {
+    let mut output = BTreeMap::new();
+    for value in values {
+        if output
+            .insert(value.name.clone(), evaluate(&value.value, context)?)
+            .is_some()
+        {
+            return Err(invalid(format!("duplicate named value: {}", value.name)));
+        }
+    }
+    Ok(output)
+}
+
+fn bind_task_arguments(
+    task: &Task,
+    provided: &BTreeMap<String, String>,
+    positional: &[String],
+) -> Result<BTreeMap<String, String>, RunError> {
+    if task.invocation.is_some() {
+        return bind_powershell_arguments(task, provided, positional);
+    }
+    let mut output = provided.clone();
+    if !positional.is_empty() && task.inputs.is_empty() {
+        return Ok(output);
+    }
+    for (index, value) in positional.iter().enumerate() {
+        let numeric = (index + 1).to_string();
+        let binding = task
+            .inputs
+            .iter()
+            .find(|binding| binding.name == numeric)
+            .or_else(|| task.inputs.get(index));
+        let Some(binding) = binding else {
+            return Err(invalid(format!("unexpected positional argument: {value}")));
+        };
+        if output.insert(binding.name.clone(), value.clone()).is_some() {
+            return Err(invalid(format!(
+                "task input {} was specified more than once",
+                binding.name
+            )));
+        }
+    }
+    Ok(output)
+}
+
+fn bind_powershell_arguments(
+    task: &Task,
+    provided: &BTreeMap<String, String>,
+    positional: &[String],
+) -> Result<BTreeMap<String, String>, RunError> {
+    let invocation = task.invocation.as_ref().expect("checked by caller");
+    let mut output = BTreeMap::new();
+    for (name, value) in provided {
+        let parameter = invocation
+            .parameters
+            .iter()
+            .find(|parameter| parameter.input.eq_ignore_ascii_case(name))
+            .ok_or_else(|| invalid(format!("unknown PowerShell parameter: -{name}")))?;
+        if output
+            .insert(parameter.input.clone(), value.clone())
+            .is_some()
+        {
+            return Err(invalid(format!(
+                "PowerShell parameter -{name} was specified more than once"
+            )));
+        }
+    }
+    let mut index = 0;
+    while index < positional.len() {
+        let argument = &positional[index];
+        if let Some(raw) = argument
+            .strip_prefix('-')
+            .filter(|value| !value.is_empty() && !value.as_bytes()[0].is_ascii_digit())
+        {
+            let (name, inline) = raw
+                .split_once(':')
+                .map_or((raw, None), |(name, value)| (name, Some(value)));
+            let candidates: Vec<_> = invocation
+                .parameters
+                .iter()
+                .filter(|parameter| {
+                    parameter
+                        .input
+                        .to_ascii_lowercase()
+                        .starts_with(&name.to_ascii_lowercase())
+                })
+                .collect();
+            let parameter = if let Some(exact) = candidates
+                .iter()
+                .find(|parameter| parameter.input.eq_ignore_ascii_case(name))
+            {
+                *exact
+            } else if candidates.len() == 1 {
+                candidates[0]
+            } else if candidates.is_empty() {
+                return Err(invalid(format!("unknown PowerShell parameter: -{name}")));
+            } else {
+                return Err(invalid(format!("ambiguous PowerShell parameter: -{name}")));
+            };
+            let value = if parameter.is_switch {
+                inline.unwrap_or("true").to_owned()
+            } else if let Some(value) = inline {
+                value.to_owned()
+            } else {
+                index += 1;
+                positional.get(index).cloned().ok_or_else(|| {
+                    invalid(format!(
+                        "PowerShell parameter -{} requires a value",
+                        parameter.input
+                    ))
+                })?
+            };
+            if output.insert(parameter.input.clone(), value).is_some() {
+                return Err(invalid(format!(
+                    "PowerShell parameter -{} was specified more than once",
+                    parameter.input
+                )));
+            }
+        } else {
+            let mut candidates: Vec<_> = invocation
+                .parameters
+                .iter()
+                .filter_map(|parameter| parameter.position.map(|position| (position, parameter)))
+                .collect();
+            candidates.sort_by_key(|(position, _)| *position);
+            let parameter = candidates
+                .into_iter()
+                .map(|(_, parameter)| parameter)
+                .find(|parameter| !output.contains_key(&parameter.input))
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "unexpected positional PowerShell argument: {argument}"
+                    ))
+                })?;
+            output.insert(parameter.input.clone(), argument.clone());
+        }
+        index += 1;
+    }
+    for parameter in &invocation.parameters {
+        if !output.contains_key(&parameter.input) {
+            if parameter.required {
+                return Err(invalid(format!(
+                    "missing mandatory PowerShell parameter -{}",
+                    parameter.input
+                )));
+            }
+            let value = if let Some(default) = &parameter.default {
+                default
+                    .evaluate(&BTreeMap::new(), &BTreeMap::new())
+                    .map_err(invalid)?
+            } else if parameter.is_switch {
+                "false".into()
+            } else {
+                let binding = task
+                    .inputs
+                    .iter()
+                    .find(|binding| binding.name == parameter.input)
+                    .ok_or_else(|| invalid(format!("unknown task input: {}", parameter.input)))?;
+                default_value(&binding.value_type)
+                    .ok_or_else(|| invalid(format!("task input {} has no default", binding.name)))?
+            };
+            output.insert(parameter.input.clone(), value);
+        }
+    }
+    let mut normalized = BTreeMap::new();
+    for binding in &task.inputs {
+        let raw = output.get(&binding.name).ok_or_else(|| {
+            invalid(format!(
+                "task {} is missing input {}",
+                task.name, binding.name
+            ))
+        })?;
+        normalized.insert(
+            binding.name.clone(),
+            normalize_value(&binding.name, &binding.value_type, raw).map_err(invalid)?,
+        );
+    }
+    Ok(normalized)
+}
+
+fn default_value(value_type: &ValueType) -> Option<String> {
+    match value_type {
+        ValueType::Primitive(PrimitiveType::Text | PrimitiveType::Path) => Some(String::new()),
+        ValueType::Primitive(PrimitiveType::Bool) => Some("false".into()),
+        ValueType::Primitive(PrimitiveType::Int) => Some("0".into()),
+        ValueType::Secret { secret } => default_value(secret),
+    }
+}
+
+fn normalize_value(name: &str, value_type: &ValueType, value: &str) -> Result<String, String> {
+    match value_type {
+        ValueType::Primitive(PrimitiveType::Text) => Ok(value.to_owned()),
+        ValueType::Primitive(PrimitiveType::Bool) => match value.to_ascii_lowercase().as_str() {
+            "true" | "1" => Ok("true".into()),
+            "false" | "0" => Ok("false".into()),
+            _ => Err(format!("{name} must be a boolean")),
+        },
+        ValueType::Primitive(PrimitiveType::Int) => {
+            let parsed = value
+                .trim()
+                .parse::<i64>()
+                .map_err(|_| format!("{name} must be a signed 64-bit integer"))?;
+            Ok(parsed.to_string())
+        }
+        ValueType::Primitive(PrimitiveType::Path) => {
+            let normalized = crate::ir::normalize_path(value)
+                .map_err(|error| format!("{name} must be a normalized path: {error}"))?;
+            if normalized != value {
+                return Err(format!("{name} must use normalized / path separators"));
+            }
+            Ok(normalized)
+        }
+        ValueType::Secret { secret } => normalize_value(name, secret, value),
+    }
+}
+
+fn value_type_is_secret(value_type: &ValueType) -> bool {
+    matches!(value_type, ValueType::Secret { .. })
+}
+
+fn validate_runtime_path(path: &str) -> Result<(), RunError> {
+    let normalized = crate::ir::normalize_path(path).map_err(invalid)?;
+    if normalized != path {
+        return Err(invalid(format!("runtime path is not normalized: {path}")));
+    }
+    Ok(())
+}
+
+fn redact(message: &str, secrets: &[String]) -> String {
+    let mut output = message.to_owned();
+    for secret in secrets {
+        if !secret.is_empty() {
+            output = output.replace(secret, "<redacted>");
+        }
+    }
+    output
+}
+
+fn execution(message: impl Into<String>) -> RunError {
+    RunError {
+        kind: RunErrorKind::Execution,
+        message: message.into(),
+    }
+}
+fn invalid(message: impl Into<String>) -> RunError {
+    RunError {
+        kind: RunErrorKind::Invalid,
+        message: message.into(),
+    }
+}
+fn policy(message: impl Into<String>) -> RunError {
+    RunError {
+        kind: RunErrorKind::Policy,
+        message: message.into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{
+        Binding, Guarantee, NamedExpression, Node, Operation, PrimitiveType, SourceBytes, Task,
+        TextExpression, TextPart, ValueType,
+    };
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct MockBackend {
+        calls: Mutex<Vec<ProcessRequest>>,
+        capsule: Mutex<Vec<CapsuleRequest>>,
+    }
+
+    impl Backend for MockBackend {
+        fn execute(&self, request: ProcessRequest) -> Result<ProcessResult, String> {
+            self.calls.lock().unwrap().push(request.clone());
+            match request.argv.as_slice() {
+                [command, value] if command == "emit" => Ok(ProcessResult {
+                    exit_code: 0,
+                    stdout: value.as_bytes().to_vec(),
+                    stderr: vec![],
+                }),
+                [command] if command == "upper" => Ok(ProcessResult {
+                    exit_code: 0,
+                    stdout: request.stdin.iter().map(u8::to_ascii_uppercase).collect(),
+                    stderr: vec![],
+                }),
+                [command, code] if command == "fail" => Ok(ProcessResult {
+                    exit_code: code.parse().unwrap(),
+                    stdout: vec![],
+                    stderr: b"failed".to_vec(),
+                }),
+                [command] if command == "invalid-utf8" => Ok(ProcessResult {
+                    exit_code: 0,
+                    stdout: vec![0xff],
+                    stderr: vec![],
+                }),
+                [command] if command == "backend-secret-error" => {
+                    Err("failed with super-secret-value".into())
+                }
+                _ => Ok(ProcessResult {
+                    exit_code: 0,
+                    stdout: request.stdin,
+                    stderr: vec![],
+                }),
+            }
+        }
+        fn execute_capsule(&self, request: CapsuleRequest) -> Result<ProcessResult, String> {
+            self.capsule.lock().unwrap().push(request.clone());
+            Ok(ProcessResult {
+                exit_code: 0,
+                stdout: request.source,
+                stderr: vec![],
+            })
+        }
+        fn read_file(&self, path: &str) -> Result<Vec<u8>, String> {
+            Ok(format!("read:{path}").into_bytes())
+        }
+        fn write_file(&self, _path: &str, _contents: &[u8], _append: bool) -> Result<(), String> {
+            Ok(())
+        }
+        fn remove_file(&self, _path: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn network_request(&self, _method: &str, uri: &str) -> Result<Vec<u8>, String> {
+            Ok(format!("network:{uri}").into_bytes())
+        }
+    }
+
+    fn node(operation: Operation) -> Node {
+        Node {
+            id: String::new(),
+            operation,
+            guarantee: Guarantee::Formal {
+                basis: "runner-test-v1".into(),
+            },
+            source: None,
+        }
+    }
+
+    fn plan(body: Node) -> Plan {
+        let mut plan = Plan {
+            schema_version: 1,
+            generator: "test".into(),
+            entrypoint: "main".into(),
+            tasks: vec![Task {
+                name: "main".into(),
+                inputs: vec![],
+                outputs: vec![],
+                environment: vec![],
+                secrets: vec![],
+                platform_capabilities: vec![],
+                cacheable: false,
+                invocation: None,
+                body,
+            }],
+        };
+        plan.assign_node_ids().unwrap();
+        plan
+    }
+
+    fn exec(argv: &[&str]) -> Node {
+        node(Operation::Exec {
+            argv: argv
+                .iter()
+                .map(|value| TextExpression::literal(*value))
+                .collect(),
+            environment: vec![],
+            working_directory: None,
+        })
+    }
+
+    fn run(backend: &MockBackend, body: Node) -> Result<RunResult, RunError> {
+        run_plan(
+            backend,
+            Policy::default(),
+            &plan(body),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &[],
+        )
+    }
+
+    #[test]
+    fn pipeline_streams_raw_bytes_and_sequence_uses_last_status() {
+        let backend = MockBackend::default();
+        let pipeline = node(Operation::Pipeline {
+            nodes: vec![exec(&["emit", "hello"]), exec(&["upper"])],
+        });
+        assert_eq!(run(&backend, pipeline).unwrap().stdout, b"HELLO");
+        let sequence = node(Operation::Sequence {
+            nodes: vec![exec(&["fail", "9"]), exec(&["emit", "after"])],
+        });
+        let result = run(&backend, sequence).unwrap();
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, b"after");
+        assert_eq!(result.stderr, b"failed");
+    }
+
+    #[test]
+    fn expression_values_are_never_reparsed_by_runner() {
+        let backend = MockBackend::default();
+        let body = node(Operation::Exec {
+            argv: vec![
+                TextExpression::literal("emit"),
+                TextExpression {
+                    parts: vec![
+                        TextPart::Variable {
+                            name: "FIRST".into(),
+                        },
+                        TextPart::Argument {
+                            name: "input".into(),
+                        },
+                    ],
+                },
+            ],
+            environment: vec![],
+            working_directory: None,
+        });
+        let mut plan = plan(body);
+        plan.tasks[0].environment = vec!["FIRST".into(), "SECOND".into()];
+        plan.tasks[0].inputs = vec![Binding {
+            name: "input".into(),
+            value_type: ValueType::Primitive(PrimitiveType::Text),
+        }];
+        plan.tasks[0].secrets = vec![];
+        plan.assign_node_ids().unwrap();
+        let host = BTreeMap::from([
+            ("FIRST".into(), "$SECOND".into()),
+            ("SECOND".into(), "wrong".into()),
+        ]);
+        let inputs = BTreeMap::from([("input".into(), "-${SECOND}".into())]);
+        let result = run_plan(&backend, Policy::default(), &plan, &host, &inputs, &[]).unwrap();
+        assert_eq!(result.stdout, b"$SECOND-${SECOND}");
+    }
+
+    #[test]
+    fn capture_validates_utf8_only_at_the_text_boundary() {
+        let backend = MockBackend::default();
+        let body = node(Operation::CaptureStdout {
+            name: "CAPTURED".into(),
+            value_type: PrimitiveType::Text,
+            body: Box::new(exec(&["invalid-utf8"])),
+        });
+        let error = run(&backend, body).unwrap_err();
+        assert_eq!(error.kind, RunErrorKind::Execution);
+        assert!(error.message.contains("UTF-8"));
+    }
+
+    #[test]
+    fn policy_denials_do_not_call_backends() {
+        let backend = MockBackend::default();
+        let body = node(Operation::FileRead {
+            path: TextExpression::literal("input.txt"),
+        });
+        let error = run(&backend, body).unwrap_err();
+        assert_eq!(error.kind, RunErrorKind::Policy);
+        assert!(backend.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn opaque_capsules_keep_original_bytes_and_arguments() {
+        let backend = MockBackend::default();
+        let source = vec![b'e', b'c', b'h', b'o', b' ', 0xff];
+        let mut capsule = node(Operation::OpaqueCapsule {
+            interpreter: "sh".into(),
+            source: SourceBytes::from_bytes(&source),
+            path: Some("build.sh".into()),
+        });
+        capsule.guarantee = Guarantee::Residual {
+            reason: "non-UTF-8".into(),
+        };
+        let result = run_plan(
+            &backend,
+            Policy {
+                allow_opaque: true,
+                ..Policy::default()
+            },
+            &plan(capsule),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &["one".into()],
+        )
+        .unwrap();
+        assert_eq!(result.stdout, source);
+        let requests = backend.capsule.lock().unwrap();
+        assert_eq!(requests[0].source, source);
+        assert_eq!(requests[0].arguments, ["one"]);
+    }
+
+    #[test]
+    fn secret_values_are_redacted_from_backend_errors_and_trace() {
+        let backend = MockBackend::default();
+        let body = node(Operation::Exec {
+            argv: vec![TextExpression::literal("backend-secret-error")],
+            environment: vec![NamedExpression {
+                name: "TOKEN".into(),
+                value: TextExpression {
+                    parts: vec![TextPart::Variable {
+                        name: "TOKEN".into(),
+                    }],
+                },
+            }],
+            working_directory: None,
+        });
+        let mut plan = plan(body);
+        plan.tasks[0].environment = vec!["TOKEN".into()];
+        plan.tasks[0].secrets = vec!["TOKEN".into()];
+        plan.assign_node_ids().unwrap();
+        let error = run_plan(
+            &backend,
+            Policy::default(),
+            &plan,
+            &BTreeMap::from([("TOKEN".into(), "super-secret-value".into())]),
+            &BTreeMap::new(),
+            &[],
+        )
+        .unwrap_err();
+        assert!(!error.message.contains("super-secret-value"));
+        assert!(error.message.contains("<redacted>"));
+    }
+
+    #[test]
+    fn parallel_output_is_merged_in_declared_order() {
+        let backend = MockBackend::default();
+        let body = node(Operation::Parallel {
+            nodes: vec![
+                exec(&["emit", "a"]),
+                exec(&["emit", "b"]),
+                exec(&["emit", "c"]),
+            ],
+        });
+        assert_eq!(run(&backend, body).unwrap().stdout, b"abc");
+    }
+}

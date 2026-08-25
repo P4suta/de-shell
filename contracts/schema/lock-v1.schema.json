@@ -1,0 +1,65 @@
+{
+  "$id": "https://deshell.dev/contracts/lock/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "adapters": {
+      "additionalProperties": false,
+      "properties": {
+        "nushell": { "$ref": "#/$defs/pin" },
+        "powershell": { "$ref": "#/$defs/pin" }
+      },
+      "required": ["powershell", "nushell"],
+      "type": "object"
+    },
+    "artifacts": {
+      "additionalProperties": false,
+      "properties": { "command_model": { "$ref": "#/$defs/pin" } },
+      "required": ["command_model"],
+      "type": "object"
+    },
+    "interpreters": {
+      "additionalProperties": false,
+      "properties": {
+        "bash": { "minLength": 1, "type": "string" },
+        "cmd": { "minLength": 1, "type": "string" },
+        "fish": { "minLength": 1, "type": "string" },
+        "nushell": { "minLength": 1, "type": "string" },
+        "posix_sh": { "minLength": 1, "type": "string" },
+        "powershell": { "minLength": 1, "type": "string" },
+        "zsh": { "minLength": 1, "type": "string" }
+      },
+      "required": ["posix_sh", "bash", "zsh", "fish", "powershell", "cmd", "nushell"],
+      "type": "object"
+    },
+    "lab": {
+      "additionalProperties": false,
+      "properties": { "image": { "minLength": 1, "type": "string" } },
+      "required": ["image"],
+      "type": "object"
+    },
+    "protocol": {
+      "additionalProperties": false,
+      "properties": {
+        "effect_ir": { "const": 1 },
+        "evidence": { "const": 1 },
+        "json_rpc": { "const": 1 }
+      },
+      "required": ["json_rpc", "effect_ir", "evidence"],
+      "type": "object"
+    },
+    "toolchain": {
+      "additionalProperties": false,
+      "properties": { "rust": { "const": "1.98.0" } },
+      "required": ["rust"],
+      "type": "object"
+    },
+    "version": { "const": 1 }
+  },
+  "required": ["version", "toolchain", "protocol", "artifacts", "adapters", "interpreters", "lab"],
+  "title": "de-shell lock file v1",
+  "type": "object",
+  "$defs": {
+    "pin": { "pattern": "^sha256:[0-9a-f]{64}$", "type": "string" }
+  }
+}

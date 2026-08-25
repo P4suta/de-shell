@@ -3,7 +3,8 @@
 `deshell-audit-corpus.ps1` provides a reproducible, non-executing audit of the
 immediate repository children under a corpus directory. It inventories every
 supported embedded format and analyzes shell files on isolated temporary
-copies. The report conforms to `schema/corpus-audit.schema.json`.
+copies. The report conforms to
+`contracts/schema/corpus-audit-v1.schema.json`.
 
 ## Run it
 
@@ -13,14 +14,14 @@ comma-separated exclusion value: an unquoted list can be split by the caller
 before it reaches the script.
 
 ```console
-mise run corpus:audit -- -CorpusRoot .. -ExcludeRepository 'de-shell,workflow-verifier,beamtrace' -ExcludePattern 'cargo-mutants-wt-*' -DeshellExecutable _build/default/bin/main.exe -Format Json -OutputPath _build/local-corpus-audit.json
+mise run corpus:audit -- -CorpusRoot .. -ExcludeRepository 'de-shell,workflow-verifier,beamtrace' -ExcludePattern 'cargo-mutants-wt-*' -DeshellExecutable target/debug/deshell -Format Json -OutputPath target/local-corpus-audit.json
 ```
 
 Exact exclusions must name an immediate child of `-CorpusRoot`; a typo fails
 closed instead of silently broadening the audit. The JSON records the normalized
 exact exclusions, patterns, selected repositories, and `source_execution=false`
 so the selection can be reviewed with the result. Use `-Format Human` for a
-concise terminal summary. `_build/local-corpus-audit.json` is a local evidence
+concise terminal summary. `target/local-corpus-audit.json` is a local evidence
 artifact and is not committed.
 
 The auditor:
@@ -35,11 +36,14 @@ The auditor:
 - omits source bodies from the report and removes only a verified audit temp
   directory.
 
-## Local snapshot: 2026-08-25
+## Historical pre-cutover baseline: 2026-08-25
 
-The command above was run on the current Windows development machine, excluding
-the actively changing `workflow-verifier` and `beamtrace` repositories and the
-de-shell repository itself.
+This snapshot was produced by the unpublished OCaml implementation on a Windows
+development machine. It is retained only as the selection and comparison
+baseline. The same declared 48-repository selection must be rerun with the Rust implementation,
+and unexplained differences must be zero before `0.1.0` is
+released. The run excluded the actively changing `workflow-verifier` and
+`beamtrace` repositories and the de-shell repository itself.
 
 | Measure | Result |
 | --- | ---: |
@@ -52,7 +56,7 @@ de-shell repository itself.
 | Fully non-residual shell files | 2 / 47 |
 | Formal IR nodes | 47 |
 | Residual IR nodes | 45 |
-| Exhaustive / differential nodes | 0 / 0 |
+| Exhaustive nodes / observations | 0 / 0 |
 
 The two fully non-residual files were:
 
@@ -78,12 +82,12 @@ This is deliberately a raw shell-file audit. Its denominator includes five
 copies each of the generated `gradlew` and `gradlew.bat` launchers and four
 interactive completion definitions. Embedded locations are inventoried but are
 not lowered by this shell-file analysis pass. A `formal` node identifies its
-static semantic basis; this snapshot contains no scenario-based exhaustive or
-differential evidence.
+static semantic basis; this snapshot contains no scenario-based exhaustive
+guarantees or Evidence v1 observations.
 
 Consequently, this snapshot does not certify de-shell 1.0 and is not the
 release-gate corpus. A release corpus must explicitly declare non-interactive
-entrypoints and scenarios, then pass differential observation on the required
+entrypoints and scenarios, then record matching observations on the required
 OS/shell matrix. The unchanged whole-file count does not mean the compiler made
 no progress. The former 16-file typed-parameter blocker and six-file POSIX
 control-assignment blocker are gone; the unquoted-expansion first-boundary group

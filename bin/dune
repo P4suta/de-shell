@@ -1,5 +1,4 @@
-(executables
- (names main observer_agent_main process_agent_main)
- (public_names deshell deshell-observer-agent deshell-process-agent)
- (package de-shell)
- (libraries deshell unix))
+(executable
+ (name reference_conformance)
+ (modules reference_conformance)
+ (libraries deshell_reference_v1))
