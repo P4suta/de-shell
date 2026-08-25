@@ -3,123 +3,58 @@
 [![CI](https://github.com/P4suta/de-shell/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/P4suta/de-shell/actions/workflows/ci.yml)
 [![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/P4suta/de-shell/badge)](https://securityscorecards.dev/viewer/?uri=github.com/P4suta/de-shell)
 
-`de-shell` is an OCaml behavioral compiler for migrating shell automation. It
-inventories shell files, embedded shell, and their callers; lowers supported
-behavior into a typed Effect IR; and preserves unsupported behavior as explicit,
-executable residual capsules.
+`de-shell` is a Rust behavioral compiler for shell automation. It inventories
+shell entrypoints and embedded shell, lowers the behavior it can prove into
+Effect IR v1, and retains unsupported source as a lossless residual capsule.
 
-Behavior preservation and improvement are separate operations. Equivalent
-rewrites can be applied transactionally, while portability, security, and
-reproducibility changes are emitted as proposals and require an explicit
-`--apply`.
+The first public product is the single `deshell` executable at version 0.1.0.
+Its supported interfaces are the CLI, generated files, the JSON Schemas under
+[`contracts/`](contracts/), and JSON-RPC v1. The Rust modules and the
+unpublished OCaml reference implementation are private, unstable implementation
+details.
 
 ## Status
 
-This repository is a production-oriented 0.1.0 pre-release, not a certified
-1.0 release. Its implemented subset is intended for real migrations: accepted
-behavior carries an explicit guarantee, unsupported behavior remains an exact
-executable capsule, and behavior-changing improvements require approval. The
-following compiler and runtime foundations are implemented and covered by the
-repository's test gates:
+The Rust implementation is the repository default and is exercised on Linux,
+macOS, and Windows by CI. The repository is release-candidate ready only after
+the checked-in gates pass; it does not claim that a tag, crates.io package, or
+the 48-repository audit has already been published or rerun.
 
-- Git-aware recursive inventory of shell files plus Make, Dockerfile, GitHub
-  workflows and composite actions, GitLab CI, Azure Pipelines, CircleCI,
-  `package.json`, and VS Code shell tasks;
-- conservative embedded-shell detection across JVM, .NET, native, BEAM, and
-  scripting-language source families, including multiple callsites on one line,
-  import-aware JavaScript APIs, and candidate fallback for dynamic host
-  expressions;
-- executable-field candidate reporting for unrecognized YAML, JSON, and TOML
-  hosts without treating lockfiles and descriptive metadata as commands;
-- a call graph and content-hash-guarded, all-or-nothing callsite migration for
-  exact standalone calls;
-- POSIX sh/Bash lowering for literal commands, immutable and typed runtime
-  assignment dataflow, command-local environments, pipelines, sequences, `&&`,
-  homogeneous `||`, simple conditions, static loops, script-relative working
-  directories, literal heredoc writes, static subshell working directories,
-  expansion-safe static unquoted fields, and ordered stdout capture for whole-RHS
-  and quoted nested command substitutions;
-- conservative literal subsets for zsh, fish, PowerShell, cmd, and Nushell,
-  including immutable PowerShell scalar/environment dataflow, typed script
-  parameters, validation attributes, `CmdletBinding` common parameters, and
-  static multi-statement files, with trace-only residual fallback for unknown
-  or dynamic behavior;
-- versioned Effect IR v3, JSON schemas, v0/v1/v2-to-v3 migration, typed scalar
-  runtime state and stdout-capture effects, and `formal`, `exhaustive`,
-  `differential`, and `residual` evidence;
-- official PowerShell AST and pinned `nu-parser` JSON-RPC adapter contracts;
-- equivalent rewrites, separate modernization proposals, concolic scenario
-  generation, command-effect models, and differential comparison;
-- a policy-gated internal runner with declared environment inheritance,
-  project-scoped filesystem backend, secret redaction in traces and failure
-  diagnostics, fail-fast template validation, and deterministic replay tapes;
-- rootless OCI launch specifications, a Windows Sandbox launcher, a portable
-  observer agent, and Hyper-V/Virtualization.framework agent protocols;
-- strict Internal, Dagger, Nushell, and CWL 1.2 exporters, with explicit
-  `--bridge` fallback only;
-- an installable package containing the CLI, process/observer agents, schemas,
-  PowerShell adapter, and Rust Nushell adapter;
-- a machine-checkable 1.0 release-gate evaluator for the 95% corpus, complete
-  residual execution, embedded inventory, and 7-shell x 3-OS requirements.
+Implemented behavior includes:
 
-Unsupported input is never silently discarded. It is either rejected by policy
-or represented as a residual capsule with its interpreter, source, reason, and
-source map.
+- Git-aware, bounded-worker inventory of shell files and conservative embedded
+  shell candidates in common build and repository formats;
+- literal and explicitly modelled subsets of POSIX shell, zsh, fish,
+  PowerShell, cmd, and Nushell, plus a policy-controlled unknown-interpreter
+  residual;
+- typed `text`, `bool`, signed 64-bit `int`, normalized `path`, and `secret<T>`
+  values, with explicit `literal`, `variable`, and `argument` text parts;
+- deterministic node IDs derived from normalized paths, half-open byte spans,
+  operation kinds, and preorder positions;
+- static `formal`, `exhaustive`, and `residual` node guarantees, with observed
+  comparisons stored separately in Evidence v1;
+- strict duplicate-key and unknown-field rejection for persisted JSON,
+  RFC 8785-style canonical bytes for digests, and deterministic pretty files;
+- transactional equivalent rewrites, opt-in modernization proposals, strict
+  exporters, replay-only network access, and project-confined filesystem
+  boundaries;
+- injectable disposable-lab launch contracts with platform-checked rootless
+  OCI, Windows Sandbox, Hyper-V, and Virtualization.framework providers;
+- raw-byte process output internally, UTF-8 validation at text capture
+  boundaries, bounded execution, and secret-safe diagnostics and traces;
+- one multicall executable with hidden process-agent, observer-agent, and
+  Nushell-adapter modes using newline-delimited JSON-RPC v1;
+- embedded schemas retrievable with `deshell schema NAME`.
 
-### Host-language inventory boundaries
+Unsupported behavior is never silently discarded. Analysis either rejects it
+under project policy or emits an opaque capsule carrying one residual reason,
+its interpreter, source span, and the exact UTF-8 or base64 source bytes.
 
-The source scanner has contract fixtures for Java, Kotlin, Scala, Groovy,
-Python, JavaScript/TypeScript, Go, Rust, C/C++/Objective-C, C#, F#, VB, OCaml,
-Haskell, Elixir, Erlang, Lua, Perl, Ruby, PHP, R, Nim, D, Clojure, Dart, Julia,
-Zig, and Crystal. It recognizes explicit shell APIs or explicit `sh -c`,
-`pwsh -Command`, and `cmd /c` launcher shapes. Host-language interpolation,
-concatenation, dynamic command expressions, and extra command arguments are
-reported as candidates rather than being presented as static shell.
+## Toolchain and tests
 
-Each detected callsite carries a line-and-column-stable locator. Multiple direct
-or argv-shaped shell calls on the same source line are inventoried separately,
-and JavaScript's unqualified `exec`/`execSync` forms require an explicit
-`child_process` import or binding.
-
-This is conservative lexical inventory, not a claim that de-shell contains a
-complete parser for every host language. Commented examples, string literals
-containing API names, non-shell shebangs, and direct process APIs without a
-shell launcher are excluded by contract. Source-language callsites are not
-automatically rewritten yet: `--apply` refuses them until that language has a
-syntax-aware patcher.
-
-### Honest runtime boundaries
-
-The local `deshell run` backend is not an OS sandbox: `Exec` nodes start host
-processes. File effects remain project-scoped and residual/network effects are
-denied unless explicitly allowed, but untrusted automation should be run through
-the disposable observer path.
-
-`deshell init` intentionally writes `lab.image = "unconfigured"` to
-`deshell.lock`. Observation stays unavailable until the project selects a real,
-digest-pinned lab image containing `deshell-observer-agent`. Linux supports
-rootless Podman or rootless Docker and Windows supports Windows Sandbox. The
-Hyper-V and macOS Virtualization.framework protocols are implemented, but their
-signed platform launcher helpers and a published lab image are release
-artifacts, not files fabricated by this repository.
-
-The repository validates generated artifacts structurally and exercises the
-Nushell output with the pinned official parser. The optional
-`mise run test:official-exporters` gate additionally validates a representative
-CWL artifact with a digest-pinned official `cwltool` image and executes the
-corresponding module with Dagger v0.21.8. Final 1.0 certification still requires
-that official-tool evidence across the release corpus, signed
-binaries/installers and platform launchers, and the complete physical 21-cell
-OS/shell matrix.
-
-## Toolchain with mise
-
-The development toolchain is managed by
-[mise](https://mise.jdx.dev/). `mise.toml` and `mise.lock` pin opam 2.5.2,
-Rust 1.98.0, PowerShell 7.6.5, actionlint 1.7.12, and Dagger 0.21.8. Opam
-creates the local `_opam` switch with OCaml 5.5.0 and Dune 3.24.2; no global
-OCaml installation is used. Rust builds are limited to one job for predictable
-memory use.
+The public implementation uses Rust 1.98 and edition 2024. `mise.toml` pins the
+development tools; Cargo uses a locked dependency graph and a bounded build job
+count.
 
 ```console
 mise trust
@@ -130,108 +65,116 @@ mise run test
 mise run package
 ```
 
-After changing `de-shell.opam`, rerun `mise run setup`. `mise run package`
-builds the Rust adapter through Dune and verifies every required installed file.
+The main tasks are:
 
 | Task | Purpose |
 | --- | --- |
-| `mise run build` | Build the OCaml project and Rust adapter |
-| `mise run deshell -- ARGS` | Run the project-local CLI |
-| `mise run lint` | Validate opam metadata and GitHub Actions |
-| `mise run test:fast` | Deterministic unit and property tests |
-| `mise run test:contract` | CLI, schema, adapter, and exporter contracts |
-| `mise run test:adapters` | Pinned parser-adapter contracts |
-| `mise run test:official-exporters` | Validate and execute representative CWL/Dagger exports with pinned official tools |
-| `mise run test:platform` | Scanner, filesystem, process, and lab contracts |
-| `mise run test:differential` | Lowering and observation comparisons |
-| `mise run test:security` | Traversal, protocol, secret, and transaction regressions |
-| `mise run test` | Every repository test gate |
-| `mise run corpus:audit -- ARGS` | Rebuild the compiler, then inventory repositories and analyze hash-verified temporary shell copies without executing source scripts |
-| `mise run fmt` | Format OCaml and Dune sources |
-| `mise run fmt:check` | Check formatting without accepting changes |
-| `mise run package` | Build and verify the installable package payload |
+| `mise run deshell -- ARGS` | Run the Rust CLI |
+| `mise run test:fast` | Unit, property, and deterministic regression tests |
+| `mise run test:contract` | Shared CLI, schema, golden, and agent conformance |
+| `mise run test:adapters` | JSON-RPC adapter and internal-agent contracts |
+| `mise run test:platform` | Filesystem, process, disposable-lab, scanner, and workspace boundaries |
+| `mise run test:differential` | Observation and Evidence v1 comparisons |
+| `mise run test:security` | Traversal, duplicate-key, protocol, replay, and transaction regressions |
+| `mise run lint` | Clippy, repository guardrails, and workflow validation |
+| `mise run package` | Verify the crates.io payload |
+| `mise run reference:test` | Test the unpublished OCaml reference explicitly |
 
-The official-exporter gate is intentionally separate from `mise run test`
-because it requires a running Docker engine. `mise install` supplies the pinned
-Dagger CLI; `DESHELL_DAGGER_EXE` can override it for controlled validation. The
-validator uses a digest-pinned `cwltool` image without mounting the Docker socket
-and removes its isolated temporary project after the run.
+Every implementation phase follows Red, Green, Refactor: first add a failing
+public contract or focused reproduction, implement the smallest correct change,
+then refactor while the relevant and full gates stay green. See
+[`CONTRIBUTING.md`](CONTRIBUTING.md).
 
-## Auditing a local corpus
-
-The bundled corpus auditor makes broad local measurements reproducible without
-executing source automation. It records the selected immediate-child
-repositories and exclusions, inventories embedded shell, verifies each shell
-file hash, and analyzes an isolated temporary copy. See
-[docs/corpus-audit.md](docs/corpus-audit.md) for the exact safe command and the
-2026-08-25 snapshot: 48 repositories, 1,457 inventory locations, zero analysis
-failures, and 2 of 47 raw shell files fully non-residual. That measurement is
-local evidence, not 1.0 certification; the document explains the denominator
-and the remaining residual groups. Typed branch state, safe static unquoted
-expansion, and simple/quoted-nested stdout capture moved every former
-command-substitution-first file to a later, explicitly reported boundary even
-though the whole-file numerator remains unchanged.
-
-## First migration
+## First project
 
 ```console
 mise run deshell -- init
-mise run deshell -- scan
+mise run deshell -- scan --format json
 mise run deshell -- analyze --entry scripts/build.sh
+mise run deshell -- check
 mise run deshell -- verify
 mise run deshell -- rewrite --equivalent --entry scripts/build.sh
-mise run deshell -- migrate --target nu --entry scripts/build.sh
+mise run deshell -- modernize --profile secure
 mise run deshell -- run -- --original-script-argument
-mise run deshell -- export --target dagger
+mise run deshell -- export --target cwl
+mise run deshell -- schema effect-ir
 ```
 
-Commands that can edit files default to a preview. Pass `--apply` only after
-reviewing the patch. Application is rejected if any source hash has changed, and
-multi-file migrations either commit in full or leave every file untouched.
+Commands that can alter source default to a preview and require `--apply`.
+Project files are fresh v1 contracts; 0.1.0 intentionally provides no legacy IR
+or lock migration path.
 
-`deshell init` creates the canonical project artifacts:
+`deshell init` creates:
 
-- `.deshell/project.toml`: entrypoints, runtime policy, sandbox, and export policy;
-- `.deshell/scenarios/*.toml`: arguments, environment, fixtures, and expectations;
-- `.deshell/plan.json`: canonical Effect IR;
-- `.deshell/evidence.json`: guarantees, digests, and observation status;
-- `deshell.lock`: protocol, adapter, command-model, interpreter, and lab digests.
+- `.deshell/project.toml`, containing entrypoints and policy;
+- `.deshell/scenarios/default.toml`, containing named inputs and expectations;
+- `deshell.lock`, containing protocol and provider pins.
 
-Use `mise run deshell -- --help` or an installed `deshell COMMAND --help` for the
-full CLI contract.
+`deshell analyze` then writes `.deshell/plan.json` and
+`.deshell/evidence.json`. Name/value arrays reject duplicates, paths are
+normalized project-relative paths, and persisted JSON rejects unknown fields.
 
-## Guarantee model
+## Diagnostics and exit behavior
 
-Every IR node carries exactly one evidence level:
+`--diagnostics human|jsonl` controls stderr only. It never changes stdout
+artifacts or bytes emitted by an executed plan. Normal commands use these fixed
+categories:
 
-- `formal`: covered by the named static semantic basis;
-- `exhaustive`: covered over a declared finite scenario set;
-- `differential`: matched against observations for declared scenarios;
-- `residual`: not lowered, with an explicit reason and original capsule.
+| Code | Meaning |
+| ---: | --- |
+| 0 | Success |
+| 1 | Execution or I/O failure |
+| 2 | CLI usage error |
+| 3 | Invalid configuration or IR |
+| 4 | Policy refusal |
+| 5 | Observed difference |
+| 6 | Provider unavailable |
+| 70 | Internal invariant violation |
 
-`deshell verify` audits coverage. It never upgrades static evidence merely
-because observation was requested; differential status is recorded only from an
-actual comparison.
+Once `run` starts the selected plan, it returns the plan's exit code unchanged.
 
-## Design boundaries
+## Runtime boundary
 
-The analysis core is deterministic and platform-neutral. Process, filesystem,
-network, and disposable-lab effects live behind runtime boundaries. Adapters use
-versioned JSON-RPC 2.0 over stdin/stdout with message limits and forward-compatible
-unknown fields. Exporters are strict by default and reject any node they cannot
-represent.
+The local backend is not an operating-system sandbox. It starts host processes
+with exact argv. Project file effects are confined and network access is
+replay-only, but untrusted automation still requires an externally isolated
+environment. Opaque residual execution is denied unless explicitly enabled.
 
-Repository governance follows the same explicit-capability rule: branch and
-release-tag Rulesets are enforced natively. GitHub does not expose push Rulesets
-for this public, personal-account repository, so the required CI gate enforces
-the equivalent tracked-file size and path-length guardrails and records the
-platform limitation in `.github/settings/capabilities.json`.
+Internal agents and adapters use a 4 MiB-bounded JSON-RPC v1 protocol. RPC
+objects ignore unknown fields for forward compatibility while still rejecting
+duplicate keys, invalid IDs, malformed UTF-8, disconnects, and protocol-version
+mismatches.
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the TDD contract and
-[ROADMAP.md](ROADMAP.md) for the remaining release-only gates. Support questions
-belong in [Discussions](https://github.com/P4suta/de-shell/discussions), and
-vulnerabilities must follow the private process in [SECURITY.md](SECURITY.md).
+## Conformance and release
+
+The language-neutral golden corpus covers POSIX, zsh, fish, PowerShell, cmd,
+Nushell, unknown interpreters, non-UTF-8 residual source, and integer bounds.
+Run it together with the CLI cases and internal-agent handshakes using:
+
+```console
+cargo build --locked -p deshell
+cargo run --locked -p xtask -- conformance target/debug/deshell
+```
+
+The release workflow defines six archives: Linux musl, macOS, and Windows for
+x86_64 and Arm64. It generates SHA-256 checksums, a keyless signature bundle,
+and build provenance, and publishes to crates.io only for the final `v0.1.0`
+tag in the protected release environment.
+
+The safe corpus auditor never executes source scripts. It inventories source,
+rechecks each content digest, and analyzes isolated temporary copies. Its
+selection and report contract are documented in
+[`docs/corpus-audit.md`](docs/corpus-audit.md). A 0.1.0 release requires the
+declared 2026-08-25 48-repository selection to have zero unexplained inventory,
+IR, guarantee, residual-reason, diagnostic, or export differences.
+
+## OCaml reference
+
+OCaml is retained only for deterministic contract comparison. It is not the
+default CLI, an install target, or a release artifact. Reference setup and tests
+are opt-in through the `reference:*` mise tasks; operating-system integration,
+packaging, and future runtime work belong to Rust.
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE).
+Apache-2.0. See [`LICENSE`](LICENSE).

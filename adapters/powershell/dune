@@ -1,5 +1,1 @@
-(install
- (package de-shell)
- (section libexec)
- (files
-  (adapter.ps1 as deshell-powershell-adapter.ps1)))
+; The Rust package embeds this adapter. The OCaml reference does not install it.

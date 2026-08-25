@@ -1,5 +1,1 @@
-(install
- (package de-shell)
- (section libexec)
- (files
-  (audit-corpus.ps1 as deshell-audit-corpus.ps1)))
+; Repository scripts are development tools, not OCaml package artifacts.

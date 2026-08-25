@@ -1,0 +1,431 @@
+{
+  "$defs": {
+    "binding": {
+      "additionalProperties": false,
+      "properties": {
+        "name": { "minLength": 1, "type": "string" },
+        "type": { "$ref": "#/$defs/valueType" }
+      },
+      "required": ["name", "type"],
+      "type": "object"
+    },
+    "guarantee": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "basis": { "minLength": 1, "type": "string" },
+            "level": { "const": "formal" }
+          },
+          "required": ["level", "basis"],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "level": { "const": "exhaustive" },
+            "scenarios": {
+              "items": { "minLength": 1, "type": "string" },
+              "minItems": 1,
+              "type": "array",
+              "uniqueItems": true
+            }
+          },
+          "required": ["level", "scenarios"],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "level": { "const": "residual" },
+            "reason": { "minLength": 1, "type": "string" }
+          },
+          "required": ["level", "reason"],
+          "type": "object"
+        }
+      ]
+    },
+    "invocation": {
+      "additionalProperties": false,
+      "properties": {
+        "accepts_common_parameters": { "type": "boolean" },
+        "parameters": {
+          "items": { "$ref": "#/$defs/invocationParameter" },
+          "type": "array"
+        },
+        "style": { "const": "powershell" }
+      },
+      "required": ["style", "accepts_common_parameters", "parameters"],
+      "type": "object"
+    },
+    "invocationParameter": {
+      "additionalProperties": false,
+      "properties": {
+        "default": {
+          "oneOf": [{ "$ref": "#/$defs/textExpression" }, { "type": "null" }]
+        },
+        "input": { "minLength": 1, "type": "string" },
+        "position": {
+          "oneOf": [{ "minimum": 0, "type": "integer" }, { "type": "null" }]
+        },
+        "required": { "type": "boolean" },
+        "switch": { "type": "boolean" },
+        "validations": {
+          "items": { "$ref": "#/$defs/invocationValidation" },
+          "type": "array"
+        }
+      },
+      "required": ["input", "position", "required", "switch", "default", "validations"],
+      "type": "object"
+    },
+    "invocationValidation": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": { "kind": { "const": "allow_empty_string" } },
+          "required": ["kind"],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": { "kind": { "const": "not_null_or_empty" } },
+          "required": ["kind"],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "ignore_case": { "type": "boolean" },
+            "kind": { "const": "string_set" },
+            "values": {
+              "items": { "type": "string" },
+              "minItems": 1,
+              "type": "array",
+              "uniqueItems": true
+            }
+          },
+          "required": ["kind", "values", "ignore_case"],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "int_range" },
+            "maximum": { "maximum": 9223372036854775807, "minimum": -9223372036854775808, "type": "integer" },
+            "minimum": { "maximum": 9223372036854775807, "minimum": -9223372036854775808, "type": "integer" }
+          },
+          "required": ["kind", "minimum", "maximum"],
+          "type": "object"
+        }
+      ]
+    },
+    "namedExpression": {
+      "additionalProperties": false,
+      "properties": {
+        "name": { "minLength": 1, "type": "string" },
+        "value": { "$ref": "#/$defs/textExpression" }
+      },
+      "required": ["name", "value"],
+      "type": "object"
+    },
+    "node": {
+      "additionalProperties": false,
+      "properties": {
+        "guarantee": { "$ref": "#/$defs/guarantee" },
+        "id": { "pattern": "^[0-9a-f]{32}$", "type": "string" },
+        "operation": { "$ref": "#/$defs/operation" },
+        "source": {
+          "oneOf": [{ "$ref": "#/$defs/span" }, { "type": "null" }]
+        }
+      },
+      "required": ["id", "operation", "guarantee", "source"],
+      "type": "object"
+    },
+    "operation": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "argv": {
+              "items": { "$ref": "#/$defs/textExpression" },
+              "minItems": 1,
+              "type": "array"
+            },
+            "environment": {
+              "items": { "$ref": "#/$defs/namedExpression" },
+              "type": "array"
+            },
+            "type": { "const": "exec" },
+            "working_directory": {
+              "oneOf": [{ "$ref": "#/$defs/textExpression" }, { "type": "null" }]
+            }
+          },
+          "required": ["type", "argv", "environment", "working_directory"],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "nodes": { "items": { "$ref": "#/$defs/node" }, "minItems": 1, "type": "array" },
+            "type": { "enum": ["pipeline", "sequence", "parallel"] }
+          },
+          "required": ["type", "nodes"],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "if_false": { "oneOf": [{ "$ref": "#/$defs/node" }, { "type": "null" }] },
+            "if_true": { "$ref": "#/$defs/node" },
+            "predicate": { "$ref": "#/$defs/node" },
+            "type": { "const": "condition" }
+          },
+          "required": ["type", "predicate", "if_true", "if_false"],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "cases": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "body": { "$ref": "#/$defs/node" },
+                  "pattern": { "$ref": "#/$defs/textExpression" }
+                },
+                "required": ["pattern", "body"],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "default": { "oneOf": [{ "$ref": "#/$defs/node" }, { "type": "null" }] },
+            "type": { "const": "match" },
+            "value": { "$ref": "#/$defs/textExpression" }
+          },
+          "required": ["type", "value", "cases", "default"],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "body": { "$ref": "#/$defs/node" },
+            "items": { "items": { "$ref": "#/$defs/textExpression" }, "type": "array" },
+            "type": { "const": "foreach" },
+            "variable": { "pattern": "^[A-Za-z_][A-Za-z0-9_]*$", "type": "string" }
+          },
+          "required": ["type", "variable", "items", "body"],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "body": { "$ref": "#/$defs/node" },
+            "finalizer": { "$ref": "#/$defs/node" },
+            "type": { "const": "try_finally" }
+          },
+          "required": ["type", "body", "finalizer"],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "arguments": { "items": { "$ref": "#/$defs/namedExpression" }, "type": "array" },
+            "task": { "minLength": 1, "type": "string" },
+            "type": { "const": "task_call" }
+          },
+          "required": ["type", "task", "arguments"],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "name": { "pattern": "^[A-Za-z_][A-Za-z0-9_]*$", "type": "string" },
+            "type": { "const": "set_variable" },
+            "value": { "$ref": "#/$defs/textExpression" },
+            "value_type": { "$ref": "#/$defs/valueType" }
+          },
+          "required": ["type", "name", "value_type", "value"],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "body": { "$ref": "#/$defs/node" },
+            "name": { "pattern": "^[A-Za-z_][A-Za-z0-9_]*$", "type": "string" },
+            "type": { "const": "capture_stdout" },
+            "value_type": { "const": "text" }
+          },
+          "required": ["type", "name", "value_type", "body"],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "path": { "$ref": "#/$defs/textExpression" },
+            "type": { "enum": ["file_read", "file_remove"] }
+          },
+          "required": ["type", "path"],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "append": { "type": "boolean" },
+            "contents": { "$ref": "#/$defs/textExpression" },
+            "path": { "$ref": "#/$defs/textExpression" },
+            "type": { "const": "file_write" }
+          },
+          "required": ["type", "path", "contents", "append"],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "method": { "$ref": "#/$defs/textExpression" },
+            "type": { "const": "network_request" },
+            "uri": { "$ref": "#/$defs/textExpression" }
+          },
+          "required": ["type", "method", "uri"],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "interpreter": { "minLength": 1, "type": "string" },
+            "path": {
+              "oneOf": [
+                { "$ref": "#/$defs/path" },
+                { "type": "null" }
+              ]
+            },
+            "source": { "$ref": "#/$defs/sourceBytes" },
+            "type": { "const": "opaque_capsule" }
+          },
+          "required": ["type", "interpreter", "source", "path"],
+          "type": "object"
+        }
+      ]
+    },
+    "path": {
+      "pattern": "^(?!/)(?!\\.{1,2}(?:/|$))(?!.*//)(?!.*\\/\\.{1,2}(?:/|$))(?!.*\\/$)[^\\\\:\\u0000]+$",
+      "type": "string"
+    },
+    "sourceBytes": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "encoding": { "const": "utf8" },
+            "text": { "type": "string" }
+          },
+          "required": ["encoding", "text"],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "base64": { "contentEncoding": "base64", "type": "string" },
+            "encoding": { "const": "base64" }
+          },
+          "required": ["encoding", "base64"],
+          "type": "object"
+        }
+      ]
+    },
+    "span": {
+      "additionalProperties": false,
+      "properties": {
+        "end_byte": { "minimum": 0, "type": "integer" },
+        "end_column": { "minimum": 0, "type": "integer" },
+        "end_line": { "minimum": 1, "type": "integer" },
+        "file": { "$ref": "#/$defs/path" },
+        "start_byte": { "minimum": 0, "type": "integer" },
+        "start_column": { "minimum": 0, "type": "integer" },
+        "start_line": { "minimum": 1, "type": "integer" }
+      },
+      "required": ["file", "start_line", "start_column", "end_line", "end_column", "start_byte", "end_byte"],
+      "type": "object"
+    },
+    "task": {
+      "additionalProperties": false,
+      "properties": {
+        "body": { "$ref": "#/$defs/node" },
+        "cacheable": { "type": "boolean" },
+        "environment": { "items": { "minLength": 1, "type": "string" }, "type": "array", "uniqueItems": true },
+        "inputs": { "items": { "$ref": "#/$defs/binding" }, "type": "array" },
+        "invocation": { "oneOf": [{ "$ref": "#/$defs/invocation" }, { "type": "null" }] },
+        "name": { "minLength": 1, "type": "string" },
+        "outputs": { "items": { "$ref": "#/$defs/binding" }, "type": "array" },
+        "platform_capabilities": { "items": { "minLength": 1, "type": "string" }, "type": "array", "uniqueItems": true },
+        "secrets": { "items": { "minLength": 1, "type": "string" }, "type": "array", "uniqueItems": true }
+      },
+      "required": ["name", "inputs", "outputs", "environment", "secrets", "platform_capabilities", "cacheable", "invocation", "body"],
+      "type": "object"
+    },
+    "textExpression": {
+      "additionalProperties": false,
+      "properties": {
+        "parts": {
+          "items": {
+            "oneOf": [
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "kind": { "const": "literal" },
+                  "value": { "type": "string" }
+                },
+                "required": ["kind", "value"],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "kind": { "const": "variable" },
+                  "name": { "pattern": "^[A-Za-z_][A-Za-z0-9_]*$", "type": "string" }
+                },
+                "required": ["kind", "name"],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "kind": { "const": "argument" },
+                  "name": { "minLength": 1, "type": "string" }
+                },
+                "required": ["kind", "name"],
+                "type": "object"
+              }
+            ]
+          },
+          "minItems": 1,
+          "type": "array"
+        }
+      },
+      "required": ["parts"],
+      "type": "object"
+    },
+    "valueType": {
+      "oneOf": [
+        { "enum": ["text", "bool", "int", "path"] },
+        {
+          "additionalProperties": false,
+          "properties": { "secret": { "$ref": "#/$defs/valueType" } },
+          "required": ["secret"],
+          "type": "object"
+        }
+      ]
+    }
+  },
+  "$id": "https://deshell.dev/contracts/effect-ir/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "entrypoint": { "minLength": 1, "type": "string" },
+    "generator": { "minLength": 1, "type": "string" },
+    "schema_version": { "const": 1 },
+    "tasks": { "items": { "$ref": "#/$defs/task" }, "minItems": 1, "type": "array" }
+  },
+  "required": ["schema_version", "generator", "entrypoint", "tasks"],
+  "title": "de-shell Effect IR v1",
+  "type": "object"
+}

@@ -1,0 +1,103 @@
+{
+  "$defs": {
+    "guarantee": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "basis": { "minLength": 1, "type": "string" },
+            "level": { "const": "formal" }
+          },
+          "required": ["level", "basis"],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "level": { "const": "exhaustive" },
+            "scenarios": {
+              "items": { "minLength": 1, "type": "string" },
+              "minItems": 1,
+              "type": "array",
+              "uniqueItems": true
+            }
+          },
+          "required": ["level", "scenarios"],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "level": { "const": "residual" },
+            "reason": { "minLength": 1, "type": "string" }
+          },
+          "required": ["level", "reason"],
+          "type": "object"
+        }
+      ]
+    },
+    "observation": {
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": { "properties": { "status": { "enum": ["verified", "different"] } }, "required": ["status"] },
+          "then": { "properties": { "digest": { "pattern": "^[0-9a-f]{64}$", "type": "string" } } }
+        }
+      ],
+      "properties": {
+        "digest": { "type": ["string", "null"] },
+        "provider": { "type": ["string", "null"] },
+        "reason": { "type": ["string", "null"] },
+        "scenarios": {
+          "items": { "minLength": 1, "type": "string" },
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "status": { "enum": ["verified", "different", "unavailable", "failed"] }
+      },
+      "required": ["scenarios", "status", "provider", "reason", "digest"],
+      "type": "object"
+    },
+    "path": {
+      "pattern": "^(?!/)(?!\\.{1,2}(?:/|$))(?!.*//)(?!.*\\/\\.{1,2}(?:/|$))(?!.*\\/$)[^\\\\:\\u0000]+$",
+      "type": "string"
+    }
+  },
+  "$id": "https://deshell.dev/contracts/evidence/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "nodes": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "guarantee": { "$ref": "#/$defs/guarantee" },
+          "id": { "pattern": "^[0-9a-f]{32}$", "type": "string" },
+          "operation": { "minLength": 1, "type": "string" }
+        },
+        "required": ["id", "operation", "guarantee"],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "observations": {
+      "items": { "$ref": "#/$defs/observation" },
+      "type": "array"
+    },
+    "plan_digest": { "pattern": "^[0-9a-f]{64}$", "type": "string" },
+    "schema_version": { "const": 1 },
+    "source": {
+      "additionalProperties": false,
+      "properties": {
+        "content_hash": { "pattern": "^[0-9a-f]{64}$", "type": "string" },
+        "path": { "$ref": "#/$defs/path" }
+      },
+      "required": ["path", "content_hash"],
+      "type": "object"
+    }
+  },
+  "required": ["schema_version", "plan_digest", "source", "nodes", "observations"],
+  "title": "de-shell Evidence v1",
+  "type": "object"
+}

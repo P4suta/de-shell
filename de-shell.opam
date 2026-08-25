@@ -1,10 +1,10 @@
 opam-version: "2.0"
 name: "de-shell"
 version: "0.1.0"
-synopsis: "Behavioral compiler for migrating shell automation"
+synopsis: "Unpublished OCaml Effect IR v1 reference"
 description: """
-de-shell inventories shell automation, lowers supported behavior into a typed
-Effect IR, and preserves unsupported behavior in executable residual capsules.
+Private deterministic reference used to compare the shared Effect IR v1 golden
+corpus with the public Rust deshell implementation. This package is not shipped.
 """
 maintainer: ["de-shell contributors"]
 authors: ["de-shell contributors"]
@@ -15,16 +15,10 @@ dev-repo: "git+https://github.com/P4suta/de-shell.git"
 depends: [
   "ocaml" {>= "5.5.0" & < "5.6"}
   "dune" {>= "3.24" & < "3.25"}
-  "cmdliner" {>= "1.3.0"}
   "yojson" {>= "2.2.0"}
-  "conf-rust"
-  "alcotest" {with-test}
-  "qcheck" {with-test}
-  "qcheck-core" {with-test}
-  "qcheck-alcotest" {with-test}
   "ocamlformat" {with-dev-setup & = "0.29.0"}
 ]
 build: [
   ["dune" "subst"] {dev}
-  ["dune" "build" "-p" name "-j" jobs]
+  ["dune" "build" "@reference-v1" "-j" jobs]
 ]

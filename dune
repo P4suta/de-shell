@@ -1,40 +1,12 @@
-(data_only_dirs .github)
+(data_only_dirs .github contracts crates xtask)
 
-(alias
- (name test-fast)
+(rule
+ (alias reference-v1)
  (deps
-  (alias test/fast)))
-
-(alias
- (name test-contract)
- (deps
-  (alias test/contract)))
-
-(alias
- (name test-platform)
- (deps
-  (alias test/platform)))
-
-(alias
- (name test-differential)
- (deps
-  (alias test/differential)))
-
-(alias
- (name test-security)
- (deps
-  (alias test/security)))
-
-(alias
- (name test-all)
- (deps
-  (alias test-fast)
-  (alias test-contract)
-  (alias test-platform)
-  (alias test-differential)
-  (alias test-security)))
-
-(alias
- (name runtest)
- (deps
-  (alias test-all)))
+  contracts/golden/frontend-v1.json
+  contracts/golden/transform-export-v1.json)
+ (action
+  (run
+   %{exe:bin/reference_conformance.exe}
+   %{dep:contracts/golden/frontend-v1.json}
+   %{dep:contracts/golden/transform-export-v1.json})))

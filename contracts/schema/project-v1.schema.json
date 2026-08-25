@@ -1,0 +1,48 @@
+{
+  "$id": "https://deshell.dev/contracts/project/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "entrypoints": {
+      "items": { "$ref": "#/$defs/path" },
+      "type": "array",
+      "uniqueItems": true
+    },
+    "export": {
+      "additionalProperties": false,
+      "properties": {
+        "bridge": { "type": "boolean" },
+        "strict": { "type": "boolean" }
+      },
+      "required": ["strict", "bridge"],
+      "type": "object"
+    },
+    "policy": {
+      "additionalProperties": false,
+      "properties": {
+        "host_write": { "enum": ["deny", "project"] },
+        "network": { "enum": ["deny", "record-replay"] },
+        "unknown_interpreter": { "enum": ["trace-only", "reject"] }
+      },
+      "required": ["host_write", "network", "unknown_interpreter"],
+      "type": "object"
+    },
+    "sandbox": {
+      "additionalProperties": false,
+      "properties": { "mode": { "const": "disposable" } },
+      "required": ["mode"],
+      "type": "object"
+    },
+    "version": { "const": 1 }
+  },
+  "required": ["version", "entrypoints", "policy", "sandbox", "export"],
+  "title": "de-shell project configuration v1",
+  "type": "object",
+  "$defs": {
+    "path": {
+      "minLength": 1,
+      "pattern": "^(?!/)(?!\\.{1,2}(?:/|$))(?!.*//)(?!.*\\/\\.{1,2}(?:/|$))(?!.*\\/$)[^\\\\:\\u0000]+$",
+      "type": "string"
+    }
+  }
+}

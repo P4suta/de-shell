@@ -1,8 +1,2 @@
-(install
- (package de-shell)
- (section share)
- (files
-  effect-ir.schema.json
-  evidence.schema.json
-  adapter.schema.json
-  corpus-audit.schema.json))
+; Legacy OCaml schemas are reference inputs only. Public v1 schemas live in
+; contracts/schema and are embedded by the Rust binary.

@@ -1,0 +1,61 @@
+{
+  "$id": "https://deshell.dev/contracts/scenario/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "arguments": { "items": { "$ref": "#/$defs/namedValue" }, "type": "array" },
+    "argv": { "items": { "type": "string" }, "type": "array" },
+    "environment": { "items": { "$ref": "#/$defs/namedValue" }, "type": "array" },
+    "expect": {
+      "additionalProperties": false,
+      "properties": {
+        "exit_code": { "maximum": 2147483647, "minimum": -2147483648, "type": "integer" },
+        "files": { "items": { "$ref": "#/$defs/expectedFile" }, "type": "array" },
+        "stderr": { "type": "string" },
+        "stdout": { "type": "string" }
+      },
+      "type": "object"
+    },
+    "fixtures": { "items": { "$ref": "#/$defs/fixture" }, "type": "array" },
+    "name": { "minLength": 1, "type": "string" },
+    "timeout_ms": { "maximum": 86400000, "minimum": 1, "type": "integer" },
+    "version": { "const": 1 }
+  },
+  "required": ["version", "name", "arguments", "argv", "environment", "fixtures", "timeout_ms", "expect"],
+  "title": "de-shell scenario v1",
+  "type": "object",
+  "$defs": {
+    "expectedFile": {
+      "additionalProperties": false,
+      "properties": {
+        "path": { "$ref": "#/$defs/path" },
+        "sha256": { "pattern": "^[0-9a-f]{64}$", "type": "string" }
+      },
+      "required": ["path", "sha256"],
+      "type": "object"
+    },
+    "fixture": {
+      "additionalProperties": false,
+      "properties": {
+        "contents": { "type": "string" },
+        "executable": { "type": "boolean" },
+        "path": { "$ref": "#/$defs/path" }
+      },
+      "required": ["path", "contents"],
+      "type": "object"
+    },
+    "namedValue": {
+      "additionalProperties": false,
+      "properties": {
+        "name": { "minLength": 1, "type": "string" },
+        "value": { "type": "string" }
+      },
+      "required": ["name", "value"],
+      "type": "object"
+    },
+    "path": {
+      "pattern": "^(?!/)(?!\\.{1,2}(?:/|$))(?!.*//)(?!.*\\/\\.{1,2}(?:/|$))(?!.*\\/$)[^\\\\:\\u0000]+$",
+      "type": "string"
+    }
+  }
+}

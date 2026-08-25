@@ -5,6 +5,6 @@
 
 (package
  (name de-shell)
- (synopsis "Behavioral compiler for migrating shell automation")
+ (synopsis "Unpublished OCaml Effect IR v1 reference")
  (description
-  "Discover, lower, verify, rewrite, and export shell automation through a typed Effect IR."))
+  "Private deterministic reference for the Rust deshell implementation."))

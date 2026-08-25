@@ -1,0 +1,18 @@
+{
+  "$id": "https://deshell.dev/contracts/diagnostic/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "code": { "minLength": 1, "pattern": "^DESHELL_[A-Z0-9_]+$", "type": "string" },
+    "context": {
+      "additionalProperties": { "type": "string" },
+      "type": "object"
+    },
+    "message": { "minLength": 1, "type": "string" },
+    "schema_version": { "const": 1 },
+    "severity": { "enum": ["error", "warning", "note"] }
+  },
+  "required": ["schema_version", "severity", "code", "message", "context"],
+  "title": "de-shell diagnostic v1",
+  "type": "object"
+}

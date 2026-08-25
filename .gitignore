@@ -1,6 +1,6 @@
 /_build/
 /_opam/
-/adapters/nushell/target/
+/target/
 /.opam-switch/
 /.tools/
 /.opam-root/

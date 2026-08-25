@@ -1,0 +1,104 @@
+{
+  "cases": [
+    {
+      "exhaustive": 0,
+      "formal": 1,
+      "name": "posix",
+      "path": "build.sh",
+      "plan_digest": "9eda00b3c0b2569ebd21f35c37e90594397ee743aecd572f5789b4fef676c59a",
+      "residual": 0,
+      "root_operation": "exec",
+      "source_base64": null,
+      "source_utf8": "printf '%s' \"$NAME\"\n"
+    },
+    {
+      "exhaustive": 0,
+      "formal": 1,
+      "name": "zsh",
+      "path": "build.zsh",
+      "plan_digest": "626bd7e3988ae5f45118be41305059538a72104d45a7d73ed378d4421fd83c3b",
+      "residual": 0,
+      "root_operation": "exec",
+      "source_base64": null,
+      "source_utf8": "printf 'hello'\n"
+    },
+    {
+      "exhaustive": 0,
+      "formal": 1,
+      "name": "fish",
+      "path": "build.fish",
+      "plan_digest": "aad9b7e6a44192f7800e2582a7cee0a5e307efaeece504eb769d19fc08049b56",
+      "residual": 0,
+      "root_operation": "exec",
+      "source_base64": null,
+      "source_utf8": "command printf hello\n"
+    },
+    {
+      "exhaustive": 0,
+      "formal": 1,
+      "name": "powershell",
+      "path": "build.ps1",
+      "plan_digest": "bd75b42772fd4603d14bd3822baeb74dbaeb2be56dc7810b1c05352855232c41",
+      "residual": 0,
+      "root_operation": "exec",
+      "source_base64": null,
+      "source_utf8": "& 'pwsh' '-NoProfile'\n"
+    },
+    {
+      "exhaustive": 0,
+      "formal": 1,
+      "name": "cmd",
+      "path": "build.cmd",
+      "plan_digest": "d38b5851eb1726295099025159207a6fd97697d81ce63c536b755e7291b4a2bd",
+      "residual": 0,
+      "root_operation": "exec",
+      "source_base64": null,
+      "source_utf8": "@echo off\r\n@where.exe cmd.exe\r\n"
+    },
+    {
+      "exhaustive": 0,
+      "formal": 1,
+      "name": "nushell",
+      "path": "build.nu",
+      "plan_digest": "aba2648678f29d3400a4bddd82e46fcb5fb43559fc7b5dd1c3da9886708c6190",
+      "residual": 0,
+      "root_operation": "exec",
+      "source_base64": null,
+      "source_utf8": "^printf hello\n"
+    },
+    {
+      "exhaustive": 0,
+      "formal": 0,
+      "name": "unknown",
+      "path": "build.unknown",
+      "plan_digest": "687d0ebb36c41512588b0c211e353a7df2d2904c75efb318c3ef417cda8d91d3",
+      "residual": 1,
+      "root_operation": "opaque_capsule",
+      "source_base64": null,
+      "source_utf8": "dynamic syntax\n"
+    },
+    {
+      "exhaustive": 0,
+      "formal": 0,
+      "name": "non_utf8",
+      "path": "binary.sh",
+      "plan_digest": "d8e05e1d9f2ec8c41d90e14ccc7e9b2dda16207ce47db501c972adb269ac25a0",
+      "residual": 1,
+      "root_operation": "opaque_capsule",
+      "source_base64": "cHJpbnRmIP8K",
+      "source_utf8": null
+    },
+    {
+      "exhaustive": 0,
+      "formal": 3,
+      "name": "int_boundary",
+      "path": "boundary.sh",
+      "plan_digest": "5867033a403485d6c51bf089c8cda372b9d2d41e08a8b64279d5e9250fd547a6",
+      "residual": 0,
+      "root_operation": "sequence",
+      "source_base64": null,
+      "source_utf8": "VALUE=9223372036854775807\nprintf '%s' \"$VALUE\"\n"
+    }
+  ],
+  "schema_version": 1
+}

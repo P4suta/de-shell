@@ -1,0 +1,66 @@
+{
+  "equivalent_rewrites": [
+    {
+      "edits": 1,
+      "name": "simple_backticks",
+      "output": "echo $(printf hi)\nprintf '`date`'\n",
+      "path": "build.sh",
+      "source": "echo `printf hi`\nprintf '`date`'\n"
+    },
+    {
+      "edits": 0,
+      "name": "unsafe_nested_backticks",
+      "output": "echo `printf \\`nested\\``\n",
+      "path": "build.sh",
+      "source": "echo `printf \\`nested\\``\n"
+    }
+  ],
+  "exports": [
+    {
+      "content_sha256": "2401bae642e6fc1e76e849062c3d3a25b513adb5c2ea599809b3091567136bbc",
+      "filename": "deshell.cwl",
+      "media_type": "application/cwl+json",
+      "name": "literal_cwl",
+      "path": "build.zsh",
+      "source": "printf 'hello'\n",
+      "target": "cwl"
+    },
+    {
+      "content_sha256": "772e2ca8d4577f9bdde4e0fa7b11035f7d3e02770aafd5150b12d675c021c4e8",
+      "filename": "deshell.dagger.ts",
+      "media_type": "text/typescript",
+      "name": "literal_dagger",
+      "path": "build.zsh",
+      "source": "printf 'hello'\n",
+      "target": "dagger"
+    },
+    {
+      "content_sha256": "248f4721e94761f3c9e23372617a6692b444d3b232a98e50dd0cc1ed99fa093f",
+      "filename": "deshell.nu",
+      "media_type": "text/x-nushell",
+      "name": "literal_nushell",
+      "path": "build.zsh",
+      "source": "printf 'hello'\n",
+      "target": "nu"
+    }
+  ],
+  "modernizations": [
+    {
+      "edits": 1,
+      "name": "secure_strict_mode",
+      "output": "#!/bin/sh\nset -eu\necho hello\n",
+      "path": "build.sh",
+      "profiles": ["secure"],
+      "source": "#!/bin/sh\necho hello\n"
+    },
+    {
+      "edits": 0,
+      "name": "portable_review_only",
+      "output": "[[ -f input ]] && echo yes\n",
+      "path": "build.sh",
+      "profiles": ["portable"],
+      "source": "[[ -f input ]] && echo yes\n"
+    }
+  ],
+  "schema_version": 1
+}
