@@ -217,13 +217,16 @@ pub(crate) fn check(root: &Path) -> Result<(), Vec<String>> {
 }
 
 pub(crate) fn save_evidence(root: &Path, evidence: &Evidence) -> Result<PathBuf, String> {
-    let plan_path = root.join(".deshell/plan.json");
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve project root {}: {error}", root.display()))?;
+    let plan_path = canonical_root.join(".deshell/plan.json");
     let plan = Plan::decode(
         &std::fs::read(&plan_path)
             .map_err(|error| format!("cannot read {}: {error}", plan_path.display()))?,
     )
     .map_err(|errors| errors.join("; "))?;
-    let (_, source_path) = resolve_entry(root, &evidence.source.path)?;
+    let (_, source_path) = resolve_entry(&canonical_root, &evidence.source.path)?;
     let source = std::fs::read(&source_path).map_err(|error| {
         format!(
             "cannot read evidence source {}: {error}",
@@ -233,7 +236,7 @@ pub(crate) fn save_evidence(root: &Path, evidence: &Evidence) -> Result<PathBuf,
     evidence
         .validate_against(&plan, &source)
         .map_err(|errors| errors.join("; "))?;
-    let path = root.join(".deshell/evidence.json");
+    let path = canonical_root.join(".deshell/evidence.json");
     let proposal = prepare_write(&path, evidence.encode_pretty()?)?;
     crate::patch::apply_all(&[proposal])?;
     Ok(path)
@@ -554,6 +557,21 @@ mod tests {
         tampered.plan_digest = "0".repeat(64);
         assert!(save_evidence(directory.path(), &tampered).is_err());
         assert_ne!(std::fs::read(&analysis.evidence_path).unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn evidence_updates_return_the_canonical_path_for_a_root_alias() {
+        let directory = configured_project(b"true\n");
+        let analysis = analyze(directory.path(), "build.sh").unwrap();
+        let aliases = tempfile::tempdir().unwrap();
+        let alias = aliases.path().join("project");
+        std::os::unix::fs::symlink(directory.path(), &alias).unwrap();
+
+        assert_eq!(
+            save_evidence(&alias, &analysis.evidence).unwrap(),
+            analysis.evidence_path
+        );
     }
 
     #[test]
