@@ -110,9 +110,9 @@ description = "Check Rust formatting"
 run = "cargo fmt --all --check"
 
 [tasks."reference:setup"]
-description = "Install dependencies for the unpublished OCaml reference implementation"
+description = "Install dependencies for the unpublished OCaml reference implementation (the hosted CI VM disables nested opam sandboxing)"
 run = [
-  "opam init --cli=2.5 --bare --no-setup --no",
+  "opam init --cli=2.5 --bare --no-setup --no ${CI:+--disable-sandboxing}",
   "opam switch create . 5.5.0 --cli=2.5 --deps-only --with-test --with-dev-setup --locked --assume-depexts --yes || opam install . --cli=2.5 --switch=. --deps-only --with-test --with-dev-setup --locked --assume-depexts --yes",
 ]
 run_windows = [

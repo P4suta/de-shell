@@ -401,19 +401,23 @@ mod tests {
     }
 
     #[test]
-    fn reference_ci_installs_the_opam_sandbox_dependency_before_setup() {
+    fn reference_setup_disables_opam_sandbox_only_on_isolated_ci() {
         let root = repository_root();
-        let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
-        let install = ci
-            .find("sudo apt-get install --yes bubblewrap")
-            .expect("OCaml reference CI must install opam's bwrap sandbox dependency");
-        let setup = ci
-            .find("mise run reference:setup")
-            .expect("OCaml reference CI must initialize the private switch");
+        let mise = std::fs::read_to_string(root.join("mise.toml")).unwrap();
+        let init = mise
+            .find("${CI:+--disable-sandboxing}")
+            .expect("hosted CI must select opam's no-sandbox initialization mode");
+        let switch = mise
+            .find("opam switch create . 5.5.0")
+            .expect("reference setup must create the private compiler switch");
         assert!(
-            install < setup,
-            "bubblewrap must be installed before opam init"
+            init < switch,
+            "opam must be initialized before switch creation"
         );
+
+        let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
+        assert!(ci.contains("mise run reference:setup"));
+        assert!(!ci.contains("bubblewrap"));
     }
 
     #[test]

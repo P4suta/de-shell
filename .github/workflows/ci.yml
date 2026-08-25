@@ -109,11 +109,6 @@ jobs:
           cache: true
           install_args: opam@2.5.2
 
-      - name: Install opam sandbox dependency
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes bubblewrap
-
       - name: Create the private OCaml reference switch
         run: mise run reference:setup
 
