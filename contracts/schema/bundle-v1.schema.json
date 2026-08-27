@@ -1,0 +1,59 @@
+{
+  "$id": "https://deshell.dev/contracts/bundle/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "architecture": { "enum": ["aarch64", "x86_64"] },
+    "capabilities": {
+      "items": { "minLength": 1, "type": "string" },
+      "type": "array",
+      "uniqueItems": true
+    },
+    "entrypoint": { "$ref": "#/$defs/path" },
+    "files": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "bytes": { "minimum": 0, "type": "integer" },
+          "executable": { "type": "boolean" },
+          "path": { "$ref": "#/$defs/path" },
+          "sha256": { "$ref": "#/$defs/digest" }
+        },
+        "required": ["path", "bytes", "sha256", "executable"],
+        "type": "object"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "format": { "const": "deshell-bundle-v1" },
+    "operating_system": { "enum": ["linux", "macos", "windows"] },
+    "run": {
+      "items": { "type": "string" },
+      "minItems": 1,
+      "type": "array"
+    },
+    "runtime_image": {
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9/._:-]*@sha256:[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "runtime_assets": {
+      "items": { "$ref": "#/$defs/path" },
+      "minItems": 1,
+      "type": "array",
+      "uniqueItems": true
+    },
+    "schema_version": { "const": 1 },
+    "target": { "enum": ["internal", "dagger", "nushell", "cwl"] }
+  },
+  "required": ["schema_version", "format", "target", "entrypoint", "runtime_image", "operating_system", "architecture", "capabilities", "runtime_assets", "files", "run"],
+  "title": "de-shell self-contained bundle manifest v1",
+  "type": "object",
+  "$defs": {
+    "digest": { "pattern": "^[0-9a-f]{64}$", "type": "string" },
+    "path": {
+      "minLength": 1,
+      "pattern": "^(?!/)(?!\\.{1,2}(?:/|$))(?!.*//)(?!.*\\/\\.{1,2}(?:/|$))(?!.*\\/$)[^\\\\:\\u0000]+$",
+      "type": "string"
+    }
+  }
+}

@@ -11,31 +11,49 @@
     "export": {
       "additionalProperties": false,
       "properties": {
-        "bridge": { "type": "boolean" },
-        "strict": { "type": "boolean" }
+        "mode": { "enum": ["strict", "bundle"] }
       },
-      "required": ["strict", "bridge"],
+      "required": ["mode"],
+      "type": "object"
+    },
+    "limits": {
+      "additionalProperties": false,
+      "properties": {
+        "memory_bytes": { "maximum": 1099511627776, "minimum": 16777216, "type": "integer" },
+        "processes": { "maximum": 65535, "minimum": 1, "type": "integer" },
+        "stderr_bytes": { "maximum": 1073741824, "minimum": 1, "type": "integer" },
+        "stdout_bytes": { "maximum": 1073741824, "minimum": 1, "type": "integer" },
+        "timeout_ms": { "maximum": 86400000, "minimum": 1, "type": "integer" }
+      },
+      "required": ["timeout_ms", "memory_bytes", "processes", "stdout_bytes", "stderr_bytes"],
       "type": "object"
     },
     "policy": {
       "additionalProperties": false,
       "properties": {
-        "host_write": { "enum": ["deny", "project"] },
+        "delegation": { "enum": ["deny", "pinned"] },
+        "file_read": { "enum": ["deny", "project"] },
+        "file_write": { "enum": ["deny", "sandbox"] },
+        "host_execution": { "const": "deny" },
+        "host_materialization": { "const": "deny" },
         "network": { "enum": ["deny", "record-replay"] },
         "unknown_interpreter": { "enum": ["trace-only", "reject"] }
       },
-      "required": ["host_write", "network", "unknown_interpreter"],
+      "required": ["file_read", "file_write", "host_materialization", "host_execution", "network", "delegation", "unknown_interpreter"],
       "type": "object"
     },
     "sandbox": {
       "additionalProperties": false,
-      "properties": { "mode": { "const": "disposable" } },
-      "required": ["mode"],
+      "properties": {
+        "allow_local": { "type": "boolean" },
+        "mode": { "const": "disposable" }
+      },
+      "required": ["mode", "allow_local"],
       "type": "object"
     },
     "version": { "const": 1 }
   },
-  "required": ["version", "entrypoints", "policy", "sandbox", "export"],
+  "required": ["version", "entrypoints", "policy", "sandbox", "limits", "export"],
   "title": "de-shell project configuration v1",
   "type": "object",
   "$defs": {

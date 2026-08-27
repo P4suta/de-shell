@@ -71,6 +71,13 @@ pub(crate) enum PrimitiveType {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PipelineStatus {
+    Last,
+    Pipefail,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct NamedExpression {
     pub name: String,
@@ -92,8 +99,8 @@ pub(crate) struct SourceSpan {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "snake_case", tag = "level")]
 pub(crate) enum Guarantee {
-    Formal { basis: String },
-    Exhaustive { scenarios: Vec<String> },
+    Native { semantic_model: String },
+    Delegated { reason: String },
     Residual { reason: String },
 }
 
@@ -149,6 +156,7 @@ pub(crate) enum Operation {
     },
     Pipeline {
         nodes: Vec<Node>,
+        status: PipelineStatus,
     },
     Sequence {
         nodes: Vec<Node>,
@@ -204,6 +212,14 @@ pub(crate) enum Operation {
         method: TextExpression,
         uri: TextExpression,
     },
+    InterpreterCall {
+        interpreter: String,
+        interpreter_pin: String,
+        source: SourceBytes,
+        source_span: SourceSpan,
+        capabilities: Vec<String>,
+        reason: String,
+    },
     OpaqueCapsule {
         interpreter: String,
         source: SourceBytes,
@@ -229,6 +245,7 @@ impl Operation {
             Self::FileWrite { .. } => "file_write",
             Self::FileRemove { .. } => "file_remove",
             Self::NetworkRequest { .. } => "network_request",
+            Self::InterpreterCall { .. } => "interpreter_call",
             Self::OpaqueCapsule { .. } => "opaque_capsule",
         }
     }
@@ -469,7 +486,7 @@ fn visit_children_mut<E>(
     mut visit: impl FnMut(&mut Node) -> Result<(), E>,
 ) -> Result<(), E> {
     match operation {
-        Operation::Pipeline { nodes }
+        Operation::Pipeline { nodes, .. }
         | Operation::Sequence { nodes }
         | Operation::Parallel { nodes } => {
             for node in nodes {
@@ -507,6 +524,7 @@ fn visit_children_mut<E>(
         | Operation::FileWrite { .. }
         | Operation::FileRemove { .. }
         | Operation::NetworkRequest { .. }
+        | Operation::InterpreterCall { .. }
         | Operation::OpaqueCapsule { .. } => {}
     }
     Ok(())
@@ -656,18 +674,31 @@ fn validate_node<'a>(
     *preorder = preorder.saturating_add(1);
 
     match &node.guarantee {
-        Guarantee::Formal { basis } => require_nonempty("formal basis", basis, errors),
-        Guarantee::Exhaustive { scenarios } => {
-            if scenarios.is_empty() {
-                errors.push("exhaustive guarantee requires scenarios".into());
-            }
-            duplicate_strings(
-                "guarantee scenario",
-                scenarios.iter().map(String::as_str),
-                errors,
-            );
+        Guarantee::Native { semantic_model } => {
+            require_nonempty("native semantic model", semantic_model, errors)
         }
+        Guarantee::Delegated { reason } => require_nonempty("delegation reason", reason, errors),
         Guarantee::Residual { reason } => require_nonempty("residual reason", reason, errors),
+    }
+    match &node.operation {
+        Operation::InterpreterCall { .. }
+            if !matches!(node.guarantee, Guarantee::Delegated { .. }) =>
+        {
+            errors.push("interpreter_call must use a delegated guarantee".into());
+        }
+        Operation::OpaqueCapsule { .. }
+            if !matches!(node.guarantee, Guarantee::Residual { .. }) =>
+        {
+            errors.push("opaque_capsule must use a residual guarantee".into());
+        }
+        Operation::InterpreterCall { .. } | Operation::OpaqueCapsule { .. } => {}
+        _ if !matches!(node.guarantee, Guarantee::Native { .. }) => {
+            errors.push(format!(
+                "{} must use a native guarantee",
+                node.operation.name()
+            ));
+        }
+        _ => {}
     }
 
     let expression = |value: &TextExpression, errors: &mut Vec<String>| {
@@ -703,7 +734,7 @@ fn validate_node<'a>(
                 expression(directory, errors);
             }
         }
-        Operation::Pipeline { nodes } | Operation::Parallel { nodes } => {
+        Operation::Pipeline { nodes, .. } | Operation::Parallel { nodes } => {
             if nodes.is_empty() {
                 errors.push(format!(
                     "{} must contain at least one node",
@@ -833,6 +864,43 @@ fn validate_node<'a>(
             expression(method, errors);
             expression(uri, errors);
         }
+        Operation::InterpreterCall {
+            interpreter,
+            interpreter_pin,
+            source,
+            source_span,
+            capabilities,
+            reason,
+        } => {
+            require_nonempty("delegated interpreter", interpreter, errors);
+            if !valid_pin(interpreter_pin) {
+                errors.push("delegated interpreter_pin must be sha256:<64 lowercase hex>".into());
+            }
+            let bytes = match source.to_bytes() {
+                Ok(bytes) => Some(bytes),
+                Err(_) => {
+                    errors.push("delegated source encoding is invalid".into());
+                    None
+                }
+            };
+            require_nonempty("delegation reason", reason, errors);
+            duplicate_strings(
+                "delegated capability",
+                capabilities.iter().map(String::as_str),
+                errors,
+            );
+            for capability in capabilities {
+                require_nonempty("delegated capability", capability, errors);
+            }
+            if node.source.as_ref() != Some(source_span) {
+                errors.push("interpreter_call source_span must equal the node source span".into());
+            }
+            if let Some(bytes) = bytes
+                && source_span.end_byte.saturating_sub(source_span.start_byte) != bytes.len() as u64
+            {
+                errors.push("interpreter_call source bytes must exactly cover source_span".into());
+            }
+        }
         Operation::OpaqueCapsule {
             interpreter,
             source,
@@ -849,9 +917,6 @@ fn validate_node<'a>(
                     Err(error) => errors.push(format!("invalid capsule path {path}: {error}")),
                 }
             }
-            if !matches!(node.guarantee, Guarantee::Residual { .. }) {
-                errors.push("opaque capsule must use a residual guarantee".into());
-            }
         }
     }
 }
@@ -859,7 +924,7 @@ fn validate_node<'a>(
 fn contains_state_mutation(node: &Node) -> bool {
     match &node.operation {
         Operation::SetVariable { .. } | Operation::CaptureStdout { .. } => true,
-        Operation::Pipeline { nodes }
+        Operation::Pipeline { nodes, .. }
         | Operation::Sequence { nodes }
         | Operation::Parallel { nodes } => nodes.iter().any(contains_state_mutation),
         Operation::Condition {
@@ -885,6 +950,7 @@ fn contains_state_mutation(node: &Node) -> bool {
         | Operation::FileWrite { .. }
         | Operation::FileRemove { .. }
         | Operation::NetworkRequest { .. }
+        | Operation::InterpreterCall { .. }
         | Operation::OpaqueCapsule { .. } => false,
     }
 }
@@ -953,6 +1019,12 @@ fn valid_identifier(name: &str) -> bool {
         && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
+fn valid_pin(value: &str) -> bool {
+    value
+        .strip_prefix("sha256:")
+        .is_some_and(crate::digest::valid_sha256)
+}
+
 fn require_nonempty(label: &str, value: &str, errors: &mut Vec<String>) {
     if value.trim().is_empty() {
         errors.push(format!("{label} must not be empty"));
@@ -1013,8 +1085,8 @@ mod tests {
                         environment: vec![],
                         working_directory: None,
                     },
-                    guarantee: Guarantee::Formal {
-                        basis: "test-v1".into(),
+                    guarantee: Guarantee::Native {
+                        semantic_model: "test-v1".into(),
                     },
                     source: Some(SourceSpan {
                         file: "scripts/build.sh".into(),

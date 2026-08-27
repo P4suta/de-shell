@@ -2,6 +2,7 @@ use base64::Engine as _;
 use std::io::{BufRead, Write};
 
 pub(crate) const MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_CHUNK_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AgentKind {
@@ -49,7 +50,9 @@ pub(crate) fn handle_message(kind: AgentKind, input: &[u8]) -> Vec<u8> {
     if !valid_envelope {
         return response(error(id, -32600, "invalid JSON-RPC request"));
     }
-    let method = fields["method"].as_str().expect("validated method");
+    let Some(method) = fields.get("method").and_then(serde_json::Value::as_str) else {
+        return response(error(id, -32600, "invalid JSON-RPC request"));
+    };
     if method == "deshell.handshake" {
         let Some(parameters) = fields.get("params").and_then(serde_json::Value::as_object) else {
             return response(error(id, -32602, "handshake params must be an object"));
@@ -87,6 +90,7 @@ pub(crate) fn handle_message(kind: AgentKind, input: &[u8]) -> Vec<u8> {
     let result = match (kind, method) {
         (AgentKind::Process, "process.execute") => execute_process(parameters),
         (AgentKind::Observer, "observer.observe") => observe_process(parameters),
+        (AgentKind::Observer, "observer.run_plan") => run_plan_process(parameters),
         (AgentKind::Nushell, "nushell.lower") => lower_nushell(parameters),
         _ => return response(error(id, -32601, "method not found")),
     };
@@ -104,9 +108,14 @@ pub(crate) fn serve(
     loop {
         match read_frame(input)? {
             None => return Ok(0),
-            Some(Frame::Message(message)) => output
-                .write_all(&handle_message(kind, &message))
-                .map_err(|error| format!("cannot write RPC response: {error}"))?,
+            Some(Frame::Message(message)) => {
+                let response = handle_message(kind, &message);
+                for frame in response_frames(&response)? {
+                    output
+                        .write_all(&frame)
+                        .map_err(|error| format!("cannot write RPC response: {error}"))?;
+                }
+            }
             Some(Frame::Oversized) => output
                 .write_all(&response(error(
                     serde_json::Value::Null,
@@ -166,6 +175,193 @@ pub(crate) fn decode_response(
     }
 }
 
+pub(crate) fn decode_streamed_response(
+    input: &[u8],
+    expected_id: &serde_json::Value,
+    stdout_limit: u64,
+    stderr_limit: u64,
+) -> Result<serde_json::Value, String> {
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut next_stdout = 0_u64;
+    let mut next_stderr = 0_u64;
+    let mut final_result = None;
+    for raw in input.split_inclusive(|byte| *byte == b'\n') {
+        let frame = raw.strip_suffix(b"\n").unwrap_or(raw);
+        let frame = frame.strip_suffix(b"\r").unwrap_or(frame);
+        if frame.is_empty() {
+            continue;
+        }
+        if frame.len() > MAX_MESSAGE_BYTES {
+            return Err(format!(
+                "RPC response frame exceeds the {MAX_MESSAGE_BYTES} byte limit"
+            ));
+        }
+        let value = crate::strict_json::parse(frame)
+            .map_err(|error| format!("invalid RPC response frame: {error}"))?;
+        if value.get("method").and_then(serde_json::Value::as_str) == Some("deshell.stream") {
+            let parameters = value
+                .get("params")
+                .and_then(serde_json::Value::as_object)
+                .ok_or("stream notification params must be an object")?;
+            if parameters.get("request_id") != Some(expected_id) {
+                return Err("stream notification request ID mismatch".into());
+            }
+            let stream = parameters
+                .get("stream")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("stream notification stream must be a string")?;
+            let sequence = parameters
+                .get("sequence")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or("stream notification sequence must be an integer")?;
+            let encoded = parameters
+                .get("data_base64")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("stream notification data_base64 must be a string")?;
+            let data = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .map_err(|error| format!("stream chunk is invalid base64: {error}"))?;
+            if data.len() > MAX_CHUNK_BYTES {
+                return Err("stream chunk exceeds the 262144 byte limit".into());
+            }
+            if base64::engine::general_purpose::STANDARD.encode(&data) != encoded {
+                return Err("stream chunk base64 is not canonical".into());
+            }
+            let (output, next, limit) = match stream {
+                "stdout" => (&mut stdout, &mut next_stdout, stdout_limit),
+                "stderr" => (&mut stderr, &mut next_stderr, stderr_limit),
+                _ => return Err(format!("unknown RPC stream: {stream}")),
+            };
+            if sequence != *next {
+                return Err(format!(
+                    "out-of-order {stream} chunk (expected {}, found {sequence})",
+                    *next
+                ));
+            }
+            *next += 1;
+            if output.len() as u64 + data.len() as u64 > limit {
+                return Err(format!("{stream} stream exceeds the configured byte limit"));
+            }
+            output.extend(data);
+            continue;
+        }
+        if final_result.is_some() {
+            return Err("RPC stream contains multiple final responses".into());
+        }
+        final_result = Some(decode_response(frame, expected_id)?);
+    }
+    let mut result = final_result.ok_or("RPC stream is missing a final response")?;
+    let fields = result
+        .as_object_mut()
+        .ok_or("RPC final result must be an object")?;
+    if let Some(streams) = fields.remove("streams") {
+        validate_stream_metadata(&streams, "stdout", &stdout)?;
+        validate_stream_metadata(&streams, "stderr", &stderr)?;
+        fields.insert(
+            "stdout_base64".into(),
+            serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(stdout)),
+        );
+        fields.insert(
+            "stderr_base64".into(),
+            serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(stderr)),
+        );
+    } else if next_stdout != 0 || next_stderr != 0 {
+        return Err("RPC final response is missing stream metadata".into());
+    }
+    Ok(result)
+}
+
+fn validate_stream_metadata(
+    streams: &serde_json::Value,
+    name: &str,
+    bytes: &[u8],
+) -> Result<(), String> {
+    let metadata = streams
+        .get(name)
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| format!("RPC final response is missing {name} stream metadata"))?;
+    if metadata.get("bytes").and_then(serde_json::Value::as_u64) != Some(bytes.len() as u64) {
+        return Err(format!("RPC {name} stream byte count mismatch"));
+    }
+    if metadata.get("sha256").and_then(serde_json::Value::as_str)
+        != Some(crate::digest::sha256(bytes).as_str())
+    {
+        return Err(format!("RPC {name} stream digest mismatch"));
+    }
+    Ok(())
+}
+
+fn response_frames(response: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+    if response.len() <= MAX_MESSAGE_BYTES {
+        return Ok(vec![response.to_vec()]);
+    }
+    let mut value = crate::strict_json::parse(response)
+        .map_err(|error| format!("cannot stream internal RPC response: {error}"))?;
+    let id = value
+        .get("id")
+        .cloned()
+        .ok_or("internal RPC response is missing id")?;
+    let result = value
+        .get_mut("result")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or("oversized RPC errors or non-object results cannot be streamed")?;
+    let stdout = take_stream(result, "stdout_base64")?;
+    let stderr = take_stream(result, "stderr_base64")?;
+    let mut frames = Vec::new();
+    for (name, bytes) in [("stdout", stdout.as_slice()), ("stderr", stderr.as_slice())] {
+        for (sequence, chunk) in bytes.chunks(MAX_CHUNK_BYTES).enumerate() {
+            let notification = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "deshell.stream",
+                "params": {
+                    "data_base64": base64::engine::general_purpose::STANDARD.encode(chunk),
+                    "request_id": id.clone(),
+                    "sequence": sequence,
+                    "stream": name
+                }
+            });
+            let mut frame = crate::canonical_json::canonical_bytes(&notification)?;
+            frame.push(b'\n');
+            if frame.len() > MAX_MESSAGE_BYTES {
+                return Err("internal stream frame exceeds the RPC frame limit".into());
+            }
+            frames.push(frame);
+        }
+    }
+    result.insert(
+        "streams".into(),
+        serde_json::json!({
+            "stderr": {"bytes": stderr.len(), "sha256": crate::digest::sha256(&stderr)},
+            "stdout": {"bytes": stdout.len(), "sha256": crate::digest::sha256(&stdout)}
+        }),
+    );
+    let mut final_frame = crate::canonical_json::canonical_bytes(&value)?;
+    final_frame.push(b'\n');
+    if final_frame.len() > MAX_MESSAGE_BYTES {
+        return Err("streamed RPC final response exceeds the frame limit".into());
+    }
+    frames.push(final_frame);
+    Ok(frames)
+}
+
+fn take_stream(
+    result: &mut serde_json::Map<String, serde_json::Value>,
+    name: &str,
+) -> Result<Vec<u8>, String> {
+    let encoded = result
+        .remove(name)
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .ok_or_else(|| format!("oversized RPC result is missing {name}"))?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&encoded)
+        .map_err(|error| format!("internal RPC {name} is invalid base64: {error}"))?;
+    if base64::engine::general_purpose::STANDARD.encode(&bytes) != encoded {
+        return Err(format!("internal RPC {name} is not canonical base64"));
+    }
+    Ok(bytes)
+}
+
 fn valid_id(value: &serde_json::Value) -> bool {
     value.as_str().is_some() || value.as_i64().is_some()
 }
@@ -223,9 +419,212 @@ fn observe_process(
     let mut result = process_outcome(&outcome);
     result
         .as_object_mut()
-        .expect("process outcome object")
+        .ok_or_else(|| (-32010, "process outcome is not a JSON object".to_owned()))?
         .insert("files".into(), serde_json::Value::Array(changes));
     Ok(result)
+}
+
+fn run_plan_process(
+    parameters: &serde_json::Map<String, serde_json::Value>,
+) -> Result<serde_json::Value, MethodError> {
+    let invalid = |message: &str| (-32602, message.to_owned());
+    let request = process_request(parameters)?;
+    let entrypoint = parameters
+        .get("entrypoint")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| invalid("params.entrypoint must be a string"))?;
+    let node_id = match parameters.get("node_id") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| invalid("params.node_id must be a non-empty string or null"))?,
+        ),
+    };
+    let named_inputs = named_values(parameters.get("arguments"), "arguments")?;
+    let root = std::env::current_dir().map_err(|error| {
+        (
+            -32010,
+            format!("cannot resolve observer workspace: {error}"),
+        )
+    })?;
+    if let Some(values) = parameters.get("fixtures") {
+        let fixtures = fixture_params(values)?;
+        crate::workspace::materialize(&root, &fixtures).map_err(|error| (-32602, error))?;
+    }
+    let before = crate::workspace::capture(&root).map_err(|error| (-32010, error))?;
+    let config =
+        crate::project::load_config(&root).map_err(|errors| (-32010, errors.join("; ")))?;
+    let limits = crate::config::ResourceLimits {
+        timeout_ms: request.limits.timeout_ms,
+        memory_bytes: request.limits.memory_bytes,
+        processes: request.limits.processes,
+        stdout_bytes: request.limits.stdout_bytes,
+        stderr_bytes: request.limits.stderr_bytes,
+    };
+    if !limits.narrows(config.limits) {
+        return Err(invalid(
+            "observer plan resource limits may only narrow project limits",
+        ));
+    }
+    let (mut plan, _) = crate::project::load_entry_artifacts(&root, entrypoint)
+        .map_err(|errors| (-32010, errors.join("; ")))?;
+    if let Some(node_id) = node_id {
+        plan = select_plan_node(plan, node_id).map_err(|error| (-32602, error))?;
+    }
+    let lock = crate::project::load_lock(&root).map_err(|errors| (-32010, errors.join("; ")))?;
+    let backend = crate::local_backend::LocalBackend::with_pinned_interpreters(
+        &root,
+        limits,
+        lock.interpreters,
+    )
+    .map_err(|error| (-32010, error))?;
+    let environment = request.environment.into_iter().collect();
+    let result = crate::runner::run_plan_with_io(
+        &backend,
+        crate::runner::Policy {
+            allow_file_read: matches!(
+                config.policy.file_read,
+                crate::config::FileReadPolicy::Project
+            ),
+            allow_file_write: matches!(
+                config.policy.file_write,
+                crate::config::FileWritePolicy::Sandbox
+            ),
+            allow_network: matches!(
+                config.policy.network,
+                crate::config::NetworkPolicy::RecordReplay
+            ),
+            allow_delegation: matches!(
+                config.policy.delegation,
+                crate::config::DelegationPolicy::Pinned
+            ),
+        },
+        &plan,
+        crate::runner::RunInputs {
+            host_environment: &environment,
+            named_inputs: &named_inputs,
+            arguments: &request.argv,
+            stdin: &request.stdin,
+            default_working_directory: request.working_directory.as_deref(),
+        },
+    )
+    .map_err(|error| (-32010, error.message))?;
+    let after = crate::workspace::capture(&root).map_err(|error| (-32010, error))?;
+    if let Some(values) = parameters.get("expected_files") {
+        let expected = expected_file_params(values)?;
+        crate::workspace::validate_expected(&root, &expected)
+            .map_err(|errors| (-32011, errors.join("; ")))?;
+    }
+    Ok(run_result_value(
+        &result,
+        crate::workspace::diff(&before, &after),
+    ))
+}
+
+fn named_values(
+    value: Option<&serde_json::Value>,
+    label: &str,
+) -> Result<std::collections::BTreeMap<String, String>, MethodError> {
+    let invalid = |message: String| (-32602, message);
+    let values = value
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| invalid(format!("params.{label} must be a name/value array")))?;
+    let mut output = std::collections::BTreeMap::new();
+    for value in values {
+        let fields = value
+            .as_object()
+            .ok_or_else(|| invalid(format!("params.{label} entries must be objects")))?;
+        let name = fields
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| invalid(format!("params.{label}.name must be a non-empty string")))?;
+        let value = fields
+            .get("value")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| invalid(format!("params.{label}.value must be a string")))?;
+        if output.insert(name.into(), value.into()).is_some() {
+            return Err(invalid(format!("duplicate params.{label} name: {name}")));
+        }
+    }
+    Ok(output)
+}
+
+fn run_result_value(
+    result: &crate::runner::RunResult,
+    changes: Vec<crate::workspace::Change>,
+) -> serde_json::Value {
+    let files = changes
+        .into_iter()
+        .map(|change| {
+            let kind = match change.kind {
+                crate::workspace::ChangeKind::Created => "created",
+                crate::workspace::ChangeKind::Modified => "modified",
+                crate::workspace::ChangeKind::Removed => "removed",
+            };
+            serde_json::json!({
+                "after_sha256": change.after_sha256,
+                "before_sha256": change.before_sha256,
+                "kind": kind,
+                "path": change.path
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "exit_code": result.exit_code,
+        "files": files,
+        "signal": null,
+        "stderr_base64": base64::engine::general_purpose::STANDARD.encode(&result.stderr),
+        "stdout_base64": base64::engine::general_purpose::STANDARD.encode(&result.stdout),
+        "timed_out": false,
+        "limit_exceeded": null
+    })
+}
+
+fn select_plan_node(mut plan: crate::ir::Plan, id: &str) -> Result<crate::ir::Plan, String> {
+    fn find(node: &crate::ir::Node, id: &str) -> Option<crate::ir::Node> {
+        if node.id == id {
+            return Some(node.clone());
+        }
+        let mut children = Vec::new();
+        match &node.operation {
+            crate::ir::Operation::Pipeline { nodes, .. }
+            | crate::ir::Operation::Sequence { nodes }
+            | crate::ir::Operation::Parallel { nodes } => children.extend(nodes.iter()),
+            crate::ir::Operation::Condition {
+                predicate,
+                if_true,
+                if_false,
+            } => {
+                children.extend([predicate.as_ref(), if_true.as_ref()]);
+                children.extend(if_false.as_deref());
+            }
+            crate::ir::Operation::Match { cases, default, .. } => {
+                children.extend(cases.iter().map(|case| &case.body));
+                children.extend(default.as_deref());
+            }
+            crate::ir::Operation::Foreach { body, .. }
+            | crate::ir::Operation::CaptureStdout { body, .. } => children.push(body),
+            crate::ir::Operation::TryFinally { body, finalizer } => {
+                children.extend([body.as_ref(), finalizer.as_ref()]);
+            }
+            _ => {}
+        }
+        children.into_iter().find_map(|child| find(child, id))
+    }
+    let (task_index, node) = plan
+        .tasks
+        .iter()
+        .enumerate()
+        .find_map(|(index, task)| find(&task.body, id).map(|node| (index, node)))
+        .ok_or_else(|| format!("node not found: {id}"))?;
+    let task_name = plan.tasks[task_index].name.clone();
+    plan.tasks[task_index].body = node;
+    plan.entrypoint = task_name;
+    plan.tasks.retain(|task| task.name == plan.entrypoint);
+    Ok(plan)
 }
 
 fn fixture_params(value: &serde_json::Value) -> Result<Vec<crate::config::Fixture>, MethodError> {
@@ -244,9 +643,15 @@ fn fixture_params(value: &serde_json::Value) -> Result<Vec<crate::config::Fixtur
                 .and_then(serde_json::Value::as_str)
                 .ok_or_else(|| invalid("fixture.path must be a string"))?;
             let contents = fields
-                .get("contents")
+                .get("contents_base64")
                 .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| invalid("fixture.contents must be a string"))?;
+                .ok_or_else(|| invalid("fixture.contents_base64 must be a string"))?;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(contents)
+                .map_err(|_| invalid("fixture.contents_base64 is invalid"))?;
+            if base64::engine::general_purpose::STANDARD.encode(&bytes) != contents {
+                return Err(invalid("fixture.contents_base64 must be canonical"));
+            }
             let executable = fields.get("executable").map_or(Ok(false), |value| {
                 value
                     .as_bool()
@@ -254,7 +659,10 @@ fn fixture_params(value: &serde_json::Value) -> Result<Vec<crate::config::Fixtur
             })?;
             Ok(crate::config::Fixture {
                 path: path.into(),
-                contents: contents.into(),
+                contents: crate::config::BinaryData {
+                    utf8: None,
+                    base64: Some(contents.into()),
+                },
                 executable,
             })
         })
@@ -350,12 +758,28 @@ fn process_request(
         .get("timeout_ms")
         .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| invalid("params.timeout_ms must be a positive integer"))?;
+    let defaults = crate::agent_process::Limits::default();
+    let limit = |name: &str, default: u64| -> Result<u64, MethodError> {
+        match parameters.get(name) {
+            None => Ok(default),
+            Some(value) => value
+                .as_u64()
+                .filter(|value| *value > 0)
+                .ok_or_else(|| invalid(&format!("params.{name} must be a positive integer"))),
+        }
+    };
     Ok(crate::agent_process::Request {
         argv,
         environment,
         working_directory,
         stdin,
-        timeout_ms,
+        limits: crate::agent_process::Limits {
+            timeout_ms,
+            memory_bytes: limit("memory_bytes", defaults.memory_bytes)?,
+            processes: limit("processes", defaults.processes)?,
+            stdout_bytes: limit("stdout_bytes", defaults.stdout_bytes)?,
+            stderr_bytes: limit("stderr_bytes", defaults.stderr_bytes)?,
+        },
     })
 }
 
@@ -365,7 +789,8 @@ fn process_outcome(outcome: &crate::agent_process::Outcome) -> serde_json::Value
         "signal": outcome.signal,
         "stderr_base64": base64::engine::general_purpose::STANDARD.encode(&outcome.stderr),
         "stdout_base64": base64::engine::general_purpose::STANDARD.encode(&outcome.stdout),
-        "timed_out": outcome.timed_out
+        "timed_out": outcome.timed_out,
+        "limit_exceeded": outcome.limit_exceeded
     })
 }
 
@@ -418,8 +843,9 @@ fn error(id: serde_json::Value, code: i64, message: &str) -> serde_json::Value {
 }
 
 fn response(value: serde_json::Value) -> Vec<u8> {
-    let mut bytes = crate::canonical_json::canonical_bytes(&value)
-        .expect("JSON-RPC response contains only canonical integer JSON");
+    let mut bytes = crate::canonical_json::canonical_bytes(&value).unwrap_or_else(|_| {
+        br#"{"error":{"code":-32603,"message":"cannot serialize JSON-RPC response"},"id":null,"jsonrpc":"2.0"}"#.to_vec()
+    });
     bytes.push(b'\n');
     bytes
 }
@@ -638,6 +1064,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn oversized_results_use_ordered_bounded_chunks_with_verified_digests() {
+        let stdout = vec![0xa5; MAX_MESSAGE_BYTES];
+        let stderr = vec![0x5a; MAX_CHUNK_BYTES + 7];
+        let response = result_response(
+            serde_json::json!(9),
+            serde_json::json!({
+                "exit_code": 0,
+                "stderr_base64": base64::engine::general_purpose::STANDARD.encode(&stderr),
+                "stdout_base64": base64::engine::general_purpose::STANDARD.encode(&stdout)
+            }),
+        );
+        let frames = response_frames(&response).unwrap();
+        assert!(frames.len() > 3);
+        assert!(frames.iter().all(|frame| frame.len() <= MAX_MESSAGE_BYTES));
+        let joined = frames.concat();
+        let result = decode_streamed_response(
+            &joined,
+            &serde_json::json!(9),
+            stdout.len() as u64,
+            stderr.len() as u64,
+        )
+        .unwrap();
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(result["stdout_base64"].as_str().unwrap())
+                .unwrap(),
+            stdout
+        );
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(result["stderr_base64"].as_str().unwrap())
+                .unwrap(),
+            stderr
+        );
+
+        let mut lines = frames;
+        let first: serde_json::Value = crate::strict_json::parse(&lines[0]).unwrap();
+        let mut invalid = first;
+        invalid["params"]["sequence"] = serde_json::json!(4);
+        let mut encoded = crate::canonical_json::canonical_bytes(&invalid).unwrap();
+        encoded.push(b'\n');
+        lines[0] = encoded;
+        assert!(
+            decode_streamed_response(
+                &lines.concat(),
+                &serde_json::json!(9),
+                stdout.len() as u64,
+                stderr.len() as u64,
+            )
+            .unwrap_err()
+            .contains("out-of-order")
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn process_agent_executes_exact_argv_with_raw_base64_stdio() {
@@ -672,7 +1153,7 @@ mod tests {
                 "nushell.lower",
                 serde_json::json!({
                     "path": "build.nu",
-                    "source": {"encoding": "utf8", "text": "^printf hello\\n"},
+                    "source": {"encoding": "utf8", "text": "^printf hello\n"},
                     "unknown": "ignored"
                 }),
             ),

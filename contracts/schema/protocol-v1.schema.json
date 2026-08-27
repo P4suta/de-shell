@@ -3,6 +3,30 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "oneOf": [
     {
+      "additionalProperties": false,
+      "properties": {
+        "jsonrpc": { "const": "2.0" },
+        "method": { "const": "deshell.stream" },
+        "params": {
+          "additionalProperties": false,
+          "properties": {
+            "data_base64": {
+              "contentEncoding": "base64",
+              "maxLength": 349528,
+              "type": "string"
+            },
+            "request_id": { "type": ["integer", "string"] },
+            "sequence": { "minimum": 0, "type": "integer" },
+            "stream": { "enum": ["stdout", "stderr"] }
+          },
+          "required": ["data_base64", "request_id", "sequence", "stream"],
+          "type": "object"
+        }
+      },
+      "required": ["jsonrpc", "method", "params"],
+      "type": "object"
+    },
+    {
       "additionalProperties": true,
       "properties": {
         "id": { "type": ["integer", "string"] },

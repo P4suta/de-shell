@@ -38,6 +38,16 @@ impl Diagnostic {
             context: BTreeMap::new(),
         }
     }
+
+    pub(crate) fn warning(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            schema_version: 1,
+            severity: Severity::Warning,
+            code: code.into(),
+            message: message.into(),
+            context: BTreeMap::new(),
+        }
+    }
 }
 
 pub(crate) fn emit(

@@ -5,24 +5,19 @@
         {
           "additionalProperties": false,
           "properties": {
-            "basis": { "minLength": 1, "type": "string" },
-            "level": { "const": "formal" }
+            "level": { "const": "native" },
+            "semantic_model": { "minLength": 1, "type": "string" }
           },
-          "required": ["level", "basis"],
+          "required": ["level", "semantic_model"],
           "type": "object"
         },
         {
           "additionalProperties": false,
           "properties": {
-            "level": { "const": "exhaustive" },
-            "scenarios": {
-              "items": { "minLength": 1, "type": "string" },
-              "minItems": 1,
-              "type": "array",
-              "uniqueItems": true
-            }
+            "level": { "const": "delegated" },
+            "reason": { "minLength": 1, "type": "string" }
           },
-          "required": ["level", "scenarios"],
+          "required": ["level", "reason"],
           "type": "object"
         },
         {
@@ -46,17 +41,22 @@
       ],
       "properties": {
         "digest": { "type": ["string", "null"] },
-        "provider": { "type": ["string", "null"] },
-        "reason": { "type": ["string", "null"] },
-        "scenarios": {
-          "items": { "minLength": 1, "type": "string" },
-          "minItems": 1,
-          "type": "array",
-          "uniqueItems": true
+        "key": {
+          "additionalProperties": false,
+          "properties": {
+            "provider_fingerprint": { "pattern": "^[0-9a-f]{64}$", "type": "string" },
+            "runtime_lock_digest": { "pattern": "^[0-9a-f]{64}$", "type": "string" },
+            "scenario_digest": { "pattern": "^[0-9a-f]{64}$", "type": "string" }
+          },
+          "required": ["scenario_digest", "provider_fingerprint", "runtime_lock_digest"],
+          "type": "object"
         },
-        "status": { "enum": ["verified", "different", "unavailable", "failed"] }
+        "provider": { "minLength": 1, "type": "string" },
+        "reason": { "type": ["string", "null"] },
+        "scenario": { "minLength": 1, "type": "string" },
+        "status": { "enum": ["verified", "different", "unavailable", "failed", "nondeterministic"] }
       },
-      "required": ["scenarios", "status", "provider", "reason", "digest"],
+      "required": ["scenario", "key", "status", "provider", "reason", "digest"],
       "type": "object"
     },
     "path": {

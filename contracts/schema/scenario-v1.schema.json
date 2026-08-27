@@ -6,25 +6,43 @@
     "arguments": { "items": { "$ref": "#/$defs/namedValue" }, "type": "array" },
     "argv": { "items": { "type": "string" }, "type": "array" },
     "environment": { "items": { "$ref": "#/$defs/namedValue" }, "type": "array" },
+    "cwd": {
+      "oneOf": [{ "$ref": "#/$defs/path" }, { "type": "null" }]
+    },
     "expect": {
       "additionalProperties": false,
       "properties": {
         "exit_code": { "maximum": 2147483647, "minimum": -2147483648, "type": "integer" },
         "files": { "items": { "$ref": "#/$defs/expectedFile" }, "type": "array" },
-        "stderr": { "type": "string" },
-        "stdout": { "type": "string" }
+        "stderr": { "$ref": "#/$defs/binaryData" },
+        "stdout": { "$ref": "#/$defs/binaryData" }
       },
       "type": "object"
     },
     "fixtures": { "items": { "$ref": "#/$defs/fixture" }, "type": "array" },
+    "limits": { "$ref": "#/$defs/resourceLimits" },
     "name": { "minLength": 1, "type": "string" },
-    "timeout_ms": { "maximum": 86400000, "minimum": 1, "type": "integer" },
+    "stdin": {
+      "oneOf": [{ "$ref": "#/$defs/binaryData" }, { "type": "null" }]
+    },
     "version": { "const": 1 }
   },
-  "required": ["version", "name", "arguments", "argv", "environment", "fixtures", "timeout_ms", "expect"],
+  "required": ["version", "name", "limits", "expect"],
   "title": "de-shell scenario v1",
   "type": "object",
   "$defs": {
+    "binaryData": {
+      "additionalProperties": false,
+      "oneOf": [
+        { "required": ["utf8"] },
+        { "required": ["base64"] }
+      ],
+      "properties": {
+        "base64": { "contentEncoding": "base64", "type": "string" },
+        "utf8": { "type": "string" }
+      },
+      "type": "object"
+    },
     "expectedFile": {
       "additionalProperties": false,
       "properties": {
@@ -37,7 +55,7 @@
     "fixture": {
       "additionalProperties": false,
       "properties": {
-        "contents": { "type": "string" },
+        "contents": { "$ref": "#/$defs/binaryData" },
         "executable": { "type": "boolean" },
         "path": { "$ref": "#/$defs/path" }
       },
@@ -51,6 +69,18 @@
         "value": { "type": "string" }
       },
       "required": ["name", "value"],
+      "type": "object"
+    },
+    "resourceLimits": {
+      "additionalProperties": false,
+      "properties": {
+        "memory_bytes": { "maximum": 1099511627776, "minimum": 16777216, "type": "integer" },
+        "processes": { "maximum": 65535, "minimum": 1, "type": "integer" },
+        "stderr_bytes": { "maximum": 1073741824, "minimum": 1, "type": "integer" },
+        "stdout_bytes": { "maximum": 1073741824, "minimum": 1, "type": "integer" },
+        "timeout_ms": { "maximum": 86400000, "minimum": 1, "type": "integer" }
+      },
+      "required": ["timeout_ms", "memory_bytes", "processes", "stdout_bytes", "stderr_bytes"],
       "type": "object"
     },
     "path": {

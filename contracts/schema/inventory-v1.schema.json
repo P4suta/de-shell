@@ -1,0 +1,88 @@
+{
+  "$defs": {
+    "digest": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "path": {
+      "pattern": "^(?!/)(?!\\.{1,2}(?:/|$))(?!.*//)(?!.*\\/\\.{1,2}(?:/|$))(?!.*\\/$)[^\\\\:\\u0000]+$",
+      "type": "string"
+    }
+  },
+  "$id": "https://deshell.dev/contracts/inventory/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "errors": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "message": { "minLength": 1, "type": "string" },
+          "path": {
+            "anyOf": [
+              { "$ref": "#/$defs/path" },
+              { "type": "null" }
+            ]
+          },
+          "stage": {
+            "enum": ["inventory", "walk", "path_encoding", "metadata", "read", "parse_json", "parse_toml", "parse_dockerfile", "worker"]
+          }
+        },
+        "required": ["path", "stage", "message"],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "findings": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "content_digest": { "$ref": "#/$defs/digest" },
+          "interpreter": {
+            "anyOf": [
+              { "minLength": 1, "type": "string" },
+              { "type": "null" }
+            ]
+          },
+          "interpreter_confidence": { "enum": ["high", "medium", "low"] },
+          "kind": { "enum": ["shell_file", "embedded_shell", "candidate"] },
+          "locator": {
+            "anyOf": [
+              { "minLength": 1, "type": "string" },
+              { "type": "null" }
+            ]
+          },
+          "path": { "$ref": "#/$defs/path" },
+          "span": {
+            "additionalProperties": false,
+            "properties": {
+              "end_byte": { "minimum": 0, "type": "integer" },
+              "start_byte": { "minimum": 0, "type": "integer" }
+            },
+            "required": ["start_byte", "end_byte"],
+            "type": "object"
+          }
+        },
+        "required": ["path", "kind", "interpreter", "interpreter_confidence", "locator", "span", "content_digest"],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "schema_version": { "const": 1 },
+    "skipped": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "path": { "$ref": "#/$defs/path" },
+          "reason": { "enum": ["not_regular_file", "size_limit_exceeded", "unsupported_encoding"] }
+        },
+        "required": ["path", "reason"],
+        "type": "object"
+      },
+      "type": "array"
+    }
+  },
+  "required": ["schema_version", "findings", "skipped", "errors"],
+  "title": "de-shell Inventory v1",
+  "type": "object"
+}

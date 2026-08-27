@@ -5,6 +5,10 @@ rust = "1.98.0"
 powershell = "7.6.5"
 gh = "2.96.0"
 dagger = "0.21.8"
+"cargo:cargo-audit" = "0.22.2"
+"cargo:cargo-deny" = "0.20.2"
+"cargo:cargo-llvm-cov" = "0.8.7"
+"pipx:check-jsonschema" = "0.38.0"
 
 [env]
 CARGO_BUILD_JOBS = "1"
@@ -62,7 +66,7 @@ description = "Run internal JSON-RPC adapter and agent contracts"
 run = "cargo test --locked -p deshell protocol::tests"
 
 [tasks."test:official-exporters"]
-description = "Validate a representative export with mise-pinned official tools"
+description = "Validate and execute representative CWL, Dagger, and Nushell exports with pinned official tools"
 depends = ["build"]
 run = "pwsh -NoLogo -NoProfile -File scripts/validate-official-exporters.ps1"
 
@@ -89,12 +93,38 @@ run = [
   "cargo test --locked -p deshell protocol::tests",
 ]
 
+[tasks."test:supply-chain"]
+description = "Audit advisories, licenses, duplicate dependencies, and dependency sources"
+run = [
+  "cargo audit --db target/cargo-audit-db --deny warnings",
+  "cargo deny --locked check",
+]
+
+[tasks."test:schema-validator"]
+description = "Validate schemas and generated v1 documents with an independent engine"
+depends = ["build"]
+run = "python3 scripts/validate-json-contracts.py target/debug/deshell"
+
+[tasks.coverage]
+description = "Measure line coverage and enforce the checked-in 74 percent regression floor"
+run = [
+  "rustup component add llvm-tools-preview",
+  "cargo llvm-cov --locked --workspace --all-targets --summary-only --fail-under-lines 74",
+]
+
 [tasks.test]
 description = "Run the complete test suite"
 run = [
   "cargo test --locked --workspace",
   "cargo build --locked -p deshell",
   "cargo run --locked -p xtask -- conformance target/debug/deshell",
+]
+
+[tasks.performance]
+description = "Record scan, simple local run, and release binary performance as JSON"
+run = [
+  "cargo build --locked --release -p deshell",
+  "cargo run --locked -p xtask -- performance target/release/deshell",
 ]
 
 [tasks.package]

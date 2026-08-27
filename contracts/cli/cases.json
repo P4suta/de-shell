@@ -1,11 +1,14 @@
 {
   "cases": [
     { "argv": ["--version"], "exit": 0, "stdout": "deshell 0.1.0\n" },
+    { "argv": ["schema", "inventory"], "exit": 0, "stdout_artifact": true },
+    { "argv": ["schema", "bundle"], "exit": 0, "stdout_artifact": true },
     { "argv": ["schema", "effect-ir"], "exit": 0, "stdout_artifact": true },
     { "argv": ["schema", "unknown"], "exit": 2, "stderr_only": true },
     { "argv": ["check", "--root", "missing"], "exit": 1, "stderr_only": true },
     { "argv": ["analyze", "--entry", "unknown.ext"], "exit": 4, "fixture": "reject-unknown", "stderr_only": true },
-    { "argv": ["schema", "unknown", "--diagnostics=jsonl"], "exit": 2, "stderr_only": true }
+    { "argv": ["schema", "unknown", "--diagnostics=jsonl"], "exit": 2, "stderr_only": true },
+    { "argv": ["doctor", "--root", "missing", "--format", "json"], "exit": 6, "stdout_artifact": true }
   ],
   "diagnostic_modes": ["human", "jsonl"],
   "exit_codes": {

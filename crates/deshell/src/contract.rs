@@ -45,9 +45,12 @@ mod tests {
 
         let guarantee_source = serde_json::to_string(&schema["$defs"]["guarantee"]).unwrap();
         assert!(!guarantee_source.contains("differential"));
-        assert!(guarantee_source.contains("formal"));
-        assert!(guarantee_source.contains("exhaustive"));
+        assert!(guarantee_source.contains("native"));
+        assert!(guarantee_source.contains("delegated"));
         assert!(guarantee_source.contains("residual"));
+
+        let operations = serde_json::to_string(&schema["$defs"]["operation"]).unwrap();
+        assert!(operations.contains("interpreter_call"));
 
         let value_types = serde_json::to_string(&schema["$defs"]["valueType"]).unwrap();
         for forbidden in ["bytes", "list", "stream", "record"] {
@@ -88,6 +91,9 @@ mod tests {
             "contracts/project-v1.md",
             "contracts/cli/cases.json",
             "contracts/schema/diagnostic-v1.schema.json",
+            "contracts/schema/inventory-v1.schema.json",
+            "contracts/schema/manifest-v1.schema.json",
+            "contracts/schema/bundle-v1.schema.json",
             "contracts/schema/protocol-v1.schema.json",
             "contracts/schema/project-v1.schema.json",
             "contracts/schema/scenario-v1.schema.json",
@@ -150,6 +156,9 @@ mod tests {
         }
 
         for name in [
+            "inventory",
+            "manifest",
+            "bundle",
             "effect-ir",
             "evidence",
             "diagnostic",
@@ -243,7 +252,15 @@ mod tests {
         let scenario = json("contracts/schema/scenario-v1.schema.json");
         let evidence = json("contracts/schema/evidence-v1.schema.json");
         let effect = json("contracts/schema/effect-ir-v1.schema.json");
+        let inventory = json("contracts/schema/inventory-v1.schema.json");
+        let manifest = json("contracts/schema/manifest-v1.schema.json");
+        let bundle = json("contracts/schema/bundle-v1.schema.json");
+        let lock = json("contracts/schema/lock-v1.schema.json");
         for (name, schema) in [
+            ("inventory", &inventory),
+            ("manifest", &manifest),
+            ("bundle", &bundle),
+            ("lock", &lock),
             ("project", &project),
             ("scenario", &scenario),
             ("evidence", &evidence),
@@ -276,8 +293,8 @@ mod tests {
         source_utf8: Option<String>,
         source_base64: Option<String>,
         root_operation: String,
-        formal: usize,
-        exhaustive: usize,
+        native: usize,
+        delegated: usize,
         residual: usize,
         plan_digest: String,
     }
@@ -369,15 +386,15 @@ mod tests {
                 crate::evidence::Evidence::from_plan(&plan, &case.path, &source).unwrap();
             let actual = (
                 root_operation,
-                report.formal,
-                report.exhaustive,
+                report.native,
+                report.delegated,
                 report.residual,
                 evidence.plan_digest.as_str(),
             );
             let expected = (
                 case.root_operation.as_str(),
-                case.formal,
-                case.exhaustive,
+                case.native,
+                case.delegated,
                 case.residual,
                 case.plan_digest.as_str(),
             );
@@ -436,7 +453,16 @@ mod tests {
                 crate::config::UnknownInterpreter::TraceOnly,
             )
             .unwrap();
-            let artifact = crate::exporter::export(&plan, target, false).unwrap();
+            let artifact = crate::exporter::export(
+                &plan,
+                target,
+                crate::exporter::Mode::Strict,
+                Some(concat!(
+                    "ghcr.io/deshell-lang/lab@sha256:",
+                    "14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce"
+                )),
+            )
+            .unwrap();
             assert_eq!(artifact.filename, case.filename, "{}", case.name);
             assert_eq!(artifact.media_type, case.media_type, "{}", case.name);
             assert_eq!(

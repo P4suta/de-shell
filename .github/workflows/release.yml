@@ -77,8 +77,10 @@ jobs:
           $binary = Join-Path 'target' (Join-Path '${{ matrix.target }}' (Join-Path 'release' '${{ matrix.executable }}'))
           $version = & $binary --version
           if ($LASTEXITCODE -ne 0 -or $version -ne 'deshell 0.1.0') { throw 'version smoke test failed' }
-          $schema = & $binary schema effect-ir | ConvertFrom-Json
-          if ($LASTEXITCODE -ne 0 -or $schema.properties.schema_version.const -ne 1) { throw 'schema smoke test failed' }
+          foreach ($schemaName in @('inventory', 'manifest', 'bundle', 'effect-ir', 'evidence', 'diagnostic', 'protocol', 'project', 'scenario', 'lock', 'replay', 'corpus-audit')) {
+            $schema = & $binary schema $schemaName | ConvertFrom-Json
+            if ($LASTEXITCODE -ne 0 -or $schema.'$schema' -ne 'https://json-schema.org/draft/2020-12/schema') { throw "schema smoke test failed: $schemaName" }
+          }
           foreach ($mode in @('__process-agent', '__observer-agent', '__nushell-adapter')) {
             $request = '{"id":1,"jsonrpc":"2.0","method":"deshell.handshake","params":{"protocol_version":1}}'
             $response = $request | & $binary $mode | ConvertFrom-Json
@@ -113,8 +115,10 @@ jobs:
           $installed = Join-Path $installRoot (Join-Path 'deshell-0.1.0' '${{ matrix.executable }}')
           $version = & $installed --version
           if ($LASTEXITCODE -ne 0 -or $version -ne 'deshell 0.1.0') { throw 'archive version smoke test failed' }
-          $schema = & $installed schema effect-ir | ConvertFrom-Json
-          if ($LASTEXITCODE -ne 0 -or $schema.properties.schema_version.const -ne 1) { throw 'archive schema smoke test failed' }
+          foreach ($schemaName in @('inventory', 'manifest', 'bundle', 'effect-ir', 'evidence', 'diagnostic', 'protocol', 'project', 'scenario', 'lock', 'replay', 'corpus-audit')) {
+            $schema = & $installed schema $schemaName | ConvertFrom-Json
+            if ($LASTEXITCODE -ne 0 -or $schema.'$schema' -ne 'https://json-schema.org/draft/2020-12/schema') { throw "archive schema smoke test failed: $schemaName" }
+          }
           foreach ($mode in @('__process-agent', '__observer-agent', '__nushell-adapter')) {
             $request = '{"id":1,"jsonrpc":"2.0","method":"deshell.handshake","params":{"protocol_version":1}}'
             $response = $request | & $installed $mode | ConvertFrom-Json
@@ -151,11 +155,29 @@ jobs:
           cache: true
           install_args: rust@1.98.0
 
+      - name: Install checksum-verified SBOM generator
+        uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad # v2.85.10
+        with:
+          tool: syft@1.51.0
+          fallback: none
+
       - name: Download all six archives
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: dist
           merge-multiple: true
+
+      - name: Generate and validate the CycloneDX SBOM
+        env:
+          SYFT_CHECK_FOR_APP_UPDATE: "false"
+        run: |
+          syft scan dir:. \
+            --source-name deshell \
+            --source-version 0.1.0 \
+            --output cyclonedx-json=dist/deshell-0.1.0.cdx.json
+          jq --exit-status \
+            '.bomFormat == "CycloneDX" and .specVersion != null and (.components | length > 0)' \
+            dist/deshell-0.1.0.cdx.json
 
       - name: Create SHA-256 checksums
         working-directory: dist

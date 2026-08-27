@@ -29,20 +29,30 @@ pub(crate) struct NodeEvidence {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ObservationEvidence {
-    pub scenarios: Vec<String>,
+    pub scenario: String,
+    pub key: ObservationKey,
     pub status: ObservationStatus,
-    pub provider: Option<String>,
+    pub provider: String,
     pub reason: Option<String>,
     pub digest: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ObservationKey {
+    pub scenario_digest: String,
+    pub provider_fingerprint: String,
+    pub runtime_lock_digest: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ObservationStatus {
     Verified,
     Different,
     Unavailable,
     Failed,
+    Nondeterministic,
 }
 
 impl Evidence {
@@ -116,11 +126,32 @@ impl Evidence {
 
     pub(crate) fn append_observation(
         &mut self,
-        observation: ObservationEvidence,
-    ) -> Result<(), String> {
+        mut observation: ObservationEvidence,
+    ) -> Result<ObservationStatus, String> {
         validate_observation(&observation).map_err(|errors| errors.join("; "))?;
+        if let Some(previous) = self
+            .observations
+            .iter()
+            .rev()
+            .find(|previous| previous.key == observation.key)
+        {
+            if previous == &observation {
+                return Ok(previous.status);
+            }
+            if observation_result(previous) != observation_result(&observation) {
+                let current_status = observation.status;
+                let current_digest = observation.digest.clone();
+                observation.status = ObservationStatus::Nondeterministic;
+                observation.reason = Some(format!(
+                    "conflicting observations for the same scenario/provider/runtime key (previous status {:?}, digest {:?}; current status {:?}, digest {:?})",
+                    previous.status, previous.digest, current_status, current_digest
+                ));
+                observation.digest = None;
+            }
+        }
+        let status = observation.status;
         self.observations.push(observation);
-        Ok(())
+        Ok(status)
     }
 
     fn validate_document(&self) -> Result<(), Vec<String>> {
@@ -178,7 +209,7 @@ fn collect_nodes(node: &crate::ir::Node, output: &mut Vec<NodeEvidence>) {
         guarantee: node.guarantee.clone(),
     });
     match &node.operation {
-        crate::ir::Operation::Pipeline { nodes }
+        crate::ir::Operation::Pipeline { nodes, .. }
         | crate::ir::Operation::Sequence { nodes }
         | crate::ir::Operation::Parallel { nodes } => {
             for child in nodes {
@@ -217,23 +248,30 @@ fn collect_nodes(node: &crate::ir::Node, output: &mut Vec<NodeEvidence>) {
         | crate::ir::Operation::FileWrite { .. }
         | crate::ir::Operation::FileRemove { .. }
         | crate::ir::Operation::NetworkRequest { .. }
+        | crate::ir::Operation::InterpreterCall { .. }
         | crate::ir::Operation::OpaqueCapsule { .. } => {}
     }
 }
 
 fn validate_observation(observation: &ObservationEvidence) -> Result<(), Vec<String>> {
     let mut errors = Vec::new();
-    if observation.scenarios.is_empty() {
-        errors.push("observation requires at least one scenario".into());
+    if observation.scenario.trim().is_empty() {
+        errors.push("observation scenario must not be empty".into());
     }
-    let mut seen = std::collections::BTreeSet::new();
-    for scenario in &observation.scenarios {
-        if scenario.trim().is_empty() {
-            errors.push("observation scenario must not be empty".into());
+    for (name, digest) in [
+        ("scenario_digest", &observation.key.scenario_digest),
+        (
+            "provider_fingerprint",
+            &observation.key.provider_fingerprint,
+        ),
+        ("runtime_lock_digest", &observation.key.runtime_lock_digest),
+    ] {
+        if !crate::digest::valid_sha256(digest) {
+            errors.push(format!("observation {name} must be a SHA-256 digest"));
         }
-        if !seen.insert(scenario) {
-            errors.push(format!("duplicate observation scenario: {scenario}"));
-        }
+    }
+    if observation.provider.trim().is_empty() {
+        errors.push("observation provider must not be empty".into());
     }
     match observation.status {
         ObservationStatus::Verified | ObservationStatus::Different => {
@@ -244,16 +282,15 @@ fn validate_observation(observation: &ObservationEvidence) -> Result<(), Vec<Str
             {
                 errors.push("verified or different observation requires a SHA-256 digest".into());
             }
-            if observation.provider.as_deref().is_none_or(str::is_empty) {
-                errors.push("verified or different observation requires a provider".into());
-            }
             if observation.status == ObservationStatus::Different
                 && observation.reason.as_deref().is_none_or(str::is_empty)
             {
                 errors.push("different observation requires a reason".into());
             }
         }
-        ObservationStatus::Unavailable | ObservationStatus::Failed => {
+        ObservationStatus::Unavailable
+        | ObservationStatus::Failed
+        | ObservationStatus::Nondeterministic => {
             if observation.reason.as_deref().is_none_or(str::is_empty) {
                 errors.push("unavailable or failed observation requires a reason".into());
             }
@@ -267,6 +304,10 @@ fn validate_observation(observation: &ObservationEvidence) -> Result<(), Vec<Str
     } else {
         Err(errors)
     }
+}
+
+fn observation_result(observation: &ObservationEvidence) -> (ObservationStatus, Option<&str>) {
+    (observation.status, observation.digest.as_deref())
 }
 
 #[cfg(test)]
@@ -295,8 +336,8 @@ mod tests {
                         environment: vec![],
                         working_directory: None,
                     },
-                    guarantee: Guarantee::Formal {
-                        basis: "literal-v1".into(),
+                    guarantee: Guarantee::Native {
+                        semantic_model: "literal-v1".into(),
                     },
                     source: Some(SourceSpan {
                         file: "build.sh".into(),
@@ -312,6 +353,14 @@ mod tests {
         };
         plan.assign_node_ids().unwrap();
         plan
+    }
+
+    fn key() -> ObservationKey {
+        ObservationKey {
+            scenario_digest: "1".repeat(64),
+            provider_fingerprint: "2".repeat(64),
+            runtime_lock_digest: "3".repeat(64),
+        }
     }
 
     #[test]
@@ -332,9 +381,10 @@ mod tests {
         let mut evidence = Evidence::from_plan(&plan, "build.sh", b"true\n").unwrap();
         evidence
             .append_observation(ObservationEvidence {
-                scenarios: vec!["default".into()],
+                scenario: "default".into(),
+                key: key(),
                 status: ObservationStatus::Verified,
-                provider: Some("local-test".into()),
+                provider: "local-test".into(),
                 reason: None,
                 digest: Some("a".repeat(64)),
             })
@@ -346,20 +396,44 @@ mod tests {
     }
 
     #[test]
-    fn verified_observation_requires_digest_and_unique_scenarios() {
+    fn verified_observation_requires_digest_and_a_complete_key() {
         let plan = plan();
         let mut evidence = Evidence::from_plan(&plan, "build.sh", b"true\n").unwrap();
         assert!(
             evidence
                 .append_observation(ObservationEvidence {
-                    scenarios: vec!["same".into(), "same".into()],
+                    scenario: "same".into(),
+                    key: key(),
                     status: ObservationStatus::Verified,
-                    provider: None,
+                    provider: "test".into(),
                     reason: None,
                     digest: None,
                 })
                 .is_err()
         );
+    }
+
+    #[test]
+    fn conflicting_results_for_the_same_key_become_nondeterministic() {
+        let plan = plan();
+        let mut evidence = Evidence::from_plan(&plan, "build.sh", b"true\n").unwrap();
+        for digest in ["a".repeat(64), "b".repeat(64)] {
+            evidence
+                .append_observation(ObservationEvidence {
+                    scenario: "default".into(),
+                    key: key(),
+                    status: ObservationStatus::Verified,
+                    provider: "test".into(),
+                    reason: None,
+                    digest: Some(digest),
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            evidence.observations.last().unwrap().status,
+            ObservationStatus::Nondeterministic
+        );
+        assert!(evidence.observations.last().unwrap().digest.is_none());
     }
 
     #[test]

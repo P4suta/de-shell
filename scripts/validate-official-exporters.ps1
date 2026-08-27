@@ -9,6 +9,14 @@ param(
   [string] $DaggerVersion = 'v0.21.8',
 
   [Parameter()]
+  [string] $NushellExecutable = [Environment]::GetEnvironmentVariable(
+    'DESHELL_NU_EXE'
+  ),
+
+  [Parameter()]
+  [string] $NushellVersion = '0.115.1',
+
+  [Parameter()]
   [string] $CwlImage = 'quay.io/commonwl/cwltool@sha256:05e2065d9aa0391e9cb8ed0085a80e419a031ae731b9c6aa52a2c00e554f3e51',
 
   [Parameter()]
@@ -133,6 +141,12 @@ if ([string]::IsNullOrWhiteSpace($DaggerExecutable)) {
 else {
   $DaggerExecutable = Resolve-Tool -Name $DaggerExecutable
 }
+if ([string]::IsNullOrWhiteSpace($NushellExecutable)) {
+  $NushellExecutable = Resolve-Tool -Name 'nu'
+}
+else {
+  $NushellExecutable = Resolve-Tool -Name $NushellExecutable
+}
 
 try {
   New-Item -ItemType Directory -Path $validationRoot | Out-Null
@@ -140,6 +154,16 @@ try {
     -Destination (Join-Path $validationRoot 'static-printf.sh')
 
   Invoke-Checked -FilePath $deshell -ArgumentList @('init', '--root', $validationRoot)
+  $lockPath = Join-Path $validationRoot 'deshell.lock'
+  $lockText = [IO.File]::ReadAllText($lockPath).Replace(
+    'dagger_image = "unconfigured"',
+    "dagger_image = `"$CwlImage`""
+  )
+  [IO.File]::WriteAllText(
+    $lockPath,
+    $lockText,
+    [Text.UTF8Encoding]::new($false)
+  )
   Invoke-Checked -FilePath $deshell -ArgumentList @(
     'analyze',
     '--root', $validationRoot,
@@ -155,6 +179,11 @@ try {
     -PassThru
   Set-Content -LiteralPath (Join-Path $validationRoot 'deshell.dagger.ts') `
     -Value ($daggerArtifact -join "`n") -Encoding utf8NoBOM -NoNewline
+  $nuArtifact = Invoke-Checked -FilePath $deshell `
+    -ArgumentList @('export', '--root', $validationRoot, '--target', 'nu') `
+    -PassThru
+  Set-Content -LiteralPath (Join-Path $validationRoot 'deshell.nu') `
+    -Value ($nuArtifact -join "`n") -Encoding utf8NoBOM -NoNewline
 
   Invoke-Checked -FilePath $docker -ArgumentList @(
     'run',
@@ -166,6 +195,24 @@ try {
     '--validate',
     '/work/deshell.cwl'
   )
+  $cwlOutput = Join-Path $validationRoot 'cwl-output'
+  New-Item -ItemType Directory -Path $cwlOutput | Out-Null
+  Invoke-Checked -FilePath $docker -ArgumentList @(
+    'run',
+    '--rm',
+    '--entrypoint', 'cwltool',
+    '--mount', "type=bind,source=$validationRoot,target=/work",
+    $CwlImage,
+    '--no-container',
+    '--outdir', '/work/cwl-output',
+    '/work/deshell.cwl'
+  )
+  $cwlStdout = [IO.File]::ReadAllText(
+    (Join-Path $cwlOutput 'deshell.stdout')
+  )
+  if ($cwlStdout -notmatch [regex]::Escape('hello from de-shell')) {
+    throw 'Generated CWL tool did not produce the expected output'
+  }
 
   $daggerVersionOutput = Invoke-Checked -FilePath $DaggerExecutable `
     -ArgumentList @('version') -PassThru
@@ -195,9 +242,21 @@ try {
     throw 'Generated Dagger module did not produce the expected output'
   }
 
+  $nuVersionOutput = Invoke-Checked -FilePath $NushellExecutable `
+    -ArgumentList @('--version') -PassThru
+  if (($nuVersionOutput -join "`n") -notmatch [regex]::Escape($NushellVersion)) {
+    throw "Expected Nushell $NushellVersion"
+  }
+  $nuResult = Invoke-Checked -FilePath $NushellExecutable `
+    -WorkingDirectory $validationRoot `
+    -ArgumentList @('--no-config-file', 'deshell.nu') -PassThru
+  if (($nuResult -join "`n") -notmatch [regex]::Escape('hello from de-shell')) {
+    throw 'Generated Nushell module did not produce the expected output'
+  }
+
   Write-Host (
-    "Official exporter validation passed with Dagger {0} and {1}." -f `
-      $DaggerVersion, $CwlImage
+    "Official exporter validation passed with Dagger {0}, Nushell {1}, and {2}." -f `
+      $DaggerVersion, $NushellVersion, $CwlImage
   )
 }
 finally {

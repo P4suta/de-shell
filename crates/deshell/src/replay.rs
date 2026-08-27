@@ -39,6 +39,7 @@ impl ReplayStore {
         crate::canonical_json::pretty_bytes(&value)
     }
 
+    #[cfg(test)]
     pub(crate) fn lookup(
         &self,
         method: &str,
@@ -46,6 +47,15 @@ impl ReplayStore {
         request_body: &[u8],
     ) -> Result<Vec<u8>, String> {
         self.validate().map_err(|errors| errors.join("; "))?;
+        self.lookup_prevalidated(method, uri, request_body)
+    }
+
+    pub(crate) fn lookup_prevalidated(
+        &self,
+        method: &str,
+        uri: &str,
+        request_body: &[u8],
+    ) -> Result<Vec<u8>, String> {
         let digest = crate::digest::sha256(request_body);
         let entry = self
             .entries

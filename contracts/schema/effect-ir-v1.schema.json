@@ -14,24 +14,19 @@
         {
           "additionalProperties": false,
           "properties": {
-            "basis": { "minLength": 1, "type": "string" },
-            "level": { "const": "formal" }
+            "level": { "const": "native" },
+            "semantic_model": { "minLength": 1, "type": "string" }
           },
-          "required": ["level", "basis"],
+          "required": ["level", "semantic_model"],
           "type": "object"
         },
         {
           "additionalProperties": false,
           "properties": {
-            "level": { "const": "exhaustive" },
-            "scenarios": {
-              "items": { "minLength": 1, "type": "string" },
-              "minItems": 1,
-              "type": "array",
-              "uniqueItems": true
-            }
+            "level": { "const": "delegated" },
+            "reason": { "minLength": 1, "type": "string" }
           },
-          "required": ["level", "scenarios"],
+          "required": ["level", "reason"],
           "type": "object"
         },
         {
@@ -167,7 +162,17 @@
           "additionalProperties": false,
           "properties": {
             "nodes": { "items": { "$ref": "#/$defs/node" }, "minItems": 1, "type": "array" },
-            "type": { "enum": ["pipeline", "sequence", "parallel"] }
+            "status": { "enum": ["last", "pipefail"] },
+            "type": { "const": "pipeline" }
+          },
+          "required": ["type", "nodes", "status"],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "nodes": { "items": { "$ref": "#/$defs/node" }, "minItems": 1, "type": "array" },
+            "type": { "enum": ["sequence", "parallel"] }
           },
           "required": ["type", "nodes"],
           "type": "object"
@@ -286,6 +291,27 @@
             "uri": { "$ref": "#/$defs/textExpression" }
           },
           "required": ["type", "method", "uri"],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "capabilities": {
+              "items": { "minLength": 1, "type": "string" },
+              "type": "array",
+              "uniqueItems": true
+            },
+            "interpreter": { "minLength": 1, "type": "string" },
+            "interpreter_pin": {
+              "pattern": "^sha256:[0-9a-f]{64}$",
+              "type": "string"
+            },
+            "reason": { "minLength": 1, "type": "string" },
+            "source": { "$ref": "#/$defs/sourceBytes" },
+            "source_span": { "$ref": "#/$defs/span" },
+            "type": { "const": "interpreter_call" }
+          },
+          "required": ["type", "interpreter", "interpreter_pin", "source", "source_span", "capabilities", "reason"],
           "type": "object"
         },
         {

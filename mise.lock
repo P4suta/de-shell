@@ -28,6 +28,18 @@ url = "https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_
 url_api = "https://api.github.com/repos/rhysd/actionlint/releases/assets/384924919"
 provenance = "github-attestations"
 
+[[tools."cargo:cargo-audit"]]
+version = "0.22.2"
+backend = "cargo:cargo-audit"
+
+[[tools."cargo:cargo-deny"]]
+version = "0.20.2"
+backend = "cargo:cargo-deny"
+
+[[tools."cargo:cargo-llvm-cov"]]
+version = "0.8.7"
+backend = "cargo:cargo-llvm-cov"
+
 [[tools.dagger]]
 version = "0.21.8"
 backend = "aqua:dagger/dagger"
@@ -105,6 +117,10 @@ url_api = "https://api.github.com/repos/ocaml/opam/releases/assets/470873919"
 [tools.opam."platforms.windows-x64"]
 checksum = "sha256:51a530f538e86913489b061ac13c6084276e5dc916f5bd5c450883a826f8864c"
 url = "https://github.com/ocaml/opam/releases/download/2.5.2/opam-2.5.2-x86_64-windows.exe"
+
+[[tools."pipx:check-jsonschema"]]
+version = "0.38.0"
+backend = "pipx:check-jsonschema"
 
 [[tools.powershell]]
 version = "7.6.5"

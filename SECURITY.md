@@ -29,8 +29,20 @@ the test can be published safely. Reporters may request credit or anonymity.
 
 ## Security boundaries
 
-The local `deshell run` backend starts host processes and is not an OS sandbox.
-Untrusted automation must use the disposable observer path described in the
-README. A result marked `residual` is executable coverage, not a formal proof of
-unobserved behavior. See the documented guarantee level and residual reason
-before relying on a migration in a security boundary.
+The local `deshell run --backend local` backend starts host processes and is not
+an OS sandbox. It requires both a project opt-in and a CLI opt-in. Untrusted
+automation must use the default disposable path described in the README; a
+missing or invalid provider never falls back to local execution.
+
+`native` means the node was lowered to the pinned semantic model. `delegated`
+means exact source bytes and a lock-matched interpreter identity execute only
+inside a digest-pinned disposable runtime. `residual` means unrecognized,
+non-executable source.
+Scenario observation is evidence for that scenario/provider/runtime digest
+only, not a proof of behavior for other inputs. Host materialization and host
+execution remain outside the default trust boundary.
+
+The repository build directly executes only supervised rootless OCI providers.
+Windows and macOS launch contracts remain unavailable until their signed helper
+transport is connected; provider discovery alone is never reported as execution
+readiness.

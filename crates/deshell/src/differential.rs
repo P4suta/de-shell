@@ -1,3 +1,5 @@
+#![cfg_attr(not(test), allow(dead_code))]
+
 use crate::config::Scenario;
 use crate::evidence::Evidence;
 use crate::ir::Plan;
@@ -19,6 +21,9 @@ pub(crate) struct ProviderFailure {
 pub(crate) trait Observer: Sync {
     fn observe(&self, scenario: &Scenario) -> Result<RunResult, ProviderFailure>;
     fn name(&self) -> &str;
+    fn fingerprint(&self) -> String {
+        crate::digest::sha256(format!("deshell-provider-v1:{}", self.name()).as_bytes())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -27,6 +32,7 @@ pub(crate) enum Outcome {
     Different,
     Unavailable,
     Failed,
+    Nondeterministic,
 }
 
 pub(crate) fn evaluate(
@@ -35,11 +41,20 @@ pub(crate) fn evaluate(
     policy: Policy,
     plan: &Plan,
     scenario: &Scenario,
+    runtime_lock_digest: &str,
     evidence: &mut Evidence,
 ) -> Result<Outcome, String> {
     if observer.name().trim().is_empty() {
         return Err("observer provider name must not be empty".into());
     }
+    if !crate::digest::valid_sha256(runtime_lock_digest) {
+        return Err("runtime lock digest must be a SHA-256 digest".into());
+    }
+    let key = crate::evidence::ObservationKey {
+        scenario_digest: scenario.digest()?,
+        provider_fingerprint: observer.fingerprint(),
+        runtime_lock_digest: runtime_lock_digest.into(),
+    };
     let expected = match observer.observe(scenario) {
         Ok(result) => result,
         Err(failure) => {
@@ -53,9 +68,10 @@ pub(crate) fn evaluate(
                 }
             };
             evidence.append_observation(crate::evidence::ObservationEvidence {
-                scenarios: vec![scenario.name.clone()],
+                scenario: scenario.name.clone(),
+                key,
                 status,
-                provider: Some(observer.name().into()),
+                provider: observer.name().into(),
                 reason: Some(failure.message),
                 digest: None,
             })?;
@@ -64,9 +80,10 @@ pub(crate) fn evaluate(
     };
     if let Some(reason) = expectation_failure(scenario, &expected) {
         evidence.append_observation(crate::evidence::ObservationEvidence {
-            scenarios: vec![scenario.name.clone()],
+            scenario: scenario.name.clone(),
+            key,
             status: crate::evidence::ObservationStatus::Failed,
-            provider: Some(observer.name().into()),
+            provider: observer.name().into(),
             reason: Some(reason),
             digest: None,
         })?;
@@ -82,20 +99,31 @@ pub(crate) fn evaluate(
         .iter()
         .map(|value| (value.name.clone(), value.value.clone()))
         .collect();
-    let actual = match crate::runner::run_plan(
+    let stdin = scenario
+        .stdin
+        .as_ref()
+        .map(crate::config::BinaryData::bytes)
+        .transpose()?
+        .unwrap_or_default();
+    let actual = match crate::runner::run_plan_with_io(
         backend,
         policy,
         plan,
-        &host_environment,
-        &named_inputs,
-        &scenario.argv,
+        crate::runner::RunInputs {
+            host_environment: &host_environment,
+            named_inputs: &named_inputs,
+            arguments: &scenario.argv,
+            stdin: &stdin,
+            default_working_directory: scenario.cwd.as_deref(),
+        },
     ) {
         Ok(result) => result,
         Err(error) => {
             evidence.append_observation(crate::evidence::ObservationEvidence {
-                scenarios: vec![scenario.name.clone()],
+                scenario: scenario.name.clone(),
+                key,
                 status: crate::evidence::ObservationStatus::Failed,
-                provider: Some(observer.name().into()),
+                provider: observer.name().into(),
                 reason: Some(format!(
                     "plan execution failed during differential observation: {}",
                     error.message
@@ -106,15 +134,21 @@ pub(crate) fn evaluate(
         }
     };
     let comparison = crate::verify::compare(&expected, &actual)?;
-    crate::verify::record_comparison(evidence, &scenario.name, observer.name(), &comparison)?;
-    Ok(if comparison.equivalent {
-        Outcome::Verified
-    } else {
-        Outcome::Different
+    let status = crate::verify::record_comparison(
+        evidence,
+        &scenario.name,
+        observer.name(),
+        key,
+        &comparison,
+    )?;
+    Ok(match status {
+        crate::evidence::ObservationStatus::Nondeterministic => Outcome::Nondeterministic,
+        _ if comparison.equivalent => Outcome::Verified,
+        _ => Outcome::Different,
     })
 }
 
-fn expectation_failure(scenario: &Scenario, observed: &RunResult) -> Option<String> {
+pub(crate) fn expectation_failure(scenario: &Scenario, observed: &RunResult) -> Option<String> {
     if let Some(expected) = scenario.expect.exit_code
         && expected != observed.exit_code
     {
@@ -124,12 +158,12 @@ fn expectation_failure(scenario: &Scenario, observed: &RunResult) -> Option<Stri
         ));
     }
     if let Some(expected) = &scenario.expect.stdout
-        && expected.as_bytes() != observed.stdout
+        && expected.bytes().ok().as_deref() != Some(observed.stdout.as_slice())
     {
         return Some("scenario expected stdout did not match the original observation".into());
     }
     if let Some(expected) = &scenario.expect.stderr
-        && expected.as_bytes() != observed.stderr
+        && expected.bytes().ok().as_deref() != Some(observed.stderr.as_slice())
     {
         return Some("scenario expected stderr did not match the original observation".into());
     }
@@ -141,7 +175,7 @@ mod tests {
     use super::*;
     use crate::evidence::ObservationStatus;
     use crate::ir::{Guarantee, Node, Operation, Task, TextExpression};
-    use crate::runner::{CapsuleRequest, ProcessRequest, ProcessResult, TraceEvent};
+    use crate::runner::{InterpreterRequest, ProcessRequest, ProcessResult, TraceEvent};
 
     struct MockObserver(Result<RunResult, ProviderFailure>);
     impl Observer for MockObserver {
@@ -162,7 +196,10 @@ mod tests {
                 stderr: self.0.stderr.clone(),
             })
         }
-        fn execute_capsule(&self, _request: CapsuleRequest) -> Result<ProcessResult, String> {
+        fn execute_interpreter(
+            &self,
+            _request: InterpreterRequest,
+        ) -> Result<ProcessResult, String> {
             unreachable!()
         }
         fn read_file(&self, _path: &str) -> Result<Vec<u8>, String> {
@@ -212,8 +249,8 @@ mod tests {
                         environment: vec![],
                         working_directory: None,
                     },
-                    guarantee: Guarantee::Formal {
-                        basis: "test".into(),
+                    guarantee: Guarantee::Native {
+                        semantic_model: "test".into(),
                     },
                     source: None,
                 },
@@ -230,6 +267,10 @@ mod tests {
         scenario
     }
 
+    fn runtime_digest() -> String {
+        "b".repeat(64)
+    }
+
     #[test]
     fn equivalent_runs_append_verified_evidence_without_changing_the_plan() {
         let plan = plan();
@@ -242,6 +283,7 @@ mod tests {
             Policy::default(),
             &plan,
             &scenario(),
+            &runtime_digest(),
             &mut evidence,
         )
         .unwrap();
@@ -260,6 +302,7 @@ mod tests {
             Policy::default(),
             &plan,
             &scenario(),
+            &runtime_digest(),
             &mut evidence,
         )
         .unwrap();
@@ -304,6 +347,7 @@ mod tests {
                     Policy::default(),
                     &plan,
                     &scenario(),
+                    &runtime_digest(),
                     &mut evidence
                 )
                 .unwrap(),
@@ -311,10 +355,7 @@ mod tests {
             );
             assert_eq!(evidence.observations[0].status, status);
             assert_eq!(evidence.observations[0].digest, None);
-            assert_eq!(
-                evidence.observations[0].provider,
-                Some("mock-observer".into())
-            );
+            assert_eq!(evidence.observations[0].provider, "mock-observer");
         }
     }
 
@@ -322,7 +363,7 @@ mod tests {
     fn scenario_expectations_are_checked_before_claiming_equivalence() {
         let plan = plan();
         let mut scenario = scenario();
-        scenario.expect.stdout = Some("expected".into());
+        scenario.expect.stdout = Some(crate::config::BinaryData::from("expected"));
         let mut evidence = Evidence::from_plan(&plan, "build.sh", b"emit").unwrap();
         let outcome = evaluate(
             &MockObserver(Ok(result(0, b"actual"))),
@@ -330,6 +371,7 @@ mod tests {
             Policy::default(),
             &plan,
             &scenario,
+            &runtime_digest(),
             &mut evidence,
         )
         .unwrap();

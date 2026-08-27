@@ -1,6 +1,93 @@
 use crate::config::{ExpectedFile, Fixture};
 use std::path::Path;
 
+pub(crate) struct PrivateWorkspace {
+    _directory: tempfile::TempDir,
+    root: std::path::PathBuf,
+}
+
+impl PrivateWorkspace {
+    pub(crate) fn path(&self) -> &Path {
+        &self.root
+    }
+}
+
+/// Make a private, non-symlink snapshot suitable for a disposable provider.
+/// The live project is never mounted writable or used as a process working tree.
+pub(crate) fn private_snapshot(source: &Path) -> Result<PrivateWorkspace, String> {
+    let source = canonical_directory(source)?;
+    let directory = tempfile::Builder::new()
+        .prefix("deshell-workspace-")
+        .tempdir()
+        .map_err(|error| format!("cannot create private workspace: {error}"))?;
+    let root = directory.path().join("workspace");
+    std::fs::create_dir(&root)
+        .map_err(|error| format!("cannot create private workspace root: {error}"))?;
+    for entry in walkdir::WalkDir::new(&source)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| {
+            entry.depth() == 0
+                || !entry.file_type().is_dir()
+                || entry.file_name().to_str() != Some(".git")
+        })
+    {
+        let entry = entry
+            .map_err(|error| format!("cannot snapshot workspace {}: {error}", source.display()))?;
+        if entry.depth() == 0 {
+            continue;
+        }
+        let relative = entry
+            .path()
+            .strip_prefix(&source)
+            .map_err(|_| "workspace snapshot entry escaped its source root")?;
+        let target = root.join(relative);
+        let kind = entry.file_type();
+        if kind.is_symlink() {
+            return Err(format!(
+                "private workspace refuses symlink: {}",
+                relative.display()
+            ));
+        }
+        if kind.is_dir() {
+            std::fs::create_dir(&target).map_err(|error| {
+                format!(
+                    "cannot create snapshot directory {}: {error}",
+                    target.display()
+                )
+            })?;
+        } else if kind.is_file() {
+            std::fs::copy(entry.path(), &target).map_err(|error| {
+                format!("cannot copy snapshot file {}: {error}", relative.display())
+            })?;
+            let permissions = entry
+                .metadata()
+                .map_err(|error| {
+                    format!(
+                        "cannot inspect snapshot file {}: {error}",
+                        relative.display()
+                    )
+                })?
+                .permissions();
+            std::fs::set_permissions(&target, permissions).map_err(|error| {
+                format!(
+                    "cannot preserve snapshot permissions {}: {error}",
+                    relative.display()
+                )
+            })?;
+        } else {
+            return Err(format!(
+                "private workspace refuses non-regular entry: {}",
+                relative.display()
+            ));
+        }
+    }
+    Ok(PrivateWorkspace {
+        _directory: directory,
+        root,
+    })
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct FileState {
     pub path: String,
@@ -53,7 +140,7 @@ pub(crate) fn materialize(root: &Path, fixtures: &[Fixture]) -> Result<(), Strin
         let permissions = if fixture.executable { 0o755 } else { 0o644 };
         proposals.push(crate::patch::prepare_create(
             &root.join(&fixture.path),
-            fixture.contents.as_bytes().to_vec(),
+            fixture.contents.bytes()?,
             permissions,
         )?);
     }
@@ -74,8 +161,23 @@ pub(crate) fn capture(root: &Path) -> Result<Snapshot, String> {
     {
         let entry =
             entry.map_err(|error| format!("cannot walk workspace {}: {error}", root.display()))?;
-        if entry.depth() == 0 || !entry.file_type().is_file() || entry.file_type().is_symlink() {
+        if entry.depth() == 0 {
             continue;
+        }
+        if entry.file_type().is_symlink() {
+            return Err(format!(
+                "workspace capture refuses symlink: {}",
+                entry.path().display()
+            ));
+        }
+        if entry.file_type().is_dir() {
+            continue;
+        }
+        if !entry.file_type().is_file() {
+            return Err(format!(
+                "workspace capture refuses non-regular entry: {}",
+                entry.path().display()
+            ));
         }
         let relative = entry
             .path()
@@ -164,22 +266,36 @@ pub(crate) fn validate_expected(root: &Path, expected: &[ExpectedFile]) -> Resul
             ));
             continue;
         }
-        let path = root.join(&expected.path);
-        let metadata = match path.symlink_metadata() {
-            Ok(metadata) => metadata,
-            Err(error) => {
+        let mut path = root.clone();
+        let components = expected.path.split('/').collect::<Vec<_>>();
+        let mut invalid_component = false;
+        for (index, component) in components.iter().enumerate() {
+            path.push(component);
+            let metadata = match path.symlink_metadata() {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    errors.push(format!(
+                        "cannot inspect expected file {}: {error}",
+                        expected.path
+                    ));
+                    invalid_component = true;
+                    break;
+                }
+            };
+            let final_component = index + 1 == components.len();
+            if metadata.file_type().is_symlink()
+                || (!final_component && !metadata.file_type().is_dir())
+                || (final_component && !metadata.file_type().is_file())
+            {
                 errors.push(format!(
-                    "cannot inspect expected file {}: {error}",
+                    "expected file path contains a symlink or non-regular component: {}",
                     expected.path
                 ));
-                continue;
+                invalid_component = true;
+                break;
             }
-        };
-        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
-            errors.push(format!(
-                "expected file is not a regular non-symlink file: {}",
-                expected.path
-            ));
+        }
+        if invalid_component {
             continue;
         }
         let canonical = match path.canonicalize() {
@@ -362,7 +478,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshots_are_sorted_ignore_internal_metadata_and_never_follow_symlinks() {
+    fn snapshots_are_sorted_ignore_internal_metadata_and_reject_symlinks() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::create_dir(directory.path().join("z")).unwrap();
         std::fs::write(directory.path().join("z/b"), b"b").unwrap();
@@ -371,6 +487,11 @@ mod tests {
         std::fs::write(directory.path().join(".deshell/private"), b"ignore").unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink("a", directory.path().join("link")).unwrap();
+        #[cfg(unix)]
+        {
+            assert!(capture(directory.path()).unwrap_err().contains("symlink"));
+            std::fs::remove_file(directory.path().join("link")).unwrap();
+        }
         let snapshot = capture(directory.path()).unwrap();
         assert_eq!(
             snapshot
@@ -430,6 +551,14 @@ mod tests {
             std::fs::remove_file(directory.path().join("out")).unwrap();
             std::os::unix::fs::symlink("missing", directory.path().join("out")).unwrap();
             assert!(validate_expected(directory.path(), &expected).is_err());
+            std::fs::create_dir(directory.path().join("inside")).unwrap();
+            std::fs::write(directory.path().join("inside/value"), b"value").unwrap();
+            std::os::unix::fs::symlink("inside", directory.path().join("inside-link")).unwrap();
+            let through_parent = [ExpectedFile {
+                path: "inside-link/value".into(),
+                sha256: crate::digest::sha256(b"value"),
+            }];
+            assert!(validate_expected(directory.path(), &through_parent).is_err());
         }
     }
 }
