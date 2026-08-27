@@ -402,31 +402,7 @@ pub(crate) fn execute_with_clock(
         command.env(name, value);
     }
     #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt as _;
-        command.process_group(0);
-        let memory = request.limits.memory_bytes;
-        let processes = request.limits.processes;
-        unsafe {
-            command.pre_exec(move || {
-                let memory_limit = libc::rlimit {
-                    rlim_cur: memory as libc::rlim_t,
-                    rlim_max: memory as libc::rlim_t,
-                };
-                if libc::setrlimit(libc::RLIMIT_AS, &memory_limit) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                let process_limit = libc::rlimit {
-                    rlim_cur: processes as libc::rlim_t,
-                    rlim_max: processes as libc::rlim_t,
-                };
-                if libc::setrlimit(libc::RLIMIT_NPROC, &process_limit) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-    }
+    configure_unix_limits(&mut command, request.limits);
     let mut child = command
         .spawn()
         .map_err(|error| format!("failed to start {executable}: {error}"))?;
@@ -603,7 +579,14 @@ fn configure_unix_limits(command: &mut std::process::Command, limits: Limits) {
                 rlim_cur: limits.memory_bytes as libc::rlim_t,
                 rlim_max: limits.memory_bytes as libc::rlim_t,
             };
-            if libc::setrlimit(libc::RLIMIT_AS, &memory_limit) != 0 {
+            // Darwin does not expose RLIMIT_AS as a supported setrlimit(2)
+            // resource. RLIMIT_DATA is its enforceable per-process allocation
+            // boundary; other Unix targets use the address-space boundary.
+            #[cfg(target_os = "macos")]
+            let memory_resource = libc::RLIMIT_DATA;
+            #[cfg(not(target_os = "macos"))]
+            let memory_resource = libc::RLIMIT_AS;
+            if libc::setrlimit(memory_resource, &memory_limit) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
             let process_limit = libc::rlimit {
