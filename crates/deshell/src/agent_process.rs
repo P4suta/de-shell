@@ -575,26 +575,48 @@ fn configure_unix_limits(command: &mut std::process::Command, limits: Limits) {
     command.process_group(0);
     unsafe {
         command.pre_exec(move || {
-            let memory_limit = libc::rlimit {
-                rlim_cur: limits.memory_bytes as libc::rlim_t,
-                rlim_max: limits.memory_bytes as libc::rlim_t,
-            };
-            // Darwin does not expose RLIMIT_AS as a supported setrlimit(2)
-            // resource. RLIMIT_DATA is its enforceable per-process allocation
-            // boundary; other Unix targets use the address-space boundary.
             #[cfg(target_os = "macos")]
-            let memory_resource = libc::RLIMIT_DATA;
-            #[cfg(not(target_os = "macos"))]
-            let memory_resource = libc::RLIMIT_AS;
-            if libc::setrlimit(memory_resource, &memory_limit) != 0 {
-                return Err(std::io::Error::last_os_error());
+            {
+                // Darwin's inherited data limit can be lower than the project
+                // limit. Preserve that hard limit and only narrow the soft
+                // limit so spawning never attempts to raise host policy.
+                let mut inherited = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+                if libc::getrlimit(libc::RLIMIT_DATA, inherited.as_mut_ptr()) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let inherited = inherited.assume_init();
+                let memory_limit = libc::rlimit {
+                    rlim_cur: (limits.memory_bytes as libc::rlim_t).min(inherited.rlim_max),
+                    rlim_max: inherited.rlim_max,
+                };
+                if libc::setrlimit(libc::RLIMIT_DATA, &memory_limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+
+                // RLIMIT_NPROC is a real-user-ID-wide limit on Darwin, not a
+                // child-tree limit. Applying a per-command budget here can
+                // reject every spawn when the shared runner account already
+                // owns more processes than that budget. Sandboxed providers
+                // enforce their own PID limit; the host-local backend remains
+                // bounded by its process group, timeout, and output limits.
             }
-            let process_limit = libc::rlimit {
-                rlim_cur: limits.processes as libc::rlim_t,
-                rlim_max: limits.processes as libc::rlim_t,
-            };
-            if libc::setrlimit(libc::RLIMIT_NPROC, &process_limit) != 0 {
-                return Err(std::io::Error::last_os_error());
+
+            #[cfg(not(target_os = "macos"))]
+            {
+                let memory_limit = libc::rlimit {
+                    rlim_cur: limits.memory_bytes as libc::rlim_t,
+                    rlim_max: limits.memory_bytes as libc::rlim_t,
+                };
+                if libc::setrlimit(libc::RLIMIT_AS, &memory_limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let process_limit = libc::rlimit {
+                    rlim_cur: limits.processes as libc::rlim_t,
+                    rlim_max: limits.processes as libc::rlim_t,
+                };
+                if libc::setrlimit(libc::RLIMIT_NPROC, &process_limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
             }
             Ok(())
         });
