@@ -35,9 +35,12 @@ Preorder starts at zero for a frontend result and increments before visiting
 children from left to right. Generated nodes use an empty source path and a
 zero-width byte span. Operation names are the schema `type` strings.
 
-## Guarantees and residual source
+## Guarantees, delegation, and residual source
 
-Nodes carry only static `formal`, finite-set `exhaustive`, or `residual`
-guarantees. Differential results belong to Evidence v1 and never mutate a plan.
-An opaque capsule has exactly one residual reason: the node guarantee. Its
-original bytes are retained as either UTF-8 text or canonical base64.
+Nodes carry only `native`, `delegated`, or `residual` guarantees. `native`
+identifies the pinned semantic model that fully lowered the node. `delegated`
+is represented only by an `interpreter_call` containing the interpreter digest,
+exact source bytes and span, minimum capabilities, and delegation reason.
+Differential results belong to Evidence v1 and never mutate a plan. An
+`opaque_capsule` is residual-only and is never executable; its original bytes
+are retained as either UTF-8 text or canonical base64.

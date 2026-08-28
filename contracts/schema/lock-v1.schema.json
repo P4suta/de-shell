@@ -21,21 +21,40 @@
     "interpreters": {
       "additionalProperties": false,
       "properties": {
-        "bash": { "minLength": 1, "type": "string" },
-        "cmd": { "minLength": 1, "type": "string" },
-        "fish": { "minLength": 1, "type": "string" },
-        "nushell": { "minLength": 1, "type": "string" },
-        "posix_sh": { "minLength": 1, "type": "string" },
-        "powershell": { "minLength": 1, "type": "string" },
-        "zsh": { "minLength": 1, "type": "string" }
+        "bash": { "$ref": "#/$defs/pin" },
+        "cmd": { "$ref": "#/$defs/pin" },
+        "fish": { "$ref": "#/$defs/pin" },
+        "nushell": { "$ref": "#/$defs/pin" },
+        "posix_sh": { "$ref": "#/$defs/pin" },
+        "powershell": { "$ref": "#/$defs/pin" },
+        "zsh": { "$ref": "#/$defs/pin" }
       },
       "required": ["posix_sh", "bash", "zsh", "fish", "powershell", "cmd", "nushell"],
       "type": "object"
     },
     "lab": {
       "additionalProperties": false,
-      "properties": { "image": { "minLength": 1, "type": "string" } },
-      "required": ["image"],
+      "properties": {
+        "assets": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "architecture": { "enum": ["aarch64", "x86_64"] },
+              "executable": { "type": "boolean" },
+              "name": { "pattern": "^[A-Za-z0-9._-]+$", "type": "string" },
+              "operating_system": { "enum": ["linux", "macos", "windows"] },
+              "path": { "$ref": "#/$defs/path" },
+              "role": { "enum": ["helper", "runtime"] },
+              "sha256": { "$ref": "#/$defs/pin" }
+            },
+            "required": ["name", "role", "operating_system", "architecture", "path", "sha256", "executable"],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "image": { "$ref": "#/$defs/imagePin" }
+      },
+      "required": ["image", "assets"],
       "type": "object"
     },
     "protocol": {
@@ -54,12 +73,32 @@
       "required": ["rust"],
       "type": "object"
     },
+    "targets": {
+      "additionalProperties": false,
+      "properties": { "dagger_image": { "$ref": "#/$defs/imagePin" } },
+      "required": ["dagger_image"],
+      "type": "object"
+    },
     "version": { "const": 1 }
   },
-  "required": ["version", "toolchain", "protocol", "artifacts", "adapters", "interpreters", "lab"],
+  "required": ["version", "toolchain", "protocol", "artifacts", "adapters", "interpreters", "targets", "lab"],
   "title": "de-shell lock file v1",
   "type": "object",
   "$defs": {
-    "pin": { "pattern": "^sha256:[0-9a-f]{64}$", "type": "string" }
+    "path": {
+      "minLength": 1,
+      "pattern": "^(?!/)(?!\\.{1,2}(?:/|$))(?!.*//)(?!.*\\/\\.{1,2}(?:/|$))(?!.*\\/$)[^\\\\:\\u0000]+$",
+      "type": "string"
+    },
+    "pin": { "pattern": "^sha256:[0-9a-f]{64}$", "type": "string" },
+    "imagePin": {
+      "anyOf": [
+        { "const": "unconfigured" },
+        {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9/._:-]*@sha256:[0-9a-f]{64}$",
+          "type": "string"
+        }
+      ]
+    }
   }
 }

@@ -7,7 +7,35 @@ pub(crate) struct Request {
     pub environment: Vec<(String, String)>,
     pub working_directory: Option<String>,
     pub stdin: Vec<u8>,
+    pub limits: Limits,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Limits {
     pub timeout_ms: u64,
+    pub memory_bytes: u64,
+    pub processes: u64,
+    pub stdout_bytes: u64,
+    pub stderr_bytes: u64,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        let limits = crate::config::ResourceLimits::DEFAULT;
+        Self::from(limits)
+    }
+}
+
+impl From<crate::config::ResourceLimits> for Limits {
+    fn from(value: crate::config::ResourceLimits) -> Self {
+        Self {
+            timeout_ms: value.timeout_ms,
+            memory_bytes: value.memory_bytes,
+            processes: value.processes,
+            stdout_bytes: value.stdout_bytes,
+            stderr_bytes: value.stderr_bytes,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -16,11 +44,13 @@ pub(crate) struct Outcome {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub timed_out: bool,
+    pub limit_exceeded: Option<String>,
     pub signal: Option<i32>,
 }
 
 pub(crate) trait Clock: Sync {
     fn elapsed(&self) -> Duration;
+    fn yield_now(&self);
     fn wait(&self, duration: Duration);
 }
 
@@ -40,14 +70,281 @@ impl Clock for SystemClock {
     fn elapsed(&self) -> Duration {
         self.start.elapsed()
     }
+    fn yield_now(&self) {
+        std::thread::yield_now();
+    }
     fn wait(&self, duration: Duration) {
         std::thread::sleep(duration);
+    }
+}
+
+const POLL_YIELDS: u8 = 4;
+const POLL_INITIAL_WAIT: Duration = Duration::from_micros(250);
+const POLL_MAX_WAIT: Duration = Duration::from_millis(5);
+
+#[derive(Default)]
+struct PollBackoff {
+    polls: u8,
+    wait: Duration,
+}
+
+impl PollBackoff {
+    fn pause(&mut self, clock: &dyn Clock, deadline: Duration) {
+        if self.polls < POLL_YIELDS {
+            self.polls += 1;
+            clock.yield_now();
+            return;
+        }
+        self.wait = if self.wait.is_zero() {
+            POLL_INITIAL_WAIT
+        } else {
+            self.wait.saturating_mul(2).min(POLL_MAX_WAIT)
+        };
+        let remaining = deadline.saturating_sub(clock.elapsed());
+        if !remaining.is_zero() {
+            clock.wait(self.wait.min(remaining));
+        }
     }
 }
 
 pub(crate) fn execute(root: &Path, request: Request) -> Result<Outcome, String> {
     let clock = SystemClock::start();
     execute_with_clock(root, request, &clock)
+}
+
+pub(crate) fn execute_pipeline(
+    root: &Path,
+    requests: Vec<Request>,
+) -> Result<Vec<Outcome>, String> {
+    if requests.is_empty() {
+        return Err("process pipeline must contain at least one stage".into());
+    }
+    let limits = requests[0].limits;
+    if requests.iter().any(|request| request.limits != limits) {
+        return Err("process pipeline stages must use identical resource limits".into());
+    }
+    if limits.timeout_ms == 0
+        || limits.timeout_ms > 86_400_000
+        || limits.memory_bytes < 16 * 1024 * 1024
+        || limits.processes == 0
+        || limits.stdout_bytes == 0
+        || limits.stderr_bytes == 0
+    {
+        return Err("process pipeline resource limits are invalid".into());
+    }
+
+    let clock = SystemClock::start();
+    let count = requests.len();
+    let exceeded = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+    let stderr_total = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut children: Vec<std::process::Child> = Vec::with_capacity(count);
+    let mut previous_stdout: Option<std::process::ChildStdout> = None;
+    let mut stderr_readers = Vec::with_capacity(count);
+    let mut stdout_reader = None;
+    let mut stdin_writer = None;
+
+    for (index, request) in requests.into_iter().enumerate() {
+        let executable = request
+            .argv
+            .first()
+            .filter(|value| !value.is_empty())
+            .ok_or("process pipeline argv must not be empty")?;
+        if request.argv.iter().any(|value| value.contains('\0')) {
+            terminate_children(&mut children);
+            return Err("process pipeline argv must not contain NUL".into());
+        }
+        let directory = match _resolve_directory(root, request.working_directory.as_deref()) {
+            Ok(directory) => directory,
+            Err(error) => {
+                terminate_children(&mut children);
+                return Err(error);
+            }
+        };
+        let mut seen = std::collections::BTreeSet::new();
+        for (name, value) in &request.environment {
+            if !valid_environment_name(name) || value.contains('\0') {
+                terminate_children(&mut children);
+                return Err(format!(
+                    "invalid process pipeline environment entry: {name}"
+                ));
+            }
+            let key = if cfg!(windows) {
+                name.to_ascii_uppercase()
+            } else {
+                name.clone()
+            };
+            if !seen.insert(key) {
+                terminate_children(&mut children);
+                return Err(format!(
+                    "duplicate process pipeline environment variable: {name}"
+                ));
+            }
+        }
+
+        let mut command = std::process::Command::new(executable);
+        command
+            .args(&request.argv[1..])
+            .current_dir(directory)
+            .env_clear()
+            .stderr(std::process::Stdio::piped());
+        if index == 0 {
+            command.stdin(std::process::Stdio::piped());
+        } else {
+            let input = previous_stdout
+                .take()
+                .ok_or("previous pipeline stdout is unavailable")?;
+            command.stdin(std::process::Stdio::from(input));
+        }
+        command.stdout(std::process::Stdio::piped());
+        add_essential_environment(&mut command);
+        for (name, value) in &request.environment {
+            command.env(name, value);
+        }
+        #[cfg(unix)]
+        configure_unix_limits(&mut command, limits);
+
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                terminate_children(&mut children);
+                return Err(format!(
+                    "failed to start pipeline stage {executable}: {error}"
+                ));
+            }
+        };
+        if index == 0 {
+            let mut input = child
+                .stdin
+                .take()
+                .ok_or("pipeline stdin pipe is unavailable")?;
+            stdin_writer = Some(std::thread::spawn(move || -> Result<(), String> {
+                use std::io::Write as _;
+                match input.write_all(&request.stdin) {
+                    Ok(()) => Ok(()),
+                    Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+                    Err(error) => Err(format!("failed to write pipeline stdin: {error}")),
+                }
+            }));
+        }
+        let output = child
+            .stdout
+            .take()
+            .ok_or("pipeline stdout pipe is unavailable")?;
+        if index + 1 == count {
+            let exceeded = std::sync::Arc::clone(&exceeded);
+            stdout_reader = Some(std::thread::spawn(move || {
+                read_pipe(output, "stdout", limits.stdout_bytes, &exceeded, 1)
+            }));
+        } else {
+            previous_stdout = Some(output);
+        }
+        let error = child
+            .stderr
+            .take()
+            .ok_or("pipeline stderr pipe is unavailable")?;
+        let exceeded_reader = std::sync::Arc::clone(&exceeded);
+        let stderr_total_reader = std::sync::Arc::clone(&stderr_total);
+        stderr_readers.push(std::thread::spawn(move || {
+            read_pipe_shared(
+                error,
+                "stderr",
+                limits.stderr_bytes,
+                &stderr_total_reader,
+                &exceeded_reader,
+                2,
+            )
+        }));
+        children.push(child);
+    }
+
+    let deadline = Duration::from_millis(limits.timeout_ms);
+    let mut statuses = vec![None; count];
+    let mut timed_out = false;
+    let mut backoff = PollBackoff::default();
+    loop {
+        let mut complete = true;
+        for (index, child) in children.iter_mut().enumerate() {
+            if statuses[index].is_none() {
+                statuses[index] = child
+                    .try_wait()
+                    .map_err(|error| format!("failed to poll pipeline stage: {error}"))?;
+            }
+            complete &= statuses[index].is_some();
+        }
+        if complete {
+            break;
+        }
+        if exceeded.load(std::sync::atomic::Ordering::Acquire) != 0 {
+            terminate_children(&mut children);
+            break;
+        }
+        if clock.elapsed() >= deadline {
+            timed_out = true;
+            terminate_children(&mut children);
+            break;
+        }
+        backoff.pause(&clock, deadline);
+    }
+    for (index, child) in children.iter_mut().enumerate() {
+        if statuses[index].is_none() {
+            statuses[index] = Some(
+                child
+                    .wait()
+                    .map_err(|error| format!("failed to reap pipeline stage: {error}"))?,
+            );
+        }
+    }
+    if let Some(writer) = stdin_writer {
+        writer
+            .join()
+            .map_err(|_| "pipeline stdin writer panicked".to_owned())??;
+    }
+    let mut stdout = stdout_reader
+        .ok_or("pipeline final stdout reader is unavailable")?
+        .join()
+        .map_err(|_| "pipeline stdout reader panicked".to_owned())??;
+    let mut stderrs = Vec::with_capacity(count);
+    for reader in stderr_readers {
+        stderrs.push(
+            reader
+                .join()
+                .map_err(|_| "pipeline stderr reader panicked".to_owned())??,
+        );
+    }
+    let limit_exceeded = match exceeded.load(std::sync::atomic::Ordering::Acquire) {
+        1 => Some("stdout".into()),
+        2 => Some("stderr".into()),
+        _ if timed_out => Some("timeout".into()),
+        _ => None,
+    };
+    statuses
+        .into_iter()
+        .zip(stderrs)
+        .enumerate()
+        .map(|(index, (status, stderr))| {
+            let status = status.ok_or_else(|| {
+                format!("pipeline stage {index} was reaped without recording its status")
+            })?;
+            Ok(Outcome {
+                exit_code: if timed_out {
+                    124
+                } else if limit_exceeded.is_some() {
+                    1
+                } else {
+                    exit_code(&status)
+                },
+                stdout: if index + 1 == count {
+                    std::mem::take(&mut stdout)
+                } else {
+                    Vec::new()
+                },
+                stderr,
+                timed_out,
+                limit_exceeded: limit_exceeded.clone(),
+                signal: exit_signal(&status),
+            })
+        })
+        .collect()
 }
 
 pub(crate) fn execute_with_clock(
@@ -61,8 +358,17 @@ pub(crate) fn execute_with_clock(
     if request.argv.iter().any(|value| value.contains('\0')) {
         return Err("process agent argv must not contain NUL".into());
     }
-    if request.timeout_ms == 0 || request.timeout_ms > 86_400_000 {
+    if request.limits.timeout_ms == 0 || request.limits.timeout_ms > 86_400_000 {
         return Err("process agent timeout_ms must be between 1 and 86400000".into());
+    }
+    if request.limits.memory_bytes < 16 * 1024 * 1024
+        || request.limits.processes == 0
+        || request.limits.stdout_bytes == 0
+        || request.limits.stderr_bytes == 0
+    {
+        return Err(
+            "process agent resource limits must be positive and memory at least 16 MiB".into(),
+        );
     }
     let directory = _resolve_directory(root, request.working_directory.as_deref())?;
     let mut seen = std::collections::BTreeSet::new();
@@ -96,10 +402,7 @@ pub(crate) fn execute_with_clock(
         command.env(name, value);
     }
     #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt as _;
-        command.process_group(0);
-    }
+    configure_unix_limits(&mut command, request.limits);
     let mut child = command
         .spawn()
         .map_err(|error| format!("failed to start {executable}: {error}"))?;
@@ -115,8 +418,17 @@ pub(crate) fn execute_with_clock(
         .stdin
         .take()
         .ok_or("process stdin pipe is unavailable")?;
-    let stdout_reader = std::thread::spawn(move || read_pipe(child_stdout, "stdout"));
-    let stderr_reader = std::thread::spawn(move || read_pipe(child_stderr, "stderr"));
+    let exceeded = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+    let stdout_exceeded = std::sync::Arc::clone(&exceeded);
+    let stderr_exceeded = std::sync::Arc::clone(&exceeded);
+    let stdout_limit = request.limits.stdout_bytes;
+    let stderr_limit = request.limits.stderr_bytes;
+    let stdout_reader = std::thread::spawn(move || {
+        read_pipe(child_stdout, "stdout", stdout_limit, &stdout_exceeded, 1)
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        read_pipe(child_stderr, "stderr", stderr_limit, &stderr_exceeded, 2)
+    });
     let input = request.stdin;
     let stdin_writer = std::thread::spawn(move || -> Result<(), String> {
         use std::io::Write as _;
@@ -126,9 +438,18 @@ pub(crate) fn execute_with_clock(
             Err(error) => Err(format!("failed to write process stdin: {error}")),
         }
     });
-    let deadline = Duration::from_millis(request.timeout_ms);
+    let deadline = Duration::from_millis(request.limits.timeout_ms);
     let mut timed_out = false;
+    let mut output_limited = false;
+    let mut backoff = PollBackoff::default();
     let status = loop {
+        if exceeded.load(std::sync::atomic::Ordering::Acquire) != 0 {
+            output_limited = true;
+            kill_process_tree(&mut child);
+            break child
+                .wait()
+                .map_err(|error| format!("failed to reap output-limited {executable}: {error}"))?;
+        }
         if let Some(status) = child
             .try_wait()
             .map_err(|error| format!("failed to poll {executable}: {error}"))?
@@ -142,7 +463,7 @@ pub(crate) fn execute_with_clock(
                 .wait()
                 .map_err(|error| format!("failed to reap timed-out {executable}: {error}"))?;
         }
-        clock.wait(Duration::from_millis(5));
+        backoff.pause(clock, deadline);
     };
     stdin_writer
         .join()
@@ -154,11 +475,24 @@ pub(crate) fn execute_with_clock(
         .join()
         .map_err(|_| "process stderr reader panicked".to_owned())??;
     let signal = exit_signal(&status);
+    let limit_exceeded = match exceeded.load(std::sync::atomic::Ordering::Acquire) {
+        1 => Some("stdout".into()),
+        2 => Some("stderr".into()),
+        _ if timed_out => Some("timeout".into()),
+        _ => None,
+    };
     Ok(Outcome {
-        exit_code: if timed_out { 124 } else { exit_code(&status) },
+        exit_code: if timed_out {
+            124
+        } else if output_limited || limit_exceeded.is_some() {
+            1
+        } else {
+            exit_code(&status)
+        },
         stdout,
         stderr,
         timed_out,
+        limit_exceeded,
         signal,
     })
 }
@@ -185,19 +519,22 @@ fn _resolve_directory(root: &Path, relative: Option<&str>) -> Result<PathBuf, St
             "process working directory is not normalized: {relative}"
         ));
     }
-    let candidate = root.join(relative);
-    let metadata = candidate
-        .symlink_metadata()
-        .map_err(|error| format!("cannot inspect process working directory {relative}: {error}"))?;
-    if metadata.file_type().is_symlink() {
-        return Err(format!(
-            "process working directory must not be a symlink: {relative}"
-        ));
-    }
-    if !metadata.file_type().is_dir() {
-        return Err(format!(
-            "process working directory is not a directory: {relative}"
-        ));
+    let mut candidate = root.clone();
+    for component in relative.split('/') {
+        candidate.push(component);
+        let metadata = candidate.symlink_metadata().map_err(|error| {
+            format!("cannot inspect process working directory {relative}: {error}")
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "process working directory path must not contain a symlink: {relative}"
+            ));
+        }
+        if !metadata.file_type().is_dir() {
+            return Err(format!(
+                "process working directory is not a directory: {relative}"
+            ));
+        }
     }
     let candidate = candidate
         .canonicalize()
@@ -232,10 +569,108 @@ fn add_essential_environment(command: &mut std::process::Command) {
     }
 }
 
-fn read_pipe(mut pipe: impl std::io::Read, label: &str) -> Result<Vec<u8>, String> {
+#[cfg(unix)]
+fn configure_unix_limits(command: &mut std::process::Command, limits: Limits) {
+    use std::os::unix::process::CommandExt as _;
+    command.process_group(0);
+
+    // Keep Darwin on Rust's posix_spawn path. Lowering a resource limit in a
+    // pre-exec child can be rejected when the child inherits a larger live
+    // address space, and RLIMIT_NPROC is scoped to the runner's entire user ID
+    // rather than this command tree. Disposable providers enforce their own
+    // memory and PID limits; host-local execution remains explicitly opt-in.
+    #[cfg(target_os = "macos")]
+    let _ = limits;
+
+    #[cfg(not(target_os = "macos"))]
+    unsafe {
+        command.pre_exec(move || {
+            let memory_limit = libc::rlimit {
+                rlim_cur: limits.memory_bytes as libc::rlim_t,
+                rlim_max: limits.memory_bytes as libc::rlim_t,
+            };
+            if libc::setrlimit(libc::RLIMIT_AS, &memory_limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let process_limit = libc::rlimit {
+                rlim_cur: limits.processes as libc::rlim_t,
+                rlim_max: limits.processes as libc::rlim_t,
+            };
+            if libc::setrlimit(libc::RLIMIT_NPROC, &process_limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+fn terminate_children(children: &mut [std::process::Child]) {
+    for child in children.iter_mut() {
+        kill_process_tree(child);
+    }
+}
+
+fn read_pipe(
+    mut pipe: impl std::io::Read,
+    label: &str,
+    limit: u64,
+    exceeded: &std::sync::atomic::AtomicU8,
+    code: u8,
+) -> Result<Vec<u8>, String> {
     let mut output = Vec::new();
-    pipe.read_to_end(&mut output)
-        .map_err(|error| format!("failed to read process {label}: {error}"))?;
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let count = pipe
+            .read(&mut buffer)
+            .map_err(|error| format!("failed to read process {label}: {error}"))?;
+        if count == 0 {
+            break;
+        }
+        let remaining = limit.saturating_sub(output.len() as u64) as usize;
+        output.extend_from_slice(&buffer[..count.min(remaining)]);
+        if count > remaining {
+            let _ = exceeded.compare_exchange(
+                0,
+                code,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            );
+            break;
+        }
+    }
+    Ok(output)
+}
+
+fn read_pipe_shared(
+    mut pipe: impl std::io::Read,
+    label: &str,
+    limit: u64,
+    total: &std::sync::atomic::AtomicU64,
+    exceeded: &std::sync::atomic::AtomicU8,
+    code: u8,
+) -> Result<Vec<u8>, String> {
+    let mut output = Vec::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let count = pipe
+            .read(&mut buffer)
+            .map_err(|error| format!("failed to read process {label}: {error}"))?;
+        if count == 0 {
+            break;
+        }
+        let previous = total.fetch_add(count as u64, std::sync::atomic::Ordering::AcqRel);
+        let remaining = limit.saturating_sub(previous) as usize;
+        output.extend_from_slice(&buffer[..count.min(remaining)]);
+        if count > remaining {
+            let _ = exceeded.compare_exchange(
+                0,
+                code,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            );
+            break;
+        }
+    }
     Ok(output)
 }
 
@@ -301,7 +736,10 @@ mod tests {
                 environment: vec![("VALUE".into(), "from-env".into())],
                 working_directory: Some("work".into()),
                 stdin: vec![0, 0xff],
-                timeout_ms: 5_000,
+                limits: Limits {
+                    timeout_ms: 5_000,
+                    ..Limits::default()
+                },
             },
         )
         .unwrap();
@@ -331,7 +769,10 @@ mod tests {
             environment: vec![],
             working_directory: None,
             stdin: vec![],
-            timeout_ms: 1,
+            limits: Limits {
+                timeout_ms: 1,
+                ..Limits::default()
+            },
         };
         assert!(
             execute(directory.path(), base.clone())
@@ -350,6 +791,92 @@ mod tests {
         escape.argv = vec!["missing".into()];
         escape.working_directory = Some("../outside".into());
         assert!(execute(directory.path(), escape).is_err());
+
+        let mut excessive_pipeline_limit = Request {
+            argv: vec!["missing".into()],
+            environment: vec![],
+            working_directory: None,
+            stdin: vec![],
+            limits: Limits::default(),
+        };
+        excessive_pipeline_limit.limits.timeout_ms = 86_400_001;
+        assert!(
+            execute_pipeline(directory.path(), vec![excessive_pipeline_limit])
+                .unwrap_err()
+                .contains("limits")
+        );
+    }
+
+    #[test]
+    fn poll_backoff_yields_then_doubles_caps_and_honors_the_deadline() {
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum Event {
+            Yield,
+            Wait(Duration),
+        }
+        struct RecordingClock {
+            elapsed: std::sync::Mutex<Duration>,
+            events: std::sync::Mutex<Vec<Event>>,
+        }
+        impl RecordingClock {
+            fn at(elapsed: Duration) -> Self {
+                Self {
+                    elapsed: std::sync::Mutex::new(elapsed),
+                    events: std::sync::Mutex::new(Vec::new()),
+                }
+            }
+        }
+        impl Clock for RecordingClock {
+            fn elapsed(&self) -> Duration {
+                *self.elapsed.lock().unwrap()
+            }
+            fn yield_now(&self) {
+                self.events.lock().unwrap().push(Event::Yield);
+            }
+            fn wait(&self, duration: Duration) {
+                self.events.lock().unwrap().push(Event::Wait(duration));
+                *self.elapsed.lock().unwrap() += duration;
+            }
+        }
+
+        let clock = RecordingClock::at(Duration::ZERO);
+        let mut backoff = PollBackoff::default();
+        for _ in 0..11 {
+            backoff.pause(&clock, Duration::from_secs(1));
+        }
+        assert_eq!(
+            *clock.events.lock().unwrap(),
+            [
+                Event::Yield,
+                Event::Yield,
+                Event::Yield,
+                Event::Yield,
+                Event::Wait(Duration::from_micros(250)),
+                Event::Wait(Duration::from_micros(500)),
+                Event::Wait(Duration::from_millis(1)),
+                Event::Wait(Duration::from_millis(2)),
+                Event::Wait(Duration::from_millis(4)),
+                Event::Wait(Duration::from_millis(5)),
+                Event::Wait(Duration::from_millis(5)),
+            ]
+        );
+
+        let clock = RecordingClock::at(Duration::from_micros(9_900));
+        let mut backoff = PollBackoff::default();
+        for _ in 0..5 {
+            backoff.pause(&clock, Duration::from_millis(10));
+        }
+        assert_eq!(
+            *clock.events.lock().unwrap(),
+            [
+                Event::Yield,
+                Event::Yield,
+                Event::Yield,
+                Event::Yield,
+                Event::Wait(Duration::from_micros(100)),
+            ]
+        );
+        assert_eq!(clock.elapsed(), Duration::from_millis(10));
     }
 
     #[cfg(unix)]
@@ -361,6 +888,7 @@ mod tests {
             fn elapsed(&self) -> Duration {
                 Duration::from_millis(self.0.fetch_add(10, Ordering::Relaxed))
             }
+            fn yield_now(&self) {}
             fn wait(&self, _duration: Duration) {}
         }
         let directory = tempfile::tempdir().unwrap();
@@ -371,7 +899,10 @@ mod tests {
                 environment: vec![],
                 working_directory: None,
                 stdin: vec![],
-                timeout_ms: 5,
+                limits: Limits {
+                    timeout_ms: 5,
+                    ..Limits::default()
+                },
             },
             &FakeClock(AtomicU64::new(0)),
         )
@@ -386,11 +917,118 @@ mod tests {
     fn cwd_symlinks_are_not_followed() {
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("inside")).unwrap();
         std::os::unix::fs::symlink(outside.path(), root.path().join("link")).unwrap();
+        std::os::unix::fs::symlink("inside", root.path().join("inside-link")).unwrap();
         assert!(
             _resolve_directory(root.path(), Some("link"))
                 .unwrap_err()
                 .contains("symlink")
+        );
+        assert!(
+            _resolve_directory(root.path(), Some("inside-link"))
+                .unwrap_err()
+                .contains("symlink")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_limit_is_explicit_and_bounded() {
+        let directory = tempfile::tempdir().unwrap();
+        let outcome = execute(
+            directory.path(),
+            Request {
+                argv: vec!["/bin/sh".into(), "-c".into(), "yes x".into()],
+                environment: vec![],
+                working_directory: None,
+                stdin: vec![],
+                limits: Limits {
+                    stdout_bytes: 1024,
+                    ..Limits::default()
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome.limit_exceeded.as_deref(), Some("stdout"));
+        assert_eq!(outcome.exit_code, 1);
+        assert_eq!(outcome.stdout.len(), 1024);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pipeline_processes_run_concurrently_and_broken_pipe_completes() {
+        let directory = tempfile::tempdir().unwrap();
+        let limits = Limits {
+            timeout_ms: 2_000,
+            ..Limits::default()
+        };
+        let outcomes = execute_pipeline(
+            directory.path(),
+            vec![
+                Request {
+                    argv: vec!["yes".into(), "value".into()],
+                    environment: vec![],
+                    working_directory: None,
+                    stdin: vec![],
+                    limits,
+                },
+                Request {
+                    argv: vec!["head".into(), "-n".into(), "1".into()],
+                    environment: vec![],
+                    working_directory: None,
+                    stdin: vec![],
+                    limits,
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(outcomes.len(), 2);
+        assert_eq!(outcomes[1].exit_code, 0);
+        assert_eq!(outcomes[1].stdout, b"value\n");
+        assert!(!outcomes[1].timed_out);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pipeline_stderr_limit_is_aggregate_across_stages() {
+        let directory = tempfile::tempdir().unwrap();
+        let limits = Limits {
+            stderr_bytes: 1024,
+            timeout_ms: 2_000,
+            ..Limits::default()
+        };
+        let outcomes = execute_pipeline(
+            directory.path(),
+            vec![
+                Request {
+                    argv: vec!["sh".into(), "-c".into(), "yes a >&2".into()],
+                    environment: vec![],
+                    working_directory: None,
+                    stdin: vec![],
+                    limits,
+                },
+                Request {
+                    argv: vec!["sh".into(), "-c".into(), "yes b >&2".into()],
+                    environment: vec![],
+                    working_directory: None,
+                    stdin: vec![],
+                    limits,
+                },
+            ],
+        )
+        .unwrap();
+        assert!(
+            outcomes
+                .iter()
+                .all(|outcome| { outcome.limit_exceeded.as_deref() == Some("stderr") })
+        );
+        assert!(
+            outcomes
+                .iter()
+                .map(|outcome| outcome.stderr.len())
+                .sum::<usize>()
+                <= 1024
         );
     }
 }

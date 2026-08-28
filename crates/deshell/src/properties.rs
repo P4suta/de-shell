@@ -42,7 +42,7 @@ fn generated_ir_round_trips_and_normalization_is_idempotent() {
         assert_eq!(crate::ir::normalize_path(&normalized).unwrap(), normalized);
 
         let argument = generator.identifier();
-        let source = format!("printf '%s\\n' '{argument}'\n");
+        let source = format!("/usr/bin/printf '%s\\n' '{argument}'\n");
         let plan = crate::frontend::lower(&path, source.as_bytes(), UnknownInterpreter::TraceOnly)
             .unwrap_or_else(|error| panic!("generated case {case} failed to lower: {error}"));
         let first = plan.encode_pretty().unwrap();

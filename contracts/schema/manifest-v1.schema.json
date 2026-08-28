@@ -1,0 +1,33 @@
+{
+  "$defs": {
+    "digest": { "pattern": "^[0-9a-f]{64}$", "type": "string" },
+    "path": {
+      "pattern": "^(?!/)(?!\\.{1,2}(?:/|$))(?!.*//)(?!.*\\/\\.{1,2}(?:/|$))(?!.*\\/$)[^\\\\:\\u0000]+$",
+      "type": "string"
+    }
+  },
+  "$id": "https://deshell.dev/contracts/manifest/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "entries": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "entrypoint": { "$ref": "#/$defs/path" },
+          "evidence_path": { "$ref": "#/$defs/path" },
+          "plan_digest": { "$ref": "#/$defs/digest" },
+          "plan_path": { "$ref": "#/$defs/path" },
+          "source_digest": { "$ref": "#/$defs/digest" }
+        },
+        "required": ["entrypoint", "source_digest", "plan_digest", "plan_path", "evidence_path"],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "schema_version": { "const": 1 }
+  },
+  "required": ["schema_version", "entries"],
+  "title": "de-shell artifact manifest v1",
+  "type": "object"
+}

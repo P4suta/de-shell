@@ -15,11 +15,7 @@ type span = {
   end_byte : int;
 }
 
-type guarantee =
-  | Formal of string
-  | Exhaustive of string list
-  | Residual of string
-
+type guarantee = Native of string | Delegated of string | Residual of string
 type source_bytes = Utf8 of string | Base64 of string
 
 type operation =
@@ -29,6 +25,14 @@ type operation =
       name : string;
       value_type : string;
       value : text_expression;
+    }
+  | Interpreter_call of {
+      interpreter : string;
+      interpreter_pin : string;
+      source : source_bytes;
+      source_span : span;
+      capabilities : string list;
+      reason : string;
     }
   | Opaque_capsule of {
       interpreter : string;
@@ -50,8 +54,8 @@ type golden_case = {
   source_utf8 : string option;
   source_base64 : string option;
   root_operation : string;
-  formal : int;
-  exhaustive : int;
+  native : int;
+  delegated : int;
   residual : int;
   plan_digest : string;
 }
@@ -132,6 +136,7 @@ let operation_name = function
   | Exec _ -> "exec"
   | Sequence _ -> "sequence"
   | Set_variable _ -> "set_variable"
+  | Interpreter_call _ -> "interpreter_call"
   | Opaque_capsule _ -> "opaque_capsule"
 
 let node_id node preorder =
@@ -173,16 +178,20 @@ let json_span source =
     ]
 
 let json_guarantee = function
-  | Formal basis ->
-      `Assoc [ ("level", `String "formal"); ("basis", `String basis) ]
-  | Exhaustive scenarios ->
+  | Native semantic_model ->
       `Assoc
         [
-          ("level", `String "exhaustive");
-          ("scenarios", `List (List.map (fun value -> `String value) scenarios));
+          ("level", `String "native"); ("semantic_model", `String semantic_model);
         ]
+  | Delegated reason ->
+      `Assoc [ ("level", `String "delegated"); ("reason", `String reason) ]
   | Residual reason ->
       `Assoc [ ("level", `String "residual"); ("reason", `String reason) ]
+
+let json_source_bytes = function
+  | Utf8 text -> `Assoc [ ("encoding", `String "utf8"); ("text", `String text) ]
+  | Base64 base64 ->
+      `Assoc [ ("encoding", `String "base64"); ("base64", `String base64) ]
 
 let rec json_node preorder node =
   let current = !preorder in
@@ -211,20 +220,32 @@ let rec json_node preorder node =
             ("value_type", `String value_type);
             ("value", json_expression value);
           ]
+    | Interpreter_call
+        {
+          interpreter;
+          interpreter_pin;
+          source;
+          source_span;
+          capabilities;
+          reason;
+        } ->
+        `Assoc
+          [
+            ("type", `String "interpreter_call");
+            ("interpreter", `String interpreter);
+            ("interpreter_pin", `String interpreter_pin);
+            ("source", json_source_bytes source);
+            ("source_span", json_span source_span);
+            ( "capabilities",
+              `List (List.map (fun value -> `String value) capabilities) );
+            ("reason", `String reason);
+          ]
     | Opaque_capsule { interpreter; source; path } ->
-        let source =
-          match source with
-          | Utf8 text ->
-              `Assoc [ ("encoding", `String "utf8"); ("text", `String text) ]
-          | Base64 base64 ->
-              `Assoc
-                [ ("encoding", `String "base64"); ("base64", `String base64) ]
-        in
         `Assoc
           [
             ("type", `String "opaque_capsule");
             ("interpreter", `String interpreter);
-            ("source", source);
+            ("source", json_source_bytes source);
             ("path", `String path);
           ]
   in
@@ -452,7 +473,7 @@ let lower_posix path source interpreter =
                 {
                   operation =
                     Set_variable { name; value_type; value = [ Literal value ] };
-                  guarantee = Formal "posix-immutable-assignment-v1";
+                  guarantee = Native "posix-immutable-assignment-v1";
                   source = Some (source_span path source start_byte end_byte);
                 }
           | _ ->
@@ -461,7 +482,7 @@ let lower_posix path source interpreter =
               Some
                 {
                   operation = Exec argv;
-                  guarantee = Formal (interpreter ^ "-explicit-command-v1");
+                  guarantee = Native (interpreter ^ "-explicit-command-v1");
                   source = Some (source_span path source start_byte end_byte);
                 })
   in
@@ -486,7 +507,7 @@ let lower_posix path source interpreter =
         body =
           {
             operation = Sequence nodes;
-            guarantee = Formal (interpreter ^ "-static-sequence-v1");
+            guarantee = Native (interpreter ^ "-static-sequence-v1");
             source = Some source;
           };
         environment =
@@ -545,7 +566,7 @@ let lower_literal path source interpreter =
     body =
       {
         operation = Exec argv;
-        guarantee = Formal basis;
+        guarantee = Native basis;
         source = Some (source_span path source start_byte end_byte);
       };
     environment = variables argv;
@@ -573,6 +594,39 @@ let residual path source source_span_value interpreter reason =
     environment = [];
   }
 
+let default_interpreter_pin interpreter =
+  "sha256:" ^ Sha256.hex ("deshell-official-runtime-v1:" ^ interpreter)
+
+let delegated path source source_span_value interpreter reason =
+  {
+    body =
+      {
+        operation =
+          Interpreter_call
+            {
+              interpreter;
+              interpreter_pin = default_interpreter_pin interpreter;
+              source;
+              source_span = source_span_value;
+              capabilities = [ "process"; "project_read"; "sandbox_write" ];
+              reason;
+            };
+        guarantee = Delegated reason;
+        source = Some source_span_value;
+      };
+    environment = [];
+  }
+
+let decoded_base64_length value =
+  let length = String.length value in
+  if length = 0 || length mod 4 <> 0 then fail "invalid canonical base64";
+  let padding =
+    if String.ends_with ~suffix:"==" value then 2
+    else if String.ends_with ~suffix:"=" value then 1
+    else 0
+  in
+  (length / 4 * 3) - padding
+
 let lower golden =
   match (golden.source_utf8, golden.source_base64) with
   | Some source, None ->
@@ -588,27 +642,39 @@ let lower golden =
       else lower_literal golden.path source interpreter
   | None, Some base64 ->
       let interpreter = interpreter golden.path in
-      residual golden.path (Base64 base64) None interpreter
+      let bytes = decoded_base64_length base64 in
+      let span =
+        {
+          file = golden.path;
+          start_line = 1;
+          start_column = 0;
+          end_line = 1;
+          end_column = bytes;
+          start_byte = 0;
+          end_byte = bytes;
+        }
+      in
+      delegated golden.path (Base64 base64) span interpreter
         "source is not valid UTF-8 and cannot be statically lowered"
   | _ -> fail "%s must declare exactly one source encoding" golden.name
 
 let rec counts node =
   let own =
     match node.guarantee with
-    | Formal _ -> (1, 0, 0)
-    | Exhaustive _ -> (0, 1, 0)
+    | Native _ -> (1, 0, 0)
+    | Delegated _ -> (0, 1, 0)
     | Residual _ -> (0, 0, 1)
   in
   match node.operation with
   | Sequence nodes ->
       List.fold_left
-        (fun (formal, exhaustive, residual) node ->
-          let next_formal, next_exhaustive, next_residual = counts node in
-          ( formal + next_formal,
-            exhaustive + next_exhaustive,
+        (fun (native, delegated, residual) node ->
+          let next_native, next_delegated, next_residual = counts node in
+          ( native + next_native,
+            delegated + next_delegated,
             residual + next_residual ))
         own nodes
-  | Exec _ | Set_variable _ | Opaque_capsule _ -> own
+  | Exec _ | Set_variable _ | Interpreter_call _ | Opaque_capsule _ -> own
 
 let string_member name value =
   match Yojson.Safe.Util.member name value with
@@ -633,8 +699,8 @@ let parse_case value =
     source_utf8 = optional_string_member "source_utf8" value;
     source_base64 = optional_string_member "source_base64" value;
     root_operation = string_member "root_operation" value;
-    formal = int_member "formal" value;
-    exhaustive = int_member "exhaustive" value;
+    native = int_member "native" value;
+    delegated = int_member "delegated" value;
     residual = int_member "residual" value;
     plan_digest = string_member "plan_digest" value;
   }
@@ -650,7 +716,7 @@ let load_corpus path =
 let check_case golden =
   let lowered = lower golden in
   let actual_operation = operation_name lowered.body.operation in
-  let formal, exhaustive, residual = counts lowered.body in
+  let native, delegated, residual = counts lowered.body in
   let digest = Sha256.hex (canonical_string (json_plan lowered)) in
   let differences = ref [] in
   let expect label expected actual =
@@ -660,10 +726,8 @@ let check_case golden =
         :: !differences
   in
   expect "root_operation" golden.root_operation actual_operation;
-  expect "formal" (string_of_int golden.formal) (string_of_int formal);
-  expect "exhaustive"
-    (string_of_int golden.exhaustive)
-    (string_of_int exhaustive);
+  expect "native" (string_of_int golden.native) (string_of_int native);
+  expect "delegated" (string_of_int golden.delegated) (string_of_int delegated);
   expect "residual" (string_of_int golden.residual) (string_of_int residual);
   expect "plan_digest" golden.plan_digest digest;
   match List.rev !differences with
@@ -779,7 +843,7 @@ let rec literal_commands node =
           argv;
       ]
   | Sequence nodes -> List.concat_map literal_commands nodes
-  | Set_variable _ | Opaque_capsule _ ->
+  | Set_variable _ | Interpreter_call _ | Opaque_capsule _ ->
       fail "strict reference exporter received %s"
         (operation_name node.operation)
 
@@ -823,7 +887,7 @@ let export_artifact target lowered =
         ^ "@object()\nexport class Deshell {\n"
         ^ "  @func()\n  async main(): Promise<string> {\n"
         ^ "    let container: Container = \
-           dag.container().from(\"alpine@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce\");\n"
+           dag.container().from(\"ghcr.io/deshell-lang/lab@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce\");\n"
         ^ "    let output = \"\";\n" ^ steps ^ "\n    return output;\n  }\n}\n"
       in
       ("deshell.dagger.ts", "text/typescript", content)
@@ -893,8 +957,8 @@ let check_transform_corpus path =
           source_utf8 = Some source;
           source_base64 = None;
           root_operation = "";
-          formal = 0;
-          exhaustive = 0;
+          native = 0;
+          delegated = 0;
           residual = 0;
           plan_digest = "";
         }

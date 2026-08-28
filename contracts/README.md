@@ -12,6 +12,13 @@ indentation, and one trailing LF. JSON-RPC objects ignore unknown fields for
 forward compatibility. Every embedded Schema is self-contained so a caller can
 validate artifacts offline using only the bytes returned by `deshell schema`.
 
+`scan --format json` emits the versioned Inventory v1 document described by
+`schema/inventory-v1.schema.json`; scan omissions and failures are explicit.
+Bundle exports contain a `bundle-manifest.json` conforming to
+`schema/bundle-v1.schema.json` and bind every embedded file by size and SHA-256.
+They retain every active manifest entry, identify the selected entrypoint, and
+archive runtime assets at the exact project-relative paths named by the lock.
+
 The contract starts at v1. There is no published pre-v1 Effect IR and no
 migration contract.
 

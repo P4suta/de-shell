@@ -16,9 +16,23 @@ pub(crate) struct RewriteResult {
 pub(crate) fn equivalent(path: &str, source: &str) -> RewriteResult {
     let mut output = String::with_capacity(source.len() + 16);
     let mut edits = Vec::new();
+    let protected = protected_ranges(source);
+    let mut protected_index = 0;
     let mut state = QuoteState::Normal;
     let mut index = 0;
     while index < source.len() {
+        while protected_index < protected.len() && protected[protected_index].1 <= index {
+            protected_index += 1;
+        }
+        if let Some(&(start, end)) = protected.get(protected_index)
+            && index >= start
+            && index < end
+        {
+            output.push_str(&source[index..end]);
+            index = end;
+            state = QuoteState::Normal;
+            continue;
+        }
         let character = source[index..]
             .chars()
             .next()
@@ -86,6 +100,181 @@ pub(crate) fn equivalent(path: &str, source: &str) -> RewriteResult {
         }
     }
     RewriteResult { output, edits }
+}
+
+/// Returns byte ranges whose text is data rather than shell code. Conservatively
+/// protecting every heredoc body also protects quoted heredocs without trying to
+/// reinterpret expansion rules.
+fn protected_ranges(source: &str) -> Vec<(usize, usize)> {
+    let mut ranges = comment_ranges(source);
+    let lines = source_lines(source);
+    let mut pending: std::collections::VecDeque<(String, bool)> = std::collections::VecDeque::new();
+    for (start, end) in lines {
+        let line = &source[start..end];
+        if let Some((delimiter, strip_tabs)) = pending.front() {
+            ranges.push((start, end));
+            let candidate = line
+                .trim_end_matches(['\n', '\r'])
+                .strip_prefix(if *strip_tabs { "\t" } else { "" })
+                .unwrap_or_else(|| line.trim_end_matches(['\n', '\r']));
+            let candidate = if *strip_tabs {
+                candidate.trim_start_matches('\t')
+            } else {
+                candidate
+            };
+            if candidate == delimiter {
+                pending.pop_front();
+            }
+            continue;
+        }
+        for delimiter in heredoc_delimiters(line) {
+            pending.push_back(delimiter);
+        }
+    }
+    ranges.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in ranges {
+        if let Some(last) = merged.last_mut()
+            && start <= last.1
+        {
+            last.1 = last.1.max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+    merged
+}
+
+fn source_lines(source: &str) -> Vec<(usize, usize)> {
+    let mut output = Vec::new();
+    let mut start = 0;
+    for (index, byte) in source.bytes().enumerate() {
+        if byte == b'\n' {
+            output.push((start, index + 1));
+            start = index + 1;
+        }
+    }
+    if start < source.len() {
+        output.push((start, source.len()));
+    }
+    output
+}
+
+fn comment_ranges(source: &str) -> Vec<(usize, usize)> {
+    let mut output = Vec::new();
+    let mut state = QuoteState::Normal;
+    let mut escaped = false;
+    let mut previous = None;
+    for (index, character) in source.char_indices() {
+        if escaped {
+            escaped = false;
+            previous = Some(character);
+            continue;
+        }
+        match (state, character) {
+            (QuoteState::Normal | QuoteState::Double, '\\') => escaped = true,
+            (QuoteState::Normal, '\'') => state = QuoteState::Single,
+            (QuoteState::Single, '\'') => state = QuoteState::Normal,
+            (QuoteState::Normal, '"') => state = QuoteState::Double,
+            (QuoteState::Double, '"') => state = QuoteState::Normal,
+            (QuoteState::Normal, '#')
+                if previous.is_none_or(|value: char| {
+                    value.is_whitespace() || matches!(value, ';' | '&' | '|' | '(' | ')')
+                }) =>
+            {
+                let end = source[index..]
+                    .find('\n')
+                    .map_or(source.len(), |offset| index + offset + 1);
+                output.push((index, end));
+            }
+            _ => {}
+        }
+        if character == '\n' {
+            state = QuoteState::Normal;
+            previous = None;
+        } else {
+            previous = Some(character);
+        }
+    }
+    output
+}
+
+fn heredoc_delimiters(line: &str) -> Vec<(String, bool)> {
+    let bytes = line.as_bytes();
+    let mut output = Vec::new();
+    let mut index = 0;
+    let mut quote = None;
+    let mut escaped = false;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if escaped {
+            escaped = false;
+            index += 1;
+            continue;
+        }
+        if byte == b'\\' && quote != Some(b'\'') {
+            escaped = true;
+            index += 1;
+            continue;
+        }
+        if matches!(byte, b'\'' | b'"') {
+            if quote == Some(byte) {
+                quote = None;
+            } else if quote.is_none() {
+                quote = Some(byte);
+            }
+            index += 1;
+            continue;
+        }
+        if quote.is_none() && byte == b'#' && (index == 0 || bytes[index - 1].is_ascii_whitespace())
+        {
+            break;
+        }
+        if quote.is_none() && bytes[index..].starts_with(b"<<") {
+            index += 2;
+            let strip_tabs = bytes.get(index) == Some(&b'-');
+            index += usize::from(strip_tabs);
+            while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
+                index += 1;
+            }
+            let mut delimiter = String::new();
+            let mut delimiter_quote = None;
+            while let Some(&value) = bytes.get(index) {
+                if delimiter_quote.is_none()
+                    && (value.is_ascii_whitespace() || matches!(value, b';' | b'&' | b'|'))
+                {
+                    break;
+                }
+                if matches!(value, b'\'' | b'"') {
+                    if delimiter_quote == Some(value) {
+                        delimiter_quote = None;
+                    } else if delimiter_quote.is_none() {
+                        delimiter_quote = Some(value);
+                    } else {
+                        delimiter.push(value as char);
+                    }
+                } else if value == b'\\' && delimiter_quote != Some(b'\'') {
+                    index += 1;
+                    if let Some(&escaped) = bytes.get(index) {
+                        delimiter.push(escaped as char);
+                    }
+                } else if value.is_ascii() {
+                    delimiter.push(value as char);
+                } else {
+                    let character = line[index..].chars().next().expect("UTF-8 line");
+                    delimiter.push(character);
+                    index += character.len_utf8() - 1;
+                }
+                index += 1;
+            }
+            if !delimiter.is_empty() {
+                output.push((delimiter, strip_tabs));
+            }
+            continue;
+        }
+        index += 1;
+    }
+    output
 }
 
 #[derive(Clone, Copy)]
@@ -343,5 +532,21 @@ mod tests {
             )
         );
         assert!(result.output.contains("curl https://"));
+    }
+
+    #[test]
+    fn comments_and_heredoc_data_are_never_rewritten() {
+        let source = concat!(
+            "echo `date` # leave `comment` alone\n",
+            "cat <<'DATA'\n",
+            "literal `not code`\n",
+            "DATA\n",
+            "cat <<-EOF\n",
+            "\talso `not code`\n",
+            "\tEOF\n"
+        );
+        let result = equivalent("build.sh", source);
+        assert_eq!(result.output, source.replacen("`date`", "$(date)", 1));
+        assert_eq!(result.edits.len(), 1);
     }
 }

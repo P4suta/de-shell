@@ -1,5 +1,10 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+const PERFORMANCE_WARMUPS: usize = 5;
+const PERFORMANCE_SAMPLES: usize = 20;
+const PERFORMANCE_HOST_FILES: usize = 4_096;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -58,6 +63,9 @@ fn validate_contract_tree(_root: &Path) -> Result<CliContract, Vec<String>> {
         "contracts/golden/frontend-v1.json",
         "contracts/golden/transform-export-v1.json",
         "contracts/schema/effect-ir-v1.schema.json",
+        "contracts/schema/inventory-v1.schema.json",
+        "contracts/schema/manifest-v1.schema.json",
+        "contracts/schema/bundle-v1.schema.json",
         "contracts/schema/evidence-v1.schema.json",
         "contracts/schema/diagnostic-v1.schema.json",
         "contracts/schema/protocol-v1.schema.json",
@@ -258,9 +266,10 @@ fn prepare_fixture(binary: &Path, root: &Path, fixture: &str) -> Result<(), Stri
             }
             let config = concat!(
                 "version = 1\nentrypoints = [\"unknown.ext\"]\n\n",
-                "[policy]\nhost_write = \"deny\"\nnetwork = \"deny\"\nunknown_interpreter = \"reject\"\n\n",
-                "[sandbox]\nmode = \"disposable\"\n\n",
-                "[export]\nstrict = true\nbridge = false\n",
+                "[policy]\nfile_read = \"project\"\nfile_write = \"sandbox\"\nhost_materialization = \"deny\"\nhost_execution = \"deny\"\nnetwork = \"deny\"\ndelegation = \"pinned\"\nunknown_interpreter = \"reject\"\n\n",
+                "[sandbox]\nmode = \"disposable\"\nallow_local = false\n\n",
+                "[limits]\ntimeout_ms = 30000\nmemory_bytes = 1073741824\nprocesses = 512\nstdout_bytes = 16777216\nstderr_bytes = 16777216\n\n",
+                "[export]\nmode = \"strict\"\n",
             );
             std::fs::write(root.join(".deshell/project.toml"), config)
                 .map_err(|error| error.to_string())?;
@@ -304,6 +313,245 @@ fn smoke_agent(binary: &Path, mode: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Debug, Serialize)]
+struct PerformanceReport {
+    schema_version: u32,
+    operating_system: &'static str,
+    architecture: &'static str,
+    binary: PerformanceBinary,
+    settings: PerformanceSettings,
+    benchmarks: PerformanceBenchmarks,
+}
+
+#[derive(Debug, Serialize)]
+struct PerformanceBinary {
+    path: String,
+    size_bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct PerformanceSettings {
+    warmup_iterations: usize,
+    measured_iterations: usize,
+    scan_host_files: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct PerformanceBenchmarks {
+    scan: PerformanceMetric,
+    simple_run: PerformanceMetric,
+}
+
+#[derive(Debug, Serialize)]
+struct PerformanceMetric {
+    median_ms: f64,
+    p95_ms: f64,
+}
+
+fn run_performance(binary: &Path) -> Result<(), Vec<String>> {
+    let binary = resolve_binary(binary)?;
+    let binary_size = std::fs::metadata(&binary)
+        .map_err(|error| vec![format!("cannot inspect {}: {error}", binary.display())])?
+        .len();
+    let fixture = tempfile::tempdir()
+        .map_err(|error| vec![format!("cannot create performance fixture: {error}")])?;
+    let scan_root = fixture.path().join("scan-corpus");
+    let project_root = fixture.path().join("simple-run");
+    prepare_scan_corpus(&scan_root).map_err(|error| vec![error])?;
+    prepare_simple_run_project(&binary, &project_root).map_err(|error| vec![error])?;
+
+    let scan_arguments = [
+        "scan".to_owned(),
+        "--root".to_owned(),
+        scan_root.to_string_lossy().into_owned(),
+    ];
+    let run_arguments = [
+        "run".to_owned(),
+        "--root".to_owned(),
+        project_root.to_string_lossy().into_owned(),
+        "--backend".to_owned(),
+        "local".to_owned(),
+    ];
+    let scan = measure_command(&binary, &scan_arguments, "scan")?;
+    let simple_run = measure_command(&binary, &run_arguments, "simple-run")?;
+    let report = PerformanceReport {
+        schema_version: 1,
+        operating_system: std::env::consts::OS,
+        architecture: std::env::consts::ARCH,
+        binary: PerformanceBinary {
+            path: binary.to_string_lossy().into_owned(),
+            size_bytes: binary_size,
+        },
+        settings: PerformanceSettings {
+            warmup_iterations: PERFORMANCE_WARMUPS,
+            measured_iterations: PERFORMANCE_SAMPLES,
+            scan_host_files: PERFORMANCE_HOST_FILES,
+        },
+        benchmarks: PerformanceBenchmarks { scan, simple_run },
+    };
+    serde_json::to_writer_pretty(std::io::stdout().lock(), &report)
+        .map_err(|error| vec![format!("cannot encode performance report: {error}")])?;
+    println!();
+    Ok(())
+}
+
+fn resolve_binary(binary: &Path) -> Result<PathBuf, Vec<String>> {
+    let candidate = if binary.is_file() {
+        binary.to_path_buf()
+    } else if cfg!(windows) && binary.with_extension("exe").is_file() {
+        binary.with_extension("exe")
+    } else {
+        return Err(vec![format!(
+            "deshell binary does not exist: {}",
+            binary.display()
+        )]);
+    };
+    candidate.canonicalize().map_err(|error| {
+        vec![format!(
+            "cannot resolve deshell binary {}: {error}",
+            candidate.display()
+        )]
+    })
+}
+
+fn prepare_scan_corpus(root: &Path) -> Result<(), String> {
+    for index in 0..PERFORMANCE_HOST_FILES {
+        let language = if index % 2 == 0 {
+            "python"
+        } else {
+            "javascript"
+        };
+        let directory = root.join(language).join(format!("{:02}", index % 64));
+        std::fs::create_dir_all(&directory)
+            .map_err(|error| format!("cannot create {}: {error}", directory.display()))?;
+        let (extension, source) = if index % 2 == 0 {
+            (
+                "py",
+                concat!(
+                    "# deterministic host-heavy scanner corpus: 日本語\n",
+                    "import os, subprocess\n",
+                    "os.system('printf one')\n",
+                    "subprocess.run(\"printf two\")\n",
+                    "subprocess.call(command)\n",
+                    "subprocess.Popen('printf three')\n",
+                ),
+            )
+        } else {
+            (
+                "js",
+                concat!(
+                    "// deterministic host-heavy scanner corpus: 日本語\n",
+                    "const child_process = require('child_process');\n",
+                    "child_process.exec('printf one');\n",
+                    "execSync(\"printf two\");\n",
+                    "exec(command);\n",
+                    "child_process.execSync('printf three');\n",
+                ),
+            )
+        };
+        let path = directory.join(format!("host-{index:05}.{extension}"));
+        std::fs::write(&path, source)
+            .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn prepare_simple_run_project(binary: &Path, root: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(root)
+        .map_err(|error| format!("cannot create {}: {error}", root.display()))?;
+    let entry = "benchmark.sh";
+    let source = if cfg!(windows) {
+        b"cmd.exe /d /c exit 0\n".as_slice()
+    } else {
+        b"/bin/true\n".as_slice()
+    };
+    std::fs::write(root.join(entry), source)
+        .map_err(|error| format!("cannot write simple-run entrypoint: {error}"))?;
+    command_success(
+        binary,
+        &[
+            "init".to_owned(),
+            "--root".to_owned(),
+            root.to_string_lossy().into_owned(),
+            "--entry".to_owned(),
+            entry.to_owned(),
+        ],
+        "simple-run init",
+    )?;
+    let config_path = root.join(".deshell/project.toml");
+    let config = std::fs::read_to_string(&config_path)
+        .map_err(|error| format!("cannot read {}: {error}", config_path.display()))?
+        .replace("allow_local = false", "allow_local = true");
+    std::fs::write(&config_path, config)
+        .map_err(|error| format!("cannot write {}: {error}", config_path.display()))?;
+    command_success(
+        binary,
+        &[
+            "analyze".to_owned(),
+            "--root".to_owned(),
+            root.to_string_lossy().into_owned(),
+            "--entry".to_owned(),
+            entry.to_owned(),
+        ],
+        "simple-run analyze",
+    )
+}
+
+fn command_success(binary: &Path, arguments: &[String], label: &str) -> Result<(), String> {
+    let output = std::process::Command::new(binary)
+        .args(arguments)
+        .output()
+        .map_err(|error| format!("cannot execute {label}: {error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{label} failed with status {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+fn measure_command(
+    binary: &Path,
+    arguments: &[String],
+    label: &str,
+) -> Result<PerformanceMetric, Vec<String>> {
+    for _ in 0..PERFORMANCE_WARMUPS {
+        timed_command(binary, arguments, label)?;
+    }
+    let mut samples = Vec::with_capacity(PERFORMANCE_SAMPLES);
+    for _ in 0..PERFORMANCE_SAMPLES {
+        samples.push(timed_command(binary, arguments, label)?);
+    }
+    samples.sort_unstable();
+    let middle = samples.len() / 2;
+    let median_ns = (samples[middle - 1] as f64 + samples[middle] as f64) / 2.0;
+    let p95_index = (samples.len() * 95).div_ceil(100) - 1;
+    Ok(PerformanceMetric {
+        median_ms: median_ns / 1_000_000.0,
+        p95_ms: samples[p95_index] as f64 / 1_000_000.0,
+    })
+}
+
+fn timed_command(binary: &Path, arguments: &[String], label: &str) -> Result<u128, Vec<String>> {
+    let start = Instant::now();
+    let status = std::process::Command::new(binary)
+        .args(arguments)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|error| vec![format!("cannot execute performance {label}: {error}")])?;
+    let elapsed = start.elapsed().as_nanos();
+    if !status.success() {
+        return Err(vec![format!(
+            "performance {label} failed with status {status}"
+        )]);
+    }
+    Ok(elapsed)
+}
+
 fn main() {
     let root = repository_root();
     let arguments: Vec<_> = std::env::args_os().skip(1).collect();
@@ -316,8 +564,15 @@ fn main() {
             run_conformance(&root, &binary)
         }
         Some("validate-contracts") => validate_contract_tree(&root).map(|_| ()),
+        Some("performance") => {
+            let binary = arguments
+                .get(1)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| root.join("target/release/deshell"));
+            run_performance(&binary)
+        }
         _ => Err(vec![
-            "usage: cargo run -p xtask -- conformance [DESHELL_BINARY] | validate-contracts".into(),
+            "usage: cargo run -p xtask -- conformance [DESHELL_BINARY] | performance [DESHELL_BINARY] | validate-contracts".into(),
         ]),
     };
     if let Err(errors) = result {
@@ -380,6 +635,8 @@ mod tests {
         assert!(mise.contains("cargo run --locked -p deshell --"));
         assert!(mise.contains("cargo test --locked --workspace"));
         assert!(mise.contains("cargo test --locked -p deshell lab::tests"));
+        assert!(mise.contains("[tasks.performance]"));
+        assert!(mise.contains("cargo run --locked -p xtask -- performance target/release/deshell"));
         assert!(mise.contains("[tasks.\"reference:test\"]"));
         let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
         assert!(ci.contains("cargo test --locked --workspace"));
@@ -388,6 +645,7 @@ mod tests {
         assert!(!ci.contains("Build opam package"));
         assert!(ci.contains("reference-conformance:"));
         assert!(ci.contains("official-exporters:"));
+        assert!(ci.contains("security-and-coverage:"));
         assert!(ci.contains("mise run reference:setup"));
         assert!(ci.contains("mise run reference:build"));
         assert!(ci.contains("mise run reference:test"));
@@ -397,6 +655,11 @@ mod tests {
         assert!(ci.contains("mise run test:official-exporters"));
         assert!(ci.contains("- reference-conformance"));
         assert!(ci.contains("- official-exporters"));
+        assert!(ci.contains("- security-and-coverage"));
+        assert!(ci.contains("cargo audit --db target/cargo-audit-db --deny warnings"));
+        assert!(ci.contains("cargo deny --locked check"));
+        assert!(ci.contains("mise run test:schema-validator"));
+        assert!(ci.contains("--fail-under-lines 74"));
         assert!(ci.contains("MISE_AUTO_INSTALL: \"false\""));
     }
 
@@ -485,6 +748,9 @@ mod tests {
         assert!(workflow.contains("sha256"));
         assert!(workflow.contains("attest-build-provenance"));
         assert!(workflow.contains("cosign"));
+        assert!(workflow.contains("syft@1.51.0"));
+        assert!(workflow.contains("deshell-0.1.0.cdx.json"));
+        assert!(workflow.contains("CycloneDX"));
         assert!(workflow.contains("cargo publish"));
         assert!(workflow.contains("v0.1.0-rc.1"));
         assert!(workflow.contains(
@@ -502,6 +768,8 @@ mod tests {
         assert!(workflow.contains("MISE_AUTO_INSTALL: \"false\""));
         let mise = std::fs::read_to_string(root.join("mise.toml")).unwrap();
         assert!(mise.contains("actionlint .github/workflows/ci.yml .github/workflows/release.yml"));
+        assert!(mise.contains("pipx:check-jsonschema"));
+        assert!(mise.contains("scripts/validate-json-contracts.py"));
     }
 
     #[test]
@@ -527,6 +795,8 @@ mod tests {
         assert!(readme.contains("Rust 1.98"));
         assert!(readme.contains("disposable-lab launch contracts"));
         assert!(readme.contains("unpublished OCaml reference implementation"));
+        assert!(readme.contains("mise run performance"));
+        assert!(readme.contains("five warm-up runs and twenty measured runs"));
         for stale in [
             "Effect IR v3",
             "v0/v1/v2-to-v3",

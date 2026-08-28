@@ -3,6 +3,7 @@
   "verified_allowed": false,
   "patterns_allowed": [
     "jdx/mise-action@3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518",
-    "ossf/scorecard-action@2d1146689b8cda280b9bc96326124645441f03bc"
+    "ossf/scorecard-action@2d1146689b8cda280b9bc96326124645441f03bc",
+    "taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad"
   ]
 }

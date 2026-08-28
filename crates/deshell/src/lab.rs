@@ -32,14 +32,30 @@ pub(crate) enum Network {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum Target {
+    Original {
+        interpreter: String,
+        script: String,
+    },
+    Plan {
+        entrypoint: String,
+        node_id: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Request {
     pub workspace: String,
     pub result_path: String,
-    pub interpreter: String,
-    pub script: String,
+    pub target: Target,
     pub arguments: Vec<String>,
+    pub named_inputs: Vec<(String, String)>,
     pub environment: Vec<(String, String)>,
-    pub timeout_ms: u64,
+    pub stdin: Vec<u8>,
+    pub working_directory: Option<String>,
+    pub fixtures: Vec<crate::config::Fixture>,
+    pub expected_files: Vec<crate::config::ExpectedFile>,
+    pub limits: crate::config::ResourceLimits,
     pub network: Network,
     pub image: String,
 }
@@ -75,6 +91,10 @@ pub(crate) fn provider_name(provider: Provider) -> &'static str {
         Provider::HyperV => "hyper-v",
         Provider::VirtualizationFramework => "virtualization-framework",
     }
+}
+
+pub(crate) fn execution_connected(provider: Provider) -> bool {
+    matches!(provider, Provider::Podman | Provider::DockerRootless)
 }
 
 pub(crate) fn select(platform: Platform, probe: &dyn Probe) -> Result<Provider, String> {
@@ -163,9 +183,7 @@ pub(crate) fn launch_spec(provider: Provider, request: &Request) -> Result<Launc
         Provider::Podman => oci_spec("podman", request),
         Provider::DockerRootless => oci_spec("docker", request),
         Provider::WindowsSandbox => windows_sandbox_spec(request),
-        Provider::HyperV | Provider::VirtualizationFramework => {
-            Ok(guest_agent_spec(provider, request))
-        }
+        Provider::HyperV | Provider::VirtualizationFramework => guest_agent_spec(provider, request),
     }
 }
 
@@ -175,6 +193,157 @@ pub(crate) fn platform_of_host() -> Platform {
         "macos" => Platform::Macos,
         _ => Platform::Linux,
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExecutionFailureKind {
+    Unavailable,
+    Failed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ExecutionFailure {
+    pub kind: ExecutionFailureKind,
+    pub message: String,
+}
+
+pub(crate) fn execute(
+    provider: Provider,
+    request: &Request,
+) -> Result<crate::runner::RunResult, ExecutionFailure> {
+    if !execution_connected(provider) {
+        return Err(ExecutionFailure {
+            kind: ExecutionFailureKind::Unavailable,
+            message: format!(
+                "{} has a validated launch contract, but its signed helper transport is not connected in this build",
+                provider_name(provider)
+            ),
+        });
+    }
+    let specification = launch_spec(provider, request).map_err(|message| ExecutionFailure {
+        kind: ExecutionFailureKind::Unavailable,
+        message,
+    })?;
+    let LaunchSpec::Process(specification) = specification else {
+        unreachable!("connected providers always use the supervised process transport")
+    };
+    let root = Path::new(&request.workspace);
+    let outer_stdout = request
+        .limits
+        .stdout_bytes
+        .saturating_mul(2)
+        .saturating_add(1024 * 1024);
+    let outcome = crate::agent_process::execute(
+        root,
+        crate::agent_process::Request {
+            argv: std::iter::once(specification.program)
+                .chain(specification.arguments)
+                .collect(),
+            environment: specification.environment,
+            working_directory: None,
+            stdin: specification.stdin,
+            limits: crate::agent_process::Limits {
+                timeout_ms: request
+                    .limits
+                    .timeout_ms
+                    .saturating_add(10_000)
+                    .min(86_400_000),
+                memory_bytes: request
+                    .limits
+                    .memory_bytes
+                    .saturating_add(512 * 1024 * 1024),
+                processes: request.limits.processes.saturating_add(32),
+                stdout_bytes: outer_stdout,
+                stderr_bytes: request.limits.stderr_bytes.saturating_add(1024 * 1024),
+            },
+        },
+    )
+    .map_err(|message| ExecutionFailure {
+        kind: ExecutionFailureKind::Failed,
+        message,
+    })?;
+    if let Some(limit) = outcome.limit_exceeded {
+        return Err(ExecutionFailure {
+            kind: ExecutionFailureKind::Failed,
+            message: format!("disposable provider limit_exceeded: {limit}"),
+        });
+    }
+    if outcome.exit_code != 0 {
+        return Err(ExecutionFailure {
+            kind: ExecutionFailureKind::Failed,
+            message: format!(
+                "{} exited with {}: {}",
+                provider_name(provider),
+                outcome.exit_code,
+                String::from_utf8_lossy(&outcome.stderr)
+            ),
+        });
+    }
+    decode_run_result(&outcome.stdout, request.limits).map_err(|message| ExecutionFailure {
+        kind: ExecutionFailureKind::Failed,
+        message,
+    })
+}
+
+fn decode_run_result(
+    response: &[u8],
+    limits: crate::config::ResourceLimits,
+) -> Result<crate::runner::RunResult, String> {
+    let result = crate::protocol::decode_streamed_response(
+        response,
+        &serde_json::json!(1),
+        limits.stdout_bytes,
+        limits.stderr_bytes,
+    )?;
+    let fields = result
+        .as_object()
+        .ok_or("observer RPC result must be an object")?;
+    let exit_code = fields
+        .get("exit_code")
+        .and_then(serde_json::Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok())
+        .ok_or("observer exit_code must be a 32-bit integer")?;
+    let decode_stream = |name: &str| -> Result<Vec<u8>, String> {
+        let encoded = fields
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("observer result is missing {name}"))?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|error| format!("observer {name} is invalid base64: {error}"))?;
+        if base64::engine::general_purpose::STANDARD.encode(&bytes) != encoded {
+            return Err(format!("observer {name} is not canonical base64"));
+        }
+        Ok(bytes)
+    };
+    let mut trace = Vec::new();
+    if let Some(files) = fields.get("files") {
+        let files = files.as_array().ok_or("observer files must be an array")?;
+        for file in files {
+            let file = file
+                .as_object()
+                .ok_or("observer file change must be an object")?;
+            let path = file
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("observer file change path must be a string")?;
+            match file.get("kind").and_then(serde_json::Value::as_str) {
+                Some("created" | "modified") => {
+                    trace.push(crate::runner::TraceEvent::FileWrite { path: path.into() })
+                }
+                Some("removed") => {
+                    trace.push(crate::runner::TraceEvent::FileRemove { path: path.into() })
+                }
+                _ => return Err("observer file change kind is invalid".into()),
+            }
+        }
+    }
+    Ok(crate::runner::RunResult {
+        exit_code,
+        stdout: decode_stream("stdout_base64")?,
+        stderr: decode_stream("stderr_base64")?,
+        trace,
+    })
 }
 
 pub(crate) struct SystemProbe;
@@ -215,16 +384,39 @@ impl Probe for SystemProbe {
 }
 
 fn validate_request(request: &Request) -> Result<(), String> {
-    if request.timeout_ms == 0 || request.timeout_ms > 86_400_000 {
+    if request.limits.timeout_ms == 0 || request.limits.timeout_ms > 86_400_000 {
         return Err("lab timeout must be between 1 and 86400000 milliseconds".into());
     }
-    let script = crate::ir::normalize_path(&request.script)
-        .map_err(|error| format!("lab script is invalid: {error}"))?;
-    if script != request.script {
-        return Err("lab script must be a normalized workspace-relative path".into());
-    }
-    if request.interpreter.trim().is_empty() || request.interpreter.contains('\0') {
-        return Err("lab interpreter must not be empty or contain NUL".into());
+    match &request.target {
+        Target::Original {
+            interpreter,
+            script,
+        } => {
+            let normalized = crate::ir::normalize_path(script)
+                .map_err(|error| format!("lab script is invalid: {error}"))?;
+            if normalized != *script {
+                return Err("lab script must be a normalized workspace-relative path".into());
+            }
+            if interpreter.trim().is_empty() || interpreter.contains('\0') {
+                return Err("lab interpreter must not be empty or contain NUL".into());
+            }
+        }
+        Target::Plan {
+            entrypoint,
+            node_id,
+        } => {
+            let normalized = crate::ir::normalize_path(entrypoint)
+                .map_err(|error| format!("lab entrypoint is invalid: {error}"))?;
+            if normalized != *entrypoint {
+                return Err("lab entrypoint must be a normalized workspace-relative path".into());
+            }
+            if node_id
+                .as_ref()
+                .is_some_and(|value| value.trim().is_empty() || value.contains('\0'))
+            {
+                return Err("lab node id must be non-empty and NUL-free".into());
+            }
+        }
     }
     if request.workspace.trim().is_empty()
         || request.result_path.trim().is_empty()
@@ -235,6 +427,13 @@ fn validate_request(request: &Request) -> Result<(), String> {
     }
     if request.arguments.iter().any(|value| value.contains('\0')) {
         return Err("lab arguments must not contain NUL".into());
+    }
+    if let Some(directory) = &request.working_directory {
+        let normalized = crate::ir::normalize_path(directory)
+            .map_err(|error| format!("lab working directory is invalid: {error}"))?;
+        if normalized != *directory {
+            return Err("lab working directory must be normalized".into());
+        }
     }
     let mut names = BTreeSet::new();
     for (name, value) in &request.environment {
@@ -249,6 +448,26 @@ fn validate_request(request: &Request) -> Result<(), String> {
         if !names.insert(key) {
             return Err(format!("duplicate lab environment variable: {name}"));
         }
+    }
+    let mut inputs = BTreeSet::new();
+    for (name, value) in &request.named_inputs {
+        if name.trim().is_empty() || name.contains('\0') || value.contains('\0') {
+            return Err(format!("invalid lab named input: {name}"));
+        }
+        if !inputs.insert(name) {
+            return Err(format!("duplicate lab named input: {name}"));
+        }
+    }
+    for fixture in &request.fixtures {
+        let normalized = crate::ir::normalize_path(&fixture.path)
+            .map_err(|error| format!("lab fixture path is invalid: {error}"))?;
+        if normalized != fixture.path {
+            return Err(format!(
+                "lab fixture path is not normalized: {}",
+                fixture.path
+            ));
+        }
+        fixture.contents.bytes()?;
     }
     if let Network::Replay { proxy, tape } = &request.network
         && (proxy.trim().is_empty()
@@ -273,11 +492,13 @@ fn oci_spec(program: &str, request: &Request) -> Result<LaunchSpec, String> {
         "--cap-drop=ALL".into(),
         "--security-opt".into(),
         "no-new-privileges".into(),
-        "--userns=keep-id".into(),
-        "--pids-limit=512".into(),
-        "--memory=1g".into(),
+        format!("--pids-limit={}", request.limits.processes),
+        format!("--memory={}", request.limits.memory_bytes),
         "--workdir=/workspace".into(),
     ];
+    if program == "podman" {
+        arguments.push("--userns=keep-id".into());
+    }
     match &request.network {
         Network::Deny => arguments.push("--network=none".into()),
         Network::Replay { proxy, tape } => {
@@ -294,7 +515,9 @@ fn oci_spec(program: &str, request: &Request) -> Result<LaunchSpec, String> {
         }
     }
     arguments.push("--volume".into());
-    arguments.push(format!("{}:/workspace:ro", request.workspace));
+    // The mounted tree is already a private snapshot. It may be mutated inside
+    // the disposable boundary without exposing the live project.
+    arguments.push(format!("{}:/workspace:rw", request.workspace));
     let output = Path::new(&request.result_path)
         .parent()
         .ok_or("lab result path must have a parent directory")?;
@@ -313,7 +536,7 @@ fn oci_spec(program: &str, request: &Request) -> Result<LaunchSpec, String> {
         program: program.into(),
         arguments,
         environment: vec![],
-        stdin: observer_request_bytes(request, &request.script)?,
+        stdin: observer_request_bytes(request)?,
     }))
 }
 
@@ -337,8 +560,8 @@ fn windows_sandbox_spec(request: &Request) -> Result<LaunchSpec, String> {
     let executable_directory = executable
         .parent()
         .ok_or("embedded observer executable has no parent directory")?;
-    let encoded_request = base64::engine::general_purpose::STANDARD
-        .encode(observer_request_bytes(request, &request.script)?);
+    let encoded_request =
+        base64::engine::general_purpose::STANDARD.encode(observer_request_bytes(request)?);
     let powershell = format!(
         "$r=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{encoded_request}'));$r|&'C:\\deshell\\deshell.exe' '__observer-agent'|Set-Content -LiteralPath 'C:\\output\\{result_name}' -Encoding utf8NoBOM;shutdown.exe /s /t 0 /f"
     );
@@ -373,16 +596,12 @@ fn windows_sandbox_spec(request: &Request) -> Result<LaunchSpec, String> {
     Ok(LaunchSpec::WindowsConfig(xml))
 }
 
-fn guest_agent_spec(provider: Provider, request: &Request) -> LaunchSpec {
+fn guest_agent_spec(provider: Provider, request: &Request) -> Result<LaunchSpec, String> {
     let network = network_name(&request.network);
-    let mut payload: Value = crate::strict_json::parse(
-        &observer_request_bytes(request, &request.script)
-            .expect("validated observer request must serialize"),
-    )
-    .expect("validated observer request must be JSON");
+    let mut payload: Value = crate::strict_json::parse(&observer_request_bytes(request)?)?;
     let parameters = payload["params"]
         .as_object_mut()
-        .expect("observer params are an object");
+        .ok_or_else(|| "observer params are not an object".to_owned())?;
     parameters.insert("image".into(), Value::String(request.image.clone()));
     parameters.insert(
         "result_path".into(),
@@ -390,32 +609,94 @@ fn guest_agent_spec(provider: Provider, request: &Request) -> LaunchSpec {
     );
     parameters.insert("workspace".into(), Value::String(request.workspace.clone()));
     parameters.insert("network".into(), Value::String(network.into()));
-    LaunchSpec::AgentRequest(AgentRequest {
+    Ok(LaunchSpec::AgentRequest(AgentRequest {
         provider: provider_name(provider).into(),
         host_write: "deny".into(),
         network: network.into(),
         payload,
-    })
+    }))
 }
 
-fn observer_request_bytes(request: &Request, script: &str) -> Result<Vec<u8>, String> {
-    let argv = interpreter_argv(&request.interpreter, script, &request.arguments)?;
+fn observer_request_bytes(request: &Request) -> Result<Vec<u8>, String> {
     let environment = request
         .environment
         .iter()
         .map(|(name, value)| serde_json::json!({"name": name, "value": value}))
         .collect::<Vec<_>>();
+    let named_inputs = request
+        .named_inputs
+        .iter()
+        .map(|(name, value)| serde_json::json!({"name": name, "value": value}))
+        .collect::<Vec<_>>();
+    let fixtures = request.fixtures.iter().map(|fixture| {
+        Ok(serde_json::json!({
+            "contents_base64": base64::engine::general_purpose::STANDARD.encode(fixture.contents.bytes()?),
+            "executable": fixture.executable,
+            "path": fixture.path
+        }))
+    }).collect::<Result<Vec<_>, String>>()?;
+    let expected_files = request
+        .expected_files
+        .iter()
+        .map(|file| serde_json::json!({"path": file.path, "sha256": file.sha256}))
+        .collect::<Vec<_>>();
+    let (method, mut parameters) = match &request.target {
+        Target::Original {
+            interpreter,
+            script,
+        } => (
+            "observer.observe",
+            serde_json::json!({
+                "argv": interpreter_argv(interpreter, script, &request.arguments)?
+            }),
+        ),
+        Target::Plan {
+            entrypoint,
+            node_id,
+        } => (
+            "observer.run_plan",
+            serde_json::json!({
+                "arguments": named_inputs,
+                "argv": request.arguments,
+                "entrypoint": entrypoint,
+                "node_id": node_id
+            }),
+        ),
+    };
+    let fields = parameters
+        .as_object_mut()
+        .ok_or_else(|| "lab parameters are not an object".to_owned())?;
+    fields.insert("environment".into(), serde_json::Value::Array(environment));
+    fields.insert(
+        "expected_files".into(),
+        serde_json::Value::Array(expected_files),
+    );
+    fields.insert("fixtures".into(), serde_json::Value::Array(fixtures));
+    fields.insert(
+        "stdin_base64".into(),
+        serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(&request.stdin)),
+    );
+    fields.insert(
+        "working_directory".into(),
+        request
+            .working_directory
+            .clone()
+            .map_or(serde_json::Value::Null, serde_json::Value::String),
+    );
+    for (name, value) in [
+        ("timeout_ms", request.limits.timeout_ms),
+        ("memory_bytes", request.limits.memory_bytes),
+        ("processes", request.limits.processes),
+        ("stdout_bytes", request.limits.stdout_bytes),
+        ("stderr_bytes", request.limits.stderr_bytes),
+    ] {
+        fields.insert(name.into(), serde_json::Value::from(value));
+    }
     let value = serde_json::json!({
         "id": 1,
         "jsonrpc": "2.0",
-        "method": "observer.observe",
-        "params": {
-            "argv": argv,
-            "environment": environment,
-            "stdin_base64": "",
-            "timeout_ms": request.timeout_ms,
-            "working_directory": null
-        }
+        "method": method,
+        "params": parameters
     });
     let mut bytes = crate::canonical_json::canonical_bytes(&value)?;
     bytes.push(b'\n');
@@ -564,11 +845,21 @@ mod tests {
         Request {
             workspace: "/tmp/staged/workspace".into(),
             result_path: "/tmp/staged/output/observation.json".into(),
-            interpreter: "sh".into(),
-            script: "build.sh".into(),
+            target: Target::Original {
+                interpreter: "sh".into(),
+                script: "build.sh".into(),
+            },
             arguments: vec!["--check".into()],
+            named_inputs: vec![],
             environment: vec![("MODE".into(), "test".into())],
-            timeout_ms: 5_000,
+            stdin: vec![],
+            working_directory: None,
+            fixtures: vec![],
+            expected_files: vec![],
+            limits: crate::config::ResourceLimits {
+                timeout_ms: 5_000,
+                ..crate::config::ResourceLimits::DEFAULT
+            },
             network,
             image: concat!(
                 "ghcr.io/deshell-lang/lab@sha256:",
@@ -613,6 +904,11 @@ mod tests {
             select(Platform::Macos, &probe(&["deshell-vz-agent"], &[], false)).unwrap(),
             Provider::VirtualizationFramework
         );
+        assert!(execution_connected(Provider::Podman));
+        assert!(execution_connected(Provider::DockerRootless));
+        assert!(!execution_connected(Provider::WindowsSandbox));
+        assert!(!execution_connected(Provider::HyperV));
+        assert!(!execution_connected(Provider::VirtualizationFramework));
     }
 
     #[test]
@@ -666,6 +962,19 @@ mod tests {
         );
         let rpc = crate::strict_json::parse(&spec.stdin).unwrap();
         assert_eq!(rpc["method"], "observer.observe");
+
+        let LaunchSpec::Process(docker) =
+            launch_spec(Provider::DockerRootless, &request(Network::Deny)).unwrap()
+        else {
+            panic!("rootless Docker must produce a process specification");
+        };
+        assert_eq!(docker.program, "docker");
+        assert!(
+            !docker
+                .arguments
+                .iter()
+                .any(|argument| argument == "--userns=keep-id")
+        );
     }
 
     #[test]
@@ -684,14 +993,20 @@ mod tests {
                 .contains("sha256")
         );
         invalid.image = request(Network::Deny).image;
-        invalid.script = "../escape.sh".into();
+        invalid.target = Target::Original {
+            interpreter: "sh".into(),
+            script: "../escape.sh".into(),
+        };
         assert!(
             launch_spec(Provider::Podman, &invalid)
                 .unwrap_err()
                 .contains("script")
         );
-        invalid.script = "build.sh".into();
-        invalid.timeout_ms = 0;
+        invalid.target = Target::Original {
+            interpreter: "sh".into(),
+            script: "build.sh".into(),
+        };
+        invalid.limits.timeout_ms = 0;
         assert!(
             launch_spec(Provider::Podman, &invalid)
                 .unwrap_err()

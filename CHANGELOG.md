@@ -12,21 +12,26 @@ All notable changes are documented here. No compatibility contract predates
 - Language-neutral Effect IR v1, Evidence v1, diagnostic, project, scenario,
   lock, replay, corpus-audit, and JSON-RPC schemas.
 - Explicit text expressions, restricted typed values, deterministic node IDs,
-  lossless UTF-8/base64 residual capsules, and strict plan validation.
+  lossless UTF-8/base64 delegated source, non-executable residual capsules, and
+  strict plan validation.
 - Conservative frontends for POSIX shell, zsh, fish, PowerShell, cmd, Nushell,
   and unknown interpreters.
-- Bounded scanning and execution, injected filesystem/process/clock/observer
-  boundaries, transactional patches, replay-only networking, and secret
-  redaction.
+- Versioned Inventory v1 scanning with scoped host-format discovery,
+  position-preserving JSONC support, explicit in-scope failures, and strict
+  duplicate-key rejection; concurrent pipelines, process-tree timeout,
+  memory/process/output limits, bounded RPC streaming, transactional patches,
+  replay-only networking, and secret redaction.
 - Platform-checked disposable-lab launch contracts for hardened rootless OCI,
   Windows Sandbox, Hyper-V, and Virtualization.framework providers.
-- Strict internal, Dagger, Nushell, and CWL exporters with an explicit bridge
-  option.
+- Strict internal, Dagger, Nushell, and CWL exporters plus a deterministic,
+  digest-bound self-contained bundle mode; unrepresentable sequence semantics,
+  the unsafe development bridge, and capability flags are rejected.
 - Shared golden, CLI, schema, protocol, property, platform, differential, and
-  security contracts plus the private `xtask` conformance runner.
+  security contracts, independent validation of generated v1 documents, plus
+  the private `xtask` conformance runner.
 - Rust-first Linux, macOS, and Windows CI and a six-target release workflow with
-  checksums, keyless signatures, provenance, smoke tests, and protected
-  crates.io publication.
+  dependency-policy and coverage floors, a CycloneDX SBOM, checksums, keyless
+  signatures, provenance, smoke tests, and protected crates.io publication.
 
 ### Changed
 
@@ -36,6 +41,8 @@ All notable changes are documented here. No compatibility contract predates
   JSON-RPC. Rust and OCaml modules are private and unstable.
 - Moved observed comparisons out of node guarantees and into Evidence v1 so
   observation cannot mutate an analyzed plan.
+- Replaced the development `formal/exhaustive/residual` model with the honest
+  `native/delegated/residual` contract and content-addressed project artifacts.
 - Moved all maintained schemas and golden contracts under `contracts/`.
 - Retained OCaml only as an unpublished, opt-in deterministic reference.
 

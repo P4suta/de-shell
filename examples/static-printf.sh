@@ -1,3 +1,3 @@
 #!/bin/sh
 
-printf '%s\n' 'hello from de-shell'
+/usr/bin/printf '%s\n' 'hello from de-shell'

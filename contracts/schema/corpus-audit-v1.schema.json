@@ -146,12 +146,12 @@
     "nodeCounts": {
       "additionalProperties": false,
       "properties": {
-        "exhaustive": { "$ref": "#/$defs/count" },
-        "formal": { "$ref": "#/$defs/count" },
+        "delegated": { "$ref": "#/$defs/count" },
+        "native": { "$ref": "#/$defs/count" },
         "observations": { "$ref": "#/$defs/count" },
         "residual": { "$ref": "#/$defs/count" }
       },
-      "required": ["formal", "exhaustive", "observations", "residual"],
+      "required": ["native", "delegated", "observations", "residual"],
       "type": "object"
     },
     "residualReasonGroup": {

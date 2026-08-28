@@ -114,7 +114,11 @@ pub(crate) fn lower(
     let (body, inputs, environment, invocation) = match lowered {
         Ok(lowered) => (lowered.body, lowered.inputs, lowered.environment, None),
         Err(reason) => (
-            residual_node(&normalized, source, interpreter.name(), reason),
+            if matches!(interpreter, Interpreter::Unknown(_)) {
+                residual_node(&normalized, source, interpreter.name(), reason)
+            } else {
+                delegated_node(&normalized, source, interpreter.name(), reason)
+            },
             BTreeSet::new(),
             BTreeSet::new(),
             None,
@@ -169,8 +173,8 @@ impl Default for Node {
                 environment: vec![],
                 working_directory: None,
             },
-            guarantee: Guarantee::Formal {
-                basis: "generated-v1".into(),
+            guarantee: Guarantee::Native {
+                semantic_model: "generated-v1".into(),
             },
             source: None,
         }
@@ -229,12 +233,131 @@ fn residual_node(path: &str, source: &[u8], interpreter: &str, reason: String) -
     }
 }
 
-fn formal_node(operation: Operation, basis: &str, span: SourceSpan) -> Node {
+fn delegated_node(path: &str, source: &[u8], interpreter: &str, reason: String) -> Node {
+    let span = source_span_for_bytes(path, source);
+    Node {
+        id: String::new(),
+        operation: Operation::InterpreterCall {
+            interpreter: interpreter.to_owned(),
+            interpreter_pin: default_interpreter_pin(interpreter),
+            source: SourceBytes::from_bytes(source),
+            source_span: span.clone(),
+            capabilities: vec![
+                "process".into(),
+                "project_read".into(),
+                "sandbox_write".into(),
+            ],
+            reason: reason.clone(),
+        },
+        guarantee: Guarantee::Delegated { reason },
+        source: Some(span),
+    }
+}
+
+pub(crate) fn default_interpreter_pin(interpreter: &str) -> String {
+    format!(
+        "sha256:{}",
+        crate::digest::sha256(format!("deshell-official-runtime-v1:{interpreter}").as_bytes())
+    )
+}
+
+pub(crate) fn bind_interpreter_pins(
+    plan: &mut Plan,
+    pins: &crate::config::InterpreterPins,
+) -> Result<(), String> {
+    for task in &mut plan.tasks {
+        bind_node_pin(&mut task.body, pins)?;
+    }
+    plan.validate().map_err(|errors| errors.join("; "))
+}
+
+fn bind_node_pin(node: &mut Node, pins: &crate::config::InterpreterPins) -> Result<(), String> {
+    match &mut node.operation {
+        Operation::InterpreterCall {
+            interpreter,
+            interpreter_pin,
+            ..
+        } => {
+            *interpreter_pin = match interpreter.to_ascii_lowercase().as_str() {
+                "sh" | "posix_sh" => &pins.posix_sh,
+                "bash" => &pins.bash,
+                "zsh" => &pins.zsh,
+                "fish" => &pins.fish,
+                "powershell" | "pwsh" => &pins.powershell,
+                "cmd" => &pins.cmd,
+                "nu" | "nushell" => &pins.nushell,
+                other => return Err(format!("no lock pin for delegated interpreter: {other}")),
+            }
+            .clone();
+        }
+        Operation::Pipeline { nodes, .. }
+        | Operation::Sequence { nodes }
+        | Operation::Parallel { nodes } => {
+            for child in nodes {
+                bind_node_pin(child, pins)?;
+            }
+        }
+        Operation::Condition {
+            predicate,
+            if_true,
+            if_false,
+        } => {
+            bind_node_pin(predicate, pins)?;
+            bind_node_pin(if_true, pins)?;
+            if let Some(child) = if_false {
+                bind_node_pin(child, pins)?;
+            }
+        }
+        Operation::Match { cases, default, .. } => {
+            for case in cases {
+                bind_node_pin(&mut case.body, pins)?;
+            }
+            if let Some(child) = default {
+                bind_node_pin(child, pins)?;
+            }
+        }
+        Operation::Foreach { body, .. } | Operation::CaptureStdout { body, .. } => {
+            bind_node_pin(body, pins)?;
+        }
+        Operation::TryFinally { body, finalizer } => {
+            bind_node_pin(body, pins)?;
+            bind_node_pin(finalizer, pins)?;
+        }
+        Operation::Exec { .. }
+        | Operation::TaskCall { .. }
+        | Operation::SetVariable { .. }
+        | Operation::FileRead { .. }
+        | Operation::FileWrite { .. }
+        | Operation::FileRemove { .. }
+        | Operation::NetworkRequest { .. }
+        | Operation::OpaqueCapsule { .. } => {}
+    }
+    Ok(())
+}
+
+fn source_span_for_bytes(path: &str, source: &[u8]) -> SourceSpan {
+    if let Ok(text) = std::str::from_utf8(source)
+        && let Ok(span) = span_for_range(path, text, 0, text.len())
+    {
+        return span;
+    }
+    SourceSpan {
+        file: path.into(),
+        start_line: 1,
+        start_column: 0,
+        end_line: 1,
+        end_column: source.len() as u64,
+        start_byte: 0,
+        end_byte: source.len() as u64,
+    }
+}
+
+fn native_node(operation: Operation, basis: &str, span: SourceSpan) -> Node {
     Node {
         id: String::new(),
         operation,
-        guarantee: Guarantee::Formal {
-            basis: basis.to_owned(),
+        guarantee: Guarantee::Native {
+            semantic_model: basis.to_owned(),
         },
         source: Some(span),
     }
@@ -256,13 +379,6 @@ fn lower_posix(path: &str, source: &str, interpreter: &Interpreter) -> Result<Lo
         let text = &source[range.start..range.end];
         let trimmed = text.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        if trimmed == "set -e"
-            || trimmed == "set -u"
-            || trimmed == "set -eu"
-            || trimmed == "set -ue"
-        {
             continue;
         }
         let node = lower_posix_control(
@@ -290,7 +406,7 @@ fn lower_posix(path: &str, source: &str, interpreter: &Interpreter) -> Result<Lo
             .last()
             .and_then(|node| node.source.clone())
             .ok_or("sequence source span is missing")?;
-        formal_node(
+        native_node(
             Operation::Sequence { nodes },
             &format!("{}-static-sequence-v1", interpreter.name()),
             cover_spans(first, last),
@@ -308,11 +424,23 @@ fn shell_statements(source: &str) -> Result<Vec<Range>, String> {
     let mut start = 0;
     let mut quote = None;
     let mut escaped = false;
+    let mut comment = false;
+    let mut token_started = false;
     let bytes = source.as_bytes();
     let mut index = 0;
     while index < bytes.len() {
         let byte = bytes[index];
-        if escaped {
+        if comment {
+            if byte == b'\n' {
+                comment = false;
+                let range = trim_range(source, start, index);
+                if range.start < range.end {
+                    output.push(range);
+                }
+                start = index + 1;
+                token_started = false;
+            }
+        } else if escaped {
             escaped = false;
         } else if byte == b'\\' && quote != Some(b'\'') {
             escaped = true;
@@ -322,12 +450,18 @@ fn shell_statements(source: &str) -> Result<Vec<Range>, String> {
             }
         } else if byte == b'\'' || byte == b'"' {
             quote = Some(byte);
+            token_started = true;
+        } else if byte == b'#' && !token_started {
+            comment = true;
         } else if byte == b'\n' || byte == b';' {
             let range = trim_range(source, start, index);
             if range.start < range.end {
                 output.push(range);
             }
             start = index + 1;
+            token_started = false;
+        } else {
+            token_started = !byte.is_ascii_whitespace();
         }
         index += 1;
     }
@@ -409,8 +543,11 @@ fn lower_posix_control(
     }
     let span = span_for_range(path, source, range.start, range.end)?;
     match kind {
-        "|" => Ok(formal_node(
-            Operation::Pipeline { nodes },
+        "|" => Ok(native_node(
+            Operation::Pipeline {
+                nodes,
+                status: crate::ir::PipelineStatus::Last,
+            },
             "posix-static-pipeline-v1",
             span,
         )),
@@ -418,7 +555,7 @@ fn lower_posix_control(
             let mut iterator = nodes.into_iter();
             let mut result = iterator.next().expect("pieces are non-empty");
             for next in iterator {
-                result = formal_node(
+                result = native_node(
                     Operation::Condition {
                         predicate: Box::new(result),
                         if_true: Box::new(next),
@@ -430,7 +567,10 @@ fn lower_posix_control(
             }
             Ok(result)
         }
-        "||" => Err("POSIX || requires an explicit no-op branch and remains residual".into()),
+        "||" => Err(
+            "POSIX || is outside the native model and requires pinned interpreter delegation"
+                .into(),
+        ),
         _ => Err("unsupported shell control operator".into()),
     }
 }
@@ -440,6 +580,7 @@ fn top_level_controls(source: &str, range: Range) -> Result<Vec<(usize, &'static
     let mut quote = None;
     let mut escaped = false;
     let mut output = Vec::new();
+    let mut token_started = false;
     let mut index = range.start;
     while index < range.end {
         let byte = bytes[index];
@@ -462,6 +603,15 @@ fn top_level_controls(source: &str, range: Range) -> Result<Vec<(usize, &'static
         }
         if byte == b'\'' || byte == b'"' {
             quote = Some(byte);
+            token_started = true;
+            index += 1;
+            continue;
+        }
+        if byte == b'#' && !token_started {
+            break;
+        }
+        if byte.is_ascii_whitespace() {
+            token_started = false;
             index += 1;
             continue;
         }
@@ -480,9 +630,15 @@ fn top_level_controls(source: &str, range: Range) -> Result<Vec<(usize, &'static
             index += 2;
             continue;
         }
-        if matches!(byte, b'<' | b'>' | b'&') {
-            return Err("redirection or background execution remains residual".into());
+        if byte == b'!' && !token_started {
+            return Err("POSIX negation remains delegated".into());
         }
+        if matches!(byte, b'<' | b'>' | b'&') {
+            return Err(
+                "redirection or background execution requires pinned interpreter delegation".into(),
+            );
+        }
+        token_started = true;
         index += 1;
     }
     Ok(output)
@@ -511,7 +667,7 @@ fn lower_posix_simple(
         "}",
     ] {
         if raw == reserved.trim() || raw.starts_with(reserved) {
-            return Err("shell compound syntax remains residual".into());
+            return Err("shell compound syntax requires pinned interpreter delegation".into());
         }
     }
     if raw.starts_with("eval ")
@@ -519,12 +675,14 @@ fn lower_posix_simple(
         || raw.starts_with("source ")
         || raw.starts_with(". ")
     {
-        return Err("dynamic shell evaluation remains residual".into());
+        return Err("dynamic shell evaluation requires pinned interpreter delegation".into());
     }
 
     if let Some((name, rhs)) = standalone_assignment(raw) {
         if locals.contains(name) {
-            return Err(format!("mutable shell assignment remains residual: {name}"));
+            return Err(format!(
+                "mutable shell assignment requires pinned interpreter delegation: {name}"
+            ));
         }
         let operation = if rhs.starts_with("$(") && rhs.ends_with(')') {
             let inner_start = range.start + raw.find("$(").unwrap() + 2;
@@ -552,7 +710,7 @@ fn lower_posix_simple(
             }
         };
         locals.insert(name.to_owned());
-        return Ok(formal_node(
+        return Ok(native_node(
             operation,
             "posix-immutable-assignment-v1",
             span_for_range(path, source, range.start, range.end)?,
@@ -563,13 +721,12 @@ fn lower_posix_simple(
     if words.is_empty() {
         return Err("empty shell command".into());
     }
-    let executable = literal_expression(&words[0]).ok_or("dynamic executable remains residual")?;
-    if [
-        "cd", "export", "unset", "read", "shift", "trap", "return", "exit", "exec", "set",
-    ]
-    .contains(&executable.as_str())
-    {
-        return Err(format!("shell builtin {executable} remains residual"));
+    let executable = literal_expression(&words[0])
+        .ok_or("dynamic executable requires pinned interpreter delegation")?;
+    if shell_builtin(&executable) {
+        return Err(format!(
+            "shell builtin {executable} requires pinned interpreter delegation"
+        ));
     }
     let mut command_environment = Vec::new();
     let mut argv_start = 0;
@@ -592,7 +749,7 @@ fn lower_posix_simple(
     if argv_start == words.len() {
         return Err("command-local environment is missing an executable".into());
     }
-    Ok(formal_node(
+    Ok(native_node(
         Operation::Exec {
             argv: words[argv_start..].to_vec(),
             environment: command_environment,
@@ -601,6 +758,74 @@ fn lower_posix_simple(
         &format!("{}-explicit-command-v1", interpreter.name()),
         span_for_range(path, source, range.start, range.end)?,
     ))
+}
+
+fn shell_builtin(executable: &str) -> bool {
+    [
+        "!",
+        ".",
+        ":",
+        "[",
+        "alias",
+        "bg",
+        "bind",
+        "break",
+        "builtin",
+        "caller",
+        "cd",
+        "command",
+        "compgen",
+        "complete",
+        "continue",
+        "declare",
+        "dirs",
+        "disown",
+        "echo",
+        "enable",
+        "eval",
+        "exec",
+        "exit",
+        "export",
+        "false",
+        "fc",
+        "fg",
+        "getopts",
+        "hash",
+        "help",
+        "history",
+        "jobs",
+        "kill",
+        "let",
+        "local",
+        "logout",
+        "mapfile",
+        "newgrp",
+        "popd",
+        "printf",
+        "pushd",
+        "pwd",
+        "read",
+        "readarray",
+        "readonly",
+        "return",
+        "set",
+        "shift",
+        "shopt",
+        "source",
+        "suspend",
+        "test",
+        "times",
+        "trap",
+        "true",
+        "type",
+        "typeset",
+        "ulimit",
+        "umask",
+        "unalias",
+        "unset",
+        "wait",
+    ]
+    .contains(&executable)
 }
 
 fn standalone_assignment(value: &str) -> Option<(&str, &str)> {
@@ -679,7 +904,9 @@ fn tokenize_posix(
                     continue;
                 }
                 if byte == b'`' {
-                    return Err("command substitution remains residual".into());
+                    return Err(
+                        "command substitution requires pinned interpreter delegation".into(),
+                    );
                 }
                 if byte == b'\\' {
                     let next = *bytes
@@ -689,6 +916,10 @@ fn tokenize_posix(
                         literal.push(next as char);
                         index += 2;
                         token_started = true;
+                        continue;
+                    }
+                    if next == b'\n' {
+                        index += 2;
                         continue;
                     }
                     literal.push('\\');
@@ -724,13 +955,23 @@ fn tokenize_posix(
                         .chars()
                         .next()
                         .ok_or("trailing shell escape")?;
+                    if escaped == '\n' {
+                        index += 2;
+                        continue;
+                    }
                     literal.push(escaped);
                     token_started = true;
                     index += 1 + escaped.len_utf8();
                     continue;
                 }
                 if byte == b'$' {
-                    return Err("unquoted expansion may split fields and remains residual".into());
+                    return Err(
+                        "unquoted expansion may split fields and requires pinned interpreter delegation"
+                            .into(),
+                    );
+                }
+                if byte == b'~' && !token_started {
+                    return Err("tilde expansion remains delegated".into());
                 }
                 if matches!(
                     byte,
@@ -746,7 +987,10 @@ fn tokenize_posix(
                         | b'&'
                         | b';'
                 ) {
-                    return Err("dynamic expansion or control syntax remains residual".into());
+                    return Err(
+                        "dynamic expansion or control syntax requires pinned interpreter delegation"
+                            .into(),
+                    );
                 }
                 let character = source[index..].chars().next().unwrap();
                 literal.push(character);
@@ -791,7 +1035,7 @@ fn parse_expansion(
 ) -> Result<(TextPart, usize), String> {
     let bytes = source.as_bytes();
     if bytes.get(start + 1) == Some(&b'(') {
-        return Err("command substitution remains residual".into());
+        return Err("command substitution requires pinned interpreter delegation".into());
     }
     let (name, end) = if bytes.get(start + 1) == Some(&b'{') {
         let relative = source[start + 2..]
@@ -836,7 +1080,7 @@ fn parse_expansion(
         ))
     } else {
         Err(format!(
-            "parameter expansion syntax remains residual: {name}"
+            "parameter expansion syntax requires pinned interpreter delegation: {name}"
         ))
     }
 }
@@ -887,6 +1131,7 @@ fn lower_literal_family(
     source: &str,
     interpreter: &Interpreter,
 ) -> Result<Lowered, String> {
+    validate_literal_family_source(source, interpreter)?;
     let ranges = shell_statements(source)?;
     let mut nodes = Vec::new();
     let mut cmd_echo_off = false;
@@ -948,7 +1193,7 @@ fn lower_literal_family(
             _ => return Err("not a literal frontend family".into()),
         };
         let argv = command.into_iter().map(TextExpression::literal).collect();
-        nodes.push(formal_node(
+        nodes.push(native_node(
             Operation::Exec {
                 argv,
                 environment: vec![],
@@ -969,7 +1214,7 @@ fn lower_literal_family(
     } else {
         let first = nodes.first().unwrap().source.clone().unwrap();
         let last = nodes.last().unwrap().source.clone().unwrap();
-        formal_node(
+        native_node(
             Operation::Sequence { nodes },
             &format!("{}-static-sequence-v1", interpreter.name()),
             cover_spans(first, last),
@@ -980,6 +1225,25 @@ fn lower_literal_family(
         inputs: BTreeSet::new(),
         environment: BTreeSet::new(),
     })
+}
+
+fn validate_literal_family_source(source: &str, interpreter: &Interpreter) -> Result<(), String> {
+    match interpreter {
+        Interpreter::Cmd
+            if source.bytes().any(|byte| {
+                matches!(byte, b';' | b'&' | b'|' | b'<' | b'>' | b'^' | b'(' | b')')
+            }) =>
+        {
+            Err("cmd control or escape syntax requires pinned interpreter delegation".into())
+        }
+        Interpreter::Powershell if source.contains("''") || source.contains("\"\"") => {
+            Err("PowerShell doubled-quote semantics require pinned interpreter delegation".into())
+        }
+        Interpreter::Fish | Interpreter::Nushell if source.contains('\\') => {
+            Err("language-specific escape syntax requires pinned interpreter delegation".into())
+        }
+        _ => Ok(()),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1161,7 +1425,7 @@ mod tests {
     fn posix_quoted_expansions_become_explicit_parts() {
         let plan = lower(
             "scripts/build.sh",
-            b"#!/bin/sh\nprintf '%s\\n' \"$NAME:$1\" '$NAME'\n",
+            b"#!/bin/sh\n/usr/bin/printf '%s\\n' \"$NAME:$1\" '$NAME'\n",
             UnknownInterpreter::TraceOnly,
         )
         .unwrap();
@@ -1192,7 +1456,10 @@ mod tests {
 
     #[test]
     fn posix_pipeline_and_sequence_keep_control_flow() {
-        let node = body("build.sh", b"printf one | grep one\nprintf two\n");
+        let node = body(
+            "build.sh",
+            b"/usr/bin/printf one | grep one\n/usr/bin/printf two\n",
+        );
         let Operation::Sequence { nodes } = node.operation else {
             panic!("expected sequence")
         };
@@ -1201,31 +1468,89 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_and_non_utf8_sources_are_lossless_residuals() {
+    fn unsupported_known_sources_are_lossless_pinned_delegations() {
         let source = b"eval \"$DYNAMIC\"\n";
         let node = body("build.sh", source);
-        assert!(matches!(node.guarantee, Guarantee::Residual { .. }));
-        let Operation::OpaqueCapsule {
-            source: capsule, ..
+        assert!(matches!(node.guarantee, Guarantee::Delegated { .. }));
+        let Operation::InterpreterCall {
+            source: capsule,
+            interpreter_pin,
+            source_span,
+            ..
         } = node.operation
         else {
-            panic!("expected capsule")
+            panic!("expected interpreter call")
         };
         assert_eq!(capsule.to_bytes().unwrap(), source);
+        assert!(interpreter_pin.starts_with("sha256:"));
+        assert_eq!(source_span.end_byte, source.len() as u64);
 
         let bytes = b"printf '\xff'\n";
         let node = body("bad.sh", bytes);
-        let Operation::OpaqueCapsule { source, .. } = node.operation else {
-            panic!("expected capsule")
+        let Operation::InterpreterCall { source, .. } = node.operation else {
+            panic!("expected interpreter call")
         };
         assert!(matches!(source, SourceBytes::Base64 { .. }));
         assert_eq!(source.to_bytes().unwrap(), bytes);
     }
 
     #[test]
+    fn posix_continuations_are_removed_and_expansion_boundaries_delegate() {
+        let plan = lower(
+            "build.sh",
+            b"/usr/bin/printf '%s' foo\\\n  bar\n",
+            UnknownInterpreter::Reject,
+        )
+        .unwrap();
+        let Operation::Exec { argv, .. } = &plan.tasks[0].body.operation else {
+            panic!("line continuation should remain a static exec");
+        };
+        assert_eq!(literal_expression(&argv[3]).as_deref(), Some("bar"));
+        for source in [
+            b"/usr/bin/printf '%s' ~/value\n".as_slice(),
+            b"! false\n".as_slice(),
+            b"command printf ok\n".as_slice(),
+        ] {
+            let plan = lower("build.sh", source, UnknownInterpreter::Reject).unwrap();
+            assert!(matches!(
+                plan.tasks[0].body.operation,
+                Operation::InterpreterCall { .. }
+            ));
+        }
+        let comment = lower(
+            "build.sh",
+            b"/usr/bin/printf ok # ; printf must-not-run\n",
+            UnknownInterpreter::Reject,
+        )
+        .unwrap();
+        assert!(matches!(
+            comment.tasks[0].body.operation,
+            Operation::Exec { .. }
+        ));
+    }
+
+    #[test]
+    fn foreign_control_and_escape_syntax_is_never_misclassified_as_native() {
+        for (path, source) in [
+            (
+                "build.cmd",
+                b"@echo off\r\n@one.exe & two.exe\r\n".as_slice(),
+            ),
+            ("build.ps1", b"& 'tool.exe' 'it''s'\n".as_slice()),
+            ("build.fish", b"command printf foo\\ bar\n".as_slice()),
+        ] {
+            let plan = lower(path, source, UnknownInterpreter::Reject).unwrap();
+            assert!(matches!(
+                plan.tasks[0].body.operation,
+                Operation::InterpreterCall { .. }
+            ));
+        }
+    }
+
+    #[test]
     fn literal_subsets_cover_all_declared_interpreters() {
         let fixtures: &[(&str, &[u8], &str)] = &[
-            ("build.zsh", b"printf zsh\n", "printf"),
+            ("build.zsh", b"/usr/bin/printf zsh\n", "/usr/bin/printf"),
             ("build.fish", b"command printf fish\n", "printf"),
             ("build.ps1", b"& '/bin/echo' 'powershell'\n", "/bin/echo"),
             (
@@ -1272,22 +1597,36 @@ mod tests {
     }
 
     #[test]
+    fn shell_builtins_are_delegated_instead_of_masquerading_as_external_execs() {
+        for source in [
+            b"printf value\n".as_slice(),
+            b"echo value\n".as_slice(),
+            b"true\n".as_slice(),
+            b"test -f input\n".as_slice(),
+        ] {
+            let node = body("build.sh", source);
+            assert!(matches!(node.guarantee, Guarantee::Delegated { .. }));
+            assert!(matches!(node.operation, Operation::InterpreterCall { .. }));
+        }
+    }
+
+    #[test]
     fn source_columns_count_unicode_scalars_while_bytes_remain_half_open() {
-        let node = body("unicode.sh", "printf 'é'\n".as_bytes());
+        let node = body("unicode.sh", "/usr/bin/printf 'é'\n".as_bytes());
         let span = node.source.unwrap();
         assert_eq!(span.start_line, 1);
         assert_eq!(span.start_column, 0);
         assert_eq!(span.end_line, 1);
-        assert_eq!(span.end_column, 10);
+        assert_eq!(span.end_column, 19);
         assert_eq!(span.start_byte, 0);
-        assert_eq!(span.end_byte, 11);
+        assert_eq!(span.end_byte, 20);
     }
 
     #[test]
     fn posix_single_quoted_unicode_is_preserved_as_utf8_text() {
         let plan = lower(
             "unicode.sh",
-            "printf '%s' '日本語'\n".as_bytes(),
+            "/usr/bin/printf '%s' '日本語'\n".as_bytes(),
             UnknownInterpreter::TraceOnly,
         )
         .unwrap();
@@ -1306,7 +1645,7 @@ mod tests {
     fn posix_escaped_unicode_starts_on_a_scalar_boundary() {
         let plan = lower(
             "unicode.sh",
-            "printf \\日本語\n".as_bytes(),
+            "/usr/bin/printf \\日本語\n".as_bytes(),
             UnknownInterpreter::TraceOnly,
         )
         .unwrap();

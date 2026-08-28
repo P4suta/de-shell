@@ -34,6 +34,40 @@ pub(crate) fn prepare(_path: &Path, _replacement: Vec<u8>) -> Result<Proposal, S
     })
 }
 
+pub(crate) fn prepare_expected(
+    path: &Path,
+    expected_digest: &str,
+    replacement: Vec<u8>,
+) -> Result<Proposal, String> {
+    if !crate::digest::valid_sha256(expected_digest) {
+        return Err("patch expected digest must be a lowercase SHA-256".into());
+    }
+    let metadata = path
+        .symlink_metadata()
+        .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(format!(
+            "patch target is not a regular non-symlink file: {}",
+            path.display()
+        ));
+    }
+    let actual = crate::digest::sha256(
+        &std::fs::read(path).map_err(|error| format!("cannot read {}: {error}", path.display()))?,
+    );
+    if actual != expected_digest {
+        return Err(format!(
+            "content hash mismatch for {} (expected {expected_digest}, found {actual})",
+            path.display()
+        ));
+    }
+    Ok(Proposal {
+        path: path.to_path_buf(),
+        expected: Expectation::Existing(expected_digest.into()),
+        replacement,
+        permissions: file_permissions(&metadata),
+    })
+}
+
 pub(crate) fn prepare_create(
     _path: &Path,
     _replacement: Vec<u8>,
@@ -70,6 +104,13 @@ pub(crate) fn prepare_create(
 }
 
 pub(crate) fn apply_all(proposals: &[Proposal]) -> Result<(), String> {
+    apply_all_inner(proposals, None)
+}
+
+fn apply_all_inner(
+    proposals: &[Proposal],
+    fail_after_commits: Option<usize>,
+) -> Result<(), String> {
     let validated = validate_all(proposals)?;
     let mut staged = Vec::with_capacity(validated.len());
     for item in &validated {
@@ -105,7 +146,9 @@ pub(crate) fn apply_all(proposals: &[Proposal]) -> Result<(), String> {
     let mut backups: Vec<(PathBuf, PathBuf)> = Vec::new();
     for item in &validated {
         if matches!(item.proposal.expected, Expectation::Existing(_)) {
-            let parent = item.canonical.parent().expect("validated target parent");
+            let parent = item.canonical.parent().ok_or_else(|| {
+                format!("patch target has no parent: {}", item.canonical.display())
+            })?;
             let placeholder = tempfile::NamedTempFile::new_in(parent)
                 .map_err(|error| format!("cannot allocate rollback path: {error}"))?;
             let backup = placeholder.path().to_path_buf();
@@ -120,33 +163,53 @@ pub(crate) fn apply_all(proposals: &[Proposal]) -> Result<(), String> {
                 ));
             }
             backups.push((item.canonical.clone(), backup));
+            if let Err(error) = sync_parent(&item.canonical) {
+                let restore_errors = restore_backups(&backups);
+                let suffix = if restore_errors.is_empty() {
+                    String::new()
+                } else {
+                    format!("; rollback failed: {}", restore_errors.join("; "))
+                };
+                return Err(format!(
+                    "cannot sync rollback stage for {}: {error}{suffix}",
+                    item.canonical.display()
+                ));
+            }
         }
     }
 
-    let targets: Vec<PathBuf> = validated
-        .iter()
-        .map(|item| item.canonical.clone())
-        .collect();
+    let mut committed = Vec::new();
     for (item, temporary) in validated.iter().zip(staged) {
-        if let Err(error) = temporary.persist(&item.canonical) {
-            for target in &targets {
-                let _ = std::fs::remove_file(target);
+        let mut commit_error = match temporary.persist(&item.canonical) {
+            Ok(_) => {
+                committed.push((
+                    item.canonical.clone(),
+                    crate::digest::sha256(&item.proposal.replacement),
+                ));
+                sync_parent(&item.canonical).err()
             }
-            let restore_errors = restore_backups(&backups);
+            Err(error) => Some(format!("{}", error.error)),
+        };
+        if commit_error.is_none() && fail_after_commits == Some(committed.len()) {
+            commit_error = Some("injected commit failure".into());
+        }
+        if let Some(error) = commit_error {
+            let mut restore_errors = remove_committed(&committed);
+            restore_errors.extend(restore_backups(&backups));
             let suffix = if restore_errors.is_empty() {
                 String::new()
             } else {
                 format!("; rollback failed: {}", restore_errors.join("; "))
             };
             return Err(format!(
-                "cannot commit {}: {}{suffix}",
-                item.canonical.display(),
-                error.error
+                "cannot commit {}: {error}{suffix}",
+                item.canonical.display()
             ));
         }
     }
     for (_, backup) in backups {
-        let _ = std::fs::remove_file(backup);
+        let _ = std::fs::remove_file(&backup);
+        let _ = sync_parent(&backup);
     }
     Ok(())
 }
@@ -263,12 +326,91 @@ fn validate_current(validated: &[Validated]) -> Result<(), String> {
 fn restore_backups(backups: &[(PathBuf, PathBuf)]) -> Vec<String> {
     let mut errors = Vec::new();
     for (target, backup) in backups.iter().rev() {
-        let _ = std::fs::remove_file(target);
+        if target.symlink_metadata().is_ok() {
+            errors.push(format!(
+                "refusing to overwrite a concurrent rollback target: {}",
+                target.display()
+            ));
+            continue;
+        }
         if let Err(error) = std::fs::rename(backup, target) {
             errors.push(format!("{}: {error}", target.display()));
+        } else if let Err(error) = sync_parent(target) {
+            errors.push(format!(
+                "cannot sync {} after rollback: {error}",
+                target.display()
+            ));
         }
     }
     errors
+}
+
+fn remove_committed(committed: &[(PathBuf, String)]) -> Vec<String> {
+    let mut errors = Vec::new();
+    for (target, expected) in committed.iter().rev() {
+        let metadata = match target.symlink_metadata() {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                errors.push(format!(
+                    "cannot inspect {} for rollback: {error}",
+                    target.display()
+                ));
+                continue;
+            }
+        };
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+            errors.push(format!(
+                "refusing to remove a non-regular rollback target: {}",
+                target.display()
+            ));
+            continue;
+        }
+        let actual = match std::fs::read(target) {
+            Ok(bytes) => crate::digest::sha256(&bytes),
+            Err(error) => {
+                errors.push(format!(
+                    "cannot read {} for rollback: {error}",
+                    target.display()
+                ));
+                continue;
+            }
+        };
+        if actual != *expected {
+            errors.push(format!(
+                "refusing to overwrite a concurrent rollback edit at {}",
+                target.display()
+            ));
+            continue;
+        }
+        if let Err(error) = std::fs::remove_file(target) {
+            errors.push(format!(
+                "cannot remove {} for rollback: {error}",
+                target.display()
+            ));
+        } else if let Err(error) = sync_parent(target) {
+            errors.push(format!(
+                "cannot sync {} after rollback removal: {error}",
+                target.display()
+            ));
+        }
+    }
+    errors
+}
+
+#[cfg(unix)]
+fn sync_parent(path: &Path) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("path has no parent directory: {}", path.display()))?;
+    std::fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("cannot sync directory {}: {error}", parent.display()))
+}
+
+#[cfg(not(unix))]
+fn sync_parent(_path: &Path) -> Result<(), String> {
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -321,6 +463,37 @@ mod tests {
     }
 
     #[test]
+    fn injected_commit_failure_restores_the_complete_write_set() {
+        let temporary = tempfile::tempdir().unwrap();
+        let existing = temporary.path().join("existing.txt");
+        let created = temporary.path().join("created.txt");
+        fs::write(&existing, b"before").unwrap();
+        let proposals = [
+            prepare(&existing, b"after".to_vec()).unwrap(),
+            prepare_create(&created, b"new".to_vec(), 0o640).unwrap(),
+        ];
+
+        let error = apply_all_inner(&proposals, Some(1)).unwrap_err();
+        assert!(error.contains("injected commit failure"), "{error}");
+        assert_eq!(fs::read(existing).unwrap(), b"before");
+        assert!(!created.exists());
+    }
+
+    #[test]
+    fn rollback_refuses_to_overwrite_a_concurrent_target() {
+        let temporary = tempfile::tempdir().unwrap();
+        let target = temporary.path().join("target.txt");
+        let backup = temporary.path().join("backup.txt");
+        fs::write(&target, b"concurrent").unwrap();
+        fs::write(&backup, b"original").unwrap();
+
+        let errors = restore_backups(&[(target.clone(), backup.clone())]);
+        assert!(errors.join("; ").contains("concurrent"));
+        assert_eq!(fs::read(target).unwrap(), b"concurrent");
+        assert_eq!(fs::read(backup).unwrap(), b"original");
+    }
+
+    #[test]
     fn stale_hash_prevents_every_mutation() {
         let temporary = tempfile::tempdir().unwrap();
         let first = temporary.path().join("first.txt");
@@ -339,6 +512,23 @@ mod tests {
         );
         assert_eq!(fs::read(first).unwrap(), b"first");
         assert_eq!(fs::read(second).unwrap(), b"drifted");
+    }
+
+    #[test]
+    fn explicit_expected_hash_never_overwrites_a_concurrent_change() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("file.txt");
+        fs::write(&path, b"committed replacement").unwrap();
+        let expected = crate::digest::sha256(b"committed replacement");
+        let proposal = prepare_expected(&path, &expected, b"original".to_vec()).unwrap();
+
+        fs::write(&path, b"concurrent edit").unwrap();
+        assert!(
+            apply_all(&[proposal])
+                .unwrap_err()
+                .contains("content hash mismatch")
+        );
+        assert_eq!(fs::read(path).unwrap(), b"concurrent edit");
     }
 
     #[test]

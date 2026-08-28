@@ -231,12 +231,35 @@ try {
     }
 
     try {
-      $repositoryFindings = @(($scan.Text | ConvertFrom-Json))
+      $inventory = $scan.Text | ConvertFrom-Json
+      if ([int]$inventory.schema_version -ne 1) {
+        throw "Inventory schema_version must be 1"
+      }
+      $repositoryFindings = @($inventory.findings)
     } catch {
       $failures.Add(
         "$($repository.Name): scan emitted invalid JSON: $($_.Exception.Message)"
       )
       continue
+    }
+    $repeatScan = Invoke-Deshell `
+      -Executable $deshell `
+      -Arguments @('scan', '--root', $repository.FullName, '--format', 'json')
+    if ($repeatScan.ExitCode -ne 0 -or $repeatScan.Text -cne $scan.Text) {
+      $failures.Add(
+        "$($repository.Name): repeated Inventory v1 scan was not byte-identical"
+      )
+      continue
+    }
+    foreach ($scanError in @($inventory.errors)) {
+      $failures.Add(
+        "$($repository.Name): scan $($scanError.stage) error at $($scanError.path): $($scanError.message)"
+      )
+    }
+    foreach ($skipped in @($inventory.skipped)) {
+      $failures.Add(
+        "$($repository.Name): scan skipped $($skipped.path): $($skipped.reason)"
+      )
     }
 
     foreach ($finding in $repositoryFindings) {
@@ -249,7 +272,7 @@ try {
         Kind = [string]$finding.kind
         Interpreter = [string]$finding.interpreter
         Locator = [string]$finding.locator
-        ContentHash = [string]$finding.content_hash
+        ContentHash = [string]$finding.content_digest
       }
       $findings.Add($record)
       if ($record.Kind -eq 'shell_file') {
@@ -284,8 +307,8 @@ try {
         content_hash = $file.ContentHash
         fully_non_residual = $false
         nodes = [ordered]@{
-          formal = 0
-          exhaustive = 0
+          native = 0
+          delegated = 0
           observations = 0
           residual = 0
         }
@@ -314,8 +337,8 @@ try {
         content_hash = $file.ContentHash
         fully_non_residual = $false
         nodes = [ordered]@{
-          formal = 0
-          exhaustive = 0
+          native = 0
+          delegated = 0
           observations = 0
           residual = 0
         }
@@ -337,8 +360,8 @@ try {
         content_hash = $file.ContentHash
         fully_non_residual = $false
         nodes = [ordered]@{
-          formal = 0
-          exhaustive = 0
+          native = 0
+          delegated = 0
           observations = 0
           residual = 0
         }
@@ -348,7 +371,31 @@ try {
       continue
     }
 
-    $evidencePath = Join-Path $caseRoot '.deshell/evidence.json'
+    $manifestPath = Join-Path $caseRoot '.deshell/manifest.json'
+    $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+    $manifestEntry = @(
+      $manifest.entries | Where-Object { $_.entrypoint -eq $file.Path }
+    )
+    if ($manifestEntry.Count -ne 1) {
+      $message = "$($file.Location): manifest has no unique active entry"
+      $failures.Add($message)
+      $results.Add([ordered]@{
+        location = $file.Location
+        interpreter = $file.Interpreter
+        content_hash = $file.ContentHash
+        fully_non_residual = $false
+        nodes = [ordered]@{
+          native = 0
+          delegated = 0
+          observations = 0
+          residual = 0
+        }
+        residual_reasons = @()
+        error = $message
+      })
+      continue
+    }
+    $evidencePath = Join-Path $caseRoot ([string]$manifestEntry[0].evidence_path)
     $evidence = Get-Content -LiteralPath $evidencePath -Raw | ConvertFrom-Json
     $levels = @($evidence.nodes | ForEach-Object { [string]$_.guarantee.level })
     $residualReasons = @(
@@ -356,14 +403,19 @@ try {
         Where-Object { $_.guarantee.level -eq 'residual' } |
         ForEach-Object { [string]$_.guarantee.reason }
     )
+    if ($residualReasons.Count -ne 0) {
+      $failures.Add(
+        "$($file.Location): residual nodes remain: $($residualReasons -join '; ')"
+      )
+    }
     $results.Add([ordered]@{
       location = $file.Location
       interpreter = $file.Interpreter
       content_hash = $file.ContentHash
       fully_non_residual = ($residualReasons.Count -eq 0)
       nodes = [ordered]@{
-        formal = @($levels | Where-Object { $_ -eq 'formal' }).Count
-        exhaustive = @($levels | Where-Object { $_ -eq 'exhaustive' }).Count
+        native = @($levels | Where-Object { $_ -eq 'native' }).Count
+        delegated = @($levels | Where-Object { $_ -eq 'delegated' }).Count
         observations = @($evidence.observations).Count
         residual = $residualReasons.Count
       }
@@ -389,6 +441,12 @@ finally {
   } else {
     throw "Refusing to remove unverified audit directory: $resolvedTemporaryRoot"
   }
+}
+
+if ($results.Count -ne $shellFiles.Count) {
+  $failures.Add(
+    "audit produced $($results.Count) file results for $($shellFiles.Count) shell files"
+  )
 }
 
 $sortedResults = @($results | Sort-Object { $_.location })
@@ -450,9 +508,9 @@ $inventoryGroups = @(
       @{ Expression = { $_.interpreter } }
 )
 
-$formal = ($successfulResults | ForEach-Object { $_.nodes.formal } |
+$native = ($successfulResults | ForEach-Object { $_.nodes.native } |
   Measure-Object -Sum).Sum
-$exhaustive = ($successfulResults | ForEach-Object { $_.nodes.exhaustive } |
+$delegated = ($successfulResults | ForEach-Object { $_.nodes.delegated } |
   Measure-Object -Sum).Sum
 $observations = ($successfulResults | ForEach-Object { $_.nodes.observations } |
   Measure-Object -Sum).Sum
@@ -486,8 +544,8 @@ $report = [ordered]@{
     analysis_failures = $failures.Count
     fully_non_residual = $fullyNonResidual.Count
     nodes = [ordered]@{
-      formal = [int]$formal
-      exhaustive = [int]$exhaustive
+      native = [int]$native
+      delegated = [int]$delegated
       observations = [int]$observations
       residual = [int]$residual
     }
@@ -537,15 +595,15 @@ if ($Format -eq 'Json') {
     )
   [Console]::Out.WriteLine($summaryLine)
   $nodesLine =
-    'nodes formal={0} exhaustive={1} observations={2} residual={3}' -f @(
-      $report.summary.nodes.formal,
-      $report.summary.nodes.exhaustive,
+    'nodes native={0} delegated={1} observations={2} residual={3}' -f @(
+      $report.summary.nodes.native,
+      $report.summary.nodes.delegated,
       $report.summary.nodes.observations,
       $report.summary.nodes.residual
     )
   [Console]::Out.WriteLine($nodesLine)
   foreach ($location in $report.fully_non_residual_files) {
-    [Console]::Out.WriteLine("formal file: $location")
+    [Console]::Out.WriteLine("classified file: $location")
   }
   foreach ($group in $report.residual_reason_groups) {
     $reasonLine = 'residual {0}x [{1}] {2}' -f @(

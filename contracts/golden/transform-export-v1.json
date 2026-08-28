@@ -17,30 +17,30 @@
   ],
   "exports": [
     {
-      "content_sha256": "2401bae642e6fc1e76e849062c3d3a25b513adb5c2ea599809b3091567136bbc",
+      "content_sha256": "e7873f6ab80dd7387cfa8c94ecd6e697f3b25f724bb9597f7274c6965c727653",
       "filename": "deshell.cwl",
       "media_type": "application/cwl+json",
       "name": "literal_cwl",
       "path": "build.zsh",
-      "source": "printf 'hello'\n",
+      "source": "/usr/bin/printf 'hello'\n",
       "target": "cwl"
     },
     {
-      "content_sha256": "772e2ca8d4577f9bdde4e0fa7b11035f7d3e02770aafd5150b12d675c021c4e8",
+      "content_sha256": "5f96fda80155fffe4e172d022581ee81d7c8c5c9c03b86d041ac4a35b3765fd8",
       "filename": "deshell.dagger.ts",
       "media_type": "text/typescript",
       "name": "literal_dagger",
       "path": "build.zsh",
-      "source": "printf 'hello'\n",
+      "source": "/usr/bin/printf 'hello'\n",
       "target": "dagger"
     },
     {
-      "content_sha256": "248f4721e94761f3c9e23372617a6692b444d3b232a98e50dd0cc1ed99fa093f",
+      "content_sha256": "befcf1f18289c0b18bbabc3778bc1150bd5ad10e63e514ec0e51b9c281d8b154",
       "filename": "deshell.nu",
       "media_type": "text/x-nushell",
       "name": "literal_nushell",
       "path": "build.zsh",
-      "source": "printf 'hello'\n",
+      "source": "/usr/bin/printf 'hello'\n",
       "target": "nu"
     }
   ],

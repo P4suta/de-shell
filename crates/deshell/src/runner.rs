@@ -13,9 +13,11 @@ pub(crate) struct ProcessRequest {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct CapsuleRequest {
+pub(crate) struct InterpreterRequest {
     pub interpreter: String,
+    pub interpreter_pin: String,
     pub source: Vec<u8>,
+    pub capabilities: Vec<String>,
     pub arguments: Vec<String>,
     pub environment: Vec<(String, String)>,
     pub stdin: Vec<u8>,
@@ -30,7 +32,23 @@ pub(crate) struct ProcessResult {
 
 pub(crate) trait Backend: Sync {
     fn execute(&self, request: ProcessRequest) -> Result<ProcessResult, String>;
-    fn execute_capsule(&self, request: CapsuleRequest) -> Result<ProcessResult, String>;
+    fn execute_pipeline(
+        &self,
+        requests: Vec<ProcessRequest>,
+    ) -> Result<Vec<ProcessResult>, String> {
+        let mut results = Vec::with_capacity(requests.len());
+        let mut stdin = Vec::new();
+        for (index, mut request) in requests.into_iter().enumerate() {
+            if index > 0 {
+                request.stdin = stdin;
+            }
+            let result = self.execute(request)?;
+            stdin = result.stdout.clone();
+            results.push(result);
+        }
+        Ok(results)
+    }
+    fn execute_interpreter(&self, request: InterpreterRequest) -> Result<ProcessResult, String>;
     fn read_file(&self, path: &str) -> Result<Vec<u8>, String>;
     fn write_file(&self, path: &str, contents: &[u8], append: bool) -> Result<(), String>;
     fn remove_file(&self, path: &str) -> Result<(), String>;
@@ -42,7 +60,7 @@ pub(crate) struct Policy {
     pub allow_file_read: bool,
     pub allow_file_write: bool,
     pub allow_network: bool,
-    pub allow_opaque: bool,
+    pub allow_delegation: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -60,12 +78,28 @@ pub(crate) struct RunError {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TraceEvent {
-    Process { argv: Vec<String>, exit_code: i32 },
-    FileRead { path: String },
-    FileWrite { path: String },
-    FileRemove { path: String },
-    Network { method: String, uri: String },
-    Opaque { interpreter: String, exit_code: i32 },
+    Process {
+        argv: Vec<String>,
+        exit_code: i32,
+    },
+    FileRead {
+        path: String,
+    },
+    FileWrite {
+        path: String,
+    },
+    FileRemove {
+        path: String,
+    },
+    Network {
+        method: String,
+        uri: String,
+    },
+    Delegated {
+        interpreter: String,
+        interpreter_pin: String,
+        exit_code: i32,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -76,6 +110,15 @@ pub(crate) struct RunResult {
     pub trace: Vec<TraceEvent>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct RunInputs<'a> {
+    pub host_environment: &'a BTreeMap<String, String>,
+    pub named_inputs: &'a BTreeMap<String, String>,
+    pub arguments: &'a [String],
+    pub stdin: &'a [u8],
+    pub default_working_directory: Option<&'a str>,
+}
+
 pub(crate) fn run_plan(
     backend: &dyn Backend,
     policy: Policy,
@@ -83,6 +126,26 @@ pub(crate) fn run_plan(
     host_environment: &BTreeMap<String, String>,
     named_inputs: &BTreeMap<String, String>,
     arguments: &[String],
+) -> Result<RunResult, RunError> {
+    run_plan_with_io(
+        backend,
+        policy,
+        plan,
+        RunInputs {
+            host_environment,
+            named_inputs,
+            arguments,
+            stdin: &[],
+            default_working_directory: None,
+        },
+    )
+}
+
+pub(crate) fn run_plan_with_io(
+    backend: &dyn Backend,
+    policy: Policy,
+    plan: &Plan,
+    inputs: RunInputs<'_>,
 ) -> Result<RunResult, RunError> {
     plan.validate()
         .map_err(|errors| invalid(errors.join("; ")))?;
@@ -95,10 +158,17 @@ pub(crate) fn run_plan(
         backend,
         policy,
         tasks,
-        host_environment,
-        script_arguments: arguments,
+        host_environment: inputs.host_environment,
+        script_arguments: inputs.arguments,
+        default_working_directory: inputs.default_working_directory,
     };
-    executor.run_task(&plan.entrypoint, named_inputs, arguments, &[])
+    executor.run_task(
+        &plan.entrypoint,
+        inputs.named_inputs,
+        inputs.arguments,
+        inputs.stdin.to_vec(),
+        &[],
+    )
 }
 
 #[derive(Clone)]
@@ -116,6 +186,7 @@ struct Executor<'a> {
     tasks: BTreeMap<&'a str, &'a Task>,
     host_environment: &'a BTreeMap<String, String>,
     script_arguments: &'a [String],
+    default_working_directory: Option<&'a str>,
 }
 
 impl Executor<'_> {
@@ -124,6 +195,7 @@ impl Executor<'_> {
         name: &str,
         provided: &BTreeMap<String, String>,
         positional: &[String],
+        stdin: Vec<u8>,
         stack: &[String],
     ) -> Result<RunResult, RunError> {
         if stack.iter().any(|item| item == name) {
@@ -188,7 +260,7 @@ impl Executor<'_> {
         };
         let mut next_stack = stack.to_vec();
         next_stack.push(name.to_owned());
-        self.run_node(&task.body, context, Vec::new(), &next_stack)
+        self.run_node(&task.body, context, stdin, &next_stack)
             .map(|(result, _)| result)
     }
 
@@ -218,6 +290,8 @@ impl Executor<'_> {
                     .as_ref()
                     .map(|value| evaluate(value, &context))
                     .transpose()?;
+                let working_directory =
+                    working_directory.or_else(|| self.default_working_directory.map(str::to_owned));
                 if let Some(directory) = &working_directory {
                     validate_runtime_path(directory)?;
                 }
@@ -248,7 +322,96 @@ impl Executor<'_> {
                     context,
                 ))
             }
-            Operation::Pipeline { nodes } => {
+            Operation::Pipeline { nodes, status } => {
+                if nodes
+                    .iter()
+                    .all(|child| matches!(child.operation, Operation::Exec { .. }))
+                {
+                    let mut requests = Vec::with_capacity(nodes.len());
+                    let mut trace_argv = Vec::with_capacity(nodes.len());
+                    for (index, child) in nodes.iter().enumerate() {
+                        let Operation::Exec {
+                            argv,
+                            environment,
+                            working_directory,
+                        } = &child.operation
+                        else {
+                            unreachable!("pipeline shape checked above")
+                        };
+                        let argv = evaluate_list(argv, &context)?;
+                        if argv.first().is_none_or(String::is_empty) {
+                            return Err(invalid("Exec executable must not be empty"));
+                        }
+                        let mut process_environment = context.process_environment.clone();
+                        for value in environment {
+                            process_environment
+                                .insert(value.name.clone(), evaluate(&value.value, &context)?);
+                        }
+                        let working_directory = working_directory
+                            .as_ref()
+                            .map(|value| evaluate(value, &context))
+                            .transpose()?;
+                        let working_directory = working_directory
+                            .or_else(|| self.default_working_directory.map(str::to_owned));
+                        if let Some(directory) = &working_directory {
+                            validate_runtime_path(directory)?;
+                        }
+                        trace_argv.push(
+                            argv.iter()
+                                .map(|value| redact(value, &context.secret_values))
+                                .collect::<Vec<_>>(),
+                        );
+                        requests.push(ProcessRequest {
+                            argv,
+                            environment: process_environment.into_iter().collect(),
+                            working_directory,
+                            stdin: if index == 0 {
+                                stdin.clone()
+                            } else {
+                                Vec::new()
+                            },
+                        });
+                    }
+                    let results = self
+                        .backend
+                        .execute_pipeline(requests)
+                        .map_err(|message| execution(redact(&message, &context.secret_values)))?;
+                    if results.len() != nodes.len() {
+                        return Err(execution("pipeline backend returned the wrong stage count"));
+                    }
+                    let mut stderr = Vec::new();
+                    let mut trace = Vec::new();
+                    let mut pipeline_exit = 0;
+                    let mut stdout = Vec::new();
+                    for (index, result) in results.into_iter().enumerate() {
+                        stderr.extend(result.stderr);
+                        if index + 1 == nodes.len() {
+                            stdout = result.stdout;
+                        }
+                        match status {
+                            crate::ir::PipelineStatus::Last if index + 1 == nodes.len() => {
+                                pipeline_exit = result.exit_code;
+                            }
+                            crate::ir::PipelineStatus::Pipefail if result.exit_code != 0 => {
+                                pipeline_exit = result.exit_code;
+                            }
+                            _ => {}
+                        }
+                        trace.push(TraceEvent::Process {
+                            argv: trace_argv[index].clone(),
+                            exit_code: result.exit_code,
+                        });
+                    }
+                    return Ok((
+                        RunResult {
+                            exit_code: pipeline_exit,
+                            stdout,
+                            stderr,
+                            trace,
+                        },
+                        context,
+                    ));
+                }
                 let mut input = stdin;
                 let mut stderr = Vec::new();
                 let mut trace = Vec::new();
@@ -260,7 +423,13 @@ impl Executor<'_> {
                     stdout = result.stdout;
                     stderr.extend(result.stderr);
                     trace.extend(result.trace);
-                    exit_code = result.exit_code;
+                    exit_code = match status {
+                        crate::ir::PipelineStatus::Last => result.exit_code,
+                        crate::ir::PipelineStatus::Pipefail if result.exit_code != 0 => {
+                            result.exit_code
+                        }
+                        crate::ir::PipelineStatus::Pipefail => exit_code,
+                    };
                 }
                 Ok((
                     RunResult {
@@ -379,7 +548,7 @@ impl Executor<'_> {
             }
             Operation::TaskCall { task, arguments } => {
                 let provided = evaluate_named(arguments, &context)?;
-                let result = self.run_task(task, &provided, &[], stack)?;
+                let result = self.run_task(task, &provided, &[], Vec::new(), stack)?;
                 Ok((result, context))
             }
             Operation::SetVariable {
@@ -514,40 +683,53 @@ impl Executor<'_> {
                     context,
                 ))
             }
-            Operation::OpaqueCapsule {
+            Operation::InterpreterCall {
                 interpreter,
+                interpreter_pin,
                 source,
+                capabilities,
                 ..
             } => {
-                if !self.policy.allow_opaque {
-                    return Err(policy("opaque capsule execution denied by policy"));
+                if !self.policy.allow_delegation {
+                    return Err(policy("pinned interpreter delegation denied by policy"));
                 }
-                if !matches!(node.guarantee, Guarantee::Residual { .. }) {
-                    return Err(invalid("opaque capsule lacks a residual guarantee"));
+                if !matches!(node.guarantee, Guarantee::Delegated { .. }) {
+                    return Err(invalid("interpreter call lacks a delegated guarantee"));
                 }
-                let source = source.to_bytes().map_err(invalid)?;
-                let request = CapsuleRequest {
-                    interpreter: interpreter.clone(),
-                    source,
-                    arguments: self.script_arguments.to_vec(),
-                    environment: context.process_environment.clone().into_iter().collect(),
-                    stdin,
-                };
                 let result = self
                     .backend
-                    .execute_capsule(request)
+                    .execute_interpreter(InterpreterRequest {
+                        interpreter: interpreter.clone(),
+                        interpreter_pin: interpreter_pin.clone(),
+                        source: source.to_bytes().map_err(invalid)?,
+                        capabilities: capabilities.clone(),
+                        arguments: self.script_arguments.to_vec(),
+                        environment: context.process_environment.clone().into_iter().collect(),
+                        stdin,
+                    })
                     .map_err(|message| execution(redact(&message, &context.secret_values)))?;
                 Ok((
                     RunResult {
                         exit_code: result.exit_code,
                         stdout: result.stdout,
                         stderr: result.stderr,
-                        trace: vec![TraceEvent::Opaque {
+                        trace: vec![TraceEvent::Delegated {
                             interpreter: interpreter.clone(),
+                            interpreter_pin: interpreter_pin.clone(),
                             exit_code: result.exit_code,
                         }],
                     },
                     context,
+                ))
+            }
+            Operation::OpaqueCapsule {
+                interpreter,
+                source,
+                ..
+            } => {
+                let _ = (interpreter, source, stdin);
+                Err(policy(
+                    "opaque capsule is residual-only and cannot be executed",
                 ))
             }
         }
@@ -582,9 +764,14 @@ impl Executor<'_> {
                         use std::sync::atomic::Ordering;
                         let index = next.fetch_add(1, Ordering::Relaxed);
                         let Some(node) = nodes.get(index) else { break };
-                        let result = self.run_node(node, context.clone(), stdin.clone(), stack);
-                        results.lock().expect("parallel result lock poisoned")[index] =
-                            Some(result);
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            self.run_node(node, context.clone(), stdin.clone(), stack)
+                        }))
+                        .unwrap_or_else(|_| Err(execution("parallel worker panicked")));
+                        let Ok(mut output) = results.lock() else {
+                            break;
+                        };
+                        output[index] = Some(result);
                     }
                 });
             }
@@ -717,27 +904,32 @@ fn bind_powershell_arguments(
             let (name, inline) = raw
                 .split_once(':')
                 .map_or((raw, None), |(name, value)| (name, Some(value)));
-            let candidates: Vec<_> = invocation
-                .parameters
-                .iter()
-                .filter(|parameter| {
-                    parameter
-                        .input
-                        .to_ascii_lowercase()
-                        .starts_with(&name.to_ascii_lowercase())
-                })
-                .collect();
-            let parameter = if let Some(exact) = candidates
-                .iter()
-                .find(|parameter| parameter.input.eq_ignore_ascii_case(name))
-            {
-                *exact
-            } else if candidates.len() == 1 {
-                candidates[0]
-            } else if candidates.is_empty() {
-                return Err(invalid(format!("unknown PowerShell parameter: -{name}")));
-            } else {
-                return Err(invalid(format!("ambiguous PowerShell parameter: -{name}")));
+            let mut prefix_match = None;
+            let mut ambiguous = false;
+            let mut exact = None;
+            for parameter in &invocation.parameters {
+                if parameter.input.eq_ignore_ascii_case(name) {
+                    exact = Some(parameter);
+                    break;
+                }
+                if parameter
+                    .input
+                    .get(..name.len())
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(name))
+                {
+                    ambiguous |= prefix_match.is_some();
+                    prefix_match.get_or_insert(parameter);
+                }
+            }
+            let parameter = match (exact, prefix_match, ambiguous) {
+                (Some(exact), _, _) => exact,
+                (None, Some(parameter), false) => parameter,
+                (None, None, _) => {
+                    return Err(invalid(format!("unknown PowerShell parameter: -{name}")));
+                }
+                (None, Some(_), true) => {
+                    return Err(invalid(format!("ambiguous PowerShell parameter: -{name}")));
+                }
             };
             let value = if parameter.is_switch {
                 inline.unwrap_or("true").to_owned()
@@ -909,7 +1101,7 @@ mod tests {
     #[derive(Default)]
     struct MockBackend {
         calls: Mutex<Vec<ProcessRequest>>,
-        capsule: Mutex<Vec<CapsuleRequest>>,
+        delegated: Mutex<Vec<InterpreterRequest>>,
     }
 
     impl Backend for MockBackend {
@@ -939,6 +1131,7 @@ mod tests {
                 [command] if command == "backend-secret-error" => {
                     Err("failed with super-secret-value".into())
                 }
+                [command] if command == "panic" => panic!("injected backend panic"),
                 _ => Ok(ProcessResult {
                     exit_code: 0,
                     stdout: request.stdin,
@@ -946,8 +1139,11 @@ mod tests {
                 }),
             }
         }
-        fn execute_capsule(&self, request: CapsuleRequest) -> Result<ProcessResult, String> {
-            self.capsule.lock().unwrap().push(request.clone());
+        fn execute_interpreter(
+            &self,
+            request: InterpreterRequest,
+        ) -> Result<ProcessResult, String> {
+            self.delegated.lock().unwrap().push(request.clone());
             Ok(ProcessResult {
                 exit_code: 0,
                 stdout: request.source,
@@ -972,8 +1168,8 @@ mod tests {
         Node {
             id: String::new(),
             operation,
-            guarantee: Guarantee::Formal {
-                basis: "runner-test-v1".into(),
+            guarantee: Guarantee::Native {
+                semantic_model: "runner-test-v1".into(),
             },
             source: None,
         }
@@ -1027,6 +1223,7 @@ mod tests {
         let backend = MockBackend::default();
         let pipeline = node(Operation::Pipeline {
             nodes: vec![exec(&["emit", "hello"]), exec(&["upper"])],
+            status: crate::ir::PipelineStatus::Last,
         });
         assert_eq!(run(&backend, pipeline).unwrap().stdout, b"HELLO");
         let sequence = node(Operation::Sequence {
@@ -1100,7 +1297,7 @@ mod tests {
     }
 
     #[test]
-    fn opaque_capsules_keep_original_bytes_and_arguments() {
+    fn opaque_capsules_are_residual_only_and_never_execute() {
         let backend = MockBackend::default();
         let source = vec![b'e', b'c', b'h', b'o', b' ', 0xff];
         let mut capsule = node(Operation::OpaqueCapsule {
@@ -1111,10 +1308,9 @@ mod tests {
         capsule.guarantee = Guarantee::Residual {
             reason: "non-UTF-8".into(),
         };
-        let result = run_plan(
+        let error = run_plan(
             &backend,
             Policy {
-                allow_opaque: true,
                 ..Policy::default()
             },
             &plan(capsule),
@@ -1122,11 +1318,9 @@ mod tests {
             &BTreeMap::new(),
             &["one".into()],
         )
-        .unwrap();
-        assert_eq!(result.stdout, source);
-        let requests = backend.capsule.lock().unwrap();
-        assert_eq!(requests[0].source, source);
-        assert_eq!(requests[0].arguments, ["one"]);
+        .unwrap_err();
+        assert_eq!(error.kind, RunErrorKind::Policy);
+        assert!(error.message.contains("residual-only"));
     }
 
     #[test]
@@ -1172,5 +1366,16 @@ mod tests {
             ],
         });
         assert_eq!(run(&backend, body).unwrap().stdout, b"abc");
+    }
+
+    #[test]
+    fn parallel_worker_panics_become_execution_errors() {
+        let backend = MockBackend::default();
+        let body = node(Operation::Parallel {
+            nodes: vec![exec(&["panic"]), exec(&["emit", "after"])],
+        });
+        let error = run(&backend, body).unwrap_err();
+        assert_eq!(error.kind, RunErrorKind::Execution);
+        assert!(error.message.contains("parallel worker panicked"));
     }
 }
