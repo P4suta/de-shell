@@ -1,0 +1,113 @@
+{
+  "$id": "https://deshell.dev/contracts/migration-plan/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "blockers": { "items": { "$ref": "#/$defs/blocker" }, "type": "array" },
+    "coverage": {
+      "additionalProperties": false,
+      "properties": {
+        "delegated_bytes": { "minimum": 0, "type": "integer" },
+        "native_bytes": { "minimum": 0, "type": "integer" },
+        "residual_bytes": { "minimum": 0, "type": "integer" },
+        "total_bytes": { "minimum": 0, "type": "integer" },
+        "trivia_bytes": { "minimum": 0, "type": "integer" }
+      },
+      "required": ["total_bytes", "native_bytes", "delegated_bytes", "residual_bytes", "trivia_bytes"],
+      "type": "object"
+    },
+    "inventory_digest": { "$ref": "#/$defs/digest" },
+    "kind": { "const": "migration" },
+    "network_replay_digest": { "oneOf": [{ "$ref": "#/$defs/digest" }, { "type": "null" }] },
+    "plan_digest": { "$ref": "#/$defs/digest" },
+    "proposals": { "items": { "$ref": "#/$defs/digest" }, "type": "array", "uniqueItems": true },
+    "required_cells": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "id": { "minLength": 1, "type": "string" },
+          "platform_fingerprint": { "$ref": "#/$defs/digest" },
+          "runtime_fingerprint": { "$ref": "#/$defs/digest" }
+        },
+        "required": ["id", "platform_fingerprint", "runtime_fingerprint"],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "required_scenarios": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "digest": { "$ref": "#/$defs/digest" },
+          "name": { "minLength": 1, "type": "string" }
+        },
+        "required": ["name", "digest"],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "schema_version": { "const": 1 },
+    "sources": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "content_digest": { "$ref": "#/$defs/digest" },
+          "interpreter": { "enum": ["sh", "bash", "zsh", "fish", "powershell", "cmd", "nu"] },
+          "ir_digest": { "$ref": "#/$defs/digest" },
+          "kind": { "enum": ["shell_file", "embedded_shell"] },
+          "location": { "$ref": "#/$defs/location" },
+          "proposal_digest": { "oneOf": [{ "$ref": "#/$defs/digest" }, { "type": "null" }] }
+        },
+        "required": ["location", "kind", "interpreter", "content_digest", "ir_digest", "proposal_digest"],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "validation_commands": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "argv": { "$ref": "#/$defs/exactArgv" },
+          "kind": { "enum": ["build", "test"] },
+          "name": { "minLength": 1, "type": "string" }
+        },
+        "required": ["name", "kind", "argv"],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "validation_limits": { "$ref": "#/$defs/resourceLimits" }
+  },
+  "required": ["schema_version", "kind", "plan_digest", "inventory_digest", "sources", "proposals", "required_scenarios", "required_cells", "validation_commands", "validation_limits", "network_replay_digest", "coverage", "blockers"],
+  "title": "de-shell Migration Plan v1",
+  "type": "object",
+  "$defs": {
+    "blocker": {
+      "additionalProperties": false,
+      "properties": { "code": { "pattern": "^DESHELL_BLOCKER_[A-Z0-9_]+$", "type": "string" }, "location": { "oneOf": [{ "$ref": "#/$defs/location" }, { "type": "null" }] }, "message": { "minLength": 1, "type": "string" } },
+      "required": ["code", "message", "location"],
+      "type": "object"
+    },
+    "digest": { "pattern": "^[0-9a-f]{64}$", "type": "string" },
+    "exactArgv": { "items": { "type": "string" }, "minItems": 1, "type": "array" },
+    "location": {
+      "additionalProperties": false,
+      "properties": { "end_byte": { "minimum": 0, "type": "integer" }, "path": { "$ref": "#/$defs/path" }, "start_byte": { "minimum": 0, "type": "integer" } },
+      "required": ["path", "start_byte", "end_byte"],
+      "type": "object"
+    },
+    "resourceLimits": {
+      "additionalProperties": false,
+      "properties": {
+        "memory_bytes": { "maximum": 1099511627776, "minimum": 16777216, "type": "integer" },
+        "processes": { "maximum": 65535, "minimum": 1, "type": "integer" },
+        "stderr_bytes": { "maximum": 1073741824, "minimum": 1, "type": "integer" },
+        "stdout_bytes": { "maximum": 1073741824, "minimum": 1, "type": "integer" },
+        "timeout_ms": { "maximum": 86400000, "minimum": 1, "type": "integer" }
+      },
+      "required": ["timeout_ms", "memory_bytes", "processes", "stdout_bytes", "stderr_bytes"],
+      "type": "object"
+    },
+    "path": { "pattern": "^(?!/)(?!\\.{1,2}(?:/|$))(?!.*//)(?!.*\\/\\.{1,2}(?:/|$))(?!.*\\/$)[^\\\\:\\u0000]+$", "type": "string" }
+  }
+}

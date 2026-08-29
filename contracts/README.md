@@ -19,8 +19,23 @@ Bundle exports contain a `bundle-manifest.json` conforming to
 They retain every active manifest entry, identify the selected entrypoint, and
 archive runtime assets at the exact project-relative paths named by the lock.
 
-The contract starts at v1. There is no published pre-v1 Effect IR and no
-migration contract.
+The migration oracle is a development and CI tool, not a production runtime or
+a replacement DSL. It lowers shell locations into Effect IR v1 and asks a
+digest-pinned generator for ordinary project-native code. The generator sees a
+minimal Migration Request v1 and returns a Proposal v1; it cannot delete the
+source, write the archive, or mutate the live workspace. `migrate plan` binds
+all requests and proposals into a content-addressed Migration Plan v1.
+
+Migration Evidence v1 independently compares the original source, native IR,
+and replacement for every approved scenario and platform cell. Only the core
+can atomically apply a complete plan, archive retired bytes under an
+Archive Manifest v1, and remove the live shell. Audit Finding v1 is the shared
+finding shape for human, JSONL, SARIF, and GitHub annotation output. Intentional
+semantic changes use the separate Harden Plan, Harden Approval, and Harden
+Evidence v1 series and are never accepted as migration equivalence.
+
+The contract starts at v1. There is no published pre-v1 Effect IR or migration
+format, and pre-release local project formats are not migration inputs.
 
 `golden/frontend-v1.json` is shared by the Rust implementation and the
 unpublished OCaml reference for lowering, guarantees, node IDs, and canonical

@@ -1,0 +1,18 @@
+{
+  "$id": "https://deshell.dev/contracts/harden-approval/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "approval": { "enum": ["draft", "approved"] },
+    "owner": { "oneOf": [{ "minLength": 1, "type": "string" }, { "type": "null" }] },
+    "plan_digest": { "$ref": "#/$defs/digest" },
+    "reason": { "oneOf": [{ "minLength": 1, "type": "string" }, { "type": "null" }] },
+    "schema_version": { "const": 1 }
+  },
+  "required": ["schema_version", "plan_digest", "approval", "owner", "reason"],
+  "title": "de-shell Harden Approval v1",
+  "type": "object",
+  "$defs": {
+    "digest": { "pattern": "^[0-9a-f]{64}$", "type": "string" }
+  }
+}

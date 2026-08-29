@@ -411,6 +411,21 @@ fn executable(_metadata: &std::fs::Metadata) -> bool {
 mod tests {
     use super::*;
 
+    fn fixture(path: &str, contents: crate::config::BinaryData) -> Fixture {
+        Fixture {
+            path: path.into(),
+            contents,
+            executable: false,
+        }
+    }
+
+    fn snapshot_error(root: &Path) -> String {
+        match private_snapshot(root) {
+            Ok(_) => panic!("snapshot unexpectedly accepted {}", root.display()),
+            Err(error) => error,
+        }
+    }
+
     #[test]
     fn fixtures_are_project_relative_unique_and_preserve_executable_intent() {
         let directory = tempfile::tempdir().unwrap();
@@ -560,5 +575,184 @@ mod tests {
             }];
             assert!(validate_expected(directory.path(), &through_parent).is_err());
         }
+    }
+
+    #[test]
+    fn private_snapshot_is_independent_and_excludes_git_metadata() {
+        let source = tempfile::tempdir().unwrap();
+        std::fs::create_dir(source.path().join("nested")).unwrap();
+        std::fs::create_dir(source.path().join(".git")).unwrap();
+        std::fs::write(source.path().join("nested/value"), b"before").unwrap();
+        std::fs::write(source.path().join(".git/config"), b"secret").unwrap();
+
+        let snapshot = private_snapshot(source.path()).unwrap();
+        assert_eq!(
+            std::fs::read(snapshot.path().join("nested/value")).unwrap(),
+            b"before"
+        );
+        assert!(!snapshot.path().join(".git").exists());
+        std::fs::write(source.path().join("nested/value"), b"after").unwrap();
+        assert_eq!(
+            std::fs::read(snapshot.path().join("nested/value")).unwrap(),
+            b"before"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshots_and_capture_reject_symlinks_non_regular_and_non_utf8_entries() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let source = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("missing", source.path().join("link")).unwrap();
+        assert!(snapshot_error(source.path()).contains("symlink"));
+        assert!(capture(source.path()).unwrap_err().contains("symlink"));
+        std::fs::remove_file(source.path().join("link")).unwrap();
+
+        let fifo = source.path().join("fifo");
+        let fifo_bytes = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_bytes.as_ptr(), 0o600) }, 0);
+        assert!(snapshot_error(source.path()).contains("non-regular"));
+        assert!(capture(source.path()).unwrap_err().contains("non-regular"));
+        std::fs::remove_file(&fifo).unwrap();
+
+        let invalid = std::ffi::OsString::from_vec(vec![b'b', b'a', b'd', 0xff]);
+        std::fs::write(source.path().join(invalid), b"bytes").unwrap();
+        assert!(
+            capture(source.path())
+                .unwrap_err()
+                .contains("not valid UTF-8")
+        );
+    }
+
+    #[test]
+    fn materialize_rejects_invalid_duplicate_prefix_and_existing_shapes_atomically() {
+        let root = tempfile::tempdir().unwrap();
+        let invalid_binary = crate::config::BinaryData {
+            utf8: Some("one".into()),
+            base64: Some("b25l".into()),
+        };
+        assert!(materialize(root.path(), &[fixture("../outside", "x".into())]).is_err());
+        assert!(
+            materialize(
+                root.path(),
+                &[fixture("same", "one".into()), fixture("same", "two".into())]
+            )
+            .unwrap_err()
+            .contains("duplicate fixture")
+        );
+        assert!(
+            materialize(
+                root.path(),
+                &[
+                    fixture("prefix", "one".into()),
+                    fixture("prefix/child", "two".into())
+                ]
+            )
+            .unwrap_err()
+            .contains("both a file and a directory prefix")
+        );
+        std::fs::write(root.path().join("parent"), b"file").unwrap();
+        assert!(
+            materialize(root.path(), &[fixture("parent/child", "value".into())])
+                .unwrap_err()
+                .contains("parent is not a regular directory")
+        );
+        assert!(materialize(root.path(), &[fixture("invalid", invalid_binary)]).is_err());
+        assert!(!root.path().join("invalid").exists());
+    }
+
+    #[test]
+    fn expected_file_validation_aggregates_path_digest_kind_and_content_errors() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("directory")).unwrap();
+        std::fs::write(root.path().join("value"), b"actual").unwrap();
+        let good_digest = crate::digest::sha256(b"actual");
+        let errors = validate_expected(
+            root.path(),
+            &[
+                ExpectedFile {
+                    path: "../outside".into(),
+                    sha256: good_digest.clone(),
+                },
+                ExpectedFile {
+                    path: "value".into(),
+                    sha256: "bad".into(),
+                },
+                ExpectedFile {
+                    path: "value".into(),
+                    sha256: good_digest.clone(),
+                },
+                ExpectedFile {
+                    path: "missing".into(),
+                    sha256: good_digest.clone(),
+                },
+                ExpectedFile {
+                    path: "directory".into(),
+                    sha256: good_digest.clone(),
+                },
+                ExpectedFile {
+                    path: "value/more".into(),
+                    sha256: good_digest.clone(),
+                },
+                ExpectedFile {
+                    path: "wrong".into(),
+                    sha256: good_digest.clone(),
+                },
+            ],
+        )
+        .unwrap_err()
+        .join("; ");
+        for expected in [
+            "path is not normalized",
+            "digest is invalid",
+            "duplicate expected file",
+            "cannot inspect expected file",
+            "symlink or non-regular component",
+        ] {
+            assert!(
+                errors.contains(expected),
+                "missing {expected:?} in {errors}"
+            );
+        }
+
+        let mismatch = validate_expected(
+            root.path(),
+            &[ExpectedFile {
+                path: "value".into(),
+                sha256: crate::digest::sha256(b"different"),
+            }],
+        )
+        .unwrap_err()
+        .join("; ");
+        assert!(mismatch.contains("digest mismatch"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_root_must_be_an_existing_non_symlink_directory() {
+        let parent = tempfile::tempdir().unwrap();
+        let missing = parent.path().join("missing");
+        assert!(capture(&missing).unwrap_err().contains("cannot inspect"));
+        let file = parent.path().join("file");
+        std::fs::write(&file, b"file").unwrap();
+        assert!(
+            capture(&file)
+                .unwrap_err()
+                .contains("not a regular directory")
+        );
+        let link = parent.path().join("link");
+        std::os::unix::fs::symlink(parent.path(), &link).unwrap();
+        assert!(
+            capture(&link)
+                .unwrap_err()
+                .contains("not a regular directory")
+        );
+        assert!(
+            validate_expected(&link, &[])
+                .unwrap_err()
+                .join("; ")
+                .contains("not a regular")
+        );
     }
 }

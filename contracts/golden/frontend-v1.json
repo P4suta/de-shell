@@ -49,7 +49,7 @@
       "native": 1,
       "name": "cmd",
       "path": "build.cmd",
-      "plan_digest": "2a39176bcc269265e3a3d48e630b46ef6d299733ff1bce8ca9a42af7d62bfc4e",
+      "plan_digest": "516ff0fdc4047ea1e2a5bea34db15364717652b4745242f39f46a3ee6c27d074",
       "residual": 0,
       "root_operation": "exec",
       "source_base64": null,
@@ -98,6 +98,17 @@
       "root_operation": "sequence",
       "source_base64": null,
       "source_utf8": "VALUE=9223372036854775807\n/usr/bin/printf '%s' \"$VALUE\"\n"
+    },
+    {
+      "delegated": 0,
+      "native": 3,
+      "name": "pipeline",
+      "path": "pipeline.sh",
+      "plan_digest": "65b4140602ce11fc0052adb5ba94537a71b71fa245cda4aa62bbc2a4132c57b4",
+      "residual": 0,
+      "root_operation": "pipeline",
+      "source_base64": null,
+      "source_utf8": "/usr/bin/printf hello | /usr/bin/tr a-z A-Z\n"
     }
   ],
   "schema_version": 1

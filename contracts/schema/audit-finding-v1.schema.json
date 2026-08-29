@@ -1,0 +1,37 @@
+{
+  "$id": "https://deshell.dev/contracts/audit-finding/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "acknowledged": { "type": "boolean" },
+    "category": { "enum": ["injection", "supply_chain", "filesystem", "secret", "race", "status", "nondeterminism", "interpreter", "portability"] },
+    "confidence": { "enum": ["low", "medium", "high"] },
+    "location_digest": { "$ref": "#/$defs/digest" },
+    "message": { "minLength": 1, "type": "string" },
+    "path": { "$ref": "#/$defs/path" },
+    "rule_id": { "pattern": "^[a-z0-9_.-]+$", "type": "string" },
+    "schema_version": { "const": 1 },
+    "severity": { "enum": ["note", "low", "medium", "high", "critical"] },
+    "span": {
+      "additionalProperties": false,
+      "properties": {
+        "end_byte": { "minimum": 0, "type": "integer" },
+        "end_column": { "minimum": 0, "type": "integer" },
+        "end_line": { "minimum": 1, "type": "integer" },
+        "start_byte": { "minimum": 0, "type": "integer" },
+        "start_column": { "minimum": 0, "type": "integer" },
+        "start_line": { "minimum": 1, "type": "integer" }
+      },
+      "required": ["start_line", "start_column", "end_line", "end_column", "start_byte", "end_byte"],
+      "type": "object"
+    },
+    "url": { "format": "uri", "type": "string" }
+  },
+  "required": ["schema_version", "rule_id", "category", "severity", "confidence", "message", "url", "path", "span", "location_digest", "acknowledged"],
+  "title": "de-shell Audit Finding v1",
+  "type": "object",
+  "$defs": {
+    "digest": { "pattern": "^[0-9a-f]{64}$", "type": "string" },
+    "path": { "pattern": "^(?!/)(?!\\.{1,2}(?:/|$))(?!.*//)(?!.*\\/\\.{1,2}(?:/|$))(?!.*\\/$)[^\\\\:\\u0000]+$", "type": "string" }
+  }
+}

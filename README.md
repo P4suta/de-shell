@@ -3,11 +3,12 @@
 [![CI](https://github.com/P4suta/de-shell/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/P4suta/de-shell/actions/workflows/ci.yml)
 [![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/P4suta/de-shell/badge)](https://securityscorecards.dev/viewer/?uri=github.com/P4suta/de-shell)
 
-`de-shell` is a Rust behavioral compiler for shell automation. It inventories
-shell entrypoints and embedded shell, lowers the behavior it can prove into
-Effect IR v1, and delegates recognized-but-unlowered source losslessly to an
-interpreter identity pinned by `deshell.lock`. Unrecognized source remains a
-non-executable residual.
+`de-shell` is a Rust shell-retirement migration oracle. It inventories standalone
+and embedded shell, lowers only the behavior it can prove into Effect IR v1,
+obtains ordinary project-native replacement proposals, and independently
+compares the original, IR, and replacement before an atomic retirement. It is
+not a production runtime or a new automation DSL, and generated code has no
+de-shell runtime dependency.
 
 The first public product is the single `deshell` executable at version 0.1.0.
 Its supported interfaces are the CLI, generated files, the JSON Schemas under
@@ -24,6 +25,12 @@ the 48-repository audit has already been published or rerun.
 
 Implemented behavior includes:
 
+- repository-wide `audit`, scenario synthesis, content-addressed migration
+  plans, matrix-keyed Evidence import, atomic apply, archive integrity, status,
+  a shell-free CI gate, and a separate hardening approval/evidence series;
+- official Rust, Go, and structured-host generators plus a digest-pinned,
+  bounded JSON-RPC generator bridge. Generators may propose create/update
+  patches and exact argv, but only core may archive or delete a live source;
 - Git-aware, byte-safe, bounded-worker Inventory v1 scanning of shell files and
   conservative host-format-specific embedded shell candidates. Unrelated data
   and binary files remain outside that inventory scope; read, size, encoding,
@@ -90,7 +97,7 @@ The main tasks are:
 | `mise run test:security` | Traversal, duplicate-key, protocol, replay, and transaction regressions |
 | `mise run test:supply-chain` | RustSec advisory, license, duplicate-dependency, and source-policy checks |
 | `mise run test:schema-validator` | Independent meta-schema and generated-document validation |
-| `mise run coverage` | LLVM line coverage with the measured 74% regression floor |
+| `mise run coverage` | LLVM line coverage with the v0.1 90% release floor |
 | `mise run lint` | Clippy, repository guardrails, and workflow validation |
 | `mise run performance` | Record fixed-corpus scan, simple local run, and release binary metrics as JSON |
 | `mise run package` | Verify the crates.io payload |
@@ -120,28 +127,31 @@ The report is recording evidence only. The task has no time-based CI failure
 threshold and does not complete the separate release-runner regression gate in
 the roadmap.
 
-## First project
+## First retirement
 
 ```console
 mise run deshell -- init --entry scripts/build.sh
-mise run deshell -- scan --format json
-mise run deshell -- analyze
-mise run deshell -- check
-mise run deshell -- doctor
-mise run deshell -- observe --entry scripts/build.sh
-mise run deshell -- verify
-mise run deshell -- rewrite --equivalent --entry scripts/build.sh
-mise run deshell -- modernize --profile secure
-mise run deshell -- run --entry scripts/build.sh -- --original-script-argument
-mise run deshell -- export --entry scripts/build.sh --target cwl --mode strict
-mise run deshell -- schema effect-ir
+mise run deshell -- audit --format human
+mise run deshell -- scenario synthesize
+# Review the draft, fill its boundaries, then set approval = "approved".
+mise run deshell -- migrate plan
+mise run deshell -- migrate verify --plan PLAN_DIGEST --cell CELL --output evidence.json
+mise run deshell -- migrate evidence import --plan PLAN_DIGEST evidence.json
+mise run deshell -- migrate apply --plan PLAN_DIGEST
+mise run deshell -- migrate status --format human
+mise run deshell -- verify --require shell-free
 ```
 
-Commands that can alter source default to a preview and require `--apply`.
-Rewrite and modernization previews write only a three-line-context unified diff
-to stdout; modernization review findings are versioned diagnostics on stderr.
-Project files are fresh v1 contracts; 0.1.0 intentionally provides no legacy IR
-or lock migration path.
+Scenario synthesis and migration planning are preview-first. A scenario is not
+retirement evidence until a human changes it to `approval = "approved"`.
+Start a repository proposal with `deshell migrate plan`; after retirement, CI
+must keep `deshell verify --require shell-free` enabled.
+`migrate apply` has no partial mode: one blocker, missing cell, stale digest,
+difference, nondeterminism, delegated/residual byte, validation failure, or
+remaining shell candidate refuses the whole repository transaction. Intentional
+behavior changes use `deshell harden`, never migration equivalence. Project
+files are fresh v1 contracts; 0.1.0 intentionally provides no legacy project,
+IR, or lock migration path.
 
 `deshell init` creates:
 
@@ -150,7 +160,7 @@ or lock migration path.
 - `.deshell/manifest.json`, initially containing no analyzed entries;
 - `deshell.lock`, containing protocol, interpreter, and provider pins.
 
-`deshell analyze` writes immutable plan/evidence pairs below
+The lower-level `deshell analyze` command writes immutable plan/evidence pairs below
 `.deshell/artifacts/<source-sha256>/<plan-sha256>/` and atomically updates the
 manifest. Reanalysis never overwrites Evidence for older content. Name/value
 arrays reject duplicates, paths are normalized project-relative paths, and
@@ -189,6 +199,10 @@ Once `run` starts the selected plan, it returns the plan's exit code unchanged.
 
 ## Runtime boundary
 
+After retirement, de-shell remains a development/CI dependency only, to reject
+shell reintroduction and archive/Evidence tampering. It is not linked into or
+invoked by the generated production program.
+
 `run` defaults to a private snapshot in a disposable provider. Missing provider
 features, an unconfigured image, or a pin mismatch fail with code 6. The local
 backend is not an operating-system sandbox: it starts host processes with exact
@@ -225,7 +239,12 @@ The release workflow defines six archives: Linux musl, macOS, and Windows for
 x86_64 and Arm64. It generates a CycloneDX SBOM, SHA-256 checksums covering the
 SBOM and archives, a keyless signature bundle, and build provenance, and
 publishes to crates.io only for the final `v0.1.0` tag in the protected release
-environment.
+environment. CI and release candidates enforce at least 90% measured line
+coverage. The final tag additionally checks at least 90% in scanner, frontend,
+runner, protocol, lab, and patch, and blocks publication unless the full
+retirement workflow succeeds with both official Rust and Go generators for
+POSIX sh, Bash, zsh, fish, PowerShell, cmd, and Nushell. A candidate passing
+does not authorize publication.
 
 The safe corpus auditor never executes source scripts. It inventories source,
 rechecks each content digest, and analyzes isolated temporary copies. Its

@@ -35,7 +35,7 @@ description = "Lint Rust, repository metadata, and GitHub Actions"
 run = [
   "cargo clippy --locked --workspace --all-targets -- -D warnings",
   "mise run repository:guardrails",
-  "actionlint .github/workflows/ci.yml .github/workflows/release.yml .github/workflows/dependency-review.yml .github/workflows/scorecard.yml",
+  "actionlint .github/workflows/ci.yml .github/workflows/release.yml .github/workflows/nightly.yml .github/workflows/dependency-review.yml .github/workflows/scorecard.yml",
 ]
 
 [tasks."repository:guardrails"]
@@ -106,16 +106,16 @@ depends = ["build"]
 run = "python3 scripts/validate-json-contracts.py target/debug/deshell"
 
 [tasks.coverage]
-description = "Measure line coverage and enforce the checked-in 74 percent regression floor"
+description = "Measure line coverage and enforce the v0.1 90 percent release floor"
 run = [
   "rustup component add llvm-tools-preview",
-  "cargo llvm-cov --locked --workspace --all-targets --summary-only --fail-under-lines 74",
+  "cargo llvm-cov --locked --workspace --all-targets --summary-only --fail-under-lines 90 -- --test-threads=1",
 ]
 
 [tasks.test]
 description = "Run the complete test suite"
 run = [
-  "cargo test --locked --workspace",
+  "cargo test --locked --workspace -- --test-threads=1",
   "cargo build --locked -p deshell",
   "cargo run --locked -p xtask -- conformance target/debug/deshell",
 ]
@@ -129,7 +129,7 @@ run = [
 
 [tasks.package]
 description = "Build and verify the crates.io package payload"
-run = "cargo package --locked"
+run = "cargo package --locked --target-dir target/package-build"
 
 [tasks.fmt]
 description = "Format the Rust implementation"

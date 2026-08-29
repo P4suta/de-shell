@@ -12,6 +12,19 @@ pub(crate) struct Proposal {
     pub expected: Expectation,
     pub replacement: Vec<u8>,
     pub permissions: u32,
+    mutation: Mutation,
+}
+
+impl Proposal {
+    pub(crate) fn deletes(&self) -> bool {
+        self.mutation == Mutation::Delete
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Mutation {
+    Write,
+    Delete,
 }
 
 pub(crate) fn prepare(_path: &Path, _replacement: Vec<u8>) -> Result<Proposal, String> {
@@ -31,6 +44,7 @@ pub(crate) fn prepare(_path: &Path, _replacement: Vec<u8>) -> Result<Proposal, S
         expected: Expectation::Existing(crate::digest::sha256(&contents)),
         replacement: _replacement,
         permissions: file_permissions(&metadata),
+        mutation: Mutation::Write,
     })
 }
 
@@ -65,6 +79,7 @@ pub(crate) fn prepare_expected(
         expected: Expectation::Existing(expected_digest.into()),
         replacement,
         permissions: file_permissions(&metadata),
+        mutation: Mutation::Write,
     })
 }
 
@@ -100,6 +115,28 @@ pub(crate) fn prepare_create(
         expected: Expectation::Missing,
         replacement: _replacement,
         permissions: _permissions,
+        mutation: Mutation::Write,
+    })
+}
+
+pub(crate) fn prepare_delete(path: &Path) -> Result<Proposal, String> {
+    let metadata = path
+        .symlink_metadata()
+        .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(format!(
+            "delete target is not a regular non-symlink file: {}",
+            path.display()
+        ));
+    }
+    let contents =
+        std::fs::read(path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    Ok(Proposal {
+        path: path.to_path_buf(),
+        expected: Expectation::Existing(crate::digest::sha256(&contents)),
+        replacement: Vec::new(),
+        permissions: file_permissions(&metadata),
+        mutation: Mutation::Delete,
     })
 }
 
@@ -114,6 +151,10 @@ fn apply_all_inner(
     let validated = validate_all(proposals)?;
     let mut staged = Vec::with_capacity(validated.len());
     for item in &validated {
+        if item.proposal.mutation == Mutation::Delete {
+            staged.push(None);
+            continue;
+        }
         let parent = item
             .canonical
             .parent()
@@ -137,7 +178,7 @@ fn apply_all_inner(
                 item.canonical.display()
             )
         })?;
-        staged.push(temporary);
+        staged.push(Some(temporary));
     }
     // Revalidate the complete read set after all writes are staged. No target
     // has been changed at this point.
@@ -179,18 +220,27 @@ fn apply_all_inner(
     }
 
     let mut committed = Vec::new();
+    let mut commit_count = 0;
     for (item, temporary) in validated.iter().zip(staged) {
-        let mut commit_error = match temporary.persist(&item.canonical) {
-            Ok(_) => {
-                committed.push((
-                    item.canonical.clone(),
-                    crate::digest::sha256(&item.proposal.replacement),
-                ));
-                sync_parent(&item.canonical).err()
+        let mut commit_error = if item.proposal.mutation == Mutation::Delete {
+            sync_parent(&item.canonical).err()
+        } else {
+            match temporary
+                .expect("write mutation has a staged file")
+                .persist(&item.canonical)
+            {
+                Ok(_) => {
+                    committed.push((
+                        item.canonical.clone(),
+                        crate::digest::sha256(&item.proposal.replacement),
+                    ));
+                    sync_parent(&item.canonical).err()
+                }
+                Err(error) => Some(format!("{}", error.error)),
             }
-            Err(error) => Some(format!("{}", error.error)),
         };
-        if commit_error.is_none() && fail_after_commits == Some(committed.len()) {
+        commit_count += usize::from(commit_error.is_none());
+        if commit_error.is_none() && fail_after_commits == Some(commit_count) {
             commit_error = Some("injected commit failure".into());
         }
         if let Some(error) = commit_error {
@@ -238,6 +288,12 @@ fn validate_all(proposals: &[Proposal]) -> Result<Vec<Validated>, String> {
 }
 
 fn validate_proposal(proposal: &Proposal) -> Result<PathBuf, String> {
+    if proposal.mutation == Mutation::Delete
+        && (!matches!(proposal.expected, Expectation::Existing(_))
+            || !proposal.replacement.is_empty())
+    {
+        return Err("delete proposal must target existing content and have no replacement".into());
+    }
     match &proposal.expected {
         Expectation::Existing(expected) => {
             let metadata = proposal
@@ -463,6 +519,32 @@ mod tests {
     }
 
     #[test]
+    fn delete_participates_in_the_same_transaction_and_is_rollback_safe() {
+        let temporary = tempfile::tempdir().unwrap();
+        let removed = temporary.path().join("removed.txt");
+        let created = temporary.path().join("created.txt");
+        fs::write(&removed, b"archive me").unwrap();
+        let proposals = [
+            prepare_delete(&removed).unwrap(),
+            prepare_create(&created, b"replacement".to_vec(), 0o644).unwrap(),
+        ];
+        apply_all(&proposals).unwrap();
+        assert!(!removed.exists());
+        assert_eq!(fs::read(&created).unwrap(), b"replacement");
+
+        let rollback_source = temporary.path().join("rollback.txt");
+        let rollback_create = temporary.path().join("rollback-created.txt");
+        fs::write(&rollback_source, b"must survive").unwrap();
+        let rollback = [
+            prepare_delete(&rollback_source).unwrap(),
+            prepare_create(&rollback_create, b"temporary".to_vec(), 0o644).unwrap(),
+        ];
+        assert!(apply_all_inner(&rollback, Some(1)).is_err());
+        assert_eq!(fs::read(&rollback_source).unwrap(), b"must survive");
+        assert!(!rollback_create.exists());
+    }
+
+    #[test]
     fn injected_commit_failure_restores_the_complete_write_set() {
         let temporary = tempfile::tempdir().unwrap();
         let existing = temporary.path().join("existing.txt");
@@ -548,6 +630,202 @@ mod tests {
             let link = temporary.path().join("link.txt");
             std::os::unix::fs::symlink(&path, &link).unwrap();
             assert!(prepare(&link, b"bad".to_vec()).is_err());
+        }
+    }
+
+    #[test]
+    fn preparation_rejects_missing_non_regular_and_stale_targets() {
+        let temporary = tempfile::tempdir().unwrap();
+        let missing = temporary.path().join("missing.txt");
+        let directory = temporary.path().join("directory");
+        fs::create_dir(&directory).unwrap();
+        assert!(prepare(&missing, vec![]).is_err());
+        assert!(prepare(&directory, vec![]).is_err());
+        assert!(prepare_delete(&missing).is_err());
+        assert!(prepare_delete(&directory).is_err());
+        assert!(prepare_expected(&missing, "not-a-digest", vec![]).is_err());
+
+        let file = temporary.path().join("file.txt");
+        fs::write(&file, b"current").unwrap();
+        assert!(
+            prepare_expected(&file, &crate::digest::sha256(b"stale"), vec![])
+                .unwrap_err()
+                .contains("content hash mismatch")
+        );
+        assert!(prepare_expected(&directory, &crate::digest::sha256(b""), vec![]).is_err());
+        assert!(prepare_create(&file, vec![], 0o644).is_err());
+        assert!(
+            prepare_create(&temporary.path().join("absent/child"), vec![], 0o644)
+                .unwrap_err()
+                .contains("parent")
+        );
+
+        let write = prepare(&file, b"replacement".to_vec()).unwrap();
+        let delete = prepare_delete(&file).unwrap();
+        assert!(!write.deletes());
+        assert!(delete.deletes());
+
+        #[cfg(unix)]
+        {
+            let file_link = temporary.path().join("file-link");
+            std::os::unix::fs::symlink(&file, &file_link).unwrap();
+            assert!(prepare_delete(&file_link).is_err());
+
+            let directory_link = temporary.path().join("directory-link");
+            std::os::unix::fs::symlink(&directory, &directory_link).unwrap();
+            assert!(
+                prepare_create(&directory_link.join("new"), vec![], 0o644)
+                    .unwrap_err()
+                    .contains("not a directory")
+            );
+        }
+    }
+
+    #[test]
+    fn validation_rejects_post_preparation_tampering_and_races() {
+        let temporary = tempfile::tempdir().unwrap();
+        let existing = temporary.path().join("existing.txt");
+        let created = temporary.path().join("created.txt");
+        fs::write(&existing, b"before").unwrap();
+
+        let mut malformed_delete = prepare_delete(&existing).unwrap();
+        malformed_delete.replacement.push(1);
+        assert!(
+            validate_proposal(&malformed_delete)
+                .unwrap_err()
+                .contains("delete proposal")
+        );
+        malformed_delete.replacement.clear();
+        malformed_delete.expected = Expectation::Missing;
+        assert!(validate_proposal(&malformed_delete).is_err());
+
+        let create = prepare_create(&created, b"new".to_vec(), 0o644).unwrap();
+        fs::write(&created, b"concurrent").unwrap();
+        assert!(
+            validate_proposal(&create)
+                .unwrap_err()
+                .contains("now exists")
+        );
+
+        let absent_parent = Proposal {
+            path: temporary.path().join("gone/new.txt"),
+            expected: Expectation::Missing,
+            replacement: vec![],
+            permissions: 0o644,
+            mutation: Mutation::Write,
+        };
+        assert!(
+            validate_proposal(&absent_parent)
+                .unwrap_err()
+                .contains("create parent")
+        );
+        let no_parent = Proposal {
+            path: PathBuf::new(),
+            expected: Expectation::Missing,
+            replacement: vec![],
+            permissions: 0o644,
+            mutation: Mutation::Write,
+        };
+        assert!(validate_proposal(&no_parent).is_err());
+
+        let valid = prepare(&existing, b"after".to_vec()).unwrap();
+        let directory = temporary.path().join("directory");
+        fs::create_dir(&directory).unwrap();
+        let mut retargeted = valid.clone();
+        retargeted.path = directory;
+        assert!(
+            validate_proposal(&retargeted)
+                .unwrap_err()
+                .contains("regular non-symlink")
+        );
+
+        let parent_file = temporary.path().join("parent-file");
+        fs::write(&parent_file, b"not a directory").unwrap();
+        let inaccessible_child = parent_file.join("child");
+        assert!(
+            prepare_create(&inaccessible_child, vec![], 0o644)
+                .unwrap_err()
+                .contains("cannot inspect create target")
+        );
+        let invalid_create = Proposal {
+            path: inaccessible_child.clone(),
+            expected: Expectation::Missing,
+            replacement: vec![],
+            permissions: 0o644,
+            mutation: Mutation::Write,
+        };
+        assert!(
+            validate_proposal(&invalid_create)
+                .unwrap_err()
+                .contains("cannot inspect")
+        );
+        assert!(
+            !remove_committed(&[(inaccessible_child, crate::digest::sha256(b"anything"))])
+                .is_empty()
+        );
+
+        let canonical = existing.canonicalize().unwrap();
+        let validated = Validated {
+            proposal: valid.clone(),
+            canonical: canonical.clone(),
+        };
+        fs::write(&existing, b"drift").unwrap();
+        assert!(validate_current(std::slice::from_ref(&validated)).is_err());
+        fs::remove_file(&existing).unwrap();
+        assert!(validate_current(&[validated]).is_err());
+
+        let concurrent = Validated {
+            proposal: create,
+            canonical: created,
+        };
+        assert!(validate_current(&[concurrent]).is_err());
+        assert!(validate_all(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn rollback_helpers_restore_only_unchanged_regular_files() {
+        let temporary = tempfile::tempdir().unwrap();
+        let target = temporary.path().join("target.txt");
+        let backup = temporary.path().join("backup.txt");
+        fs::write(&backup, b"original").unwrap();
+        assert!(restore_backups(&[(target.clone(), backup)]).is_empty());
+        assert_eq!(fs::read(&target).unwrap(), b"original");
+
+        let absent_target = temporary.path().join("absent-target.txt");
+        let absent_backup = temporary.path().join("absent-backup.txt");
+        assert!(!restore_backups(&[(absent_target, absent_backup)]).is_empty());
+
+        let missing = temporary.path().join("missing.txt");
+        assert!(remove_committed(&[(missing, crate::digest::sha256(b"x"))]).is_empty());
+
+        let directory = temporary.path().join("directory");
+        fs::create_dir(&directory).unwrap();
+        assert!(!remove_committed(&[(directory, crate::digest::sha256(b""))]).is_empty());
+
+        let edited = temporary.path().join("edited.txt");
+        fs::write(&edited, b"concurrent").unwrap();
+        assert!(
+            remove_committed(&[(edited.clone(), crate::digest::sha256(b"original"))])
+                .join("; ")
+                .contains("concurrent")
+        );
+        assert_eq!(fs::read(&edited).unwrap(), b"concurrent");
+
+        let committed = temporary.path().join("committed.txt");
+        fs::write(&committed, b"replacement").unwrap();
+        assert!(
+            remove_committed(&[(committed.clone(), crate::digest::sha256(b"replacement"))])
+                .is_empty()
+        );
+        assert!(!committed.exists());
+
+        #[cfg(unix)]
+        {
+            let link = temporary.path().join("link.txt");
+            std::os::unix::fs::symlink(&edited, &link).unwrap();
+            assert!(!remove_committed(&[(link, crate::digest::sha256(b"concurrent"))]).is_empty());
+            assert!(sync_parent(Path::new("/")).is_err());
+            assert!(set_permissions(&temporary.path().join("absent"), 0o600).is_err());
         }
     }
 }

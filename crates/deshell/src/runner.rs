@@ -2,6 +2,7 @@ use crate::ir::{
     Guarantee, NamedExpression, Node, Operation, Plan, PrimitiveType, Task, TextExpression,
     ValueType,
 };
+use base64::Engine as _;
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -683,6 +684,21 @@ impl Executor<'_> {
                     context,
                 ))
             }
+            Operation::ExpandWords { .. }
+            | Operation::Redirect { .. }
+            | Operation::Scope { .. }
+            | Operation::SetEnvironment { .. }
+            | Operation::SetWorkingDirectory { .. }
+            | Operation::Spawn { .. }
+            | Operation::Wait { .. }
+            | Operation::SendSignal { .. }
+            | Operation::FileMetadata { .. }
+            | Operation::FileSetMetadata { .. }
+            | Operation::ClockRead { .. }
+            | Operation::RandomBytes { .. } => Err(execution(format!(
+                "{} requires an Effect IR v1 backend capability that is unavailable",
+                node.operation.name()
+            ))),
             Operation::InterpreterCall {
                 interpreter,
                 interpreter_pin,
@@ -1017,6 +1033,19 @@ fn default_value(value_type: &ValueType) -> Option<String> {
         ValueType::Primitive(PrimitiveType::Text | PrimitiveType::Path) => Some(String::new()),
         ValueType::Primitive(PrimitiveType::Bool) => Some("false".into()),
         ValueType::Primitive(PrimitiveType::Int) => Some("0".into()),
+        ValueType::Primitive(PrimitiveType::Bytes) => Some(String::new()),
+        ValueType::List { .. } => Some("[]".into()),
+        ValueType::Record { record } => {
+            let mut value = serde_json::Map::new();
+            for field in record {
+                let default = default_value(&field.value_type)?;
+                let parsed = typed_value_as_json(&field.value_type, &default).ok()?;
+                value.insert(field.name.clone(), parsed);
+            }
+            crate::canonical_json::canonical_bytes(&serde_json::Value::Object(value))
+                .ok()
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+        }
         ValueType::Secret { secret } => default_value(secret),
     }
 }
@@ -1044,12 +1073,112 @@ fn normalize_value(name: &str, value_type: &ValueType, value: &str) -> Result<St
             }
             Ok(normalized)
         }
+        ValueType::Primitive(PrimitiveType::Bytes) => {
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(value)
+                .map_err(|_| format!("{name} must be canonical base64 bytes"))?;
+            if base64::engine::general_purpose::STANDARD.encode(&decoded) != value {
+                return Err(format!("{name} must be canonical padded base64 bytes"));
+            }
+            Ok(value.into())
+        }
+        ValueType::List { .. } | ValueType::Record { .. } => {
+            let parsed = crate::strict_json::parse(value.as_bytes())
+                .map_err(|error| format!("{name} must be strict JSON: {error}"))?;
+            let normalized = normalize_typed_json(name, value_type, parsed)?;
+            String::from_utf8(crate::canonical_json::canonical_bytes(&normalized)?)
+                .map_err(|_| format!("{name} canonical JSON was not UTF-8"))
+        }
         ValueType::Secret { secret } => normalize_value(name, secret, value),
     }
 }
 
 fn value_type_is_secret(value_type: &ValueType) -> bool {
-    matches!(value_type, ValueType::Secret { .. })
+    match value_type {
+        ValueType::Secret { .. } => true,
+        ValueType::List { list } => value_type_is_secret(list),
+        ValueType::Record { record } => record
+            .iter()
+            .any(|field| value_type_is_secret(&field.value_type)),
+        ValueType::Primitive(_) => false,
+    }
+}
+
+fn typed_value_as_json(value_type: &ValueType, value: &str) -> Result<serde_json::Value, String> {
+    match value_type {
+        ValueType::Primitive(PrimitiveType::Text | PrimitiveType::Path | PrimitiveType::Bytes) => {
+            Ok(serde_json::Value::String(value.into()))
+        }
+        ValueType::Primitive(PrimitiveType::Bool) => Ok(serde_json::Value::Bool(value == "true")),
+        ValueType::Primitive(PrimitiveType::Int) => value
+            .parse::<i64>()
+            .map(Into::into)
+            .map_err(|_| "invalid normalized integer".into()),
+        ValueType::List { .. } | ValueType::Record { .. } => {
+            crate::strict_json::parse(value.as_bytes())
+        }
+        ValueType::Secret { secret } => typed_value_as_json(secret, value),
+    }
+}
+
+fn normalize_typed_json(
+    name: &str,
+    value_type: &ValueType,
+    value: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    match value_type {
+        ValueType::Primitive(primitive) => {
+            let raw = match (primitive, value) {
+                (
+                    PrimitiveType::Text | PrimitiveType::Path | PrimitiveType::Bytes,
+                    serde_json::Value::String(value),
+                ) => value,
+                (PrimitiveType::Bool, serde_json::Value::Bool(value)) => value.to_string(),
+                (PrimitiveType::Int, serde_json::Value::Number(value)) if value.is_i64() => {
+                    value.to_string()
+                }
+                _ => return Err(format!("{name} JSON value has the wrong type")),
+            };
+            typed_value_as_json(value_type, &normalize_value(name, value_type, &raw)?)
+        }
+        ValueType::Secret { secret } => normalize_typed_json(name, secret, value),
+        ValueType::List { list } => {
+            let serde_json::Value::Array(values) = value else {
+                return Err(format!("{name} must be a JSON array"));
+            };
+            values
+                .into_iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    normalize_typed_json(&format!("{name}[{index}]"), list, value)
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map(serde_json::Value::Array)
+        }
+        ValueType::Record { record } => {
+            let serde_json::Value::Object(mut values) = value else {
+                return Err(format!("{name} must be a JSON object"));
+            };
+            let mut normalized = serde_json::Map::new();
+            for field in record {
+                let value = values
+                    .remove(&field.name)
+                    .ok_or_else(|| format!("{name} is missing record field {}", field.name))?;
+                normalized.insert(
+                    field.name.clone(),
+                    normalize_typed_json(
+                        &format!("{name}.{}", field.name),
+                        &field.value_type,
+                        value,
+                    )?,
+                );
+            }
+            if let Some(unknown) = values.keys().next() {
+                return Err(format!("{name} has unknown record field {unknown}"));
+            }
+            Ok(serde_json::Value::Object(normalized))
+        }
+    }
 }
 
 fn validate_runtime_path(path: &str) -> Result<(), RunError> {
@@ -1093,8 +1222,9 @@ fn policy(message: impl Into<String>) -> RunError {
 mod tests {
     use super::*;
     use crate::ir::{
-        Binding, Guarantee, NamedExpression, Node, Operation, PrimitiveType, SourceBytes, Task,
-        TextExpression, TextPart, ValueType,
+        Binding, Guarantee, Invocation, InvocationParameter, InvocationStyle, MatchCase,
+        NamedExpression, Node, Operation, PrimitiveType, RecordField, SourceBytes, SourceSpan,
+        Task, TextExpression, TextPart, ValueType,
     };
     use std::sync::Mutex;
 
@@ -1151,15 +1281,27 @@ mod tests {
             })
         }
         fn read_file(&self, path: &str) -> Result<Vec<u8>, String> {
+            if path == "fail" {
+                return Err("read failed".into());
+            }
             Ok(format!("read:{path}").into_bytes())
         }
-        fn write_file(&self, _path: &str, _contents: &[u8], _append: bool) -> Result<(), String> {
+        fn write_file(&self, path: &str, _contents: &[u8], _append: bool) -> Result<(), String> {
+            if path == "fail" {
+                return Err("write failed".into());
+            }
             Ok(())
         }
-        fn remove_file(&self, _path: &str) -> Result<(), String> {
+        fn remove_file(&self, path: &str) -> Result<(), String> {
+            if path == "fail" {
+                return Err("remove failed".into());
+            }
             Ok(())
         }
         fn network_request(&self, _method: &str, uri: &str) -> Result<Vec<u8>, String> {
+            if uri == "fail" {
+                return Err("network failed".into());
+            }
             Ok(format!("network:{uri}").into_bytes())
         }
     }
@@ -1205,6 +1347,12 @@ mod tests {
             environment: vec![],
             working_directory: None,
         })
+    }
+
+    fn variable(name: &str) -> TextExpression {
+        TextExpression {
+            parts: vec![TextPart::Variable { name: name.into() }],
+        }
     }
 
     fn run(backend: &MockBackend, body: Node) -> Result<RunResult, RunError> {
@@ -1377,5 +1525,501 @@ mod tests {
         let error = run(&backend, body).unwrap_err();
         assert_eq!(error.kind, RunErrorKind::Execution);
         assert!(error.message.contains("parallel worker panicked"));
+    }
+
+    #[test]
+    fn control_flow_and_effect_nodes_execute_with_typed_mutable_context() {
+        let backend = MockBackend::default();
+        let body = node(Operation::Sequence {
+            nodes: vec![
+                node(Operation::SetVariable {
+                    name: "VALUE".into(),
+                    value_type: ValueType::Primitive(PrimitiveType::Text),
+                    value: TextExpression::literal("seed"),
+                }),
+                node(Operation::CaptureStdout {
+                    name: "CAPTURED".into(),
+                    value_type: PrimitiveType::Text,
+                    body: Box::new(exec(&["emit", "captured\n\n"])),
+                }),
+                node(Operation::Exec {
+                    argv: vec![TextExpression::literal("emit"), variable("CAPTURED")],
+                    environment: vec![],
+                    working_directory: Some(TextExpression::literal("work")),
+                }),
+                node(Operation::Condition {
+                    predicate: Box::new(exec(&["fail", "1"])),
+                    if_true: Box::new(exec(&["emit", "wrong"])),
+                    if_false: Some(Box::new(exec(&["emit", "false-branch"]))),
+                }),
+                node(Operation::Match {
+                    value: TextExpression::literal("selected"),
+                    cases: vec![
+                        MatchCase {
+                            pattern: TextExpression::literal("other"),
+                            body: exec(&["emit", "wrong"]),
+                        },
+                        MatchCase {
+                            pattern: TextExpression::literal("selected"),
+                            body: exec(&["emit", "matched"]),
+                        },
+                    ],
+                    default: Some(Box::new(exec(&["emit", "default"]))),
+                }),
+                node(Operation::Foreach {
+                    variable: "ITEM".into(),
+                    items: vec![TextExpression::literal("a"), TextExpression::literal("b")],
+                    body: Box::new(node(Operation::Exec {
+                        argv: vec![TextExpression::literal("emit"), variable("ITEM")],
+                        environment: vec![],
+                        working_directory: None,
+                    })),
+                }),
+                node(Operation::FileWrite {
+                    path: TextExpression::literal("out.txt"),
+                    contents: variable("VALUE"),
+                    append: false,
+                }),
+                node(Operation::FileRead {
+                    path: TextExpression::literal("out.txt"),
+                }),
+                node(Operation::FileRemove {
+                    path: TextExpression::literal("out.txt"),
+                }),
+                node(Operation::NetworkRequest {
+                    method: TextExpression::literal("GET"),
+                    uri: TextExpression::literal("https://example.invalid/value"),
+                }),
+            ],
+        });
+        let result = run_plan_with_io(
+            &backend,
+            Policy {
+                allow_file_read: true,
+                allow_file_write: true,
+                allow_network: true,
+                allow_delegation: false,
+            },
+            &plan(body),
+            RunInputs {
+                host_environment: &BTreeMap::new(),
+                named_inputs: &BTreeMap::new(),
+                arguments: &[],
+                stdin: b"stdin",
+                default_working_directory: Some("default"),
+            },
+        )
+        .unwrap();
+        assert_eq!(result.exit_code, 0);
+        assert!(result.stdout.starts_with(b"capturedfalse-branchmatchedab"));
+        assert!(
+            result
+                .stdout
+                .ends_with(b"network:https://example.invalid/value")
+        );
+        assert_eq!(result.stderr, b"failed");
+        assert!(
+            result
+                .trace
+                .iter()
+                .any(|event| matches!(event, TraceEvent::FileRead { .. }))
+        );
+        assert!(
+            result
+                .trace
+                .iter()
+                .any(|event| matches!(event, TraceEvent::FileWrite { .. }))
+        );
+        assert!(
+            result
+                .trace
+                .iter()
+                .any(|event| matches!(event, TraceEvent::FileRemove { .. }))
+        );
+        assert!(
+            result
+                .trace
+                .iter()
+                .any(|event| matches!(event, TraceEvent::Network { .. }))
+        );
+        assert_eq!(
+            backend.calls.lock().unwrap()[1]
+                .working_directory
+                .as_deref(),
+            Some("work")
+        );
+    }
+
+    #[test]
+    fn task_calls_try_finally_and_delegation_cover_success_and_failure_semantics() {
+        let backend = MockBackend::default();
+        let helper = Task {
+            name: "helper".into(),
+            inputs: vec![Binding {
+                name: "message".into(),
+                value_type: ValueType::Primitive(PrimitiveType::Text),
+            }],
+            outputs: vec![],
+            environment: vec![],
+            secrets: vec![],
+            platform_capabilities: vec![],
+            cacheable: false,
+            invocation: None,
+            body: node(Operation::Exec {
+                argv: vec![
+                    TextExpression::literal("emit"),
+                    TextExpression {
+                        parts: vec![TextPart::Argument {
+                            name: "message".into(),
+                        }],
+                    },
+                ],
+                environment: vec![],
+                working_directory: None,
+            }),
+        };
+        let mut task_plan = plan(node(Operation::TaskCall {
+            task: "helper".into(),
+            arguments: vec![NamedExpression {
+                name: "message".into(),
+                value: TextExpression::literal("called"),
+            }],
+        }));
+        task_plan.tasks.push(helper);
+        task_plan.assign_node_ids().unwrap();
+        assert_eq!(
+            run_plan(
+                &backend,
+                Policy::default(),
+                &task_plan,
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &[],
+            )
+            .unwrap()
+            .stdout,
+            b"called"
+        );
+
+        let success = node(Operation::TryFinally {
+            body: Box::new(exec(&["emit", "body"])),
+            finalizer: Box::new(exec(&["fail", "7"])),
+        });
+        let result = run(&backend, success).unwrap();
+        assert_eq!(result.exit_code, 7);
+        assert_eq!(result.stdout, b"body");
+
+        let body_error = node(Operation::TryFinally {
+            body: Box::new(exec(&["backend-secret-error"])),
+            finalizer: Box::new(exec(&["emit", "cleanup"])),
+        });
+        assert!(
+            run(&backend, body_error)
+                .unwrap_err()
+                .message
+                .contains("failed with")
+        );
+        let both_error = node(Operation::TryFinally {
+            body: Box::new(exec(&["backend-secret-error"])),
+            finalizer: Box::new(exec(&["backend-secret-error"])),
+        });
+        assert!(
+            run(&backend, both_error)
+                .unwrap_err()
+                .message
+                .contains("finalizer also failed")
+        );
+
+        let delegated_span = SourceSpan {
+            file: "build.sh".into(),
+            start_line: 1,
+            start_column: 0,
+            end_line: 1,
+            end_column: 16,
+            start_byte: 0,
+            end_byte: 16,
+        };
+        let mut delegated = node(Operation::InterpreterCall {
+            interpreter: "sh".into(),
+            interpreter_pin: format!("sha256:{}", "a".repeat(64)),
+            source: SourceBytes::from_bytes(b"printf delegated"),
+            source_span: delegated_span.clone(),
+            capabilities: vec!["process".into()],
+            reason: "fixture".into(),
+        });
+        delegated.guarantee = Guarantee::Delegated {
+            reason: "fixture".into(),
+        };
+        delegated.source = Some(delegated_span);
+        let result = run_plan_with_io(
+            &backend,
+            Policy {
+                allow_delegation: true,
+                ..Policy::default()
+            },
+            &plan(delegated),
+            RunInputs {
+                host_environment: &BTreeMap::new(),
+                named_inputs: &BTreeMap::new(),
+                arguments: &["one".into()],
+                stdin: b"input",
+                default_working_directory: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(result.stdout, b"printf delegated");
+        assert!(matches!(
+            result.trace.as_slice(),
+            [TraceEvent::Delegated { .. }]
+        ));
+    }
+
+    #[test]
+    fn effect_policies_paths_and_backend_failures_are_fail_closed() {
+        let backend = MockBackend::default();
+        for operation in [
+            Operation::FileWrite {
+                path: TextExpression::literal("out"),
+                contents: TextExpression::literal("value"),
+                append: true,
+            },
+            Operation::FileRemove {
+                path: TextExpression::literal("out"),
+            },
+            Operation::NetworkRequest {
+                method: TextExpression::literal("GET"),
+                uri: TextExpression::literal("https://example.invalid"),
+            },
+        ] {
+            assert_eq!(
+                run(&backend, node(operation)).unwrap_err().kind,
+                RunErrorKind::Policy
+            );
+        }
+        for operation in [
+            Operation::FileRead {
+                path: TextExpression::literal("../escape"),
+            },
+            Operation::FileWrite {
+                path: TextExpression::literal("../escape"),
+                contents: TextExpression::literal("value"),
+                append: false,
+            },
+        ] {
+            let error = run_plan(
+                &backend,
+                Policy {
+                    allow_file_read: true,
+                    allow_file_write: true,
+                    ..Policy::default()
+                },
+                &plan(node(operation)),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &[],
+            )
+            .unwrap_err();
+            assert_eq!(error.kind, RunErrorKind::Invalid);
+        }
+        for operation in [
+            Operation::FileRead {
+                path: TextExpression::literal("fail"),
+            },
+            Operation::FileWrite {
+                path: TextExpression::literal("fail"),
+                contents: TextExpression::literal("value"),
+                append: false,
+            },
+            Operation::FileRemove {
+                path: TextExpression::literal("fail"),
+            },
+            Operation::NetworkRequest {
+                method: TextExpression::literal("GET"),
+                uri: TextExpression::literal("fail"),
+            },
+        ] {
+            let error = run_plan(
+                &backend,
+                Policy {
+                    allow_file_read: true,
+                    allow_file_write: true,
+                    allow_network: true,
+                    allow_delegation: false,
+                },
+                &plan(node(operation)),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &[],
+            )
+            .unwrap_err();
+            assert_eq!(error.kind, RunErrorKind::Execution);
+        }
+        let unsupported = node(Operation::ExpandWords {
+            name: "words".into(),
+            value: TextExpression::literal("value"),
+            field_splitting: crate::ir::FieldSplitting::None,
+            glob: crate::ir::GlobBehavior::Disabled,
+        });
+        assert!(
+            run(&backend, unsupported)
+                .unwrap_err()
+                .message
+                .contains("unavailable")
+        );
+    }
+
+    #[test]
+    fn typed_values_and_powershell_binding_are_canonical_and_strict() {
+        let list = ValueType::List {
+            list: Box::new(ValueType::Primitive(PrimitiveType::Int)),
+        };
+        let record = ValueType::Record {
+            record: vec![
+                RecordField {
+                    name: "enabled".into(),
+                    value_type: ValueType::Primitive(PrimitiveType::Bool),
+                },
+                RecordField {
+                    name: "items".into(),
+                    value_type: list.clone(),
+                },
+            ],
+        };
+        assert_eq!(
+            normalize_value("flag", &ValueType::Primitive(PrimitiveType::Bool), "1").unwrap(),
+            "true"
+        );
+        assert_eq!(
+            normalize_value("flag", &ValueType::Primitive(PrimitiveType::Bool), "0").unwrap(),
+            "false"
+        );
+        assert!(
+            normalize_value("flag", &ValueType::Primitive(PrimitiveType::Bool), "maybe").is_err()
+        );
+        assert_eq!(
+            normalize_value("count", &ValueType::Primitive(PrimitiveType::Int), " 7 ").unwrap(),
+            "7"
+        );
+        assert!(
+            normalize_value("count", &ValueType::Primitive(PrimitiveType::Int), "huge").is_err()
+        );
+        assert_eq!(
+            normalize_value("path", &ValueType::Primitive(PrimitiveType::Path), "a/b").unwrap(),
+            "a/b"
+        );
+        assert!(
+            normalize_value("path", &ValueType::Primitive(PrimitiveType::Path), "a\\b").is_err()
+        );
+        assert_eq!(
+            normalize_value("bytes", &ValueType::Primitive(PrimitiveType::Bytes), "AA==").unwrap(),
+            "AA=="
+        );
+        assert!(
+            normalize_value("bytes", &ValueType::Primitive(PrimitiveType::Bytes), "AA").is_err()
+        );
+        assert_eq!(normalize_value("items", &list, "[2,1]").unwrap(), "[2,1]");
+        assert!(normalize_value("items", &list, "{}").is_err());
+        assert_eq!(
+            normalize_value("record", &record, r#"{"items":[1],"enabled":true}"#).unwrap(),
+            r#"{"enabled":true,"items":[1]}"#
+        );
+        assert!(normalize_value("record", &record, r#"{"enabled":true}"#).is_err());
+        assert!(
+            normalize_value(
+                "record",
+                &record,
+                r#"{"enabled":true,"items":[],"extra":1}"#
+            )
+            .is_err()
+        );
+        assert!(value_type_is_secret(&ValueType::List {
+            list: Box::new(ValueType::Secret {
+                secret: Box::new(ValueType::Primitive(PrimitiveType::Text)),
+            }),
+        }));
+        assert_eq!(
+            default_value(&record).unwrap(),
+            r#"{"enabled":false,"items":[]}"#
+        );
+
+        let task = Task {
+            name: "powershell".into(),
+            inputs: vec![
+                Binding {
+                    name: "Name".into(),
+                    value_type: ValueType::Primitive(PrimitiveType::Text),
+                },
+                Binding {
+                    name: "Flag".into(),
+                    value_type: ValueType::Primitive(PrimitiveType::Bool),
+                },
+                Binding {
+                    name: "Count".into(),
+                    value_type: ValueType::Primitive(PrimitiveType::Int),
+                },
+            ],
+            outputs: vec![],
+            environment: vec![],
+            secrets: vec![],
+            platform_capabilities: vec![],
+            cacheable: false,
+            invocation: Some(Invocation {
+                style: InvocationStyle::Powershell,
+                accepts_common_parameters: false,
+                parameters: vec![
+                    InvocationParameter {
+                        input: "Name".into(),
+                        position: Some(0),
+                        required: true,
+                        is_switch: false,
+                        default: None,
+                        validations: vec![],
+                    },
+                    InvocationParameter {
+                        input: "Flag".into(),
+                        position: None,
+                        required: false,
+                        is_switch: true,
+                        default: None,
+                        validations: vec![],
+                    },
+                    InvocationParameter {
+                        input: "Count".into(),
+                        position: None,
+                        required: false,
+                        is_switch: false,
+                        default: Some(TextExpression::literal("7")),
+                        validations: vec![],
+                    },
+                ],
+            }),
+            body: exec(&["emit", "unused"]),
+        };
+        let bound = bind_task_arguments(
+            &task,
+            &BTreeMap::new(),
+            &["alice".into(), "-Fl".into(), "-Count:9".into()],
+        )
+        .unwrap();
+        assert_eq!(bound["Name"], "alice");
+        assert_eq!(bound["Flag"], "true");
+        assert_eq!(bound["Count"], "9");
+        assert!(bind_task_arguments(&task, &BTreeMap::new(), &[]).is_err());
+        assert!(
+            bind_task_arguments(
+                &task,
+                &BTreeMap::new(),
+                &["alice".into(), "-Unknown".into()]
+            )
+            .is_err()
+        );
+        assert!(
+            bind_task_arguments(
+                &task,
+                &BTreeMap::from([("Name".into(), "a".into())]),
+                &["b".into()]
+            )
+            .is_err()
+        );
     }
 }

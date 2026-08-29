@@ -1,0 +1,8 @@
+/artifacts/
+/target/
+/coverage/
+/corpus/*/*
+!/corpus/frontend/posix
+!/corpus/scanner/workflow
+!/corpus/protocol/response
+!/corpus/schema/object

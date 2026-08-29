@@ -57,7 +57,8 @@ impl ProjectReader {
     }
 
     fn read_file(&self, relative: &str) -> Result<Vec<u8>, String> {
-        let path = project_file_path_from_root(&self.root, relative)?;
+        let path = project_file_path_from_root(&self.root, relative)
+            .map_err(|error| format!("cannot resolve project file {relative}: {error}"))?;
         std::fs::read(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))
     }
 
@@ -68,10 +69,12 @@ impl ProjectReader {
 
     fn file_path(&self, relative: &str) -> Result<PathBuf, String> {
         project_file_path_from_root(&self.root, relative)
+            .map_err(|error| format!("cannot resolve project file {relative}: {error}"))
     }
 
     fn directory_path(&self, relative: &str) -> Result<PathBuf, String> {
         project_directory_path_from_root(&self.root, relative)
+            .map_err(|error| format!("cannot resolve project directory {relative}: {error}"))
     }
 
     fn entry_path(&self, entry: &str) -> Result<PathBuf, String> {
@@ -293,7 +296,7 @@ impl Manifest {
         Ok(manifest)
     }
 
-    fn encode_pretty(&self) -> Result<Vec<u8>, String> {
+    pub(crate) fn encode_pretty(&self) -> Result<Vec<u8>, String> {
         self.validate().map_err(|errors| errors.join("; "))?;
         crate::canonical_json::pretty_bytes(
             &serde_json::to_value(self).map_err(|error| error.to_string())?,
@@ -576,7 +579,15 @@ fn resolve_normalized_entry_from_root(
 }
 
 pub(crate) fn scan(root: &Path) -> Result<Inventory, String> {
-    crate::scanner::scan(root)
+    match root.join(".deshell/project.toml").symlink_metadata() {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return crate::scanner::scan(root);
+        }
+        Err(error) => return Err(format!("cannot inspect project.toml: {error}")),
+        Ok(_) => {}
+    }
+    let config = load_config(root).map_err(|errors| errors.join("; "))?;
+    crate::scanner::scan_with_interpreters(root, &config.interpreter_overrides)
 }
 
 pub(crate) fn analyze(root: &Path, entry: &str) -> Result<AnalysisResult, String> {
@@ -594,7 +605,19 @@ pub(crate) fn analyze(root: &Path, entry: &str) -> Result<AnalysisResult, String
     let (canonical_root, entry_path) = resolve_entry(root, entry)?;
     let source = std::fs::read(&entry_path)
         .map_err(|error| format!("cannot read entrypoint {entry}: {error}"))?;
-    let mut plan = crate::frontend::lower(entry, &source, config.policy.unknown_interpreter)?;
+    let mut plan = match config
+        .interpreter_overrides
+        .iter()
+        .find(|override_| override_.path == entry)
+    {
+        Some(override_) => crate::frontend::lower_with_interpreter(
+            entry,
+            &source,
+            config.policy.unknown_interpreter,
+            override_.interpreter.name(),
+        )?,
+        None => crate::frontend::lower(entry, &source, config.policy.unknown_interpreter)?,
+    };
     crate::frontend::bind_interpreter_pins(&mut plan, &lock.interpreters)?;
     let mut evidence = Evidence::from_plan(&plan, entry, &source)?;
     let directory = canonical_root.join(".deshell");
@@ -1376,5 +1399,227 @@ mod tests {
         )
         .unwrap();
         check(directory.path()).unwrap();
+    }
+
+    #[test]
+    fn manifest_validation_aggregates_path_order_digest_and_addressing_errors() {
+        let digest = crate::digest::sha256(b"value");
+        let entry = |entrypoint: &str| ManifestEntry {
+            entrypoint: entrypoint.into(),
+            source_digest: digest.clone(),
+            plan_digest: digest.clone(),
+            plan_path: format!(".deshell/artifacts/{digest}/{digest}/plan.json"),
+            evidence_path: format!(".deshell/artifacts/{digest}/{digest}/evidence.json"),
+        };
+        let valid = Manifest {
+            schema_version: 1,
+            entries: vec![entry("a.sh"), entry("b.sh")],
+        };
+        let bytes = valid.encode_pretty().unwrap();
+        assert_eq!(Manifest::decode(&bytes).unwrap(), valid);
+
+        let mut invalid = valid;
+        invalid.schema_version = 2;
+        invalid.entries = vec![entry("b.sh"), entry("../outside"), entry("b.sh")];
+        invalid.entries[0].source_digest = "bad".into();
+        invalid.entries[0].plan_digest = "bad".into();
+        invalid.entries[0].plan_path = "plan.json".into();
+        invalid.entries[0].evidence_path = "evidence.json".into();
+        let errors = invalid.validate().unwrap_err().join("; ");
+        for expected in [
+            "schema_version",
+            "invalid manifest entrypoint",
+            "duplicate manifest entrypoint",
+            "sorted by entrypoint",
+            "digests are invalid",
+            "not content-addressed",
+        ] {
+            assert!(
+                errors.contains(expected),
+                "missing {expected:?} in {errors}"
+            );
+        }
+        assert!(
+            invalid
+                .encode_pretty()
+                .unwrap_err()
+                .contains("schema_version")
+        );
+        assert!(Manifest::decode(b"{not-json").is_err());
+    }
+
+    #[test]
+    fn initialization_rejects_ambiguous_roots_entries_and_artifact_shapes() {
+        let parent = tempfile::tempdir().unwrap();
+        let missing = parent.path().join("new-project");
+        assert_eq!(init(&missing).unwrap().created.len(), 4);
+
+        let file = parent.path().join("file");
+        std::fs::write(&file, b"file").unwrap();
+        assert!(init(&file).unwrap_err().contains("not a regular directory"));
+
+        let metadata_file = tempfile::tempdir().unwrap();
+        std::fs::write(metadata_file.path().join(".deshell"), b"file").unwrap();
+        assert!(
+            init(metadata_file.path())
+                .unwrap_err()
+                .contains("not a regular directory")
+        );
+
+        let artifact_directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(artifact_directory.path().join("deshell.lock")).unwrap();
+        assert!(
+            init(artifact_directory.path())
+                .unwrap_err()
+                .contains("artifact is not a regular")
+        );
+
+        let entries = tempfile::tempdir().unwrap();
+        std::fs::write(entries.path().join("a.sh"), b"true\n").unwrap();
+        assert!(
+            init_with_entries(entries.path(), &["a.sh".into(), "a.sh".into()])
+                .unwrap_err()
+                .contains("duplicate --entry")
+        );
+        init_with_entries(entries.path(), &["a.sh".into()]).unwrap();
+        std::fs::write(entries.path().join("b.sh"), b"true\n").unwrap();
+        assert!(
+            init_with_entries(entries.path(), &["b.sh".into()])
+                .unwrap_err()
+                .contains("cannot replace")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_file_and_directory_resolution_rejects_every_unsafe_component_kind() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("directory")).unwrap();
+        std::fs::write(root.path().join("directory/file"), b"value").unwrap();
+        std::fs::write(root.path().join("parent-file"), b"value").unwrap();
+        assert!(project_file_path(root.path(), "directory/file").is_ok());
+        assert!(project_directory_path(root.path(), "directory").is_ok());
+        for relative in ["../outside", "double//slash", "directory/../file"] {
+            assert!(project_file_path(root.path(), relative).is_err());
+            assert!(project_directory_path(root.path(), relative).is_err());
+        }
+        assert!(
+            project_file_path(root.path(), "directory")
+                .unwrap_err()
+                .contains("not a regular file")
+        );
+        assert!(
+            project_directory_path(root.path(), "parent-file")
+                .unwrap_err()
+                .contains("regular directories")
+        );
+        assert!(
+            project_file_path(root.path(), "missing")
+                .unwrap_err()
+                .contains("inspect")
+        );
+        assert!(
+            project_directory_path(root.path(), "missing")
+                .unwrap_err()
+                .contains("inspect")
+        );
+        std::os::unix::fs::symlink("directory", root.path().join("link")).unwrap();
+        assert!(
+            project_file_path(root.path(), "link/file")
+                .unwrap_err()
+                .contains("symlink")
+        );
+        assert!(
+            project_directory_path(root.path(), "link")
+                .unwrap_err()
+                .contains("regular directories")
+        );
+
+        let aliases = tempfile::tempdir().unwrap();
+        let root_link = aliases.path().join("root-link");
+        std::os::unix::fs::symlink(root.path(), &root_link).unwrap();
+        assert!(
+            canonical_project_root(&root_link)
+                .unwrap_err()
+                .contains("non-symlink")
+        );
+    }
+
+    #[test]
+    fn scenario_and_replay_loaders_reject_empty_duplicate_broad_and_unsafe_inputs() {
+        let root = tempfile::tempdir().unwrap();
+        init(root.path()).unwrap();
+        let scenarios = root.path().join(".deshell/scenarios");
+        let default = scenarios.join("default.toml");
+        std::fs::remove_file(&default).unwrap();
+        std::fs::write(scenarios.join("ignored.txt"), b"ignored").unwrap();
+        assert!(
+            load_validated_scenarios(
+                root.path(),
+                None,
+                Some(crate::config::ResourceLimits::DEFAULT)
+            )
+            .unwrap_err()
+            .join("; ")
+            .contains("at least one scenario")
+        );
+
+        let broad = Scenario::default_text().replace("timeout_ms = 30000", "timeout_ms = 30001");
+        std::fs::write(&default, &broad).unwrap();
+        std::fs::write(scenarios.join("duplicate.toml"), &broad).unwrap();
+        let errors = load_validated_scenarios(
+            root.path(),
+            None,
+            Some(crate::config::ResourceLimits::DEFAULT),
+        )
+        .unwrap_err()
+        .join("; ");
+        assert!(errors.contains("duplicate scenario name"), "{errors}");
+        assert!(errors.contains("may only narrow"), "{errors}");
+
+        std::fs::remove_file(scenarios.join("duplicate.toml")).unwrap();
+        std::fs::write(&default, [0xff]).unwrap();
+        assert!(
+            load_validated_scenarios(root.path(), None, None)
+                .unwrap_err()
+                .join("; ")
+                .contains("not valid UTF-8")
+        );
+
+        let replay = root.path().join(".deshell/replay.json");
+        std::fs::create_dir(&replay).unwrap();
+        assert!(
+            load_validated_replay(root.path())
+                .unwrap_err()
+                .join("; ")
+                .contains("not a regular")
+        );
+        std::fs::remove_dir(&replay).unwrap();
+        std::fs::write(&replay, b"not-json").unwrap();
+        assert!(load_validated_replay(root.path()).is_err());
+    }
+
+    #[test]
+    fn validated_project_reports_missing_contracts_and_unknown_analyzed_entries() {
+        let empty = tempfile::tempdir().unwrap();
+        let errors = ValidatedProject::load(empty.path()).unwrap_err().join("; ");
+        for expected in ["project.toml", "deshell.lock", "scenarios", "manifest.json"] {
+            assert!(
+                errors.contains(expected),
+                "missing {expected:?} in {errors}"
+            );
+        }
+
+        let project = configured_project(b"true\n");
+        analyze(project.path(), "build.sh").unwrap();
+        let loaded = ValidatedProject::load(project.path()).unwrap();
+        assert!(
+            loaded
+                .entry("missing.sh")
+                .unwrap_err()
+                .join("; ")
+                .contains("not analyzed")
+        );
+        assert!(load_entry_artifacts(project.path(), "missing.sh").is_err());
     }
 }

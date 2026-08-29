@@ -13,6 +13,195 @@ env:
   MISE_AUTO_INSTALL: "false"
 
 jobs:
+  release-qualification:
+    name: Final release qualification
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        uses: jdx/mise-action@3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518 # v4.2.5
+        with:
+          version: 2026.8.6
+          cache: true
+          install_args: rust@1.98.0
+
+      - name: Install coverage instrumentation
+        run: rustup component add llvm-tools-preview
+
+      - name: Install checksum-verified coverage tool
+        uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad # v2.85.10
+        with:
+          tool: cargo-llvm-cov@0.8.7
+          fallback: none
+
+      - name: Keep the release-candidate measurement reproducible
+        if: github.ref_name != 'v0.1.0'
+        run: cargo llvm-cov --locked --workspace --all-targets --summary-only --fail-under-lines 90 -- --test-threads=1
+
+      - name: Enforce the final 0.1.0 coverage contract
+        if: github.ref_name == 'v0.1.0'
+        run: |
+          cargo llvm-cov --locked --workspace --all-targets --json --summary-only --fail-under-lines 90 --output-path target/release-coverage.json -- --test-threads=1
+          python3 scripts/check-release-coverage.py target/release-coverage.json
+
+  dynamic-analysis:
+    name: Fuzz, Miri, ASan, and UBSan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned dynamic-analysis toolchain
+        uses: jdx/mise-action@3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518 # v4.2.5
+        with:
+          version: 2026.8.6
+          cache: true
+          install_args: rust@nightly-2026-07-15
+
+      - name: Install Miri and Rust sources
+        run: rustup component add miri rust-src
+
+      - name: Install checksum-verified cargo-fuzz
+        uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad # v2.85.10
+        with:
+          tool: cargo-fuzz@0.13.2
+          fallback: none
+
+      - name: Fuzz every parser and protocol boundary from its saved corpus
+        env:
+          ASAN_OPTIONS: detect_leaks=0
+        shell: bash
+        run: |
+          cargo fuzz run frontend fuzz/corpus/frontend -- -runs=512 -max_len=65536
+          cargo fuzz run scanner fuzz/corpus/scanner -- -runs=512 -max_len=65536
+          cargo fuzz run protocol fuzz/corpus/protocol -- -runs=512 -max_len=65536
+          cargo fuzz run schema fuzz/corpus/schema -- -runs=512 -max_len=65536
+
+      - name: Interpret strict document decoding with Miri
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/deshell-miri-target
+          XDG_CACHE_HOME: ${{ runner.temp }}/deshell-miri-cache
+        run: cargo miri test -p deshell strict_json::tests::decodes_a_strict_document -- --exact
+
+      - name: Run the complete implementation under AddressSanitizer
+        env:
+          ASAN_OPTIONS: detect_leaks=0
+          CARGO_TARGET_DIR: ${{ runner.temp }}/deshell-asan-target
+          RUSTFLAGS: -Zsanitizer=address --cfg deshell_sanitizer_address
+        run: cargo test --locked -p deshell --target x86_64-unknown-linux-gnu -- --test-threads=1
+
+      - name: Run native parser code under UndefinedBehaviorSanitizer
+        env:
+          CC: clang
+          CXX: clang++
+          # Tree-sitter grammars use a legacy external-scanner function prototype;
+          # keep every other UBSan class fatal while excluding that known ABI check.
+          CFLAGS: -fsanitize=undefined -fno-sanitize=function
+          CXXFLAGS: -fsanitize=undefined -fno-sanitize=function
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_DIR: ${{ runner.temp }}/deshell-ubsan-target
+          RUSTFLAGS: -Clink-arg=-fsanitize=undefined --cfg deshell_sanitizer_undefined
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: cargo test --locked -p deshell --target x86_64-unknown-linux-gnu -- --test-threads=1
+
+  migration-e2e:
+    name: Migration E2E (${{ matrix.interpreter }}, ${{ matrix.generator }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            interpreter: sh
+            generator: rust
+          - runner: ubuntu-24.04
+            interpreter: sh
+            generator: go
+          - runner: ubuntu-24.04
+            interpreter: bash
+            generator: rust
+          - runner: ubuntu-24.04
+            interpreter: bash
+            generator: go
+          - runner: ubuntu-24.04
+            interpreter: zsh
+            generator: rust
+          - runner: ubuntu-24.04
+            interpreter: zsh
+            generator: go
+          - runner: ubuntu-24.04
+            interpreter: fish
+            generator: rust
+          - runner: ubuntu-24.04
+            interpreter: fish
+            generator: go
+          - runner: ubuntu-24.04
+            interpreter: nu
+            generator: rust
+          - runner: ubuntu-24.04
+            interpreter: nu
+            generator: go
+          - runner: windows-2025
+            interpreter: powershell
+            generator: rust
+          - runner: windows-2025
+            interpreter: powershell
+            generator: go
+          - runner: windows-2025
+            interpreter: cmd
+            generator: rust
+          - runner: windows-2025
+            interpreter: cmd
+            generator: go
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install migration toolchains
+        uses: jdx/mise-action@3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518 # v4.2.5
+        with:
+          version: 2026.8.6
+          cache: true
+          install_args: rust@1.98.0 go@1.27.0 powershell@7.6.5
+
+      - name: Install zsh and fish runtimes
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes zsh fish
+
+      - name: Install checksum-pinned Nushell runtime
+        if: matrix.interpreter == 'nu'
+        shell: bash
+        run: |
+          archive="$RUNNER_TEMP/nu-0.115.1-x86_64-unknown-linux-gnu.tar.gz"
+          install_root="$RUNNER_TEMP/nushell-0.115.1"
+          curl --fail --location --silent --show-error \
+            --output "$archive" \
+            https://github.com/nushell/nushell/releases/download/0.115.1/nu-0.115.1-x86_64-unknown-linux-gnu.tar.gz
+          echo 'd11d825241f6504a3617c535fa725a9dd6d009c86d7b19fb3168b47635b9d8b0  '"$archive" | sha256sum --check --strict
+          mkdir "$install_root"
+          tar --extract --gzip --file "$archive" --directory "$install_root"
+          nu_binary="$(find "$install_root" -type f -name nu -print -quit)"
+          test -n "$nu_binary"
+          chmod +x "$nu_binary"
+          dirname "$nu_binary" >> "$GITHUB_PATH"
+
+      - name: Build the migration oracle
+        run: cargo build --locked -p deshell
+
+      - name: Retire the representative interpreter corpus with independent Evidence
+        run: cargo run --locked -p xtask -- migration-e2e ${{ matrix.interpreter }} ${{ matrix.generator }}
+
   build:
     name: Build ${{ matrix.target }}
     strategy:
@@ -66,7 +255,7 @@ jobs:
         run: rustup target add ${{ matrix.target }}
 
       - name: Test host implementation
-        run: cargo test --locked --workspace
+        run: cargo test --locked --workspace -- --test-threads=1
 
       - name: Build release executable
         run: cargo build --locked --release --target ${{ matrix.target }} -p deshell
@@ -77,14 +266,15 @@ jobs:
           $binary = Join-Path 'target' (Join-Path '${{ matrix.target }}' (Join-Path 'release' '${{ matrix.executable }}'))
           $version = & $binary --version
           if ($LASTEXITCODE -ne 0 -or $version -ne 'deshell 0.1.0') { throw 'version smoke test failed' }
-          foreach ($schemaName in @('inventory', 'manifest', 'bundle', 'effect-ir', 'evidence', 'diagnostic', 'protocol', 'project', 'scenario', 'lock', 'replay', 'corpus-audit')) {
+          foreach ($schemaName in @('inventory', 'manifest', 'bundle', 'effect-ir', 'evidence', 'diagnostic', 'protocol', 'project', 'scenario', 'lock', 'replay', 'corpus-audit', 'generator-protocol', 'migration-request', 'proposal', 'migration-plan', 'migration-evidence', 'archive-manifest', 'audit-finding', 'harden-plan', 'harden-approval', 'harden-evidence')) {
             $schema = & $binary schema $schemaName | ConvertFrom-Json
             if ($LASTEXITCODE -ne 0 -or $schema.'$schema' -ne 'https://json-schema.org/draft/2020-12/schema') { throw "schema smoke test failed: $schemaName" }
           }
-          foreach ($mode in @('__process-agent', '__observer-agent', '__nushell-adapter')) {
+          foreach ($mode in @('__process-agent', '__observer-agent', '__nushell-adapter', '__generator')) {
             $request = '{"id":1,"jsonrpc":"2.0","method":"deshell.handshake","params":{"protocol_version":1}}'
             $response = $request | & $binary $mode | ConvertFrom-Json
-            if ($LASTEXITCODE -ne 0 -or $response.result.protocol_version -ne 1) { throw "$mode handshake failed" }
+            $valid = if ($mode -eq '__generator') { $response.result.protocol -eq 'deshell.generator.v1' } else { $response.result.protocol_version -eq 1 }
+            if ($LASTEXITCODE -ne 0 -or -not $valid) { throw "$mode handshake failed" }
           }
 
       - name: Create archive
@@ -115,14 +305,15 @@ jobs:
           $installed = Join-Path $installRoot (Join-Path 'deshell-0.1.0' '${{ matrix.executable }}')
           $version = & $installed --version
           if ($LASTEXITCODE -ne 0 -or $version -ne 'deshell 0.1.0') { throw 'archive version smoke test failed' }
-          foreach ($schemaName in @('inventory', 'manifest', 'bundle', 'effect-ir', 'evidence', 'diagnostic', 'protocol', 'project', 'scenario', 'lock', 'replay', 'corpus-audit')) {
+          foreach ($schemaName in @('inventory', 'manifest', 'bundle', 'effect-ir', 'evidence', 'diagnostic', 'protocol', 'project', 'scenario', 'lock', 'replay', 'corpus-audit', 'generator-protocol', 'migration-request', 'proposal', 'migration-plan', 'migration-evidence', 'archive-manifest', 'audit-finding', 'harden-plan', 'harden-approval', 'harden-evidence')) {
             $schema = & $installed schema $schemaName | ConvertFrom-Json
             if ($LASTEXITCODE -ne 0 -or $schema.'$schema' -ne 'https://json-schema.org/draft/2020-12/schema') { throw "archive schema smoke test failed: $schemaName" }
           }
-          foreach ($mode in @('__process-agent', '__observer-agent', '__nushell-adapter')) {
+          foreach ($mode in @('__process-agent', '__observer-agent', '__nushell-adapter', '__generator')) {
             $request = '{"id":1,"jsonrpc":"2.0","method":"deshell.handshake","params":{"protocol_version":1}}'
             $response = $request | & $installed $mode | ConvertFrom-Json
-            if ($LASTEXITCODE -ne 0 -or $response.result.protocol_version -ne 1) { throw "archive $mode handshake failed" }
+            $valid = if ($mode -eq '__generator') { $response.result.protocol -eq 'deshell.generator.v1' } else { $response.result.protocol_version -eq 1 }
+            if ($LASTEXITCODE -ne 0 -or -not $valid) { throw "archive $mode handshake failed" }
           }
 
       - name: Upload archive
@@ -134,7 +325,12 @@ jobs:
 
   publish:
     name: Sign, attest, and publish
-    needs: build
+    if: ${{ github.ref == 'refs/tags/v0.1.0-rc.1' || github.ref == 'refs/tags/v0.1.0' }}
+    needs:
+      - build
+      - dynamic-analysis
+      - release-qualification
+      - migration-e2e
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     environment: release

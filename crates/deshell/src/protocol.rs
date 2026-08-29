@@ -9,6 +9,7 @@ pub(crate) enum AgentKind {
     Process,
     Observer,
     Nushell,
+    Generator,
 }
 
 pub(crate) fn handle_message(kind: AgentKind, input: &[u8]) -> Vec<u8> {
@@ -74,6 +75,22 @@ pub(crate) fn handle_message(kind: AgentKind, input: &[u8]) -> Vec<u8> {
                 &format!("unsupported protocol version {version}; supported version is 1"),
             ));
         }
+        if kind == AgentKind::Generator {
+            return result_response(
+                id,
+                serde_json::json!({
+                    "generator": {
+                        "capabilities": ["rust", "go"],
+                        "digest": crate::migration::official_generator_digest(),
+                        "name": "deshell-official",
+                        "version": env!("CARGO_PKG_VERSION")
+                    },
+                    "max_frame_bytes": MAX_MESSAGE_BYTES,
+                    "protocol": "deshell.generator.v1",
+                    "schema_version": 1
+                }),
+            );
+        }
         let (name, capability) = agent_identity(kind);
         return result_response(
             id,
@@ -92,6 +109,9 @@ pub(crate) fn handle_message(kind: AgentKind, input: &[u8]) -> Vec<u8> {
         (AgentKind::Observer, "observer.observe") => observe_process(parameters),
         (AgentKind::Observer, "observer.run_plan") => run_plan_process(parameters),
         (AgentKind::Nushell, "nushell.lower") => lower_nushell(parameters),
+        (AgentKind::Generator, "generator.propose") => {
+            crate::migration::generator_propose(parameters).map_err(|message| (-32602, message))
+        }
         _ => return response(error(id, -32601, "method not found")),
     };
     match result {
@@ -371,6 +391,7 @@ fn agent_identity(kind: AgentKind) -> (&'static str, &'static str) {
         AgentKind::Process => ("deshell-process-agent", "process.execute"),
         AgentKind::Observer => ("deshell-observer-agent", "observer.observe"),
         AgentKind::Nushell => ("deshell-nushell-adapter", "nushell.lower"),
+        AgentKind::Generator => ("deshell-official", "generator.propose"),
     }
 }
 
@@ -393,23 +414,30 @@ fn execute_process(
 fn observe_process(
     parameters: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<serde_json::Value, MethodError> {
-    let request = process_request(parameters)?;
     let root = std::env::current_dir().map_err(|error| {
         (
             -32010,
             format!("cannot resolve observer workspace: {error}"),
         )
     })?;
+    observe_process_at(&root, parameters)
+}
+
+fn observe_process_at(
+    root: &std::path::Path,
+    parameters: &serde_json::Map<String, serde_json::Value>,
+) -> Result<serde_json::Value, MethodError> {
+    let request = process_request(parameters)?;
     if let Some(values) = parameters.get("fixtures") {
         let fixtures = fixture_params(values)?;
-        crate::workspace::materialize(&root, &fixtures).map_err(|error| (-32602, error))?;
+        crate::workspace::materialize(root, &fixtures).map_err(|error| (-32602, error))?;
     }
-    let before = crate::workspace::capture(&root).map_err(|error| (-32010, error))?;
-    let outcome = crate::agent_process::execute(&root, request).map_err(|error| (-32010, error))?;
-    let after = crate::workspace::capture(&root).map_err(|error| (-32010, error))?;
+    let before = crate::workspace::capture(root).map_err(|error| (-32010, error))?;
+    let outcome = crate::agent_process::execute(root, request).map_err(|error| (-32010, error))?;
+    let after = crate::workspace::capture(root).map_err(|error| (-32010, error))?;
     if let Some(values) = parameters.get("expected_files") {
         let expected = expected_file_params(values)?;
-        crate::workspace::validate_expected(&root, &expected)
+        crate::workspace::validate_expected(root, &expected)
             .map_err(|errors| (-32011, errors.join("; ")))?;
     }
     let changes = crate::workspace::diff(&before, &after).into_iter().map(|change| {
@@ -425,6 +453,19 @@ fn observe_process(
 }
 
 fn run_plan_process(
+    parameters: &serde_json::Map<String, serde_json::Value>,
+) -> Result<serde_json::Value, MethodError> {
+    let root = std::env::current_dir().map_err(|error| {
+        (
+            -32010,
+            format!("cannot resolve observer workspace: {error}"),
+        )
+    })?;
+    run_plan_process_at(&root, parameters)
+}
+
+fn run_plan_process_at(
+    root: &std::path::Path,
     parameters: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<serde_json::Value, MethodError> {
     let invalid = |message: &str| (-32602, message.to_owned());
@@ -443,19 +484,12 @@ fn run_plan_process(
         ),
     };
     let named_inputs = named_values(parameters.get("arguments"), "arguments")?;
-    let root = std::env::current_dir().map_err(|error| {
-        (
-            -32010,
-            format!("cannot resolve observer workspace: {error}"),
-        )
-    })?;
     if let Some(values) = parameters.get("fixtures") {
         let fixtures = fixture_params(values)?;
-        crate::workspace::materialize(&root, &fixtures).map_err(|error| (-32602, error))?;
+        crate::workspace::materialize(root, &fixtures).map_err(|error| (-32602, error))?;
     }
-    let before = crate::workspace::capture(&root).map_err(|error| (-32010, error))?;
-    let config =
-        crate::project::load_config(&root).map_err(|errors| (-32010, errors.join("; ")))?;
+    let before = crate::workspace::capture(root).map_err(|error| (-32010, error))?;
+    let config = crate::project::load_config(root).map_err(|errors| (-32010, errors.join("; ")))?;
     let limits = crate::config::ResourceLimits {
         timeout_ms: request.limits.timeout_ms,
         memory_bytes: request.limits.memory_bytes,
@@ -468,14 +502,14 @@ fn run_plan_process(
             "observer plan resource limits may only narrow project limits",
         ));
     }
-    let (mut plan, _) = crate::project::load_entry_artifacts(&root, entrypoint)
+    let (mut plan, _) = crate::project::load_entry_artifacts(root, entrypoint)
         .map_err(|errors| (-32010, errors.join("; ")))?;
     if let Some(node_id) = node_id {
         plan = select_plan_node(plan, node_id).map_err(|error| (-32602, error))?;
     }
-    let lock = crate::project::load_lock(&root).map_err(|errors| (-32010, errors.join("; ")))?;
+    let lock = crate::project::load_lock(root).map_err(|errors| (-32010, errors.join("; ")))?;
     let backend = crate::local_backend::LocalBackend::with_pinned_interpreters(
-        &root,
+        root,
         limits,
         lock.interpreters,
     )
@@ -511,10 +545,10 @@ fn run_plan_process(
         },
     )
     .map_err(|error| (-32010, error.message))?;
-    let after = crate::workspace::capture(&root).map_err(|error| (-32010, error))?;
+    let after = crate::workspace::capture(root).map_err(|error| (-32010, error))?;
     if let Some(values) = parameters.get("expected_files") {
         let expected = expected_file_params(values)?;
-        crate::workspace::validate_expected(&root, &expected)
+        crate::workspace::validate_expected(root, &expected)
             .map_err(|errors| (-32011, errors.join("; ")))?;
     }
     Ok(run_result_value(
@@ -757,6 +791,7 @@ fn process_request(
     let timeout_ms = parameters
         .get("timeout_ms")
         .and_then(serde_json::Value::as_u64)
+        .filter(|value| *value > 0)
         .ok_or_else(|| invalid("params.timeout_ms must be a positive integer"))?;
     let defaults = crate::agent_process::Limits::default();
     let limit = |name: &str, default: u64| -> Result<u64, MethodError> {
@@ -958,6 +993,99 @@ mod tests {
                     .any(|item| item == capability)
             );
         }
+    }
+
+    #[test]
+    fn official_generator_handshake_uses_generator_protocol_v1() {
+        let response = handle_message(
+            AgentKind::Generator,
+            &request(
+                11,
+                "deshell.handshake",
+                serde_json::json!({"protocol_version": 1}),
+            ),
+        );
+        let response = value(&response);
+        let result = &response["result"];
+        assert_eq!(result["schema_version"], 1);
+        assert_eq!(result["protocol"], "deshell.generator.v1");
+        assert_eq!(result["max_frame_bytes"], MAX_MESSAGE_BYTES);
+        assert_eq!(result["generator"]["name"], "deshell-official");
+        assert!(
+            result["generator"]["digest"]
+                .as_str()
+                .unwrap()
+                .starts_with("sha256:")
+        );
+        assert_eq!(
+            result["generator"]["capabilities"],
+            serde_json::json!(["rust", "go"])
+        );
+    }
+
+    #[test]
+    fn official_generator_proposes_from_a_persisted_migration_request() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        std::fs::write(
+            directory.path().join("build.sh"),
+            b"#!/bin/sh\n/usr/bin/printf generated\n",
+        )
+        .unwrap();
+        let config_path = directory.path().join(".deshell/project.toml");
+        let config = std::fs::read_to_string(&config_path)
+            .unwrap()
+            .replace("entrypoints = []", "entrypoints = [\"build.sh\"]")
+            .replace(
+                "platform_cells = []",
+                &format!(
+                    "platform_cells = [{{ id = \"host\", operating_system = \"{}\", architecture = \"{}\", runtime = \"native\", approval = \"approved\" }}]",
+                    std::env::consts::OS,
+                    std::env::consts::ARCH
+                ),
+            );
+        std::fs::write(config_path, config).unwrap();
+        let scenario_path = directory.path().join(".deshell/scenarios/default.toml");
+        let scenario = std::fs::read_to_string(&scenario_path)
+            .unwrap()
+            .replace("approval = \"draft\"", "approval = \"approved\"");
+        std::fs::write(scenario_path, scenario).unwrap();
+        std::fs::create_dir_all(directory.path().join("src/bin")).unwrap();
+        let planned = crate::migration::create_plan(directory.path()).unwrap();
+        assert!(planned.blockers.is_empty(), "{:#?}", planned.blockers);
+        let plan_directory = directory
+            .path()
+            .join(format!(".deshell/migrations/sha256/{}", planned.digest));
+        let request_path = std::fs::read_dir(plan_directory.join("requests"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let proposal_path = std::fs::read_dir(plan_directory.join("proposals"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let migration_request =
+            crate::strict_json::parse(&std::fs::read(request_path).unwrap()).unwrap();
+        let expected = crate::strict_json::parse(&std::fs::read(proposal_path).unwrap()).unwrap();
+        let response = handle_message(
+            AgentKind::Generator,
+            &request(
+                12,
+                "generator.propose",
+                serde_json::json!({
+                    "expected_digest": null,
+                    "request": migration_request,
+                    "target_path": "src/bin/deshell_build.rs",
+                    "validation": []
+                }),
+            ),
+        );
+        let response = value(&response);
+        assert_eq!(response["result"], expected, "{response:#}");
     }
 
     #[test]
@@ -1163,6 +1291,448 @@ mod tests {
         assert_eq!(
             response["result"]["plan"]["tasks"][0]["body"]["operation"]["type"],
             "exec"
+        );
+    }
+
+    #[test]
+    fn process_fixture_expected_file_and_named_value_parameters_are_strict() {
+        let base = serde_json::json!({
+            "argv": ["program", "literal"],
+            "environment": [{"name": "MODE", "value": "test"}],
+            "memory_bytes": 33554432,
+            "processes": 4,
+            "stderr_bytes": 2048,
+            "stdin_base64": "AP8=",
+            "stdout_bytes": 1024,
+            "timeout_ms": 5000,
+            "working_directory": "work"
+        });
+        let fields = base.as_object().unwrap();
+        let request = process_request(fields).unwrap();
+        assert_eq!(request.argv, ["program", "literal"]);
+        assert_eq!(request.environment, [("MODE".into(), "test".into())]);
+        assert_eq!(request.stdin, [0, 0xff]);
+        assert_eq!(request.working_directory.as_deref(), Some("work"));
+        assert_eq!(request.limits.stdout_bytes, 1024);
+
+        for (field, invalid) in [
+            ("argv", serde_json::json!(null)),
+            ("environment", serde_json::json!([1])),
+            ("stdin_base64", serde_json::json!("AA")),
+            ("timeout_ms", serde_json::json!(0)),
+            ("memory_bytes", serde_json::json!(0)),
+            ("working_directory", serde_json::json!(false)),
+        ] {
+            let mut value = base.clone();
+            value[field] = invalid;
+            assert!(
+                process_request(value.as_object().unwrap()).is_err(),
+                "{field}"
+            );
+        }
+        let mut bad_environment = base.clone();
+        bad_environment["environment"] = serde_json::json!([{"name": 1, "value": "x"}]);
+        assert!(process_request(bad_environment.as_object().unwrap()).is_err());
+        bad_environment["environment"] = serde_json::json!([{"name": "A", "value": 1}]);
+        assert!(process_request(bad_environment.as_object().unwrap()).is_err());
+
+        let fixtures = fixture_params(&serde_json::json!([
+            {"contents_base64": "dmFsdWU=", "executable": true, "path": "bin/tool"},
+            {"contents_base64": "", "path": "empty"}
+        ]))
+        .unwrap();
+        assert_eq!(fixtures.len(), 2);
+        assert!(fixtures[0].executable);
+        for invalid in [
+            serde_json::json!({}),
+            serde_json::json!([1]),
+            serde_json::json!([{"contents_base64": "AA=="}]),
+            serde_json::json!([{"contents_base64": "AA", "path": "x"}]),
+            serde_json::json!([{"contents_base64": "", "executable": 1, "path": "x"}]),
+        ] {
+            assert!(fixture_params(&invalid).is_err(), "{invalid}");
+        }
+
+        let expected = expected_file_params(&serde_json::json!([
+            {"path": "out", "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+        ]))
+        .unwrap();
+        assert_eq!(expected[0].path, "out");
+        for invalid in [
+            serde_json::json!({}),
+            serde_json::json!([1]),
+            serde_json::json!([{"sha256": "a"}]),
+            serde_json::json!([{"path": "out"}]),
+        ] {
+            assert!(expected_file_params(&invalid).is_err(), "{invalid}");
+        }
+
+        let named = named_values(
+            Some(&serde_json::json!([
+                {"name": "first", "value": "one"},
+                {"name": "second", "value": "two"}
+            ])),
+            "arguments",
+        )
+        .unwrap();
+        assert_eq!(named["second"], "two");
+        for invalid in [
+            None,
+            Some(serde_json::json!({})),
+            Some(serde_json::json!([1])),
+            Some(serde_json::json!([{"name": "", "value": "x"}])),
+            Some(serde_json::json!([{"name": "x", "value": 1}])),
+            Some(serde_json::json!([
+                {"name": "x", "value": "1"},
+                {"name": "x", "value": "2"}
+            ])),
+        ] {
+            assert!(named_values(invalid.as_ref(), "arguments").is_err());
+        }
+    }
+
+    #[test]
+    fn streamed_response_validation_rejects_every_unbound_or_corrupt_shape() {
+        fn notification(
+            id: serde_json::Value,
+            stream: &str,
+            sequence: u64,
+            data_base64: &str,
+        ) -> Vec<u8> {
+            let mut bytes = crate::canonical_json::canonical_bytes(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "deshell.stream",
+                "params": {
+                    "data_base64": data_base64,
+                    "request_id": id,
+                    "sequence": sequence,
+                    "stream": stream
+                }
+            }))
+            .unwrap();
+            bytes.push(b'\n');
+            bytes
+        }
+
+        let id = serde_json::json!(4);
+        assert!(
+            decode_streamed_response(b"", &id, 10, 10)
+                .unwrap_err()
+                .contains("missing")
+        );
+        assert!(
+            decode_streamed_response(
+                &notification(serde_json::json!(5), "stdout", 0, "YQ=="),
+                &id,
+                10,
+                10
+            )
+            .unwrap_err()
+            .contains("ID mismatch")
+        );
+        assert!(
+            decode_streamed_response(&notification(id.clone(), "unknown", 0, "YQ=="), &id, 10, 10)
+                .unwrap_err()
+                .contains("unknown RPC stream")
+        );
+        assert!(
+            decode_streamed_response(&notification(id.clone(), "stdout", 0, "?"), &id, 10, 10)
+                .is_err()
+        );
+        assert!(
+            decode_streamed_response(&notification(id.clone(), "stdout", 0, "YQ=="), &id, 0, 10)
+                .unwrap_err()
+                .contains("configured byte limit")
+        );
+
+        let mut missing_metadata = notification(id.clone(), "stdout", 0, "YQ==");
+        missing_metadata.extend(result_response(
+            id.clone(),
+            serde_json::json!({"exit_code": 0}),
+        ));
+        assert!(
+            decode_streamed_response(&missing_metadata, &id, 10, 10)
+                .unwrap_err()
+                .contains("missing stream metadata")
+        );
+
+        let mut wrong_count = notification(id.clone(), "stdout", 0, "YQ==");
+        wrong_count.extend(result_response(
+            id.clone(),
+            serde_json::json!({
+                "streams": {
+                    "stdout": {"bytes": 2, "sha256": crate::digest::sha256(b"a")},
+                    "stderr": {"bytes": 0, "sha256": crate::digest::sha256(b"")}
+                }
+            }),
+        ));
+        assert!(
+            decode_streamed_response(&wrong_count, &id, 10, 10)
+                .unwrap_err()
+                .contains("byte count")
+        );
+        let mut wrong_digest = notification(id.clone(), "stdout", 0, "YQ==");
+        wrong_digest.extend(result_response(
+            id.clone(),
+            serde_json::json!({
+                "streams": {
+                    "stdout": {"bytes": 1, "sha256": "0".repeat(64)},
+                    "stderr": {"bytes": 0, "sha256": crate::digest::sha256(b"")}
+                }
+            }),
+        ));
+        assert!(
+            decode_streamed_response(&wrong_digest, &id, 10, 10)
+                .unwrap_err()
+                .contains("digest mismatch")
+        );
+
+        let mut duplicate_final = result_response(id.clone(), serde_json::json!({"ok": true}));
+        duplicate_final.extend(result_response(id.clone(), serde_json::json!({"ok": true})));
+        assert!(
+            decode_streamed_response(&duplicate_final, &id, 10, 10)
+                .unwrap_err()
+                .contains("multiple final")
+        );
+    }
+
+    #[test]
+    fn node_selection_and_result_encoding_preserve_observable_structure() {
+        use crate::ir::{Guarantee, Node, Operation, Plan, Task, TextExpression};
+
+        fn native(operation: Operation) -> Node {
+            Node {
+                id: String::new(),
+                operation,
+                guarantee: Guarantee::Native {
+                    semantic_model: "protocol-test-v1".into(),
+                },
+                source: None,
+            }
+        }
+        fn emit(value: &str) -> Node {
+            native(Operation::Exec {
+                argv: vec![
+                    TextExpression::literal("emit"),
+                    TextExpression::literal(value),
+                ],
+                environment: vec![],
+                working_directory: None,
+            })
+        }
+
+        let target = emit("selected");
+        let mut plan = Plan {
+            schema_version: 1,
+            generator: "test".into(),
+            entrypoint: "main".into(),
+            tasks: vec![Task {
+                name: "main".into(),
+                inputs: vec![],
+                outputs: vec![],
+                environment: vec![],
+                secrets: vec![],
+                platform_capabilities: vec![],
+                cacheable: false,
+                invocation: None,
+                body: native(Operation::Condition {
+                    predicate: Box::new(emit("predicate")),
+                    if_true: Box::new(native(Operation::Sequence {
+                        nodes: vec![emit("first"), target],
+                    })),
+                    if_false: Some(Box::new(emit("false"))),
+                }),
+            }],
+        };
+        plan.assign_node_ids().unwrap();
+        let selected_id = match &plan.tasks[0].body.operation {
+            Operation::Condition { if_true, .. } => match &if_true.operation {
+                Operation::Sequence { nodes } => nodes[1].id.clone(),
+                _ => unreachable!(),
+            },
+            _ => unreachable!(),
+        };
+        let selected = select_plan_node(plan.clone(), &selected_id).unwrap();
+        assert_eq!(selected.tasks.len(), 1);
+        assert_eq!(selected.tasks[0].body.id, selected_id);
+        assert!(
+            select_plan_node(plan, "missing")
+                .unwrap_err()
+                .contains("not found")
+        );
+
+        let encoded = run_result_value(
+            &crate::runner::RunResult {
+                exit_code: 3,
+                stdout: vec![0, 0xff],
+                stderr: b"error".to_vec(),
+                trace: vec![],
+            },
+            vec![
+                crate::workspace::Change {
+                    path: "created".into(),
+                    kind: crate::workspace::ChangeKind::Created,
+                    before_sha256: None,
+                    after_sha256: Some("a".repeat(64)),
+                },
+                crate::workspace::Change {
+                    path: "modified".into(),
+                    kind: crate::workspace::ChangeKind::Modified,
+                    before_sha256: Some("b".repeat(64)),
+                    after_sha256: Some("c".repeat(64)),
+                },
+                crate::workspace::Change {
+                    path: "removed".into(),
+                    kind: crate::workspace::ChangeKind::Removed,
+                    before_sha256: Some("d".repeat(64)),
+                    after_sha256: None,
+                },
+            ],
+        );
+        assert_eq!(encoded["exit_code"], 3);
+        assert_eq!(encoded["stdout_base64"], "AP8=");
+        assert_eq!(encoded["files"][0]["kind"], "created");
+        assert_eq!(encoded["files"][1]["kind"], "modified");
+        assert_eq!(encoded["files"][2]["kind"], "removed");
+
+        let outcome = process_outcome(&crate::agent_process::Outcome {
+            exit_code: 9,
+            stdout: b"out".to_vec(),
+            stderr: b"err".to_vec(),
+            timed_out: true,
+            limit_exceeded: Some("timeout".into()),
+            signal: Some(15),
+        });
+        assert_eq!(outcome["signal"], 15);
+        assert_eq!(outcome["limit_exceeded"], "timeout");
+    }
+
+    #[test]
+    fn envelope_and_frame_errors_remain_bounded_and_machine_readable() {
+        for message in [
+            serde_json::json!(null),
+            serde_json::json!({"id": true, "jsonrpc": "2.0", "method": "x", "params": {}}),
+            serde_json::json!({"id": 1, "jsonrpc": "2.0", "params": {}}),
+            serde_json::json!({"id": 1, "jsonrpc": "2.0", "method": "x", "params": []}),
+            serde_json::json!({"id": 1, "jsonrpc": "2.0", "method": "deshell.handshake", "params": {}}),
+        ] {
+            let encoded = crate::canonical_json::canonical_bytes(&message).unwrap();
+            assert!(value(&handle_message(AgentKind::Process, &encoded))["error"]["code"].is_i64());
+        }
+
+        let mut oversized = vec![b'x'; MAX_MESSAGE_BYTES + 1];
+        oversized.push(b'\n');
+        let mut output = Vec::new();
+        assert_eq!(
+            serve(
+                AgentKind::Process,
+                &mut std::io::Cursor::new(oversized),
+                &mut output,
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(value(&output)["error"]["code"], -32002);
+
+        let rpc_error = br#"{"error":{"code":-1,"message":"denied"},"id":1,"jsonrpc":"2.0"}"#;
+        assert!(
+            decode_response(rpc_error, &serde_json::json!(1))
+                .unwrap_err()
+                .contains("denied")
+        );
+        assert!(
+            decode_response(
+                br#"{"id":1,"jsonrpc":"1.0","result":{}}"#,
+                &serde_json::json!(1)
+            )
+            .is_err()
+        );
+        assert!(
+            decode_response(
+                br#"{"error":1,"id":1,"jsonrpc":"2.0"}"#,
+                &serde_json::json!(1)
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn observer_process_and_persisted_plan_run_in_an_explicit_workspace() {
+        let observed = tempfile::tempdir().unwrap();
+        let expected = crate::digest::sha256(b"created");
+        let observe = serde_json::json!({
+            "argv": ["/bin/sh", "-c", "printf created > output.txt; printf observed"],
+            "environment": [{"name": "MODE", "value": "test"}],
+            "expected_files": [{"path": "output.txt", "sha256": expected}],
+            "fixtures": [{"contents_base64": "aW5wdXQ=", "executable": false, "path": "input.txt"}],
+            "memory_bytes": 1073741824_u64,
+            "processes": 512,
+            "stderr_bytes": 16777216,
+            "stdin_base64": "",
+            "stdout_bytes": 16777216,
+            "timeout_ms": 5000,
+            "working_directory": null
+        });
+        let result = observe_process_at(observed.path(), observe.as_object().unwrap()).unwrap();
+        assert_eq!(result["exit_code"], 0);
+        assert_eq!(result["stdout_base64"], "b2JzZXJ2ZWQ=");
+        assert_eq!(result["files"][0]["kind"], "created");
+        assert_eq!(result["files"][0]["path"], "output.txt");
+        let mut mismatch = observe.clone();
+        mismatch["expected_files"][0]["sha256"] = serde_json::json!("0".repeat(64));
+        let mismatched = tempfile::tempdir().unwrap();
+        assert_eq!(
+            observe_process_at(mismatched.path(), mismatch.as_object().unwrap())
+                .unwrap_err()
+                .0,
+            -32011
+        );
+
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join("build.sh"),
+            b"#!/bin/sh\n/usr/bin/printf '%s' \"$1\"\n",
+        )
+        .unwrap();
+        crate::project::init_with_entries(project.path(), &["build.sh".into()]).unwrap();
+        crate::project::analyze(project.path(), "build.sh").unwrap();
+        let run = serde_json::json!({
+            "arguments": [],
+            "argv": ["native"],
+            "entrypoint": "build.sh",
+            "environment": [],
+            "expected_files": [],
+            "fixtures": [],
+            "memory_bytes": 1073741824_u64,
+            "node_id": null,
+            "processes": 512,
+            "stderr_bytes": 16777216,
+            "stdin_base64": "",
+            "stdout_bytes": 16777216,
+            "timeout_ms": 5000,
+            "working_directory": null
+        });
+        let result = run_plan_process_at(project.path(), run.as_object().unwrap()).unwrap();
+        assert_eq!(result["exit_code"], 0);
+        assert_eq!(result["stdout_base64"], "bmF0aXZl");
+        assert_eq!(result["files"], serde_json::json!([]));
+
+        let mut invalid_node = run.clone();
+        invalid_node["node_id"] = serde_json::json!("");
+        assert_eq!(
+            run_plan_process_at(project.path(), invalid_node.as_object().unwrap())
+                .unwrap_err()
+                .0,
+            -32602
+        );
+        let mut broad_limits = run;
+        broad_limits["memory_bytes"] = serde_json::json!(2_147_483_648_u64);
+        assert_eq!(
+            run_plan_process_at(project.path(), broad_limits.as_object().unwrap())
+                .unwrap_err()
+                .0,
+            -32602
         );
     }
 }

@@ -5,7 +5,27 @@ Red, Green, Refactor increments, and a checked box means the repository contains
 the implementation and deterministic test—not that an external release or
 hardware gate has already run.
 
-## 0.1.0 contract and compiler — implemented
+## 0.1.0 migration oracle — implementation in progress
+
+Version 0.1.0 must not be published until representative end-to-end retirement
+passes for all seven interpreters (POSIX/Bash, zsh, fish, PowerShell, cmd, and
+Nushell), with both official Rust and Go generators where applicable.
+
+- [x] Repository-wide audit, scenario draft, migration plan/verify/evidence
+  import/apply/status, harden, and shell-free gate command surfaces.
+- [x] Strict v1 Generator Protocol, Migration Request, Proposal, Migration Plan,
+  Migration Evidence, Archive Manifest, Audit Finding, and harden contracts.
+- [x] Content-addressed plans, full-cell Evidence keys, repeat comparison,
+  coverage checks, staged shell-free scan, atomic retirement, rollback, and
+  archive/Evidence integrity verification.
+- [x] Official Rust, Go, Docker/Python/JavaScript/GitHub-host generators and a
+  digest-pinned isolated external-generator bridge.
+- [x] Complete project-native Make/package/task interface rewrites and resolve
+  every supported static call site in the proposal rather than blocking it.
+- [x] Add enforced network record/replay observations and the complete
+  seven-interpreter, two-generator E2E corpus.
+
+## Foundational contract and compiler substrate — implemented
 
 - [x] Language-neutral Inventory v1, manifest, Effect IR v1, Evidence v1,
   diagnostic, project, scenario, lock, replay, audit, and JSON-RPC contracts
@@ -43,12 +63,14 @@ hardware gate has already run.
 
 ## 0.1.0 release evidence — must pass before publication
 
+- [ ] Pass `scenario -> plan -> matrix verify -> evidence import -> apply ->
+  scan zero` for shell files and embedded sources across the seven interpreters,
+  including input, environment, branch, failure, and parser-blocker cases.
 - [ ] Run every fast, contract, platform, differential, security, package,
   official-exporter, and workflow gate from `v0.1.0-rc.1`, including the
   required three-operating-system matrix.
-- [ ] Raise measured line coverage from the checked-in 74% regression floor to
-  at least 90% overall and at least 90% in scanner, frontend, runner, protocol,
-  lab, and patch before treating coverage as a 0.1.0 release gate.
+- [x] Enforce measured line coverage at 90% overall and at least 90% in scanner,
+  frontend, runner, protocol, lab, and patch as a 0.1.0 release gate.
 - [ ] Run the fixed 2026-08-25 48-repository audit selection through both
   deterministic implementations and record zero scanner errors/skips,
   unclassified files, residual executable coverage, nondeterminism, or

@@ -3,30 +3,117 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "properties": {
-    "entrypoints": {
-      "items": { "$ref": "#/$defs/path" },
-      "type": "array",
-      "uniqueItems": true
-    },
-    "export": {
+    "audit": {
       "additionalProperties": false,
       "properties": {
-        "mode": { "enum": ["strict", "bundle"] }
+        "acknowledgement_max_days": { "maximum": 366, "minimum": 1, "type": "integer" },
+        "acknowledgements": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "expires": { "format": "date", "type": "string" },
+              "location_digest": { "$ref": "#/$defs/digest" },
+              "owner": { "minLength": 1, "type": "string" },
+              "reason": { "minLength": 1, "type": "string" },
+              "rule": { "minLength": 1, "type": "string" }
+            },
+            "required": ["rule", "location_digest", "reason", "owner", "expires"],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "fail_on": { "$ref": "#/$defs/severity" },
+        "persona": { "const": "pedantic" }
       },
+      "required": ["persona", "fail_on", "acknowledgement_max_days", "acknowledgements"],
+      "type": "object"
+    },
+    "entrypoints": { "items": { "$ref": "#/$defs/path" }, "type": "array", "uniqueItems": true },
+    "export": {
+      "additionalProperties": false,
+      "properties": { "mode": { "enum": ["strict", "bundle"] } },
       "required": ["mode"],
       "type": "object"
     },
-    "limits": {
+    "integration": {
       "additionalProperties": false,
       "properties": {
-        "memory_bytes": { "maximum": 1099511627776, "minimum": 16777216, "type": "integer" },
-        "processes": { "maximum": 65535, "minimum": 1, "type": "integer" },
-        "stderr_bytes": { "maximum": 1073741824, "minimum": 1, "type": "integer" },
-        "stdout_bytes": { "maximum": 1073741824, "minimum": 1, "type": "integer" },
-        "timeout_ms": { "maximum": 86400000, "minimum": 1, "type": "integer" }
+        "go": { "$ref": "#/$defs/integrationTarget" },
+        "rust": { "$ref": "#/$defs/integrationTarget" }
       },
-      "required": ["timeout_ms", "memory_bytes", "processes", "stdout_bytes", "stderr_bytes"],
+      "required": ["rust", "go"],
       "type": "object"
+    },
+    "interpreter_overrides": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "interpreter": { "enum": ["sh", "bash", "zsh", "fish", "powershell", "cmd", "nu"] },
+          "path": { "$ref": "#/$defs/path" }
+        },
+        "required": ["path", "interpreter"],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "limits": { "$ref": "#/$defs/resourceLimits" },
+    "location_overrides": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "end_byte": { "minimum": 1, "type": "integer" },
+          "generator": { "minLength": 1, "pattern": "^\\S+$", "type": "string" },
+          "module_root": { "$ref": "#/$defs/path" },
+          "path": { "$ref": "#/$defs/path" },
+          "start_byte": { "minimum": 0, "type": "integer" },
+          "target": { "$ref": "#/$defs/migrationTarget" }
+        },
+        "required": ["path", "start_byte", "end_byte", "generator", "target", "module_root"],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "migration": {
+      "additionalProperties": false,
+      "properties": {
+        "agent_context": { "const": "minimal" },
+        "allow_agent_network": { "type": "boolean" },
+        "allow_source_send": { "type": "boolean" },
+        "external_generators": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "capabilities": { "items": { "$ref": "#/$defs/migrationTarget" }, "minItems": 1, "type": "array", "uniqueItems": true },
+              "digest": { "$ref": "#/$defs/pinnedDigest" },
+              "executable": { "$ref": "#/$defs/path" },
+              "name": { "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$", "type": "string" }
+            },
+            "required": ["name", "executable", "digest", "capabilities"],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "generator": { "minLength": 1, "pattern": "^\\S+$", "type": "string" },
+        "module_root": { "$ref": "#/$defs/path" },
+        "target": { "$ref": "#/$defs/migrationTarget" }
+      },
+      "required": ["generator", "target", "module_root", "agent_context", "allow_agent_network", "allow_source_send", "external_generators"],
+      "type": "object"
+    },
+    "platform_cells": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "approval": { "$ref": "#/$defs/approval" },
+          "architecture": { "minLength": 1, "type": "string" },
+          "id": { "minLength": 1, "type": "string" },
+          "operating_system": { "minLength": 1, "type": "string" },
+          "runtime": { "minLength": 1, "type": "string" }
+        },
+        "required": ["id", "operating_system", "architecture", "runtime", "approval"],
+        "type": "object"
+      },
+      "type": "array"
     },
     "policy": {
       "additionalProperties": false,
@@ -44,23 +131,57 @@
     },
     "sandbox": {
       "additionalProperties": false,
-      "properties": {
-        "allow_local": { "type": "boolean" },
-        "mode": { "const": "disposable" }
-      },
+      "properties": { "allow_local": { "type": "boolean" }, "mode": { "const": "disposable" } },
       "required": ["mode", "allow_local"],
       "type": "object"
     },
+    "validation_commands": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "argv": { "$ref": "#/$defs/exactArgv" },
+          "kind": { "enum": ["build", "test"] },
+          "name": { "minLength": 1, "type": "string" }
+        },
+        "required": ["name", "kind", "argv"],
+        "type": "object"
+      },
+      "type": "array"
+    },
     "version": { "const": 1 }
   },
-  "required": ["version", "entrypoints", "policy", "sandbox", "limits", "export"],
+  "required": ["version", "entrypoints", "location_overrides", "interpreter_overrides", "platform_cells", "validation_commands", "migration", "integration", "audit", "policy", "sandbox", "limits", "export"],
   "title": "de-shell project configuration v1",
   "type": "object",
   "$defs": {
+    "approval": { "enum": ["draft", "approved"] },
+    "digest": { "pattern": "^[0-9a-f]{64}$", "type": "string" },
+    "exactArgv": { "items": { "type": "string" }, "minItems": 1, "type": "array" },
+    "integrationTarget": {
+      "additionalProperties": false,
+      "properties": { "module_root": { "$ref": "#/$defs/path" } },
+      "required": ["module_root"],
+      "type": "object"
+    },
+    "migrationTarget": { "enum": ["rust", "go", "host", "agent"] },
     "path": {
       "minLength": 1,
       "pattern": "^(?!/)(?!\\.{1,2}(?:/|$))(?!.*//)(?!.*\\/\\.{1,2}(?:/|$))(?!.*\\/$)[^\\\\:\\u0000]+$",
       "type": "string"
-    }
+    },
+    "pinnedDigest": { "pattern": "^sha256:[0-9a-f]{64}$", "type": "string" },
+    "resourceLimits": {
+      "additionalProperties": false,
+      "properties": {
+        "memory_bytes": { "maximum": 1099511627776, "minimum": 16777216, "type": "integer" },
+        "processes": { "maximum": 65535, "minimum": 1, "type": "integer" },
+        "stderr_bytes": { "maximum": 1073741824, "minimum": 1, "type": "integer" },
+        "stdout_bytes": { "maximum": 1073741824, "minimum": 1, "type": "integer" },
+        "timeout_ms": { "maximum": 86400000, "minimum": 1, "type": "integer" }
+      },
+      "required": ["timeout_ms", "memory_bytes", "processes", "stdout_bytes", "stderr_bytes"],
+      "type": "object"
+    },
+    "severity": { "enum": ["note", "low", "medium", "high", "critical"] }
   }
 }

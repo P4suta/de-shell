@@ -123,6 +123,89 @@
       "required": ["name", "value"],
       "type": "object"
     },
+    "environmentBinding": {
+      "additionalProperties": false,
+      "properties": {
+        "name": { "pattern": "^[A-Za-z_][A-Za-z0-9_]*$", "type": "string" },
+        "secret": { "type": "boolean" },
+        "value": { "oneOf": [{ "$ref": "#/$defs/textExpression" }, { "type": "null" }] }
+      },
+      "required": ["name", "value", "secret"],
+      "type": "object"
+    },
+    "fieldSplitting": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": { "kind": { "const": "none" } },
+          "required": ["kind"],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "ifs": { "$ref": "#/$defs/textExpression" },
+            "kind": { "const": "posix_ifs" }
+          },
+          "required": ["kind", "ifs"],
+          "type": "object"
+        }
+      ]
+    },
+    "redirection": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "fd": { "maximum": 1024, "minimum": 0, "type": "integer" },
+            "kind": { "const": "read" },
+            "path": { "$ref": "#/$defs/textExpression" }
+          },
+          "required": ["kind", "fd", "path"],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "append": { "type": "boolean" },
+            "fd": { "maximum": 1024, "minimum": 0, "type": "integer" },
+            "kind": { "const": "write" },
+            "path": { "$ref": "#/$defs/textExpression" }
+          },
+          "required": ["kind", "fd", "path", "append"],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "fd": { "maximum": 1024, "minimum": 0, "type": "integer" },
+            "kind": { "const": "duplicate" },
+            "target_fd": { "maximum": 1024, "minimum": 0, "type": "integer" }
+          },
+          "required": ["kind", "fd", "target_fd"],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "fd": { "maximum": 1024, "minimum": 0, "type": "integer" },
+            "kind": { "const": "close" }
+          },
+          "required": ["kind", "fd"],
+          "type": "object"
+        }
+      ]
+    },
+    "stateBinding": {
+      "additionalProperties": false,
+      "properties": {
+        "name": { "pattern": "^[A-Za-z_][A-Za-z0-9_]*$", "type": "string" },
+        "type": { "$ref": "#/$defs/valueType" },
+        "value": { "$ref": "#/$defs/textExpression" }
+      },
+      "required": ["name", "type", "value"],
+      "type": "object"
+    },
     "node": {
       "additionalProperties": false,
       "properties": {
@@ -156,6 +239,28 @@
             }
           },
           "required": ["type", "argv", "environment", "working_directory"],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "field_splitting": { "$ref": "#/$defs/fieldSplitting" },
+            "glob": { "enum": ["disabled", "literal_if_no_match", "fail_if_no_match", "drop_if_no_match"] },
+            "name": { "pattern": "^[A-Za-z_][A-Za-z0-9_]*$", "type": "string" },
+            "type": { "const": "expand_words" },
+            "value": { "$ref": "#/$defs/textExpression" }
+          },
+          "required": ["type", "name", "value", "field_splitting", "glob"],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "body": { "$ref": "#/$defs/node" },
+            "redirections": { "items": { "$ref": "#/$defs/redirection" }, "minItems": 1, "type": "array" },
+            "type": { "const": "redirect" }
+          },
+          "required": ["type", "redirections", "body"],
           "type": "object"
         },
         {
@@ -225,6 +330,18 @@
           "additionalProperties": false,
           "properties": {
             "body": { "$ref": "#/$defs/node" },
+            "environment": { "items": { "$ref": "#/$defs/environmentBinding" }, "type": "array" },
+            "type": { "const": "scope" },
+            "variables": { "items": { "$ref": "#/$defs/stateBinding" }, "type": "array" },
+            "working_directory": { "oneOf": [{ "$ref": "#/$defs/textExpression" }, { "type": "null" }] }
+          },
+          "required": ["type", "variables", "environment", "working_directory", "body"],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "body": { "$ref": "#/$defs/node" },
             "finalizer": { "$ref": "#/$defs/node" },
             "type": { "const": "try_finally" }
           },
@@ -255,12 +372,62 @@
         {
           "additionalProperties": false,
           "properties": {
+            "name": { "pattern": "^[A-Za-z_][A-Za-z0-9_]*$", "type": "string" },
+            "secret": { "type": "boolean" },
+            "type": { "const": "set_environment" },
+            "value": { "oneOf": [{ "$ref": "#/$defs/textExpression" }, { "type": "null" }] }
+          },
+          "required": ["type", "name", "value", "secret"],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "path": { "$ref": "#/$defs/textExpression" },
+            "type": { "const": "set_working_directory" }
+          },
+          "required": ["type", "path"],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
             "body": { "$ref": "#/$defs/node" },
             "name": { "pattern": "^[A-Za-z_][A-Za-z0-9_]*$", "type": "string" },
             "type": { "const": "capture_stdout" },
             "value_type": { "const": "text" }
           },
           "required": ["type", "name", "value_type", "body"],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "body": { "$ref": "#/$defs/node" },
+            "handle": { "pattern": "^[A-Za-z_][A-Za-z0-9_]*$", "type": "string" },
+            "type": { "const": "spawn" }
+          },
+          "required": ["type", "handle", "body"],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "handle": { "pattern": "^[A-Za-z_][A-Za-z0-9_]*$", "type": "string" },
+            "type": { "const": "wait" }
+          },
+          "required": ["type", "handle"],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "handle": { "pattern": "^[A-Za-z_][A-Za-z0-9_]*$", "type": "string" },
+            "process_group": { "type": "boolean" },
+            "signal": { "maximum": 64, "minimum": 1, "type": "integer" },
+            "type": { "const": "send_signal" }
+          },
+          "required": ["type", "handle", "signal", "process_group"],
           "type": "object"
         },
         {
@@ -286,11 +453,59 @@
         {
           "additionalProperties": false,
           "properties": {
+            "follow_symlinks": { "type": "boolean" },
+            "output": { "pattern": "^[A-Za-z_][A-Za-z0-9_]*$", "type": "string" },
+            "path": { "$ref": "#/$defs/textExpression" },
+            "type": { "const": "file_metadata" }
+          },
+          "required": ["type", "path", "output", "follow_symlinks"],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "executable": { "oneOf": [{ "type": "boolean" }, { "type": "null" }] },
+            "follow_symlinks": { "type": "boolean" },
+            "path": { "$ref": "#/$defs/textExpression" },
+            "permissions": {
+              "oneOf": [
+                { "maximum": 511, "minimum": 0, "type": "integer" },
+                { "type": "null" }
+              ]
+            },
+            "type": { "const": "file_set_metadata" }
+          },
+          "required": ["type", "path", "permissions", "executable", "follow_symlinks"],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
             "method": { "$ref": "#/$defs/textExpression" },
             "type": { "const": "network_request" },
             "uri": { "$ref": "#/$defs/textExpression" }
           },
           "required": ["type", "method", "uri"],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "clock": { "enum": ["realtime", "monotonic"] },
+            "output": { "pattern": "^[A-Za-z_][A-Za-z0-9_]*$", "type": "string" },
+            "type": { "const": "clock_read" }
+          },
+          "required": ["type", "clock", "output"],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "length": { "maximum": 1048576, "minimum": 1, "type": "integer" },
+            "output": { "pattern": "^[A-Za-z_][A-Za-z0-9_]*$", "type": "string" },
+            "type": { "const": "random_bytes" }
+          },
+          "required": ["type", "output", "length"],
           "type": "object"
         },
         {
@@ -432,7 +647,33 @@
     },
     "valueType": {
       "oneOf": [
-        { "enum": ["text", "bool", "int", "path"] },
+        { "enum": ["text", "bool", "int", "path", "bytes"] },
+        {
+          "additionalProperties": false,
+          "properties": { "list": { "$ref": "#/$defs/valueType" } },
+          "required": ["list"],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "record": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "name": { "pattern": "^[A-Za-z_][A-Za-z0-9_]*$", "type": "string" },
+                  "type": { "$ref": "#/$defs/valueType" }
+                },
+                "required": ["name", "type"],
+                "type": "object"
+              },
+              "minItems": 1,
+              "type": "array"
+            }
+          },
+          "required": ["record"],
+          "type": "object"
+        },
         {
           "additionalProperties": false,
           "properties": { "secret": { "$ref": "#/$defs/valueType" } },

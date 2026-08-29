@@ -57,6 +57,18 @@
       "required": ["image", "assets"],
       "type": "object"
     },
+    "parsers": {
+      "additionalProperties": false,
+      "properties": {
+        "bash": { "$ref": "#/$defs/pin" },
+        "cmd": { "$ref": "#/$defs/pin" },
+        "fish": { "$ref": "#/$defs/pin" },
+        "nushell": { "$ref": "#/$defs/pin" },
+        "powershell": { "$ref": "#/$defs/pin" }
+      },
+      "required": ["bash", "fish", "cmd", "powershell", "nushell"],
+      "type": "object"
+    },
     "protocol": {
       "additionalProperties": false,
       "properties": {
@@ -81,7 +93,7 @@
     },
     "version": { "const": 1 }
   },
-  "required": ["version", "toolchain", "protocol", "artifacts", "adapters", "interpreters", "targets", "lab"],
+  "required": ["version", "toolchain", "protocol", "artifacts", "adapters", "parsers", "interpreters", "targets", "lab"],
   "title": "de-shell lock file v1",
   "type": "object",
   "$defs": {

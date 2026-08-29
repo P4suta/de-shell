@@ -1,0 +1,56 @@
+{
+  "$id": "https://deshell.dev/contracts/harden-evidence/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "approval_digest": { "$ref": "#/$defs/digest" },
+    "changes": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "after_digest": { "$ref": "#/$defs/digest" },
+          "before_digest": { "$ref": "#/$defs/digest" },
+          "path": { "$ref": "#/$defs/path" },
+          "rules": { "items": { "minLength": 1, "type": "string" }, "minItems": 1, "type": "array" }
+        },
+        "required": ["path", "before_digest", "after_digest", "rules"],
+        "type": "object"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "evidence_digest": { "$ref": "#/$defs/digest" },
+    "kind": { "const": "harden" },
+    "plan_digest": { "$ref": "#/$defs/digest" },
+    "platform_fingerprint": { "$ref": "#/$defs/digest" },
+    "schema_version": { "const": 1 },
+    "status": { "enum": ["verified", "failed"] },
+    "validation": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "argv": { "$ref": "#/$defs/exactArgv" },
+          "exit_code": { "type": "integer" },
+          "kind": { "enum": ["build", "test"] },
+          "limit_exceeded": { "oneOf": [{ "minLength": 1, "type": "string" }, { "type": "null" }] },
+          "name": { "minLength": 1, "type": "string" },
+          "signal": { "oneOf": [{ "type": "integer" }, { "type": "null" }] },
+          "stderr_digest": { "$ref": "#/$defs/digest" },
+          "stdout_digest": { "$ref": "#/$defs/digest" },
+          "timed_out": { "type": "boolean" }
+        },
+        "required": ["name", "kind", "argv", "exit_code", "signal", "timed_out", "limit_exceeded", "stdout_digest", "stderr_digest"],
+        "type": "object"
+      },
+      "type": "array"
+    }
+  },
+  "required": ["schema_version", "kind", "evidence_digest", "plan_digest", "approval_digest", "platform_fingerprint", "status", "changes", "validation"],
+  "title": "de-shell Harden Evidence v1",
+  "type": "object",
+  "$defs": {
+    "digest": { "pattern": "^[0-9a-f]{64}$", "type": "string" },
+    "exactArgv": { "items": { "type": "string" }, "minItems": 1, "type": "array" },
+    "path": { "minLength": 1, "pattern": "^(?!/)(?!\\.{1,2}(?:/|$))(?!.*//)(?!.*\\/\\.{1,2}(?:/|$))(?!.*\\/$)[^\\\\:\\u0000]+$", "type": "string" }
+  }
+}

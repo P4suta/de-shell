@@ -323,7 +323,11 @@ fn node_children(node: &Node) -> Vec<&Node> {
             nodes.extend(default.as_deref());
             nodes
         }
-        Operation::Foreach { body, .. } | Operation::CaptureStdout { body, .. } => vec![body],
+        Operation::Foreach { body, .. }
+        | Operation::Redirect { body, .. }
+        | Operation::Scope { body, .. }
+        | Operation::CaptureStdout { body, .. }
+        | Operation::Spawn { body, .. } => vec![body],
         Operation::TryFinally { body, finalizer } => vec![body, finalizer],
         _ => Vec::new(),
     }
@@ -809,5 +813,324 @@ mod tests {
         assert!(export(&sequence, Target::Cwl, Mode::Strict, None).is_err());
         assert!(export(&sequence, Target::Nushell, Mode::Strict, None).is_err());
         assert!(export(&sequence, Target::Dagger, Mode::Strict, Some(RUNTIME)).is_err());
+    }
+
+    fn bundle_file(path: &str, bytes: &[u8], executable: bool) -> BundleFile {
+        BundleFile {
+            archive_path: path.into(),
+            source: BundleSource::Bytes(bytes.to_vec()),
+            expected_sha256: None,
+            executable,
+        }
+    }
+
+    fn valid_bundle_files() -> Vec<BundleFile> {
+        vec![
+            bundle_file("bin/deshell", b"binary", true),
+            bundle_file("runtime/asset", b"asset", false),
+        ]
+    }
+
+    #[test]
+    fn recursive_bundle_analysis_finds_residual_and_capability_nodes_under_every_wrapper() {
+        let mut residual = exec(&["residual"]);
+        residual.guarantee = Guarantee::Residual {
+            reason: "opaque".into(),
+        };
+        let wrappers = [
+            node(Operation::Redirect {
+                redirections: vec![],
+                body: Box::new(residual.clone()),
+            }),
+            node(Operation::Scope {
+                variables: vec![],
+                environment: vec![],
+                working_directory: None,
+                body: Box::new(residual.clone()),
+            }),
+            node(Operation::Spawn {
+                handle: "child".into(),
+                body: Box::new(residual.clone()),
+            }),
+        ];
+        for wrapper in wrappers {
+            assert!(plan_has_residual(&plan(wrapper)));
+        }
+
+        let effects = node(Operation::Sequence {
+            nodes: vec![
+                exec(&["process"]),
+                node(Operation::FileRead {
+                    path: TextExpression::literal("input"),
+                }),
+                node(Operation::FileWrite {
+                    path: TextExpression::literal("output"),
+                    contents: TextExpression::literal("value"),
+                    append: false,
+                }),
+                node(Operation::FileRemove {
+                    path: TextExpression::literal("old"),
+                }),
+                node(Operation::NetworkRequest {
+                    method: TextExpression::literal("GET"),
+                    uri: TextExpression::literal("http://example.test"),
+                }),
+                node(Operation::Scope {
+                    variables: vec![],
+                    environment: vec![],
+                    working_directory: None,
+                    body: Box::new(node(Operation::InterpreterCall {
+                        interpreter: "sh".into(),
+                        interpreter_pin: format!("sha256:{}", "a".repeat(64)),
+                        source: crate::ir::SourceBytes::from_bytes(b"true"),
+                        source_span: crate::ir::SourceSpan {
+                            file: "build.sh".into(),
+                            start_line: 1,
+                            start_column: 1,
+                            end_line: 1,
+                            end_column: 5,
+                            start_byte: 0,
+                            end_byte: 4,
+                        },
+                        capabilities: vec!["clock".into()],
+                        reason: "pinned".into(),
+                    })),
+                }),
+            ],
+        });
+        let mut plan = plan(effects);
+        plan.tasks[0].platform_capabilities.push("platform".into());
+        assert_eq!(
+            plan_capabilities(&plan),
+            vec![
+                "clock",
+                "delegation",
+                "file-read",
+                "file-write",
+                "network",
+                "platform",
+                "process"
+            ]
+        );
+    }
+
+    #[test]
+    fn bundle_validation_rejects_every_unbound_image_path_digest_binary_and_asset() {
+        let base_plan = plan(exec(&["true"]));
+        let run = |entrypoint: &str, image: &str, assets: Vec<String>, files: Vec<BundleFile>| {
+            let mut output = Vec::new();
+            write_bundle(
+                BundleRequest {
+                    plan: &base_plan,
+                    entrypoint,
+                    target: Target::Internal,
+                    runtime_image: image,
+                    runtime_assets: assets,
+                    files,
+                },
+                &mut output,
+            )
+        };
+        let asset = || vec!["runtime/asset".into()];
+        assert!(
+            run("build.sh", "latest", asset(), valid_bundle_files())
+                .unwrap_err()
+                .contains("digest-pinned")
+        );
+        assert!(run("../build.sh", RUNTIME, asset(), valid_bundle_files()).is_err());
+
+        let mut files = valid_bundle_files();
+        files[0].archive_path = "../binary".into();
+        assert!(run("build.sh", RUNTIME, asset(), files).is_err());
+        let mut files = valid_bundle_files();
+        files.push(files[0].clone());
+        assert!(
+            run("build.sh", RUNTIME, asset(), files)
+                .unwrap_err()
+                .contains("duplicate bundle")
+        );
+        let mut files = valid_bundle_files();
+        files[0].expected_sha256 = Some(crate::digest::sha256(b"different"));
+        assert!(
+            run("build.sh", RUNTIME, asset(), files)
+                .unwrap_err()
+                .contains("digest mismatch")
+        );
+        assert!(
+            run(
+                "build.sh",
+                RUNTIME,
+                asset(),
+                vec![bundle_file("runtime/asset", b"asset", false)]
+            )
+            .unwrap_err()
+            .contains("exact deshell binary")
+        );
+        let mut files = valid_bundle_files();
+        files[0].executable = false;
+        assert!(
+            run("build.sh", RUNTIME, asset(), files)
+                .unwrap_err()
+                .contains("must be executable")
+        );
+        assert!(
+            run("build.sh", RUNTIME, vec![], valid_bundle_files())
+                .unwrap_err()
+                .contains("at least one")
+        );
+        assert!(
+            run(
+                "build.sh",
+                RUNTIME,
+                vec!["runtime/asset".into(), "runtime/asset".into()],
+                valid_bundle_files(),
+            )
+            .unwrap_err()
+            .contains("unique")
+        );
+        assert!(
+            run(
+                "build.sh",
+                RUNTIME,
+                vec!["../asset".into()],
+                valid_bundle_files()
+            )
+            .is_err()
+        );
+        assert!(
+            run(
+                "build.sh",
+                RUNTIME,
+                vec!["runtime/missing".into()],
+                valid_bundle_files()
+            )
+            .unwrap_err()
+            .contains("absent")
+        );
+
+        let residual = Node {
+            id: String::new(),
+            operation: Operation::OpaqueCapsule {
+                interpreter: "sh".into(),
+                source: crate::ir::SourceBytes::from_bytes(b"true"),
+                path: None,
+            },
+            guarantee: Guarantee::Residual {
+                reason: "opaque".into(),
+            },
+            source: None,
+        };
+        let residual_plan = plan(node(Operation::Scope {
+            variables: vec![],
+            environment: vec![],
+            working_directory: None,
+            body: Box::new(residual),
+        }));
+        let mut output = Vec::new();
+        let error = write_bundle(
+            BundleRequest {
+                plan: &residual_plan,
+                entrypoint: "build.sh",
+                target: Target::Internal,
+                runtime_image: RUNTIME,
+                runtime_assets: asset(),
+                files: valid_bundle_files(),
+            },
+            &mut output,
+        )
+        .unwrap_err();
+        assert!(error.contains("residual"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn strict_export_and_ustar_helpers_cover_interface_environment_cwd_and_size_boundaries() {
+        assert_eq!(
+            [
+                Target::Internal,
+                Target::Dagger,
+                Target::Nushell,
+                Target::Cwl
+            ]
+            .map(target_name),
+            ["internal", "dagger", "nushell", "cwl"]
+        );
+        let command = plan(exec(&["true"]));
+        assert!(
+            export(&command, Target::Dagger, Mode::Strict, None)
+                .unwrap_err()
+                .contains("digest-pinned")
+        );
+
+        let mut interface = command.clone();
+        interface.tasks[0].inputs.push(crate::ir::Binding {
+            name: "input".into(),
+            value_type: crate::ir::ValueType::Primitive(crate::ir::PrimitiveType::Text),
+        });
+        assert!(
+            export(&interface, Target::Nushell, Mode::Strict, None)
+                .unwrap_err()
+                .contains("interface")
+        );
+
+        let environment = plan(node(Operation::Exec {
+            argv: vec![TextExpression::literal("true")],
+            environment: vec![crate::ir::NamedExpression {
+                name: "VALUE".into(),
+                value: TextExpression::literal("one"),
+            }],
+            working_directory: None,
+        }));
+        assert!(
+            flatten_exec(&environment.tasks[0].body)
+                .unwrap_err()
+                .contains("environment")
+        );
+        let cwd = plan(node(Operation::Exec {
+            argv: vec![TextExpression::literal("true")],
+            environment: vec![],
+            working_directory: Some(TextExpression::literal("work")),
+        }));
+        assert!(
+            flatten_exec(&cwd.tasks[0].body)
+                .unwrap_err()
+                .contains("working_directory")
+        );
+        assert!(cwl(&[]).unwrap_err().contains("argv"));
+
+        assert_eq!(split_tar_path("short").unwrap(), ("", "short"));
+        let long = format!("{}/name", "p".repeat(101));
+        assert_eq!(
+            split_tar_path(&long).unwrap(),
+            (long.rsplit_once('/').unwrap().0, "name")
+        );
+        assert!(split_tar_path(&"x".repeat(256)).is_err());
+        assert!(
+            write_octal(&mut [0_u8; 2], 0o777)
+                .unwrap_err()
+                .contains("too large")
+        );
+        let header = tar_header("path", 3, 0o644).unwrap();
+        assert_eq!(&header[257..263], b"ustar\0");
+
+        let source = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(source.path(), b"file-bytes").unwrap();
+        assert_eq!(
+            inspect_bundle_source(&BundleSource::File(source.path().into()))
+                .unwrap()
+                .0,
+            10
+        );
+        let mut archive = Vec::new();
+        write_tar_file(
+            &mut archive,
+            &BundleFile {
+                archive_path: "file".into(),
+                source: BundleSource::File(source.path().into()),
+                expected_sha256: None,
+                executable: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(archive.len(), 1024);
     }
 }

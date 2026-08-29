@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 #[command(
     name = "deshell",
     version = env!("CARGO_PKG_VERSION"),
-    about = "Compile shell automation behavior into typed, evidence-carrying Effect IR."
+    about = "Independently verify project-native replacements with a shell retirement migration oracle."
 )]
 struct Cli {
     #[arg(long, global = true, value_enum, default_value = "human")]
@@ -32,6 +32,20 @@ enum Command {
         root: PathBuf,
         #[arg(long, value_enum, default_value = "human")]
         format: OutputFormat,
+    },
+    /// Diagnose shell risks without executing repository content.
+    Audit {
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        #[arg(long, value_enum, default_value = "human")]
+        format: AuditOutputFormat,
+        #[arg(long, value_enum, default_value = "pedantic")]
+        persona: AuditPersona,
+    },
+    /// Create reviewable scenario drafts from repository call boundaries.
+    Scenario {
+        #[command(subcommand)]
+        command: ScenarioCommand,
     },
     /// Lower an entrypoint into canonical Effect IR.
     Analyze {
@@ -60,18 +74,15 @@ enum Command {
         #[arg(long)]
         apply: bool,
     },
-    /// Analyze and export an entrypoint.
+    /// Plan and verify intentional behavior changes separately from migration.
+    Harden {
+        #[command(subcommand)]
+        command: HardenCommand,
+    },
+    /// Plan, verify, and atomically apply repository-wide shell retirement.
     Migrate {
-        #[arg(long, default_value = ".")]
-        root: PathBuf,
-        #[arg(long)]
-        entry: Option<String>,
-        #[arg(long)]
-        observe: bool,
-        #[arg(long, value_enum)]
-        target: ExportTarget,
-        #[arg(long)]
-        apply: bool,
+        #[command(subcommand)]
+        command: MigrateCommand,
     },
     /// Audit static guarantees and recorded observations.
     Verify {
@@ -148,6 +159,8 @@ enum Command {
     ObserverAgent,
     #[command(hide = true, name = "__nushell-adapter")]
     NushellAdapter,
+    #[command(hide = true, name = "__generator")]
+    Generator,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -157,8 +170,104 @@ enum OutputFormat {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum AuditOutputFormat {
+    Human,
+    Jsonl,
+    Sarif,
+    Github,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum AuditPersona {
+    Pedantic,
+}
+
+#[derive(Debug, Subcommand)]
+enum ScenarioCommand {
+    /// Synthesize draft scenarios; write only when --apply is supplied.
+    Synthesize {
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        #[arg(long)]
+        apply: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum HardenCommand {
+    Plan {
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+    },
+    Verify {
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        #[arg(long)]
+        plan: String,
+    },
+    Apply {
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        #[arg(long)]
+        plan: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum MigrateCommand {
+    /// Scan, lower, and obtain generator proposals for one repository-wide digest.
+    Plan {
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+    },
+    /// Verify original, Effect IR, and replacement in one approved matrix cell.
+    Verify {
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        #[arg(long)]
+        plan: String,
+        #[arg(long)]
+        cell: String,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Import independently produced Evidence into a plan.
+    Evidence {
+        #[command(subcommand)]
+        command: MigrateEvidenceCommand,
+    },
+    /// Atomically retire every source in a fully verified repository plan.
+    Apply {
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        #[arg(long)]
+        plan: String,
+    },
+    /// Summarize live, blocked, planned, verified, retired, and archived state.
+    Status {
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        #[arg(long, value_enum, default_value = "human")]
+        format: OutputFormat,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum MigrateEvidenceCommand {
+    Import {
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        #[arg(long)]
+        plan: String,
+        #[arg(required = true)]
+        files: Vec<PathBuf>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum GuaranteeRequirement {
     Native,
+    ShellFree,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -198,6 +307,25 @@ enum SchemaName {
     Replay,
     #[value(name = "corpus-audit")]
     CorpusAudit,
+    #[value(name = "generator-protocol")]
+    GeneratorProtocol,
+    #[value(name = "migration-request")]
+    MigrationRequest,
+    Proposal,
+    #[value(name = "migration-plan")]
+    MigrationPlan,
+    #[value(name = "migration-evidence")]
+    MigrationEvidence,
+    #[value(name = "archive-manifest")]
+    ArchiveManifest,
+    #[value(name = "audit-finding")]
+    AuditFinding,
+    #[value(name = "harden-plan")]
+    HardenPlan,
+    #[value(name = "harden-approval")]
+    HardenApproval,
+    #[value(name = "harden-evidence")]
+    HardenEvidence,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -240,6 +368,20 @@ impl Failure {
         Self {
             exit: 4,
             code: "DESHELL_POLICY",
+            message: message.into(),
+        }
+    }
+    fn shell_reintroduced(message: impl Into<String>) -> Self {
+        Self {
+            exit: 4,
+            code: "DESHELL_SHELL_REINTRODUCED",
+            message: message.into(),
+        }
+    }
+    fn audit_failed(message: impl Into<String>) -> Self {
+        Self {
+            exit: 4,
+            code: "DESHELL_AUDIT_FAILED",
             message: message.into(),
         }
     }
@@ -394,6 +536,16 @@ fn dispatch(
             }
             Ok(0)
         }
+        Command::Audit {
+            root,
+            format,
+            persona,
+        } => audit_command(&root, format, persona, stdout),
+        Command::Scenario { command } => match command {
+            ScenarioCommand::Synthesize { root, apply } => {
+                scenario_synthesize_command(&root, apply, stdout)
+            }
+        },
         Command::Analyze { root, entry } => {
             for entry in selected_entries(&root, entry)? {
                 let result =
@@ -419,6 +571,9 @@ fn dispatch(
             entry,
             require,
         } => {
+            if require == Some(GuaranteeRequirement::ShellFree) {
+                return shell_free_command(&root, stdout);
+            }
             let project =
                 crate::project::ValidatedProject::load(&root).map_err(classify_project_errors)?;
             let entries = selected_entries_from_config(&project.config, entry)?;
@@ -624,13 +779,25 @@ fn dispatch(
             profile,
             apply,
         } => modernize_command(&root, &profile, apply, diagnostic_mode, stdout, stderr),
-        Command::Migrate {
-            root,
-            entry,
-            observe,
-            target,
-            apply,
-        } => migrate_command(&root, entry, observe, target, apply, stdout),
+        Command::Harden { command } => harden_command(command, stdout),
+        Command::Migrate { command } => match command {
+            MigrateCommand::Plan { root } => migrate_plan_command(&root, stdout),
+            MigrateCommand::Verify {
+                root,
+                plan,
+                cell,
+                output,
+            } => migrate_verify_command(&root, &plan, &cell, &output, stdout),
+            MigrateCommand::Evidence { command } => match command {
+                MigrateEvidenceCommand::Import { root, plan, files } => {
+                    migrate_evidence_import_command(&root, &plan, &files, stdout)
+                }
+            },
+            MigrateCommand::Apply { root, plan } => migrate_apply_command(&root, &plan, stdout),
+            MigrateCommand::Status { root, format } => {
+                migrate_status_command(&root, format, stdout)
+            }
+        },
         Command::ProcessAgent => {
             crate::protocol::serve_stdio(crate::protocol::AgentKind::Process, stdout)
                 .map_err(Failure::invalid)
@@ -641,6 +808,10 @@ fn dispatch(
         }
         Command::NushellAdapter => {
             crate::protocol::serve_stdio(crate::protocol::AgentKind::Nushell, stdout)
+                .map_err(Failure::invalid)
+        }
+        Command::Generator => {
+            crate::protocol::serve_stdio(crate::protocol::AgentKind::Generator, stdout)
                 .map_err(Failure::invalid)
         }
     }
@@ -669,6 +840,34 @@ fn schema(name: SchemaName) -> &'static [u8] {
         SchemaName::Replay => include_bytes!("../../../contracts/schema/replay-v1.schema.json"),
         SchemaName::CorpusAudit => {
             include_bytes!("../../../contracts/schema/corpus-audit-v1.schema.json")
+        }
+        SchemaName::GeneratorProtocol => {
+            include_bytes!("../../../contracts/schema/generator-protocol-v1.schema.json")
+        }
+        SchemaName::MigrationRequest => {
+            include_bytes!("../../../contracts/schema/migration-request-v1.schema.json")
+        }
+        SchemaName::Proposal => include_bytes!("../../../contracts/schema/proposal-v1.schema.json"),
+        SchemaName::MigrationPlan => {
+            include_bytes!("../../../contracts/schema/migration-plan-v1.schema.json")
+        }
+        SchemaName::MigrationEvidence => {
+            include_bytes!("../../../contracts/schema/migration-evidence-v1.schema.json")
+        }
+        SchemaName::ArchiveManifest => {
+            include_bytes!("../../../contracts/schema/archive-manifest-v1.schema.json")
+        }
+        SchemaName::AuditFinding => {
+            include_bytes!("../../../contracts/schema/audit-finding-v1.schema.json")
+        }
+        SchemaName::HardenPlan => {
+            include_bytes!("../../../contracts/schema/harden-plan-v1.schema.json")
+        }
+        SchemaName::HardenApproval => {
+            include_bytes!("../../../contracts/schema/harden-approval-v1.schema.json")
+        }
+        SchemaName::HardenEvidence => {
+            include_bytes!("../../../contracts/schema/harden-evidence-v1.schema.json")
         }
     }
 }
@@ -733,7 +932,7 @@ fn selected_entries_from_config(
 
 fn classify_project_errors(errors: Vec<String>) -> Failure {
     let message = errors.join("; ");
-    if message.contains("rejected by policy") {
+    if message.contains("rejected by policy") || message.contains("DESHELL_BLOCKER_") {
         Failure::policy(message)
     } else if errors.iter().all(|error| is_io_message(error)) {
         Failure::io(message)
@@ -743,7 +942,7 @@ fn classify_project_errors(errors: Vec<String>) -> Failure {
 }
 
 fn classify_project_error(message: String) -> Failure {
-    if message.contains("rejected by policy") {
+    if message.contains("rejected by policy") || message.contains("DESHELL_BLOCKER_") {
         Failure::policy(message)
     } else if is_io_message(&message) {
         Failure::io(message)
@@ -769,6 +968,409 @@ fn finding_kind(kind: &crate::scanner::FindingKind) -> &'static str {
         crate::scanner::FindingKind::ShellFile => "shell_file",
         crate::scanner::FindingKind::EmbeddedShell => "embedded_shell",
         crate::scanner::FindingKind::Candidate => "candidate",
+    }
+}
+
+fn shell_free_command(root: &Path, stdout: &mut dyn Write) -> Result<i32, Failure> {
+    let inventory = crate::project::scan(root).map_err(Failure::io)?;
+    if !inventory.errors.is_empty() || !inventory.skipped.is_empty() {
+        let blockers = inventory
+            .errors
+            .iter()
+            .map(|error| {
+                format!(
+                    "{}:{}:{}",
+                    error.path.as_deref().unwrap_or("<root>"),
+                    error.stage,
+                    error.message
+                )
+            })
+            .chain(
+                inventory
+                    .skipped
+                    .iter()
+                    .map(|skipped| format!("{}:skipped:{}", skipped.path, skipped.reason)),
+            )
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(Failure::shell_reintroduced(format!(
+            "shell-free scan is incomplete: {blockers}"
+        )));
+    }
+    if !inventory.findings.is_empty() {
+        let locations = inventory
+            .findings
+            .iter()
+            .map(|finding| {
+                format!(
+                    "{}:{}@{}..{}",
+                    finding_kind(&finding.kind),
+                    finding.path,
+                    finding.span.start_byte,
+                    finding.span.end_byte
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(Failure::shell_reintroduced(format!(
+            "live tree is not shell-free ({} location(s)): {locations}",
+            inventory.findings.len()
+        )));
+    }
+    crate::migration::verify_integrity(root).map_err(Failure::policy)?;
+    writeln_io(stdout, format_args!("shell-free: verified"))?;
+    Ok(0)
+}
+
+fn scenario_synthesize_command(
+    root: &Path,
+    apply: bool,
+    stdout: &mut dyn Write,
+) -> Result<i32, Failure> {
+    let config = crate::project::load_config(root).map_err(classify_project_errors)?;
+    if config.entrypoints.is_empty() {
+        return Err(Failure::invalid(
+            "scenario synthesis requires at least one configured entrypoint",
+        ));
+    }
+    for entry in &config.entrypoints {
+        let (_, path) =
+            crate::project::resolve_entry(root, entry).map_err(classify_project_error)?;
+        let source = std::fs::read(&path)
+            .map_err(|error| Failure::io(format!("cannot read {}: {error}", path.display())))?;
+        let plan =
+            crate::frontend::lower(entry, &source, config.policy.unknown_interpreter.clone())
+                .map_err(classify_project_error)?;
+        let task = plan
+            .tasks
+            .iter()
+            .find(|task| task.name == plan.entrypoint)
+            .ok_or_else(|| Failure::invalid("lowered plan entrypoint task is missing"))?;
+        let name = format!("synthesized-{}", scenario_stem(entry));
+        let scenario = crate::config::Scenario {
+            version: 1,
+            name: name.clone(),
+            approval: crate::config::ScenarioApproval::Draft,
+            arguments: task
+                .inputs
+                .iter()
+                .map(|input| crate::config::NamedValue {
+                    name: input.name.clone(),
+                    value: String::new(),
+                })
+                .collect(),
+            argv: Vec::new(),
+            environment: task
+                .environment
+                .iter()
+                .map(|name| crate::config::NamedValue {
+                    name: name.clone(),
+                    value: String::new(),
+                })
+                .collect(),
+            fixtures: Vec::new(),
+            stdin: None,
+            cwd: None,
+            limits: config.limits,
+            expect: crate::config::Expectation::default(),
+        };
+        let mut text = toml::to_string_pretty(&scenario)
+            .map_err(|error| Failure::internal(format!("cannot encode scenario draft: {error}")))?;
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        crate::config::Scenario::decode(&text).map_err(classify_project_errors)?;
+        let relative = format!(".deshell/scenarios/{name}.toml");
+        if apply {
+            let scenario_directory =
+                crate::project::project_directory_path(root, ".deshell/scenarios")
+                    .map_err(Failure::invalid)?;
+            let target = scenario_directory.join(format!("{name}.toml"));
+            match target.symlink_metadata() {
+                Ok(metadata) => {
+                    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+                        return Err(Failure::policy(format!(
+                            "scenario target is not a regular file: {relative}"
+                        )));
+                    }
+                    let current = std::fs::read(&target).map_err(|error| {
+                        Failure::io(format!("cannot read {}: {error}", target.display()))
+                    })?;
+                    if current != text.as_bytes() {
+                        return Err(Failure::policy(format!(
+                            "refusing to overwrite an existing scenario draft: {relative}"
+                        )));
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    let proposal =
+                        crate::patch::prepare_create(&target, text.as_bytes().to_vec(), 0o644)
+                            .map_err(Failure::io)?;
+                    crate::patch::apply_all(&[proposal]).map_err(Failure::io)?;
+                }
+                Err(error) => {
+                    return Err(Failure::io(format!(
+                        "cannot inspect {}: {error}",
+                        target.display()
+                    )));
+                }
+            }
+            writeln_io(stdout, format_args!("wrote {relative} (approval=draft)"))?;
+        } else {
+            writeln_io(stdout, format_args!("# {relative}"))?;
+            write_io(stdout, text.as_bytes())?;
+        }
+    }
+    Ok(0)
+}
+
+fn scenario_stem(path: &str) -> String {
+    let filename = path.rsplit('/').next().unwrap_or(path);
+    let stem = filename.rsplit_once('.').map_or(filename, |(stem, _)| stem);
+    let mut output = String::new();
+    for character in stem.chars() {
+        if character.is_ascii_alphanumeric() {
+            output.push(character.to_ascii_lowercase());
+        } else if !output.ends_with('-') {
+            output.push('-');
+        }
+    }
+    let output = output.trim_matches('-');
+    if output.is_empty() {
+        "entry".into()
+    } else {
+        output.into()
+    }
+}
+
+fn audit_command(
+    root: &Path,
+    format: AuditOutputFormat,
+    _persona: AuditPersona,
+    stdout: &mut dyn Write,
+) -> Result<i32, Failure> {
+    let inventory = crate::project::scan(root).map_err(Failure::io)?;
+    let config_path = root.join(".deshell/project.toml");
+    let config = match config_path.symlink_metadata() {
+        Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {
+            crate::project::load_config(root).map_err(classify_project_errors)?
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            crate::config::ProjectConfig::decode(&crate::config::ProjectConfig::default_text())
+                .map_err(classify_project_errors)?
+        }
+        Ok(_) => {
+            return Err(Failure::invalid(
+                "audit project configuration is not a regular non-symlink file",
+            ));
+        }
+        Err(error) => {
+            return Err(Failure::io(format!(
+                "cannot inspect {}: {error}",
+                config_path.display()
+            )));
+        }
+    };
+    let findings = crate::audit::analyze(
+        root,
+        &inventory,
+        &config.audit.acknowledgements,
+        config.audit.acknowledgement_max_days,
+    )
+    .map_err(Failure::invalid)?;
+    match format {
+        AuditOutputFormat::Human => {
+            for finding in &findings {
+                writeln_io(
+                    stdout,
+                    format_args!(
+                        "{}[{}]: {}:{}:{}: {} ({})",
+                        audit_severity(finding.severity),
+                        finding.rule_id,
+                        finding.path,
+                        finding.span.start_line,
+                        finding.span.start_column + 1,
+                        finding.message,
+                        finding.url,
+                    ),
+                )?;
+            }
+        }
+        AuditOutputFormat::Jsonl => {
+            for finding in &findings {
+                let value = serde_json::to_value(finding)
+                    .map_err(|error| Failure::internal(error.to_string()))?;
+                let bytes =
+                    crate::canonical_json::canonical_bytes(&value).map_err(Failure::internal)?;
+                write_io(stdout, &bytes)?;
+                write_io(stdout, b"\n")?;
+            }
+        }
+        AuditOutputFormat::Sarif => {
+            let mut rules = std::collections::BTreeMap::new();
+            for finding in &findings {
+                rules.entry(finding.rule_id.as_str()).or_insert_with(|| {
+                    serde_json::json!({
+                        "id": finding.rule_id,
+                        "helpUri": finding.url,
+                        "shortDescription": {"text": finding.message},
+                        "defaultConfiguration": {"level": sarif_level(finding.severity)}
+                    })
+                });
+            }
+            let results = findings
+                .iter()
+                .map(|finding| {
+                    serde_json::json!({
+                        "ruleId": finding.rule_id,
+                        "level": sarif_level(finding.severity),
+                        "message": {"text": finding.message},
+                        "locations": [{"physicalLocation": {
+                            "artifactLocation": {"uri": finding.path},
+                            "region": {
+                                "startLine": finding.span.start_line,
+                                "startColumn": finding.span.start_column + 1,
+                                "endLine": finding.span.end_line,
+                                "endColumn": finding.span.end_column + 1
+                            }
+                        }}],
+                        "partialFingerprints": {"deshellLocationDigest": finding.location_digest}
+                    })
+                })
+                .collect::<Vec<_>>();
+            let value = serde_json::json!({
+                "version": "2.1.0",
+                "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+                "runs": [{
+                    "tool": {"driver": {"name": "deshell", "rules": rules.into_values().collect::<Vec<_>>() }},
+                    "results": results
+                }]
+            });
+            write_io(
+                stdout,
+                &crate::canonical_json::pretty_bytes(&value).map_err(Failure::internal)?,
+            )?;
+        }
+        AuditOutputFormat::Github => {
+            for finding in &findings {
+                let level = if finding.severity >= crate::config::AuditSeverity::High {
+                    "error"
+                } else if finding.severity >= crate::config::AuditSeverity::Medium {
+                    "warning"
+                } else {
+                    "notice"
+                };
+                writeln_io(
+                    stdout,
+                    format_args!(
+                        "::{level} file={},line={},col={},endLine={},endColumn={},title={}::{}",
+                        github_escape(&finding.path),
+                        finding.span.start_line,
+                        finding.span.start_column + 1,
+                        finding.span.end_line,
+                        finding.span.end_column + 1,
+                        github_escape(&finding.rule_id),
+                        github_escape(&finding.message),
+                    ),
+                )?;
+            }
+        }
+    }
+    let failures = findings
+        .iter()
+        .filter(|finding| !finding.acknowledged && finding.severity >= config.audit.fail_on)
+        .count();
+    if failures == 0 {
+        Ok(0)
+    } else {
+        Err(Failure::audit_failed(format!(
+            "{failures} unacknowledged audit finding(s) met fail_on={}",
+            audit_severity(config.audit.fail_on)
+        )))
+    }
+}
+
+fn audit_severity(severity: crate::config::AuditSeverity) -> &'static str {
+    match severity {
+        crate::config::AuditSeverity::Note => "note",
+        crate::config::AuditSeverity::Low => "low",
+        crate::config::AuditSeverity::Medium => "medium",
+        crate::config::AuditSeverity::High => "high",
+        crate::config::AuditSeverity::Critical => "critical",
+    }
+}
+
+fn sarif_level(severity: crate::config::AuditSeverity) -> &'static str {
+    match severity {
+        crate::config::AuditSeverity::Critical | crate::config::AuditSeverity::High => "error",
+        crate::config::AuditSeverity::Medium => "warning",
+        crate::config::AuditSeverity::Low | crate::config::AuditSeverity::Note => "note",
+    }
+}
+
+fn github_escape(value: &str) -> String {
+    value
+        .replace('%', "%25")
+        .replace('\r', "%0D")
+        .replace('\n', "%0A")
+        .replace(':', "%3A")
+        .replace(',', "%2C")
+}
+
+fn harden_command(command: HardenCommand, stdout: &mut dyn Write) -> Result<i32, Failure> {
+    match command {
+        HardenCommand::Plan { root } => {
+            let output = crate::harden::plan(&root).map_err(classify_harden_error)?;
+            writeln_io(stdout, format_args!("harden plan {}", output.digest))?;
+            for blocker in output.blockers {
+                writeln_io(
+                    stdout,
+                    format_args!("blocker {}: {}", blocker.code, blocker.message),
+                )?;
+            }
+            write_io(stdout, output.diff.as_bytes())?;
+            writeln_io(
+                stdout,
+                format_args!("approval {}", output.approval_path.display()),
+            )?;
+            Ok(0)
+        }
+        HardenCommand::Verify { root, plan } => {
+            let evidence = crate::harden::verify(&root, &plan).map_err(classify_harden_error)?;
+            writeln_io(
+                stdout,
+                format_args!(
+                    "harden evidence {} {}",
+                    evidence.evidence_digest,
+                    match evidence.status {
+                        crate::harden::HardenEvidenceStatus::Verified => "verified",
+                        crate::harden::HardenEvidenceStatus::Failed => "failed",
+                    }
+                ),
+            )?;
+            Ok(match evidence.status {
+                crate::harden::HardenEvidenceStatus::Verified => 0,
+                crate::harden::HardenEvidenceStatus::Failed => 5,
+            })
+        }
+        HardenCommand::Apply { root, plan } => {
+            crate::harden::apply(&root, &plan).map_err(classify_harden_error)?;
+            writeln_io(stdout, format_args!("applied harden plan {plan}"))?;
+            Ok(0)
+        }
+    }
+}
+
+fn classify_harden_error(message: String) -> Failure {
+    if message.contains("APPROVAL_REQUIRED")
+        || message.contains("HARDEN_BLOCKED")
+        || message.contains("NO_CHANGES")
+    {
+        Failure::policy(message)
+    } else if is_io_message(&message) {
+        Failure::io(message)
+    } else {
+        Failure::invalid(message)
     }
 }
 
@@ -2095,55 +2697,111 @@ fn parse_profiles(value: &str) -> Result<Vec<crate::rewrite::Profile>, Failure> 
     }
 }
 
-fn migrate_command(
-    root: &Path,
-    entry: Option<String>,
-    observe: bool,
-    target: ExportTarget,
-    apply: bool,
-    stdout: &mut dyn Write,
-) -> Result<i32, Failure> {
-    let entry = selected_entry(root, entry)?;
-    let analysis = crate::project::analyze(root, &entry).map_err(classify_project_error)?;
-    let mut observation_summary = Vec::new();
-    if observe {
-        match observe_command(root, Some(entry.clone()), &[], &mut observation_summary)? {
-            0 => {}
-            5 => {
-                return Err(Failure::difference(
-                    "migration stopped because observation differs or is nondeterministic",
-                ));
-            }
-            6 => return Err(Failure::unavailable("observation provider is unavailable")),
-            _ => return Err(Failure::io("observation provider failed")),
-        }
-    }
-    let artifact = crate::exporter::export(
-        &analysis.plan,
-        exporter_target(target),
-        crate::exporter::Mode::Strict,
-        export_runtime(
-            &crate::project::load_lock(root).map_err(classify_project_errors)?,
-            target,
-        ),
-    )
-    .map_err(Failure::policy)?;
-    if apply || target == ExportTarget::Internal {
-        write_io(stdout, &observation_summary)?;
-    }
-    if target == ExportTarget::Internal {
+fn migrate_plan_command(root: &Path, stdout: &mut dyn Write) -> Result<i32, Failure> {
+    let output = crate::migration::create_plan(root).map_err(classify_project_error)?;
+    writeln_io(stdout, format_args!("plan {}", output.digest))?;
+    for blocker in &output.blockers {
+        let location = blocker.location.as_ref().map_or_else(
+            || "<repository>".to_owned(),
+            |location| {
+                format!(
+                    "{}@{}..{}",
+                    location.path, location.start_byte, location.end_byte
+                )
+            },
+        );
         writeln_io(
             stdout,
-            format_args!("plan: {}", analysis.plan_path.display()),
+            format_args!("blocker {} {location}: {}", blocker.code, blocker.message),
         )?;
-    } else if apply {
-        let directory = root.join(".deshell/export");
-        ensure_output_directory(&directory)?;
-        let path = directory.join(&artifact.filename);
-        atomic_write(&path, artifact.content)?;
-        writeln_io(stdout, format_args!("wrote {}", path.display()))?;
-    } else {
-        write_io(stdout, &artifact.content)?;
+    }
+    write_io(stdout, output.diff.as_bytes())?;
+    Ok(0)
+}
+
+fn migrate_verify_command(
+    root: &Path,
+    plan: &str,
+    cell: &str,
+    output: &Path,
+    stdout: &mut dyn Write,
+) -> Result<i32, Failure> {
+    let evidence = crate::migration::verify(root, plan, cell).map_err(Failure::policy)?;
+    let status = evidence.status;
+    atomic_write(output, evidence.encode_pretty().map_err(Failure::invalid)?)?;
+    writeln_io(
+        stdout,
+        format_args!("{} {}", status.as_str(), output.display()),
+    )?;
+    match status {
+        crate::migration::EvidenceStatus::Verified => Ok(0),
+        crate::migration::EvidenceStatus::Different
+        | crate::migration::EvidenceStatus::Nondeterministic => Err(Failure::difference(format!(
+            "migration verification was {} (Evidence: {})",
+            status.as_str(),
+            output.display()
+        ))),
+        crate::migration::EvidenceStatus::Unavailable => Err(Failure::unavailable(format!(
+            "migration verification was unavailable (Evidence: {})",
+            output.display()
+        ))),
+        crate::migration::EvidenceStatus::Failed => Err(Failure::io(format!(
+            "migration verification failed (Evidence: {})",
+            output.display()
+        ))),
+    }
+}
+
+fn migrate_evidence_import_command(
+    root: &Path,
+    plan: &str,
+    files: &[PathBuf],
+    stdout: &mut dyn Write,
+) -> Result<i32, Failure> {
+    let digests =
+        crate::migration::import_evidence(root, plan, files).map_err(classify_project_error)?;
+    for digest in digests {
+        writeln_io(stdout, format_args!("imported {digest}"))?;
+    }
+    Ok(0)
+}
+
+fn migrate_apply_command(root: &Path, plan: &str, stdout: &mut dyn Write) -> Result<i32, Failure> {
+    crate::migration::apply(root, plan).map_err(Failure::policy)?;
+    writeln_io(stdout, format_args!("retired migration plan {plan}"))?;
+    Ok(0)
+}
+
+fn migrate_status_command(
+    root: &Path,
+    format: OutputFormat,
+    stdout: &mut dyn Write,
+) -> Result<i32, Failure> {
+    let status = crate::migration::status(root).map_err(Failure::io)?;
+    match format {
+        OutputFormat::Json => write_io(
+            stdout,
+            &crate::canonical_json::pretty_bytes(
+                &serde_json::to_value(status)
+                    .map_err(|error| Failure::internal(error.to_string()))?,
+            )
+            .map_err(Failure::internal)?,
+        )?,
+        OutputFormat::Human => {
+            writeln_io(
+                stdout,
+                format_args!(
+                    "live={} blocked={} planned={} verified={} retired={} archived={}",
+                    status.live,
+                    status.blocked,
+                    status.planned,
+                    status.verified,
+                    status.retired,
+                    status.archived
+                ),
+            )?;
+            writeln_io(stdout, format_args!("next: {}", status.next))?;
+        }
     }
     Ok(0)
 }
@@ -2280,25 +2938,17 @@ fn preview(path: &str, before: &str, after: &str) -> String {
     output
 }
 
-fn ensure_output_directory(path: &Path) -> Result<(), Failure> {
-    match path.symlink_metadata() {
-        Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
-            Ok(())
-        }
-        Ok(_) => Err(Failure::io(format!(
-            "output path is not a regular directory: {}",
-            path.display()
-        ))),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir(path)
-            .map_err(|error| Failure::io(format!("cannot create {}: {error}", path.display()))),
-        Err(error) => Err(Failure::io(format!(
-            "cannot inspect {}: {error}",
-            path.display()
-        ))),
-    }
-}
-
 fn atomic_write(path: &Path, contents: Vec<u8>) -> Result<(), Failure> {
+    let normalized;
+    let path = if path
+        .parent()
+        .is_some_and(|parent| parent.as_os_str().is_empty())
+    {
+        normalized = Path::new(".").join(path);
+        normalized.as_path()
+    } else {
+        path
+    };
     let proposal = match path.symlink_metadata() {
         Ok(_) => crate::patch::prepare(path, contents),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -2402,8 +3052,12 @@ mod tests {
         assert_eq!(code, 0);
         assert!(stderr.is_empty());
         let help = String::from_utf8(stdout).unwrap();
+        assert!(help.contains("migration oracle"), "{help}");
+        assert!(!help.contains("behavioral compiler"), "{help}");
         for command in [
             "init",
+            "audit",
+            "scenario",
             "scan",
             "analyze",
             "rewrite",
@@ -2417,9 +3071,323 @@ mod tests {
             "check",
             "explain",
             "schema",
+            "harden",
         ] {
             assert!(help.contains(command), "help omitted {command}");
         }
+    }
+
+    #[test]
+    fn shell_free_gate_rejects_live_shell_and_accepts_an_empty_live_tree() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        std::fs::write(
+            directory.path().join("live.sh"),
+            b"#!/bin/sh\nprintf live\n",
+        )
+        .unwrap();
+        let root = path(directory.path());
+        let blocked = invoke_owned(vec![
+            "deshell".into(),
+            "verify".into(),
+            "--root".into(),
+            root.clone(),
+            "--require".into(),
+            "shell-free".into(),
+        ]);
+        assert_eq!(blocked.0, 4, "{}", String::from_utf8_lossy(&blocked.2));
+        assert!(String::from_utf8_lossy(&blocked.2).contains("DESHELL_SHELL_REINTRODUCED"));
+
+        std::fs::remove_file(directory.path().join("live.sh")).unwrap();
+        let clean = invoke_owned(vec![
+            "deshell".into(),
+            "verify".into(),
+            "--root".into(),
+            root,
+            "--require".into(),
+            "shell-free".into(),
+        ]);
+        assert_eq!(clean.0, 0, "{}", String::from_utf8_lossy(&clean.2));
+    }
+
+    #[test]
+    fn scenario_synthesis_is_preview_first_and_persists_only_drafts() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        configure(
+            directory.path(),
+            "build.sh",
+            b"#!/bin/sh\nprintf '%s' \"$MODE\"\n",
+        );
+        let root = path(directory.path());
+        let preview = invoke_owned(vec![
+            "deshell".into(),
+            "scenario".into(),
+            "synthesize".into(),
+            "--root".into(),
+            root.clone(),
+        ]);
+        assert_eq!(preview.0, 0, "{}", String::from_utf8_lossy(&preview.2));
+        assert!(String::from_utf8_lossy(&preview.1).contains("approval = \"draft\""));
+        assert!(
+            !directory
+                .path()
+                .join(".deshell/scenarios/synthesized-build.toml")
+                .exists()
+        );
+
+        let applied = invoke_owned(vec![
+            "deshell".into(),
+            "scenario".into(),
+            "synthesize".into(),
+            "--root".into(),
+            root,
+            "--apply".into(),
+        ]);
+        assert_eq!(applied.0, 0, "{}", String::from_utf8_lossy(&applied.2));
+        let persisted = std::fs::read_to_string(
+            directory
+                .path()
+                .join(".deshell/scenarios/synthesized-build.toml"),
+        )
+        .unwrap();
+        assert!(persisted.contains("approval = \"draft\""));
+    }
+
+    #[test]
+    fn audit_ignores_comments_and_heredoc_data_and_reports_exact_risk_spans() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        let source = concat!(
+            "#!/usr/bin/env bash\n",
+            "# curl https://comment.invalid/x | sh\n",
+            "cat <<'DATA'\n",
+            "eval \"$HEREDOC\"\n",
+            "DATA\n",
+            "eval \"$DYNAMIC\"\n",
+            "printf '%s\\n' \"$API_TOKEN\"\n",
+            "rm -rf \"$TARGET\"\n",
+        );
+        configure(directory.path(), "audit.sh", source.as_bytes());
+        let result = invoke_owned(vec![
+            "deshell".into(),
+            "audit".into(),
+            "--root".into(),
+            path(directory.path()),
+            "--format".into(),
+            "jsonl".into(),
+        ]);
+        assert_eq!(result.0, 4, "{}", String::from_utf8_lossy(&result.2));
+        let findings = result
+            .1
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| crate::strict_json::parse(line).unwrap())
+            .collect::<Vec<_>>();
+        let rules = findings
+            .iter()
+            .map(|finding| finding["rule_id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rules,
+            [
+                "shell.dynamic-eval",
+                "secret.argv-exposure",
+                "filesystem.dangerous-delete"
+            ]
+        );
+        assert!(!String::from_utf8_lossy(&result.1).contains("comment.invalid"));
+        assert!(!String::from_utf8_lossy(&result.1).contains("HEREDOC"));
+        for finding in &findings {
+            assert_eq!(finding["schema_version"], 1);
+            assert_eq!(finding["confidence"], "high");
+            assert!(finding["url"].as_str().unwrap().starts_with("https://"));
+            let start = finding["span"]["start_byte"].as_u64().unwrap() as usize;
+            let end = finding["span"]["end_byte"].as_u64().unwrap() as usize;
+            assert!(start < end);
+            let selected = &source.as_bytes()[start..end];
+            assert!(
+                selected.starts_with(b"eval")
+                    || selected.starts_with(b"$API_TOKEN")
+                    || selected.starts_with(b"rm -rf"),
+                "unexpected span: {}",
+                String::from_utf8_lossy(selected)
+            );
+        }
+    }
+
+    #[test]
+    fn audit_ignores_comments_for_every_supported_interpreter() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        for (path, source) in [
+            ("comment.sh", "#!/bin/sh\n# eval \"$SH_COMMENT\"\n"),
+            (
+                "comment.bash",
+                "#!/usr/bin/env bash\n# eval \"$BASH_COMMENT\"\n",
+            ),
+            (
+                "comment.zsh",
+                "#!/usr/bin/env zsh\n# eval \"$ZSH_COMMENT\"\n",
+            ),
+            (
+                "comment.fish",
+                "#!/usr/bin/env fish\n# eval $FISH_COMMENT\n",
+            ),
+            (
+                "comment.ps1",
+                concat!(
+                    "# eval $POWERSHELL_COMMENT\n",
+                    "<# eval $POWERSHELL_BLOCK_COMMENT #>\n",
+                    "@'\n",
+                    "eval $POWERSHELL_HERE_STRING\n",
+                    "'@\n",
+                ),
+            ),
+            (
+                "comment.cmd",
+                "@echo off\r\nREM eval %CMD_COMMENT%\r\n:: eval %CMD_LABEL_COMMENT%\r\n",
+            ),
+            ("comment.nu", "#!/usr/bin/env nu\n# eval $NU_COMMENT\n"),
+        ] {
+            std::fs::write(directory.path().join(path), source).unwrap();
+        }
+
+        let result = invoke_owned(vec![
+            "deshell".into(),
+            "audit".into(),
+            "--root".into(),
+            path(directory.path()),
+            "--format".into(),
+            "jsonl".into(),
+        ]);
+        assert_eq!(result.0, 0, "{}", String::from_utf8_lossy(&result.2));
+        assert!(
+            result.1.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&result.1)
+        );
+    }
+
+    #[test]
+    fn audit_maps_embedded_shell_risks_to_host_bytes_and_ignores_comments() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        let workflow = concat!(
+            "jobs:\n",
+            "  audit:\n",
+            "    runs-on: ubuntu-latest\n",
+            "    steps:\n",
+            "      - run: |\n",
+            "          # curl https://comment.invalid/tool | sh\n",
+            "          eval \"$DYNAMIC\"\n",
+        );
+        std::fs::create_dir_all(directory.path().join(".github/workflows")).unwrap();
+        std::fs::write(
+            directory.path().join(".github/workflows/audit.yml"),
+            workflow,
+        )
+        .unwrap();
+
+        let result = invoke_owned(vec![
+            "deshell".into(),
+            "audit".into(),
+            "--root".into(),
+            path(directory.path()),
+            "--format".into(),
+            "jsonl".into(),
+        ]);
+        assert_eq!(result.0, 4, "{}", String::from_utf8_lossy(&result.2));
+        let findings = result
+            .1
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| crate::strict_json::parse(line).unwrap())
+            .collect::<Vec<serde_json::Value>>();
+        assert_eq!(findings.len(), 1, "{findings:#?}");
+        assert_eq!(findings[0]["rule_id"], "shell.dynamic-eval");
+        let start = findings[0]["span"]["start_byte"].as_u64().unwrap() as usize;
+        let end = findings[0]["span"]["end_byte"].as_u64().unwrap() as usize;
+        assert_eq!(&workflow[start..end], "eval");
+    }
+
+    #[test]
+    fn audit_reports_splitting_glob_symlink_and_toctou_with_exact_spans() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        let source = concat!(
+            "#!/bin/sh\n",
+            "rm -rf $TARGET/*.tmp\n",
+            "ln -s \"$TARGET\" \"$LINK\"\n",
+            "test -e \"$TARGET\"\n",
+        );
+        configure(directory.path(), "risk.sh", source.as_bytes());
+
+        let result = invoke_owned(vec![
+            "deshell".into(),
+            "audit".into(),
+            "--root".into(),
+            path(directory.path()),
+            "--format".into(),
+            "jsonl".into(),
+        ]);
+        assert_eq!(result.0, 4, "{}", String::from_utf8_lossy(&result.2));
+        let findings = result
+            .1
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| crate::strict_json::parse(line).unwrap())
+            .collect::<Vec<serde_json::Value>>();
+        for (rule, selected) in [
+            ("filesystem.unquoted-expansion", "$TARGET"),
+            ("filesystem.unbounded-glob", "$TARGET/*.tmp"),
+            ("filesystem.symlink-race", "ln -s"),
+            ("filesystem.toctou-check", "test -e"),
+        ] {
+            let finding = findings
+                .iter()
+                .find(|finding| finding["rule_id"] == rule)
+                .unwrap_or_else(|| panic!("missing {rule}: {findings:#?}"));
+            let start = finding["span"]["start_byte"].as_u64().unwrap() as usize;
+            let end = finding["span"]["end_byte"].as_u64().unwrap() as usize;
+            assert_eq!(&source[start..end], selected, "{rule}");
+        }
+    }
+
+    #[test]
+    fn audit_sarif_and_github_formats_are_derived_from_the_same_finding() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        configure(directory.path(), "audit.sh", b"#!/bin/sh\neval \"$X\"\n");
+        let root = path(directory.path());
+        let sarif = invoke_owned(vec![
+            "deshell".into(),
+            "audit".into(),
+            "--root".into(),
+            root.clone(),
+            "--format".into(),
+            "sarif".into(),
+        ]);
+        assert_eq!(sarif.0, 4);
+        let document: serde_json::Value = crate::strict_json::parse(&sarif.1).unwrap();
+        assert_eq!(document["version"], "2.1.0");
+        assert_eq!(
+            document["runs"][0]["results"][0]["ruleId"],
+            "shell.dynamic-eval"
+        );
+
+        let github = invoke_owned(vec![
+            "deshell".into(),
+            "audit".into(),
+            "--root".into(),
+            root,
+            "--format".into(),
+            "github".into(),
+        ]);
+        assert_eq!(github.0, 4);
+        assert!(String::from_utf8(github.1).unwrap().starts_with(
+            "::error file=audit.sh,line=2,col=1,endLine=2,endColumn=5,title=shell.dynamic-eval::"
+        ));
     }
 
     #[test]
@@ -2450,6 +3418,16 @@ mod tests {
             "lock",
             "replay",
             "corpus-audit",
+            "generator-protocol",
+            "migration-request",
+            "proposal",
+            "migration-plan",
+            "migration-evidence",
+            "archive-manifest",
+            "audit-finding",
+            "harden-plan",
+            "harden-approval",
+            "harden-evidence",
         ] {
             let (code, stdout, stderr) = invoke(&["deshell", "schema", name]);
             assert_eq!(code, 0, "{name}: {}", String::from_utf8_lossy(&stderr));
@@ -2525,6 +3503,36 @@ mod tests {
         ]);
         assert_eq!(checked.0, 0, "{}", String::from_utf8_lossy(&checked.2));
         assert!(checked.2.is_empty());
+    }
+
+    #[test]
+    fn analyze_uses_the_same_explicit_interpreter_resolution_as_scan() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        configure(
+            directory.path(),
+            "automation",
+            b"/usr/bin/printf configured\n",
+        );
+        let config_path = directory.path().join(".deshell/project.toml");
+        let config = std::fs::read_to_string(&config_path).unwrap().replace(
+            "interpreter_overrides = []",
+            "interpreter_overrides = [{ path = \"automation\", interpreter = \"sh\" }]",
+        );
+        std::fs::write(config_path, config).unwrap();
+
+        let analyzed = invoke_owned(vec![
+            "deshell".into(),
+            "analyze".into(),
+            "--root".into(),
+            path(directory.path()),
+            "--entry".into(),
+            "automation".into(),
+        ]);
+        assert_eq!(analyzed.0, 0, "{}", String::from_utf8_lossy(&analyzed.2));
+        let manifest = crate::project::load_manifest(directory.path()).unwrap();
+        assert_eq!(manifest.entries.len(), 1);
+        assert_eq!(manifest.entries[0].entrypoint, "automation");
     }
 
     #[test]
@@ -2634,6 +3642,84 @@ mod tests {
             7
         );
         assert_eq!(run_from(args, &mut Vec::new(), &mut closed_stderr), 7);
+    }
+
+    #[test]
+    fn scan_uses_an_explicit_interpreter_for_an_extensionless_source() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        std::fs::write(
+            directory.path().join("automation"),
+            b"/usr/bin/printf configured\n",
+        )
+        .unwrap();
+        let config_path = directory.path().join(".deshell/project.toml");
+        let config = std::fs::read_to_string(&config_path)
+            .unwrap()
+            .replace("entrypoints = []", "entrypoints = [\"automation\"]")
+            .replace(
+                "interpreter_overrides = []",
+                "interpreter_overrides = [{ path = \"automation\", interpreter = \"sh\" }]",
+            );
+        std::fs::write(config_path, config).unwrap();
+
+        let scan = invoke_owned(vec![
+            "deshell".into(),
+            "scan".into(),
+            "--root".into(),
+            path(directory.path()),
+            "--format".into(),
+            "json".into(),
+        ]);
+        assert_eq!(scan.0, 0, "{}", String::from_utf8_lossy(&scan.2));
+        assert!(scan.2.is_empty());
+        let inventory: serde_json::Value = crate::strict_json::parse(&scan.1).unwrap();
+        assert!(inventory["errors"].as_array().unwrap().is_empty());
+        let findings = inventory["findings"].as_array().unwrap();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0]["path"], "automation");
+        assert_eq!(findings[0]["kind"], "shell_file");
+        assert_eq!(findings[0]["interpreter"], "sh");
+        assert_eq!(findings[0]["interpreter_confidence"], "high");
+    }
+
+    #[test]
+    fn scan_blocks_an_explicit_interpreter_that_conflicts_with_the_source() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        std::fs::write(
+            directory.path().join("automation.bash"),
+            b"/usr/bin/printf configured\n",
+        )
+        .unwrap();
+        let config_path = directory.path().join(".deshell/project.toml");
+        let config = std::fs::read_to_string(&config_path).unwrap().replace(
+            "interpreter_overrides = []",
+            "interpreter_overrides = [{ path = \"automation.bash\", interpreter = \"sh\" }]",
+        );
+        std::fs::write(config_path, config).unwrap();
+
+        let scan = invoke_owned(vec![
+            "deshell".into(),
+            "scan".into(),
+            "--root".into(),
+            path(directory.path()),
+            "--format".into(),
+            "json".into(),
+        ]);
+        assert_eq!(scan.0, 0, "{}", String::from_utf8_lossy(&scan.2));
+        let inventory: serde_json::Value = crate::strict_json::parse(&scan.1).unwrap();
+        assert!(inventory["findings"].as_array().unwrap().is_empty());
+        let errors = inventory["errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0]["path"], "automation.bash");
+        assert_eq!(errors[0]["stage"], "interpreter");
+        assert!(
+            errors[0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("DESHELL_BLOCKER_INTERPRETER_CONFLICT")
+        );
     }
 
     #[test]
@@ -2747,6 +3833,2837 @@ mod tests {
                 .unwrap()
                 .contains("unavailable=1")
         );
+    }
+
+    fn approve_oracle_inputs(root: &Path) {
+        let config_path = root.join(".deshell/project.toml");
+        let config = std::fs::read_to_string(&config_path)
+            .unwrap()
+            .replace(
+                "platform_cells = []",
+                &format!(
+                    "platform_cells = [{{ id = \"host\", operating_system = \"{}\", architecture = \"{}\", runtime = \"native\", approval = \"approved\" }}]",
+                    std::env::consts::OS,
+                    std::env::consts::ARCH
+                ),
+            );
+        std::fs::write(config_path, config).unwrap();
+        let scenario_path = root.join(".deshell/scenarios/default.toml");
+        let scenario = std::fs::read_to_string(&scenario_path)
+            .unwrap()
+            .replace("approval = \"draft\"", "approval = \"approved\"");
+        std::fs::write(scenario_path, scenario).unwrap();
+        std::fs::create_dir_all(root.join("src/bin")).unwrap();
+    }
+
+    #[test]
+    fn migration_plan_is_content_addressed_preview_only_and_generator_cannot_delete() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        configure(
+            directory.path(),
+            "build.sh",
+            b"#!/usr/bin/env bash\n/usr/bin/printf '%s\\n' hello | /usr/bin/tr a-z A-Z\n",
+        );
+        approve_oracle_inputs(directory.path());
+        let result = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "plan".into(),
+            "--root".into(),
+            path(directory.path()),
+        ]);
+        assert_eq!(result.0, 0, "{}", String::from_utf8_lossy(&result.2));
+        let output = String::from_utf8(result.1).unwrap();
+        let digest = output
+            .lines()
+            .find_map(|line| line.strip_prefix("plan "))
+            .unwrap();
+        assert!(crate::digest::valid_sha256(digest));
+        assert!(output.contains("+++ b/src/bin/deshell_build.rs"));
+        assert!(directory.path().join("build.sh").is_file());
+        assert!(!directory.path().join("src/bin/deshell_build.rs").exists());
+        assert!(!directory.path().join(".deshell/archive").exists());
+
+        let plan_path = directory
+            .path()
+            .join(format!(".deshell/migrations/sha256/{digest}/plan.json"));
+        let plan: serde_json::Value =
+            crate::strict_json::parse(&std::fs::read(plan_path).unwrap()).unwrap();
+        assert_eq!(plan["plan_digest"], digest);
+        assert!(plan["blockers"].as_array().unwrap().is_empty());
+        assert_eq!(plan["coverage"]["delegated_bytes"], 0);
+        assert_eq!(plan["coverage"]["residual_bytes"], 0);
+        assert_eq!(plan["sources"].as_array().unwrap().len(), 1);
+        let proposal_digest = plan["proposals"][0].as_str().unwrap();
+        let proposal_path = directory.path().join(format!(
+            ".deshell/migrations/sha256/{digest}/proposals/{proposal_digest}.json"
+        ));
+        let proposal: serde_json::Value =
+            crate::strict_json::parse(&std::fs::read(&proposal_path).unwrap()).unwrap();
+        assert_eq!(proposal["patches"][0]["operation"], "create");
+        assert_eq!(proposal["patches"][0]["path"], "src/bin/deshell_build.rs");
+        assert!(
+            !std::fs::read_to_string(proposal_path)
+                .unwrap()
+                .contains("delete")
+        );
+    }
+
+    #[test]
+    fn migration_plan_blocks_when_approved_scenarios_omit_an_input_boundary() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        configure(
+            directory.path(),
+            "inputs.sh",
+            b"#!/bin/sh\n/usr/bin/printf '%s:%s\\n' \"$1\" \"$TOKEN\"\n",
+        );
+        approve_oracle_inputs(directory.path());
+
+        let planned = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "plan".into(),
+            "--root".into(),
+            path(directory.path()),
+        ]);
+        assert_eq!(planned.0, 0, "{}", String::from_utf8_lossy(&planned.2));
+        let output = String::from_utf8(planned.1).unwrap();
+        assert!(
+            output.contains("DESHELL_BLOCKER_SCENARIO_INPUT_COVERAGE"),
+            "{output}"
+        );
+        assert!(output.contains("argument 1"), "{output}");
+        assert!(output.contains("environment TOKEN"), "{output}");
+
+        let scenario_path = directory.path().join(".deshell/scenarios/default.toml");
+        let scenario = std::fs::read_to_string(&scenario_path)
+            .unwrap()
+            .replace(
+                "arguments = []",
+                "arguments = [{ name = \"1\", value = \"value\" }]",
+            )
+            .replace(
+                "environment = []",
+                "environment = [{ name = \"TOKEN\", value = \"secret\" }]",
+            );
+        std::fs::write(scenario_path, scenario).unwrap();
+        let covered = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "plan".into(),
+            "--root".into(),
+            path(directory.path()),
+        ]);
+        assert_eq!(covered.0, 0, "{}", String::from_utf8_lossy(&covered.2));
+        let covered_output = String::from_utf8(covered.1).unwrap();
+        assert!(
+            !covered_output.contains("DESHELL_BLOCKER_SCENARIO_INPUT_COVERAGE"),
+            "{covered_output}"
+        );
+    }
+
+    #[test]
+    fn migration_plan_never_fabricates_empty_network_replay_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        configure(
+            directory.path(),
+            "download.sh",
+            b"#!/bin/sh\n/usr/bin/curl https://example.invalid/artifact\n",
+        );
+        approve_oracle_inputs(directory.path());
+
+        let planned = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "plan".into(),
+            "--root".into(),
+            path(directory.path()),
+        ]);
+        assert_eq!(planned.0, 0, "{}", String::from_utf8_lossy(&planned.2));
+        let output = String::from_utf8(planned.1).unwrap();
+        assert!(
+            output.contains("DESHELL_BLOCKER_NETWORK_REPLAY_UNAVAILABLE"),
+            "{output}"
+        );
+        assert!(output.contains("download.sh"), "{output}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migration_replay_proxy_records_and_compares_network_sequence_end_to_end() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        configure(
+            directory.path(),
+            "download.sh",
+            b"#!/bin/sh\n/usr/bin/curl --silent http://artifact.test/data\n",
+        );
+        std::fs::write(
+            directory.path().join("Cargo.toml"),
+            concat!(
+                "[package]\n",
+                "name = \"network-replay-fixture\"\n",
+                "version = \"0.0.0\"\n",
+                "edition = \"2024\"\n",
+            ),
+        )
+        .unwrap();
+        let response = b"replayed artifact\n";
+        let replay = crate::replay::ReplayStore {
+            schema_version: 1,
+            entries: vec![crate::replay::ReplayEntry {
+                method: "GET".into(),
+                uri: "http://artifact.test/data".into(),
+                request_body_sha256: crate::digest::sha256(b""),
+                status: 200,
+                headers: vec![crate::replay::Header {
+                    name: "content-type".into(),
+                    value: "application/octet-stream".into(),
+                }],
+                body: crate::ir::SourceBytes::from_bytes(response),
+            }],
+        };
+        std::fs::write(
+            directory.path().join(".deshell/replay.json"),
+            replay.encode_pretty().unwrap(),
+        )
+        .unwrap();
+        approve_oracle_inputs(directory.path());
+        let scenario_path = directory.path().join(".deshell/scenarios/default.toml");
+        let scenario = std::fs::read_to_string(&scenario_path)
+            .unwrap()
+            .replace("processes = 512", "processes = 60000");
+        std::fs::write(scenario_path, scenario).unwrap();
+
+        let planned = crate::migration::create_plan(directory.path()).unwrap();
+        assert!(planned.blockers.is_empty(), "{:#?}", planned.blockers);
+        let plan_path = directory.path().join(format!(
+            ".deshell/migrations/sha256/{}/plan.json",
+            planned.digest
+        ));
+        let plan: serde_json::Value =
+            crate::strict_json::parse(&std::fs::read(plan_path).unwrap()).unwrap();
+        assert_eq!(
+            plan["network_replay_digest"],
+            crate::digest::sha256(&replay.encode_pretty().unwrap())
+        );
+
+        let evidence = crate::migration::verify(directory.path(), &planned.digest, "host").unwrap();
+        assert_eq!(
+            evidence.status,
+            crate::migration::EvidenceStatus::Verified,
+            "{evidence:#?}"
+        );
+        for comparison in &evidence.checks[0].comparisons {
+            for observation in [
+                &comparison.original,
+                &comparison.ir,
+                &comparison.replacement,
+            ] {
+                assert_eq!(observation.network.len(), 1);
+                assert_eq!(observation.network[0].sequence, 0);
+                assert_eq!(observation.network[0].method, "GET");
+                assert_eq!(observation.network[0].uri, "http://artifact.test/data");
+                assert_eq!(
+                    observation.network[0].request_body_sha256,
+                    crate::digest::sha256(b"")
+                );
+                assert_eq!(
+                    observation.network[0].response_body_sha256,
+                    crate::digest::sha256(response)
+                );
+            }
+        }
+        let mut invalid_sequence = evidence.clone();
+        invalid_sequence.checks[0].comparisons[0].original.network[0].sequence = 1;
+        assert!(invalid_sequence.encode_pretty().is_err());
+        let evidence_path = directory.path().join("network-evidence.json");
+        std::fs::write(&evidence_path, evidence.encode_pretty().unwrap()).unwrap();
+        let replay_path = directory.path().join(".deshell/replay.json");
+        let canonical_replay = replay.encode_pretty().unwrap();
+        let mut changed_replay = replay.clone();
+        changed_replay.entries[0].body = crate::ir::SourceBytes::from_bytes(b"changed\n");
+        std::fs::write(&replay_path, changed_replay.encode_pretty().unwrap()).unwrap();
+        let stale = crate::migration::import_evidence(
+            directory.path(),
+            &planned.digest,
+            std::slice::from_ref(&evidence_path),
+        )
+        .unwrap_err();
+        assert!(stale.contains("DESHELL_BLOCKER_STALE_NETWORK_REPLAY"));
+        std::fs::write(replay_path, canonical_replay).unwrap();
+        crate::migration::import_evidence(
+            directory.path(),
+            &planned.digest,
+            std::slice::from_ref(&evidence_path),
+        )
+        .unwrap();
+        crate::migration::apply(directory.path(), &planned.digest).unwrap();
+        assert!(!directory.path().join("download.sh").exists());
+        assert!(
+            crate::project::scan(directory.path())
+                .unwrap()
+                .findings
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migration_plan_lowers_an_extensionless_source_with_its_configured_interpreter() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        configure(
+            directory.path(),
+            "automation",
+            b"/usr/bin/printf configured\n",
+        );
+        let config_path = directory.path().join(".deshell/project.toml");
+        let config = std::fs::read_to_string(&config_path).unwrap().replace(
+            "interpreter_overrides = []",
+            "interpreter_overrides = [{ path = \"automation\", interpreter = \"sh\" }]",
+        );
+        std::fs::write(config_path, config).unwrap();
+        approve_oracle_inputs(directory.path());
+
+        let planned = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "plan".into(),
+            "--root".into(),
+            path(directory.path()),
+        ]);
+        assert_eq!(planned.0, 0, "{}", String::from_utf8_lossy(&planned.2));
+        let output = String::from_utf8(planned.1).unwrap();
+        assert!(!output.contains("blocker"), "{output}");
+        assert!(
+            output.contains("+++ b/src/bin/deshell_automation.rs"),
+            "{output}"
+        );
+        let digest = output
+            .lines()
+            .find_map(|line| line.strip_prefix("plan ").map(str::to_owned))
+            .unwrap();
+        let evidence_path = directory.path().join("configured-evidence.json");
+        let verified = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "verify".into(),
+            "--root".into(),
+            path(directory.path()),
+            "--plan".into(),
+            digest,
+            "--cell".into(),
+            "host".into(),
+            "--output".into(),
+            path(&evidence_path),
+        ]);
+        assert_eq!(verified.0, 0, "{}", String::from_utf8_lossy(&verified.2));
+        let evidence: serde_json::Value =
+            crate::strict_json::parse(&std::fs::read(evidence_path).unwrap()).unwrap();
+        assert_eq!(evidence["status"], "verified");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migration_plan_accepts_a_digest_pinned_external_json_rpc_generator() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        configure(
+            directory.path(),
+            "external.sh",
+            b"#!/bin/sh\n/usr/bin/printf '%s' \"$TOKEN\"\n",
+        );
+        approve_oracle_inputs(directory.path());
+        let scenario_path = directory.path().join(".deshell/scenarios/default.toml");
+        let scenario = std::fs::read_to_string(&scenario_path).unwrap().replace(
+            "environment = []",
+            "environment = [{ name = \"TOKEN\", value = \"top-secret\" }]",
+        );
+        std::fs::write(scenario_path, scenario).unwrap();
+        let generator_directory = directory.path().join(".deshell/generators");
+        std::fs::create_dir(&generator_directory).unwrap();
+        let generator_path = generator_directory.join("fixture");
+        let generator = br##"#!/usr/bin/python3
+import base64, hashlib, json, pathlib, sys
+
+ZERO = "0" * 64
+SELF_DIGEST = "sha256:" + hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest()
+
+def canonical(value):
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode()
+
+def respond(identifier, result):
+    print(json.dumps({"id": identifier, "jsonrpc": "2.0", "result": result}, separators=(",", ":"), sort_keys=True), flush=True)
+
+for line in sys.stdin:
+    request = json.loads(line)
+    if request["method"] == "deshell.handshake":
+        respond(request["id"], {
+            "generator": {"capabilities": ["agent"], "digest": SELF_DIGEST, "name": "fixture", "version": "1"},
+            "max_frame_bytes": 4194304,
+            "protocol": "deshell.generator.v1",
+            "schema_version": 1,
+        })
+        continue
+    params = request["params"]
+    migration = params["request"]
+    assert "source_bytes" not in migration["source"]
+    assert migration["interface"]["secrets"] == ["TOKEN"]
+    assert "top-secret" not in json.dumps(migration, sort_keys=True)
+    target = params["target_path"]
+    generated = b"generated by fixture\n"
+    ids = []
+    def walk(value):
+        if isinstance(value, dict):
+            if isinstance(value.get("id"), str) and "operation" in value:
+                ids.append(value["id"])
+            for child in value.values():
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+    walk(migration["effect_ir"])
+    proposal = {
+        "build_argv": ["/usr/bin/true"],
+        "dependencies": [],
+        "generator_digest": SELF_DIGEST,
+        "patches": [{
+            "content_base64": base64.b64encode(generated).decode(),
+            "content_digest": hashlib.sha256(generated).hexdigest(),
+            "expected_digest": params["expected_digest"],
+            "operation": "update" if params["expected_digest"] else "create",
+            "path": target,
+            "permissions": 493,
+        }],
+        "proposal_digest": ZERO,
+        "request_digest": migration["request_id"],
+        "run_argv": ["/usr/bin/true"],
+        "schema_version": 1,
+        "source_map": [{"generated": {"end_byte": len(generated), "path": target, "start_byte": 0}, "ir_node": identifier} for identifier in ids],
+        "validation": params["validation"],
+    }
+    proposal["proposal_digest"] = hashlib.sha256(canonical(proposal)).hexdigest()
+    respond(request["id"], proposal)
+"##;
+        std::fs::write(&generator_path, generator).unwrap();
+        std::fs::set_permissions(&generator_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let pinned_digest = format!("sha256:{}", crate::digest::sha256(generator));
+        let config_path = directory.path().join(".deshell/project.toml");
+        let config = std::fs::read_to_string(&config_path)
+            .unwrap()
+            .replacen("generator = \"rust\"", "generator = \"external:fixture\"", 1)
+            .replacen("target = \"rust\"", "target = \"agent\"", 1)
+            .replace(
+                "external_generators = []",
+                &format!(
+                    concat!(
+                        "external_generators = [{{ name = \"fixture\", executable = \".deshell/generators/fixture\", digest = \"{}\", capabilities = [\"agent\"] }}]"
+                    ),
+                    pinned_digest
+                ),
+            );
+        std::fs::write(config_path, config).unwrap();
+
+        let blocked = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "plan".into(),
+            "--root".into(),
+            path(directory.path()),
+        ]);
+        assert_eq!(blocked.0, 0, "{}", String::from_utf8_lossy(&blocked.2));
+        let blocked_output = String::from_utf8(blocked.1).unwrap();
+        assert!(
+            blocked_output.contains("DESHELL_BLOCKER_GENERATOR_NETWORK_POLICY"),
+            "{blocked_output}"
+        );
+        let config_path = directory.path().join(".deshell/project.toml");
+        let config = std::fs::read_to_string(&config_path)
+            .unwrap()
+            .replace("allow_agent_network = false", "allow_agent_network = true");
+        std::fs::write(config_path, config).unwrap();
+
+        let source_blocked = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "plan".into(),
+            "--root".into(),
+            path(directory.path()),
+        ]);
+        assert_eq!(
+            source_blocked.0,
+            0,
+            "{}",
+            String::from_utf8_lossy(&source_blocked.2)
+        );
+        let source_output = String::from_utf8(source_blocked.1).unwrap();
+        assert!(
+            source_output.contains("DESHELL_BLOCKER_GENERATOR_SOURCE_POLICY"),
+            "{source_output}"
+        );
+        let config_path = directory.path().join(".deshell/project.toml");
+        let config = std::fs::read_to_string(&config_path)
+            .unwrap()
+            .replace("allow_source_send = false", "allow_source_send = true");
+        std::fs::write(config_path, config).unwrap();
+
+        let planned = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "plan".into(),
+            "--root".into(),
+            path(directory.path()),
+        ]);
+        assert_eq!(planned.0, 0, "{}", String::from_utf8_lossy(&planned.2));
+        let output = String::from_utf8(planned.1).unwrap();
+        assert!(!output.contains("blocker"), "{output}");
+        assert!(output.contains("+++ b/src/bin/external"), "{output}");
+        let digest = output
+            .lines()
+            .find_map(|line| line.strip_prefix("plan "))
+            .unwrap();
+        let plan: serde_json::Value = crate::strict_json::parse(
+            &std::fs::read(
+                directory
+                    .path()
+                    .join(format!(".deshell/migrations/sha256/{digest}/plan.json")),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let proposal_digest = plan["proposals"][0].as_str().unwrap();
+        let proposal: serde_json::Value = crate::strict_json::parse(
+            &std::fs::read(directory.path().join(format!(
+                ".deshell/migrations/sha256/{digest}/proposals/{proposal_digest}.json"
+            )))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(proposal["generator_digest"], pinned_digest);
+    }
+
+    #[test]
+    fn migration_apply_refuses_the_whole_plan_when_one_blocker_exists() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        configure(
+            directory.path(),
+            "blocked.sh",
+            b"#!/bin/sh\neval \"$DYNAMIC\"\n",
+        );
+        approve_oracle_inputs(directory.path());
+        let planned = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "plan".into(),
+            "--root".into(),
+            path(directory.path()),
+        ]);
+        assert_eq!(planned.0, 0, "{}", String::from_utf8_lossy(&planned.2));
+        let digest = String::from_utf8(planned.1)
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("plan ").map(str::to_owned))
+            .unwrap();
+        let before = std::fs::read(directory.path().join("blocked.sh")).unwrap();
+        let applied = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "apply".into(),
+            "--root".into(),
+            path(directory.path()),
+            "--plan".into(),
+            digest,
+        ]);
+        assert_eq!(applied.0, 4);
+        assert!(String::from_utf8_lossy(&applied.2).contains("DESHELL_BLOCKER_DYNAMIC_EVAL"));
+        assert_eq!(
+            std::fs::read(directory.path().join("blocked.sh")).unwrap(),
+            before
+        );
+        assert!(!directory.path().join(".deshell/archive").exists());
+        assert!(!directory.path().join("src/bin/deshell_blocked.rs").exists());
+    }
+
+    #[test]
+    fn migration_plan_uses_a_stable_parser_error_blocker() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        configure(
+            directory.path(),
+            "broken.sh",
+            b"#!/bin/sh\nif /usr/bin/true; then\n/usr/bin/printf missing-fi\n",
+        );
+        approve_oracle_inputs(directory.path());
+
+        let planned = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "plan".into(),
+            "--root".into(),
+            path(directory.path()),
+        ]);
+        assert_eq!(planned.0, 0, "{}", String::from_utf8_lossy(&planned.2));
+        let output = String::from_utf8(planned.1).unwrap();
+        assert!(output.contains("DESHELL_BLOCKER_PARSE_ERROR"), "{output}");
+        assert!(output.contains("broken.sh"), "{output}");
+    }
+
+    #[test]
+    fn migration_plan_uses_pinned_fish_and_batch_parsers() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        std::fs::write(
+            directory.path().join("broken.fish"),
+            b"if /usr/bin/true\n/usr/bin/printf missing-end\n",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("broken.cmd"),
+            b"@echo off\r\nif exist input (\r\n@tool.exe missing-close\r\n",
+        )
+        .unwrap();
+        approve_oracle_inputs(directory.path());
+
+        let planned = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "plan".into(),
+            "--root".into(),
+            path(directory.path()),
+        ]);
+        assert_eq!(planned.0, 0, "{}", String::from_utf8_lossy(&planned.2));
+        let output = String::from_utf8(planned.1).unwrap();
+        for path in ["broken.cmd", "broken.fish"] {
+            let line = output
+                .lines()
+                .find(|line| line.contains(path))
+                .unwrap_or_else(|| panic!("missing blocker for {path}: {output}"));
+            assert!(line.contains("DESHELL_BLOCKER_PARSE_ERROR"), "{line}");
+        }
+    }
+
+    #[test]
+    fn migration_plan_uses_powershell_and_nushell_parsers() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        std::fs::write(
+            directory.path().join("broken.ps1"),
+            b"function Invoke-Build {\n& 'tool.exe'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("broken.nu"),
+            b"if true {\n^tool missing-close\n",
+        )
+        .unwrap();
+        approve_oracle_inputs(directory.path());
+
+        let planned = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "plan".into(),
+            "--root".into(),
+            path(directory.path()),
+        ]);
+        assert_eq!(planned.0, 0, "{}", String::from_utf8_lossy(&planned.2));
+        let output = String::from_utf8(planned.1).unwrap();
+        for path in ["broken.nu", "broken.ps1"] {
+            let line = output
+                .lines()
+                .find(|line| line.contains(path))
+                .unwrap_or_else(|| panic!("missing blocker for {path}: {output}"));
+            assert!(line.contains("DESHELL_BLOCKER_PARSE_ERROR"), "{line}");
+        }
+        assert!(!output.contains(".deshell.nu"), "{output}");
+        assert!(!output.contains(".deshell.ps1"), "{output}");
+
+        let digest = output
+            .lines()
+            .find_map(|line| line.strip_prefix("plan "))
+            .unwrap();
+        let plan: serde_json::Value = crate::strict_json::parse(
+            &std::fs::read(
+                directory
+                    .path()
+                    .join(format!(".deshell/migrations/sha256/{digest}/plan.json")),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        for blocker in plan["blockers"].as_array().unwrap() {
+            if blocker["code"] == "DESHELL_BLOCKER_PARSE_ERROR" {
+                let location = &blocker["location"];
+                let source_len =
+                    std::fs::read(directory.path().join(location["path"].as_str().unwrap()))
+                        .unwrap()
+                        .len() as u64;
+                assert!(
+                    location["start_byte"].as_u64().unwrap() > 0
+                        || location["end_byte"].as_u64().unwrap() < source_len,
+                    "parse blocker used a whole-file span: {blocker}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn migration_plan_blocks_static_process_references_to_retired_scripts() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        configure(
+            directory.path(),
+            "build.sh",
+            b"#!/bin/sh\n/usr/bin/printf referenced\n",
+        );
+        std::fs::write(
+            directory.path().join("caller.py"),
+            b"import subprocess\nsubprocess.run([\"sh\", \"build.sh\"], check=True)\n",
+        )
+        .unwrap();
+        approve_oracle_inputs(directory.path());
+        let planned = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "plan".into(),
+            "--root".into(),
+            path(directory.path()),
+        ]);
+        assert_eq!(planned.0, 0, "{}", String::from_utf8_lossy(&planned.2));
+        let output = String::from_utf8(planned.1).unwrap();
+        assert!(
+            output.contains("DESHELL_BLOCKER_UNRESOLVED_CALL_SITE"),
+            "{output}"
+        );
+        assert!(output.contains("caller.py"), "{output}");
+
+        let digest = output
+            .lines()
+            .find_map(|line| line.strip_prefix("plan "))
+            .unwrap();
+        let migration_root = directory
+            .path()
+            .join(format!(".deshell/migrations/sha256/{digest}"));
+        let plan: serde_json::Value =
+            crate::strict_json::parse(&std::fs::read(migration_root.join("plan.json")).unwrap())
+                .unwrap();
+        let proposal_digest = plan["proposals"][0].as_str().unwrap();
+        let proposal: serde_json::Value = crate::strict_json::parse(
+            &std::fs::read(migration_root.join(format!("proposals/{proposal_digest}.json")))
+                .unwrap(),
+        )
+        .unwrap();
+        let request_digest = proposal["request_digest"].as_str().unwrap();
+        let request: serde_json::Value = crate::strict_json::parse(
+            &std::fs::read(migration_root.join(format!("requests/{request_digest}.json"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            request["call_sites"],
+            serde_json::json!([{
+                "path": "caller.py",
+                "start_byte": 18,
+                "end_byte": 64
+            }])
+        );
+    }
+
+    #[test]
+    fn migration_plan_blocks_untyped_json_toml_and_yaml_task_references() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        std::fs::create_dir(directory.path().join("scripts")).unwrap();
+        configure(
+            directory.path(),
+            "scripts/build.sh",
+            b"#!/bin/sh\n/usr/bin/printf referenced\n",
+        );
+        std::fs::write(
+            directory.path().join("tasks.json"),
+            br#"{"tasks":{"build":{"command":"./scripts/build.sh"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("tasks.toml"),
+            b"[tasks.build]\nrun = \"./scripts/build.sh\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("taskfile.yml"),
+            b"tasks:\n  build:\n    command: ./scripts/build.sh\n",
+        )
+        .unwrap();
+        approve_oracle_inputs(directory.path());
+
+        let planned = crate::migration::create_plan(directory.path()).unwrap();
+        let unresolved = planned
+            .blockers
+            .iter()
+            .filter(|blocker| blocker.code == "DESHELL_BLOCKER_UNRESOLVED_CALL_SITE")
+            .filter_map(|blocker| {
+                blocker
+                    .location
+                    .as_ref()
+                    .map(|location| location.path.as_str())
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            unresolved,
+            ["taskfile.yml", "tasks.json", "tasks.toml"].into()
+        );
+        let candidates = planned
+            .blockers
+            .iter()
+            .filter(|blocker| blocker.code == "DESHELL_BLOCKER_DYNAMIC_CANDIDATE")
+            .filter_map(|blocker| {
+                blocker
+                    .location
+                    .as_ref()
+                    .map(|location| location.path.as_str())
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(candidates, unresolved);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rust_generator_rewrites_a_static_python_call_site_and_retires_end_to_end() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        configure(
+            directory.path(),
+            "build.sh",
+            b"#!/bin/sh\n/usr/bin/printf referenced\n",
+        );
+        std::fs::write(
+            directory.path().join("Cargo.toml"),
+            concat!(
+                "[package]\n",
+                "name = \"call-site-fixture\"\n",
+                "version = \"0.0.0\"\n",
+                "edition = \"2024\"\n",
+            ),
+        )
+        .unwrap();
+        let caller = b"import subprocess\nsubprocess.run([\"sh\", \"build.sh\"], check=True)\n";
+        std::fs::write(directory.path().join("caller.py"), caller).unwrap();
+        approve_oracle_inputs(directory.path());
+        let config_path = directory.path().join(".deshell/project.toml");
+        let config = std::fs::read_to_string(&config_path)
+            .unwrap()
+            .replace(
+                "validation_commands = []",
+                "validation_commands = [{ name = \"caller\", kind = \"test\", argv = [\"python3\", \"caller.py\"] }]",
+            )
+            .replace("memory_bytes = 1073741824", "memory_bytes = 8589934592");
+        std::fs::write(config_path, config).unwrap();
+
+        let planned = crate::migration::create_plan(directory.path()).unwrap();
+        assert!(planned.blockers.is_empty(), "{:#?}", planned.blockers);
+        assert!(planned.diff.contains("+++ b/caller.py"), "{}", planned.diff);
+        assert!(planned.diff.contains("cargo"), "{}", planned.diff);
+        assert!(!planned.diff.contains("+subprocess.run([\"sh\""));
+
+        let evidence = crate::migration::verify(directory.path(), &planned.digest, "host").unwrap();
+        assert_eq!(
+            evidence.status,
+            crate::migration::EvidenceStatus::Verified,
+            "{evidence:#?}"
+        );
+        let evidence_path = directory.path().join("evidence.json");
+        std::fs::write(&evidence_path, evidence.encode_pretty().unwrap()).unwrap();
+        crate::migration::import_evidence(
+            directory.path(),
+            &planned.digest,
+            std::slice::from_ref(&evidence_path),
+        )
+        .unwrap();
+        crate::migration::apply(directory.path(), &planned.digest).unwrap();
+
+        assert!(!directory.path().join("build.sh").exists());
+        let migrated = std::fs::read_to_string(directory.path().join("caller.py")).unwrap();
+        assert!(migrated.contains("cargo"), "{migrated}");
+        assert!(!migrated.contains("build.sh"), "{migrated}");
+        assert!(
+            crate::project::scan(directory.path())
+                .unwrap()
+                .findings
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rust_generator_rewrites_a_static_javascript_call_site_and_retires_end_to_end() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        configure(
+            directory.path(),
+            "build.sh",
+            b"#!/bin/sh\n/usr/bin/printf javascript\n",
+        );
+        std::fs::write(
+            directory.path().join("Cargo.toml"),
+            concat!(
+                "[package]\n",
+                "name = \"javascript-call-site-fixture\"\n",
+                "version = \"0.0.0\"\n",
+                "edition = \"2024\"\n",
+            ),
+        )
+        .unwrap();
+        let caller = concat!(
+            "const { spawnSync } = require('node:child_process');\n",
+            "const outcome = spawnSync(\"sh\", [\"build.sh\"], { stdio: \"inherit\" });\n",
+            "process.exit(outcome.status ?? 1);\n",
+        );
+        std::fs::write(directory.path().join("caller.cjs"), caller).unwrap();
+        approve_oracle_inputs(directory.path());
+        let config_path = directory.path().join(".deshell/project.toml");
+        let config = std::fs::read_to_string(&config_path)
+            .unwrap()
+            .replace(
+                "validation_commands = []",
+                "validation_commands = [{ name = \"caller\", kind = \"test\", argv = [\"node\", \"caller.cjs\"] }]",
+            )
+            .replace("memory_bytes = 1073741824", "memory_bytes = 8589934592");
+        std::fs::write(config_path, config).unwrap();
+
+        let planned = crate::migration::create_plan(directory.path()).unwrap();
+        assert!(planned.blockers.is_empty(), "{:#?}", planned.blockers);
+        assert!(
+            planned.diff.contains("+++ b/caller.cjs"),
+            "{}",
+            planned.diff
+        );
+        assert!(
+            planned.diff.contains("spawnSync(\"cargo\""),
+            "{}",
+            planned.diff
+        );
+
+        let evidence = crate::migration::verify(directory.path(), &planned.digest, "host").unwrap();
+        assert_eq!(evidence.status, crate::migration::EvidenceStatus::Verified);
+        let evidence_path = directory.path().join("evidence.json");
+        std::fs::write(&evidence_path, evidence.encode_pretty().unwrap()).unwrap();
+        crate::migration::import_evidence(
+            directory.path(),
+            &planned.digest,
+            std::slice::from_ref(&evidence_path),
+        )
+        .unwrap();
+        crate::migration::apply(directory.path(), &planned.digest).unwrap();
+
+        assert!(!directory.path().join("build.sh").exists());
+        let migrated = std::fs::read_to_string(directory.path().join("caller.cjs")).unwrap();
+        assert!(migrated.contains("spawnSync(\"cargo\""), "{migrated}");
+        assert!(!migrated.contains("build.sh"), "{migrated}");
+        assert!(
+            crate::project::scan(directory.path())
+                .unwrap()
+                .findings
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn go_generator_rewrites_a_static_python_call_site_and_retires_end_to_end() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        configure(
+            directory.path(),
+            "build.sh",
+            b"#!/bin/sh\n/usr/bin/printf golang\n",
+        );
+        std::fs::write(
+            directory.path().join("go.mod"),
+            "module example.test/deshell-call-site\n\ngo 1.27.0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("caller.py"),
+            b"import subprocess\nsubprocess.run([\"sh\", \"build.sh\"], check=True)\n",
+        )
+        .unwrap();
+        approve_oracle_inputs(directory.path());
+        std::fs::create_dir(directory.path().join("cmd")).unwrap();
+        let config_path = directory.path().join(".deshell/project.toml");
+        let config = std::fs::read_to_string(&config_path)
+            .unwrap()
+            .replacen("generator = \"rust\"", "generator = \"go\"", 1)
+            .replacen("target = \"rust\"", "target = \"go\"", 1)
+            .replacen("module_root = \"src/bin\"", "module_root = \"cmd\"", 1)
+            .replace(
+                "validation_commands = []",
+                "validation_commands = [{ name = \"caller\", kind = \"test\", argv = [\"python3\", \"caller.py\"] }]",
+            )
+            .replace("memory_bytes = 1073741824", "memory_bytes = 8589934592");
+        std::fs::write(config_path, config).unwrap();
+
+        let planned = crate::migration::create_plan(directory.path()).unwrap();
+        assert!(planned.blockers.is_empty(), "{:#?}", planned.blockers);
+        assert!(planned.diff.contains("subprocess.run([\"go\""));
+        let evidence = crate::migration::verify(directory.path(), &planned.digest, "host").unwrap();
+        assert_eq!(
+            evidence.status,
+            crate::migration::EvidenceStatus::Verified,
+            "{evidence:#?}"
+        );
+        let evidence_path = directory.path().join("evidence.json");
+        std::fs::write(&evidence_path, evidence.encode_pretty().unwrap()).unwrap();
+        crate::migration::import_evidence(
+            directory.path(),
+            &planned.digest,
+            std::slice::from_ref(&evidence_path),
+        )
+        .unwrap();
+        crate::migration::apply(directory.path(), &planned.digest).unwrap();
+        assert!(!directory.path().join("build.sh").exists());
+        let migrated = std::fs::read_to_string(directory.path().join("caller.py")).unwrap();
+        assert!(migrated.contains("go"), "{migrated}");
+        assert!(!migrated.contains("build.sh"), "{migrated}");
+        assert!(
+            crate::project::scan(directory.path())
+                .unwrap()
+                .findings
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rust_generator_retires_make_and_package_wrappers_with_the_script_end_to_end() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        std::fs::create_dir(directory.path().join("scripts")).unwrap();
+        configure(
+            directory.path(),
+            "scripts/build.sh",
+            b"#!/bin/sh\n/usr/bin/printf interface\n",
+        );
+        std::fs::write(
+            directory.path().join("Cargo.toml"),
+            concat!(
+                "[package]\n",
+                "name = \"structured-call-site-fixture\"\n",
+                "version = \"0.0.0\"\n",
+                "edition = \"2024\"\n",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("Makefile"),
+            b"# retain this comment\nbuild:\n\t/bin/sh scripts/build.sh\n",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("package.json"),
+            br#"{"private":true,"scripts":{"build":"sh scripts/build.sh"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("validate.py"),
+            concat!(
+                "import json, pathlib, subprocess, sys\n",
+                "assert 'build.sh' not in pathlib.Path(sys.argv[1]).read_text()\n",
+                "assert json.loads(pathlib.Path(sys.argv[2]).read_text())['scripts']['build'] == ''\n",
+                "subprocess.run(['cargo', 'run', '--quiet', '--bin', 'deshell_build', '--'], check=True)\n",
+            ),
+        )
+        .unwrap();
+        approve_oracle_inputs(directory.path());
+        let config_path = directory.path().join(".deshell/project.toml");
+        let config = std::fs::read_to_string(&config_path)
+            .unwrap()
+            .replace(
+                "validation_commands = []",
+                "validation_commands = [{ name = \"interfaces\", kind = \"test\", argv = [\"python3\", \"validate.py\", \"Makefile\", \"package.json\"] }]",
+            )
+            .replace("memory_bytes = 1073741824", "memory_bytes = 8589934592");
+        std::fs::write(config_path, config).unwrap();
+
+        let planned = crate::migration::create_plan(directory.path()).unwrap();
+        assert!(planned.blockers.is_empty(), "{:#?}", planned.blockers);
+        assert!(planned.diff.contains("--- a/Makefile"), "{}", planned.diff);
+        assert!(
+            planned.diff.contains("--- a/package.json"),
+            "{}",
+            planned.diff
+        );
+
+        let evidence = crate::migration::verify(directory.path(), &planned.digest, "host").unwrap();
+        assert_eq!(
+            evidence.status,
+            crate::migration::EvidenceStatus::Verified,
+            "{evidence:#?}"
+        );
+        assert_eq!(evidence.checks.len(), 3);
+        let evidence_path = directory.path().join("evidence.json");
+        std::fs::write(&evidence_path, evidence.encode_pretty().unwrap()).unwrap();
+        crate::migration::import_evidence(
+            directory.path(),
+            &planned.digest,
+            std::slice::from_ref(&evidence_path),
+        )
+        .unwrap();
+        crate::migration::apply(directory.path(), &planned.digest).unwrap();
+
+        assert!(!directory.path().join("scripts/build.sh").exists());
+        let makefile = std::fs::read_to_string(directory.path().join("Makefile")).unwrap();
+        assert!(makefile.contains("# retain this comment"));
+        assert!(!makefile.contains("build.sh"));
+        let package: serde_json::Value = crate::strict_json::parse_host(
+            &std::fs::read(directory.path().join("package.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(package["private"], true);
+        assert_eq!(package["scripts"]["build"], "");
+        assert!(
+            crate::project::scan(directory.path())
+                .unwrap()
+                .findings
+                .is_empty()
+        );
+        let archive: serde_json::Value = crate::strict_json::parse(
+            &std::fs::read(directory.path().join(".deshell/archive/manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(archive["entries"].as_array().unwrap().len(), 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn go_generator_retires_make_and_package_wrappers_with_the_script_end_to_end() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        std::fs::create_dir(directory.path().join("scripts")).unwrap();
+        std::fs::create_dir(directory.path().join("cmd")).unwrap();
+        configure(
+            directory.path(),
+            "scripts/build.sh",
+            b"#!/bin/sh\n/usr/bin/printf go-interface\n",
+        );
+        std::fs::write(
+            directory.path().join("go.mod"),
+            "module example.test/deshell-interface\n\ngo 1.27.0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("Makefile"),
+            b"build:\n\t/bin/sh scripts/build.sh\n",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("package.json"),
+            br#"{"private":true,"scripts":{"build":"sh scripts/build.sh"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("validate.py"),
+            concat!(
+                "import json, pathlib, subprocess, sys\n",
+                "assert 'build.sh' not in pathlib.Path(sys.argv[1]).read_text()\n",
+                "assert json.loads(pathlib.Path(sys.argv[2]).read_text())['scripts']['build'] == ''\n",
+                "subprocess.run(['go', 'run', './cmd/build.go'], check=True)\n",
+            ),
+        )
+        .unwrap();
+        approve_oracle_inputs(directory.path());
+        let config_path = directory.path().join(".deshell/project.toml");
+        let config = std::fs::read_to_string(&config_path)
+            .unwrap()
+            .replacen("generator = \"rust\"", "generator = \"go\"", 1)
+            .replacen("target = \"rust\"", "target = \"go\"", 1)
+            .replacen("module_root = \"src/bin\"", "module_root = \"cmd\"", 1)
+            .replace(
+                "validation_commands = []",
+                "validation_commands = [{ name = \"interfaces\", kind = \"test\", argv = [\"python3\", \"validate.py\", \"Makefile\", \"package.json\"] }]",
+            )
+            .replace("memory_bytes = 1073741824", "memory_bytes = 8589934592");
+        std::fs::write(config_path, config).unwrap();
+
+        let planned = crate::migration::create_plan(directory.path()).unwrap();
+        assert!(planned.blockers.is_empty(), "{:#?}", planned.blockers);
+        assert!(
+            planned.diff.contains("+++ b/cmd/build.go"),
+            "{}",
+            planned.diff
+        );
+        let evidence = crate::migration::verify(directory.path(), &planned.digest, "host").unwrap();
+        assert_eq!(evidence.status, crate::migration::EvidenceStatus::Verified);
+        assert_eq!(evidence.checks.len(), 3);
+        let evidence_path = directory.path().join("evidence.json");
+        std::fs::write(&evidence_path, evidence.encode_pretty().unwrap()).unwrap();
+        crate::migration::import_evidence(
+            directory.path(),
+            &planned.digest,
+            std::slice::from_ref(&evidence_path),
+        )
+        .unwrap();
+        crate::migration::apply(directory.path(), &planned.digest).unwrap();
+
+        assert!(!directory.path().join("scripts/build.sh").exists());
+        assert!(directory.path().join("cmd/build.go").is_file());
+        assert!(
+            crate::project::scan(directory.path())
+                .unwrap()
+                .findings
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn migration_plan_persists_make_and_package_interface_blockers_instead_of_aborting() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        std::fs::create_dir(directory.path().join("scripts")).unwrap();
+        configure(
+            directory.path(),
+            "scripts/build.sh",
+            b"#!/bin/sh\n/usr/bin/printf interface\n",
+        );
+        std::fs::write(
+            directory.path().join("Makefile"),
+            b"build:\n\t/bin/sh scripts/build.sh\n",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("package.json"),
+            br#"{"scripts":{"build":"printf scripts/build.sh"}}"#,
+        )
+        .unwrap();
+        approve_oracle_inputs(directory.path());
+
+        let planned = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "plan".into(),
+            "--root".into(),
+            path(directory.path()),
+        ]);
+        assert_eq!(planned.0, 0, "{}", String::from_utf8_lossy(&planned.2));
+        let output = String::from_utf8(planned.1).unwrap();
+        assert!(
+            output.contains("DESHELL_BLOCKER_UNIMPLEMENTED_HOST_INTERFACE"),
+            "{output}"
+        );
+        assert!(
+            output.contains("DESHELL_BLOCKER_UNRESOLVED_CALL_SITE"),
+            "{output}"
+        );
+        assert!(output.contains("Makefile"), "{output}");
+        assert!(output.contains("package.json"), "{output}");
+        let digest = output
+            .lines()
+            .find_map(|line| line.strip_prefix("plan "))
+            .unwrap();
+        assert!(
+            directory
+                .path()
+                .join(format!(".deshell/migrations/sha256/{digest}/plan.json"))
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn migration_plan_blocks_cross_script_exec_references_until_call_sites_are_updated() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        configure(
+            directory.path(),
+            "main.sh",
+            b"#!/bin/sh\n/bin/sh child.sh fixed\n",
+        );
+        std::fs::write(
+            directory.path().join("child.sh"),
+            b"#!/bin/sh\n/usr/bin/printf child\n",
+        )
+        .unwrap();
+        approve_oracle_inputs(directory.path());
+        let planned = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "plan".into(),
+            "--root".into(),
+            path(directory.path()),
+        ]);
+        assert_eq!(planned.0, 0, "{}", String::from_utf8_lossy(&planned.2));
+        let output = String::from_utf8(planned.1).unwrap();
+        assert!(
+            output.contains("DESHELL_BLOCKER_UNRESOLVED_CALL_SITE"),
+            "{output}"
+        );
+        assert!(output.contains("main.sh"), "{output}");
+        assert!(output.contains("child.sh"), "{output}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rust_generator_retires_a_static_cross_script_wrapper_end_to_end() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        configure(
+            directory.path(),
+            "main.sh",
+            b"#!/bin/sh\n/bin/sh child.sh\n",
+        );
+        std::fs::write(
+            directory.path().join("child.sh"),
+            b"#!/bin/sh\n/usr/bin/printf child\n",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("Cargo.toml"),
+            concat!(
+                "[package]\n",
+                "name = \"cross-script-fixture\"\n",
+                "version = \"0.0.0\"\n",
+                "edition = \"2024\"\n",
+            ),
+        )
+        .unwrap();
+        approve_oracle_inputs(directory.path());
+
+        let planned = crate::migration::create_plan(directory.path()).unwrap();
+        assert!(planned.blockers.is_empty(), "{:#?}", planned.blockers);
+        assert!(
+            planned.diff.contains("deshell_child.rs"),
+            "{}",
+            planned.diff
+        );
+        assert!(
+            !planned.diff.contains("deshell_main.rs"),
+            "{}",
+            planned.diff
+        );
+
+        let evidence = crate::migration::verify(directory.path(), &planned.digest, "host").unwrap();
+        assert_eq!(evidence.status, crate::migration::EvidenceStatus::Verified);
+        assert_eq!(evidence.checks.len(), 2);
+        let evidence_path = directory.path().join("evidence.json");
+        std::fs::write(&evidence_path, evidence.encode_pretty().unwrap()).unwrap();
+        crate::migration::import_evidence(
+            directory.path(),
+            &planned.digest,
+            std::slice::from_ref(&evidence_path),
+        )
+        .unwrap();
+        crate::migration::apply(directory.path(), &planned.digest).unwrap();
+
+        assert!(!directory.path().join("main.sh").exists());
+        assert!(!directory.path().join("child.sh").exists());
+        assert!(directory.path().join("src/bin/deshell_child.rs").is_file());
+        assert!(!directory.path().join("src/bin/deshell_main.rs").exists());
+        assert!(
+            crate::project::scan(directory.path())
+                .unwrap()
+                .findings
+                .is_empty()
+        );
+        let archive: serde_json::Value = crate::strict_json::parse(
+            &std::fs::read(directory.path().join(".deshell/archive/manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(archive["entries"].as_array().unwrap().len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rust_generator_rewrites_a_docker_exec_call_site_end_to_end() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        configure(
+            directory.path(),
+            "build.sh",
+            b"#!/bin/sh\n/usr/bin/printf docker-exec\n",
+        );
+        std::fs::write(
+            directory.path().join("Cargo.toml"),
+            concat!(
+                "[package]\n",
+                "name = \"docker-exec-fixture\"\n",
+                "version = \"0.0.0\"\n",
+                "edition = \"2024\"\n",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("Dockerfile"),
+            b"FROM rust:1.98\nRUN [\"/bin/sh\",\"build.sh\"]\nLABEL retained=true\n",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("validate.py"),
+            concat!(
+                "import pathlib, subprocess, sys\n",
+                "dockerfile = pathlib.Path(sys.argv[1]).read_text()\n",
+                "assert 'build.sh' not in dockerfile and 'LABEL retained=true' in dockerfile\n",
+                "subprocess.run(['cargo', 'run', '--quiet', '--bin', 'deshell_build', '--'], check=True)\n",
+            ),
+        )
+        .unwrap();
+        approve_oracle_inputs(directory.path());
+        let config_path = directory.path().join(".deshell/project.toml");
+        let config = std::fs::read_to_string(&config_path)
+            .unwrap()
+            .replace(
+                "validation_commands = []",
+                "validation_commands = [{ name = \"dockerfile\", kind = \"test\", argv = [\"python3\", \"validate.py\", \"Dockerfile\"] }]",
+            )
+            .replace("memory_bytes = 1073741824", "memory_bytes = 8589934592");
+        std::fs::write(config_path, config).unwrap();
+
+        let planned = crate::migration::create_plan(directory.path()).unwrap();
+        assert!(planned.blockers.is_empty(), "{:#?}", planned.blockers);
+        assert!(
+            planned.diff.contains("--- a/Dockerfile"),
+            "{}",
+            planned.diff
+        );
+        assert!(planned.diff.contains("[\"cargo\""), "{}", planned.diff);
+
+        let evidence = crate::migration::verify(directory.path(), &planned.digest, "host").unwrap();
+        assert_eq!(evidence.status, crate::migration::EvidenceStatus::Verified);
+        let evidence_path = directory.path().join("evidence.json");
+        std::fs::write(&evidence_path, evidence.encode_pretty().unwrap()).unwrap();
+        crate::migration::import_evidence(
+            directory.path(),
+            &planned.digest,
+            std::slice::from_ref(&evidence_path),
+        )
+        .unwrap();
+        crate::migration::apply(directory.path(), &planned.digest).unwrap();
+
+        let dockerfile = std::fs::read_to_string(directory.path().join("Dockerfile")).unwrap();
+        assert!(dockerfile.contains("LABEL retained=true"));
+        assert!(dockerfile.contains("[\"cargo\""), "{dockerfile}");
+        assert!(!dockerfile.contains("build.sh"));
+        assert!(!directory.path().join("build.sh").exists());
+        assert!(
+            crate::project::scan(directory.path())
+                .unwrap()
+                .findings
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rust_generator_rewrites_a_github_run_call_site_to_a_local_action_end_to_end() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        configure(
+            directory.path(),
+            "build.sh",
+            b"#!/bin/sh\n/usr/bin/printf github-reference\n",
+        );
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(
+                directory.path().join("build.sh"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            directory.path().join("Cargo.toml"),
+            concat!(
+                "[package]\n",
+                "name = \"github-reference-fixture\"\n",
+                "version = \"0.0.0\"\n",
+                "edition = \"2024\"\n",
+            ),
+        )
+        .unwrap();
+        std::fs::create_dir_all(directory.path().join(".github/workflows")).unwrap();
+        std::fs::write(
+            directory.path().join(".github/workflows/ci.yml"),
+            concat!(
+                "name: retained\n",
+                "jobs:\n",
+                "  build:\n",
+                "    runs-on: ubuntu-latest\n",
+                "    steps:\n",
+                "      - run: ./build.sh\n",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("validate.py"),
+            concat!(
+                "import pathlib, subprocess, sys\n",
+                "workflow = pathlib.Path(sys.argv[1]).read_text()\n",
+                "assert 'uses: ./.github/actions/deshell-' in workflow and 'name: retained' in workflow\n",
+                "actions = list(pathlib.Path('.github/actions').glob('deshell-*/index.js'))\n",
+                "assert len(actions) == 1\n",
+                "javascript = actions[0].read_text()\n",
+                "assert 'spawnSync' in javascript and 'shell: false' in javascript\n",
+                "subprocess.run(['cargo', 'run', '--quiet', '--bin', 'deshell_build', '--'], check=True)\n",
+            ),
+        )
+        .unwrap();
+        approve_oracle_inputs(directory.path());
+        let config_path = directory.path().join(".deshell/project.toml");
+        let config = std::fs::read_to_string(&config_path)
+            .unwrap()
+            .replace(
+                "validation_commands = []",
+                "validation_commands = [{ name = \"workflow\", kind = \"test\", argv = [\"python3\", \"validate.py\", \".github/workflows/ci.yml\"] }]",
+            )
+            .replace("memory_bytes = 1073741824", "memory_bytes = 8589934592");
+        std::fs::write(config_path, config).unwrap();
+
+        let planned = crate::migration::create_plan(directory.path()).unwrap();
+        assert!(planned.blockers.is_empty(), "{:#?}", planned.blockers);
+        assert!(
+            planned.diff.contains("uses: ./.github/actions/deshell-"),
+            "{}",
+            planned.diff
+        );
+        assert!(planned.diff.contains("shell: false"), "{}", planned.diff);
+
+        let evidence = crate::migration::verify(directory.path(), &planned.digest, "host").unwrap();
+        assert_eq!(evidence.status, crate::migration::EvidenceStatus::Verified);
+        assert_eq!(evidence.checks.len(), 2);
+        let evidence_path = directory.path().join("evidence.json");
+        std::fs::write(&evidence_path, evidence.encode_pretty().unwrap()).unwrap();
+        crate::migration::import_evidence(
+            directory.path(),
+            &planned.digest,
+            std::slice::from_ref(&evidence_path),
+        )
+        .unwrap();
+        crate::migration::apply(directory.path(), &planned.digest).unwrap();
+
+        let workflow =
+            std::fs::read_to_string(directory.path().join(".github/workflows/ci.yml")).unwrap();
+        assert!(workflow.contains("name: retained"));
+        assert!(workflow.contains("uses: ./.github/actions/deshell-"));
+        assert!(!workflow.contains("run:"));
+        assert!(!directory.path().join("build.sh").exists());
+        assert!(
+            crate::project::scan(directory.path())
+                .unwrap()
+                .findings
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn rust_generator_rewrites_a_github_block_run_without_damaging_siblings() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        configure(
+            directory.path(),
+            "build.sh",
+            b"#!/bin/sh\n/usr/bin/printf github-block-reference\n",
+        );
+        std::fs::write(
+            directory.path().join("Cargo.toml"),
+            concat!(
+                "[package]\n",
+                "name = \"github-block-reference-fixture\"\n",
+                "version = \"0.0.0\"\n",
+                "edition = \"2024\"\n",
+            ),
+        )
+        .unwrap();
+        std::fs::create_dir_all(directory.path().join(".github/workflows")).unwrap();
+        std::fs::write(
+            directory.path().join(".github/workflows/ci.yml"),
+            concat!(
+                "name: retained\n",
+                "jobs:\n",
+                "  build:\n",
+                "    runs-on: ubuntu-latest\n",
+                "    steps:\n",
+                "      - name: retained step\n",
+                "        run: |-\n",
+                "          ./build.sh\n",
+                "        env:\n",
+                "          RETAINED: yes\n",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("validate.py"),
+            concat!(
+                "import pathlib, sys\n",
+                "workflow = pathlib.Path(sys.argv[1]).read_text()\n",
+                "assert 'name: retained' in workflow and 'RETAINED: yes' in workflow\n",
+            ),
+        )
+        .unwrap();
+        approve_oracle_inputs(directory.path());
+        let config_path = directory.path().join(".deshell/project.toml");
+        let config = std::fs::read_to_string(&config_path)
+            .unwrap()
+            .replace(
+                "validation_commands = []",
+                "validation_commands = [{ name = \"workflow\", kind = \"test\", argv = [\"python3\", \"validate.py\", \".github/workflows/ci.yml\"] }]",
+            );
+        std::fs::write(config_path, config).unwrap();
+
+        let planned = crate::migration::create_plan(directory.path()).unwrap();
+        assert!(planned.blockers.is_empty(), "{:#?}", planned.blockers);
+        assert!(
+            planned.diff.contains("      - name: retained step\n"),
+            "{}",
+            planned.diff
+        );
+        assert!(
+            planned
+                .diff
+                .contains("        uses: ./.github/actions/deshell-"),
+            "{}",
+            planned.diff
+        );
+        assert!(
+            planned.diff.contains("        env:\n")
+                && planned.diff.contains("          RETAINED: yes\n"),
+            "{}",
+            planned.diff
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migration_verify_import_and_apply_retire_shell_atomically() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        let source = b"#!/usr/bin/env bash\n/usr/bin/printf '%s\\n' hello\n";
+        configure(directory.path(), "build.sh", source);
+        approve_oracle_inputs(directory.path());
+        let root = path(directory.path());
+        let planned = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "plan".into(),
+            "--root".into(),
+            root.clone(),
+        ]);
+        assert_eq!(planned.0, 0, "{}", String::from_utf8_lossy(&planned.2));
+        let digest = String::from_utf8(planned.1)
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("plan ").map(str::to_owned))
+            .unwrap();
+        let evidence_path = directory.path().join("host-evidence.json");
+        let verified = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "verify".into(),
+            "--root".into(),
+            root.clone(),
+            "--plan".into(),
+            digest.clone(),
+            "--cell".into(),
+            "host".into(),
+            "--output".into(),
+            path(&evidence_path),
+        ]);
+        assert_eq!(verified.0, 0, "{}", String::from_utf8_lossy(&verified.2));
+        let evidence: serde_json::Value =
+            crate::strict_json::parse(&std::fs::read(&evidence_path).unwrap()).unwrap();
+        assert_eq!(evidence["plan_digest"], digest);
+        assert_eq!(evidence["cell"], "host");
+        assert_eq!(evidence["status"], "verified");
+        assert_eq!(evidence["repetitions"], 2);
+        assert_eq!(evidence["checks"].as_array().unwrap().len(), 1);
+        assert!(
+            evidence["checks"][0]["comparisons"][0]["differences"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+
+        let imported = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "evidence".into(),
+            "import".into(),
+            "--root".into(),
+            root.clone(),
+            "--plan".into(),
+            digest.clone(),
+            path(&evidence_path),
+        ]);
+        assert_eq!(imported.0, 0, "{}", String::from_utf8_lossy(&imported.2));
+
+        let status = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "status".into(),
+            "--root".into(),
+            root.clone(),
+            "--format".into(),
+            "json".into(),
+        ]);
+        assert_eq!(status.0, 0, "{}", String::from_utf8_lossy(&status.2));
+        let status: serde_json::Value = crate::strict_json::parse(&status.1).unwrap();
+        assert_eq!(status["verified"], 1);
+        assert_eq!(status["retired"], 0);
+
+        let applied = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "apply".into(),
+            "--root".into(),
+            root.clone(),
+            "--plan".into(),
+            digest.clone(),
+        ]);
+        assert_eq!(applied.0, 0, "{}", String::from_utf8_lossy(&applied.2));
+        assert!(!directory.path().join("build.sh").exists());
+        assert!(directory.path().join("src/bin/deshell_build.rs").is_file());
+        let source_digest = crate::digest::sha256(source);
+        assert_eq!(
+            std::fs::read(
+                directory
+                    .path()
+                    .join(format!(".deshell/archive/sha256/{source_digest}"))
+            )
+            .unwrap(),
+            source
+        );
+        let archive: serde_json::Value = crate::strict_json::parse(
+            &std::fs::read(directory.path().join(".deshell/archive/manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(archive["plan_digest"], digest);
+        assert_eq!(archive["entries"].as_array().unwrap().len(), 1);
+        let shell_free = invoke_owned(vec![
+            "deshell".into(),
+            "verify".into(),
+            "--root".into(),
+            root,
+            "--require".into(),
+            "shell-free".into(),
+        ]);
+        assert_eq!(
+            shell_free.0,
+            0,
+            "{}",
+            String::from_utf8_lossy(&shell_free.2)
+        );
+
+        let archived_path = directory
+            .path()
+            .join(format!(".deshell/archive/sha256/{source_digest}"));
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&archived_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::write(&archived_path, b"tampered").unwrap();
+        let tampered = invoke_owned(vec![
+            "deshell".into(),
+            "verify".into(),
+            "--root".into(),
+            path(directory.path()),
+            "--require".into(),
+            "shell-free".into(),
+        ]);
+        assert_eq!(tampered.0, 4);
+        assert!(String::from_utf8_lossy(&tampered.2).contains("ARCHIVE_TAMPERED"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migration_archive_deduplicates_identical_source_blobs_across_locations() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        let source = b"#!/bin/sh\n/usr/bin/printf identical\n";
+        configure(directory.path(), "alpha.sh", source);
+        std::fs::write(directory.path().join("beta.sh"), source).unwrap();
+        approve_oracle_inputs(directory.path());
+        let root = path(directory.path());
+        let planned = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "plan".into(),
+            "--root".into(),
+            root.clone(),
+        ]);
+        assert_eq!(planned.0, 0, "{}", String::from_utf8_lossy(&planned.2));
+        let output = String::from_utf8(planned.1).unwrap();
+        assert!(!output.contains("blocker"), "{output}");
+        let digest = output
+            .lines()
+            .find_map(|line| line.strip_prefix("plan ").map(str::to_owned))
+            .unwrap();
+        let evidence_path = directory.path().join("identical-evidence.json");
+        let verified = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "verify".into(),
+            "--root".into(),
+            root.clone(),
+            "--plan".into(),
+            digest.clone(),
+            "--cell".into(),
+            "host".into(),
+            "--output".into(),
+            path(&evidence_path),
+        ]);
+        assert_eq!(verified.0, 0, "{}", String::from_utf8_lossy(&verified.2));
+        let imported = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "evidence".into(),
+            "import".into(),
+            "--root".into(),
+            root.clone(),
+            "--plan".into(),
+            digest.clone(),
+            path(&evidence_path),
+        ]);
+        assert_eq!(imported.0, 0, "{}", String::from_utf8_lossy(&imported.2));
+        let applied = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "apply".into(),
+            "--root".into(),
+            root,
+            "--plan".into(),
+            digest,
+        ]);
+        assert_eq!(applied.0, 0, "{}", String::from_utf8_lossy(&applied.2));
+        assert!(!directory.path().join("alpha.sh").exists());
+        assert!(!directory.path().join("beta.sh").exists());
+        let source_digest = crate::digest::sha256(source);
+        assert!(
+            directory
+                .path()
+                .join(format!(".deshell/archive/sha256/{source_digest}"))
+                .is_file()
+        );
+        let manifest: serde_json::Value = crate::strict_json::parse(
+            &std::fs::read(directory.path().join(".deshell/archive/manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest["entries"].as_array().unwrap().len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migration_validation_runs_against_the_fully_retired_staged_tree() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        configure(
+            directory.path(),
+            "build.sh",
+            b"#!/bin/sh\n/usr/bin/printf staged\n",
+        );
+        approve_oracle_inputs(directory.path());
+        let config_path = directory.path().join(".deshell/project.toml");
+        let config = std::fs::read_to_string(&config_path).unwrap().replace(
+            "validation_commands = []",
+            "validation_commands = [{ name = \"retired-source-absent\", kind = \"test\", argv = [\"test\", \"!\", \"-e\", \"build.sh\"] }]",
+        );
+        std::fs::write(config_path, config).unwrap();
+        let root = path(directory.path());
+        let planned = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "plan".into(),
+            "--root".into(),
+            root.clone(),
+        ]);
+        assert_eq!(planned.0, 0, "{}", String::from_utf8_lossy(&planned.2));
+        let digest = String::from_utf8(planned.1)
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("plan ").map(str::to_owned))
+            .unwrap();
+        let evidence_path = directory.path().join("staged-evidence.json");
+        let verified = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "verify".into(),
+            "--root".into(),
+            root,
+            "--plan".into(),
+            digest,
+            "--cell".into(),
+            "host".into(),
+            "--output".into(),
+            path(&evidence_path),
+        ]);
+        assert_eq!(verified.0, 0, "{}", String::from_utf8_lossy(&verified.2));
+        let evidence: serde_json::Value =
+            crate::strict_json::parse(&std::fs::read(evidence_path).unwrap()).unwrap();
+        assert_eq!(evidence["status"], "verified");
+        assert_eq!(evidence["validation"][0]["exit_code"], 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migration_apply_rejects_validation_policy_changed_after_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        configure(
+            directory.path(),
+            "build.sh",
+            b"#!/bin/sh\n/usr/bin/printf stale\n",
+        );
+        approve_oracle_inputs(directory.path());
+        let root = path(directory.path());
+        let planned = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "plan".into(),
+            "--root".into(),
+            root.clone(),
+        ]);
+        assert_eq!(planned.0, 0, "{}", String::from_utf8_lossy(&planned.2));
+        let digest = String::from_utf8(planned.1)
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("plan ").map(str::to_owned))
+            .unwrap();
+        let evidence_path = directory.path().join("stale-policy-evidence.json");
+        let verified = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "verify".into(),
+            "--root".into(),
+            root.clone(),
+            "--plan".into(),
+            digest.clone(),
+            "--cell".into(),
+            "host".into(),
+            "--output".into(),
+            path(&evidence_path),
+        ]);
+        assert_eq!(verified.0, 0, "{}", String::from_utf8_lossy(&verified.2));
+        let imported = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "evidence".into(),
+            "import".into(),
+            "--root".into(),
+            root.clone(),
+            "--plan".into(),
+            digest.clone(),
+            path(&evidence_path),
+        ]);
+        assert_eq!(imported.0, 0, "{}", String::from_utf8_lossy(&imported.2));
+        let config_path = directory.path().join(".deshell/project.toml");
+        let config = std::fs::read_to_string(&config_path).unwrap().replace(
+            "validation_commands = []",
+            "validation_commands = [{ name = \"new-policy\", kind = \"test\", argv = [\"true\"] }]",
+        );
+        std::fs::write(config_path, config).unwrap();
+
+        let applied = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "apply".into(),
+            "--root".into(),
+            root,
+            "--plan".into(),
+            digest,
+        ]);
+        assert_eq!(applied.0, 4, "{}", String::from_utf8_lossy(&applied.2));
+        assert!(
+            String::from_utf8_lossy(&applied.2).contains("DESHELL_BLOCKER_STALE_VALIDATION_POLICY")
+        );
+        assert!(directory.path().join("build.sh").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migration_apply_rejects_validation_limits_changed_after_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        configure(
+            directory.path(),
+            "limits.sh",
+            b"#!/bin/sh\n/usr/bin/printf limits\n",
+        );
+        approve_oracle_inputs(directory.path());
+        let config_path = directory.path().join(".deshell/project.toml");
+        let config = std::fs::read_to_string(&config_path).unwrap().replace(
+            "validation_commands = []",
+            "validation_commands = [{ name = \"true\", kind = \"test\", argv = [\"true\"] }]",
+        );
+        std::fs::write(&config_path, config).unwrap();
+
+        let planned = crate::migration::create_plan(directory.path()).unwrap();
+        assert!(planned.blockers.is_empty(), "{:#?}", planned.blockers);
+        let evidence = crate::migration::verify(directory.path(), &planned.digest, "host").unwrap();
+        assert_eq!(evidence.status, crate::migration::EvidenceStatus::Verified);
+        let evidence_path = directory.path().join("limits-evidence.json");
+        std::fs::write(&evidence_path, evidence.encode_pretty().unwrap()).unwrap();
+        crate::migration::import_evidence(
+            directory.path(),
+            &planned.digest,
+            std::slice::from_ref(&evidence_path),
+        )
+        .unwrap();
+
+        let changed = std::fs::read_to_string(&config_path)
+            .unwrap()
+            .replace("timeout_ms = 30000", "timeout_ms = 30001");
+        std::fs::write(config_path, changed).unwrap();
+        let applied = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "apply".into(),
+            "--root".into(),
+            path(directory.path()),
+            "--plan".into(),
+            planned.digest,
+        ]);
+        assert_eq!(applied.0, 4, "{}", String::from_utf8_lossy(&applied.2));
+        assert!(
+            String::from_utf8_lossy(&applied.2).contains("DESHELL_BLOCKER_STALE_VALIDATION_LIMITS")
+        );
+        assert!(directory.path().join("limits.sh").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migration_evidence_import_rejects_conflicting_verified_documents_for_one_cell() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        configure(
+            directory.path(),
+            "build.sh",
+            b"#!/bin/sh\n/usr/bin/printf evidence\n",
+        );
+        approve_oracle_inputs(directory.path());
+        let root = path(directory.path());
+        let planned = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "plan".into(),
+            "--root".into(),
+            root.clone(),
+        ]);
+        assert_eq!(planned.0, 0, "{}", String::from_utf8_lossy(&planned.2));
+        let digest = String::from_utf8(planned.1)
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("plan ").map(str::to_owned))
+            .unwrap();
+        let evidence_path = directory.path().join("evidence-a.json");
+        let verified = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "verify".into(),
+            "--root".into(),
+            root.clone(),
+            "--plan".into(),
+            digest.clone(),
+            "--cell".into(),
+            "host".into(),
+            "--output".into(),
+            path(&evidence_path),
+        ]);
+        assert_eq!(verified.0, 0, "{}", String::from_utf8_lossy(&verified.2));
+        let imported = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "evidence".into(),
+            "import".into(),
+            "--root".into(),
+            root.clone(),
+            "--plan".into(),
+            digest.clone(),
+            path(&evidence_path),
+        ]);
+        assert_eq!(imported.0, 0, "{}", String::from_utf8_lossy(&imported.2));
+
+        let mut conflicting: serde_json::Value =
+            crate::strict_json::parse(&std::fs::read(&evidence_path).unwrap()).unwrap();
+        for comparison in conflicting["checks"][0]["comparisons"]
+            .as_array_mut()
+            .unwrap()
+        {
+            for subject in ["original", "ir", "replacement"] {
+                comparison[subject]["stdout_base64"] = serde_json::json!("Zm9yZ2Vk");
+            }
+        }
+        let conflicting_path = directory.path().join("evidence-b.json");
+        std::fs::write(
+            &conflicting_path,
+            crate::canonical_json::pretty_bytes(&conflicting).unwrap(),
+        )
+        .unwrap();
+        let imported = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "evidence".into(),
+            "import".into(),
+            "--root".into(),
+            root.clone(),
+            "--plan".into(),
+            digest.clone(),
+            path(&conflicting_path),
+        ]);
+        assert_eq!(imported.0, 4, "{}", String::from_utf8_lossy(&imported.2));
+        assert!(String::from_utf8_lossy(&imported.2).contains("DESHELL_BLOCKER_EVIDENCE_CONFLICT"));
+        assert!(directory.path().join("build.sh").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migration_verify_records_an_unavailable_foreign_platform_cell() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        configure(
+            directory.path(),
+            "foreign.sh",
+            b"#!/bin/sh\n/usr/bin/printf foreign\n",
+        );
+        approve_oracle_inputs(directory.path());
+        let config_path = directory.path().join(".deshell/project.toml");
+        let config = std::fs::read_to_string(&config_path).unwrap().replace(
+            &format!("operating_system = \"{}\"", std::env::consts::OS),
+            "operating_system = \"foreign-os\"",
+        );
+        std::fs::write(config_path, config).unwrap();
+        let root = path(directory.path());
+        let planned = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "plan".into(),
+            "--root".into(),
+            root.clone(),
+        ]);
+        assert_eq!(planned.0, 0, "{}", String::from_utf8_lossy(&planned.2));
+        let digest = String::from_utf8(planned.1)
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("plan ").map(str::to_owned))
+            .unwrap();
+        let evidence_path = directory.path().join("foreign-evidence.json");
+        let verified = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "verify".into(),
+            "--root".into(),
+            root,
+            "--plan".into(),
+            digest,
+            "--cell".into(),
+            "host".into(),
+            "--output".into(),
+            path(&evidence_path),
+        ]);
+        assert_eq!(verified.0, 6, "{}", String::from_utf8_lossy(&verified.2));
+        let evidence: serde_json::Value =
+            crate::strict_json::parse(&std::fs::read(evidence_path).unwrap()).unwrap();
+        assert_eq!(evidence["status"], "unavailable");
+        assert_eq!(evidence["checks"][0]["status"], "unavailable");
+        assert!(
+            evidence["checks"][0]["comparisons"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            evidence["checks"][0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("foreign platform")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn official_go_generator_uses_an_existing_module_root_and_retires_end_to_end() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        configure(
+            directory.path(),
+            "build.sh",
+            b"#!/usr/bin/env bash\n/usr/bin/printf '%s\\n' hello | /usr/bin/tr a-z A-Z\n",
+        );
+        approve_oracle_inputs(directory.path());
+        std::fs::create_dir(directory.path().join("cmd")).unwrap();
+        let config_path = directory.path().join(".deshell/project.toml");
+        let config = std::fs::read_to_string(&config_path)
+            .unwrap()
+            .replacen("generator = \"rust\"", "generator = \"go\"", 1)
+            .replacen("target = \"rust\"", "target = \"go\"", 1)
+            .replacen("module_root = \"src/bin\"", "module_root = \"cmd\"", 1);
+        std::fs::write(config_path, config).unwrap();
+        let root = path(directory.path());
+        let planned = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "plan".into(),
+            "--root".into(),
+            root.clone(),
+        ]);
+        assert_eq!(planned.0, 0, "{}", String::from_utf8_lossy(&planned.2));
+        assert!(!String::from_utf8_lossy(&planned.1).contains("blocker"));
+        let digest = String::from_utf8(planned.1)
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("plan ").map(str::to_owned))
+            .unwrap();
+        let evidence = directory.path().join("go-evidence.json");
+        let verified = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "verify".into(),
+            "--root".into(),
+            root.clone(),
+            "--plan".into(),
+            digest.clone(),
+            "--cell".into(),
+            "host".into(),
+            "--output".into(),
+            path(&evidence),
+        ]);
+        assert_eq!(verified.0, 0, "{}", String::from_utf8_lossy(&verified.2));
+        assert_eq!(
+            invoke_owned(vec![
+                "deshell".into(),
+                "migrate".into(),
+                "evidence".into(),
+                "import".into(),
+                "--root".into(),
+                root.clone(),
+                "--plan".into(),
+                digest.clone(),
+                path(&evidence),
+            ])
+            .0,
+            0
+        );
+        let applied = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "apply".into(),
+            "--root".into(),
+            root,
+            "--plan".into(),
+            digest,
+        ]);
+        assert_eq!(applied.0, 0, "{}", String::from_utf8_lossy(&applied.2));
+        assert!(!directory.path().join("build.sh").exists());
+        let generated = std::fs::read_to_string(directory.path().join("cmd/build.go")).unwrap();
+        assert!(generated.contains("Code generated by de-shell"));
+        assert!(!generated.contains("deshell runtime"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migration_oracle_verifies_pipeline_status_and_both_condition_branches() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        configure(
+            directory.path(),
+            "branch.sh",
+            b"#!/usr/bin/env bash\n/usr/bin/printf 'hello\\n' | /usr/bin/tr a-z A-Z\n/usr/bin/test \"$1\" = yes && /usr/bin/printf 'branch\\n'\n",
+        );
+        approve_oracle_inputs(directory.path());
+        let default_path = directory.path().join(".deshell/scenarios/default.toml");
+        let default = std::fs::read_to_string(&default_path)
+            .unwrap()
+            .replace(
+                "arguments = []",
+                "arguments = [{ name = \"1\", value = \"no\" }]",
+            )
+            .replace("argv = []", "argv = [\"no\"]");
+        std::fs::write(default_path, default).unwrap();
+        let yes = crate::config::Scenario::default_text()
+            .replace("name = \"default\"", "name = \"yes\"")
+            .replace("approval = \"draft\"", "approval = \"approved\"")
+            .replace(
+                "arguments = []",
+                "arguments = [{ name = \"1\", value = \"yes\" }]",
+            )
+            .replace("argv = []", "argv = [\"yes\"]");
+        std::fs::write(directory.path().join(".deshell/scenarios/yes.toml"), yes).unwrap();
+        let root = path(directory.path());
+        let planned = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "plan".into(),
+            "--root".into(),
+            root.clone(),
+        ]);
+        assert_eq!(planned.0, 0, "{}", String::from_utf8_lossy(&planned.2));
+        assert!(
+            !String::from_utf8_lossy(&planned.1).contains("blocker"),
+            "{}",
+            String::from_utf8_lossy(&planned.1)
+        );
+        let digest = String::from_utf8(planned.1)
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("plan ").map(str::to_owned))
+            .unwrap();
+        let evidence = directory.path().join("branch-evidence.json");
+        let verified = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "verify".into(),
+            "--root".into(),
+            root.clone(),
+            "--plan".into(),
+            digest.clone(),
+            "--cell".into(),
+            "host".into(),
+            "--output".into(),
+            path(&evidence),
+        ]);
+        assert_eq!(verified.0, 0, "{}", String::from_utf8_lossy(&verified.2));
+        let document: serde_json::Value =
+            crate::strict_json::parse(&std::fs::read(&evidence).unwrap()).unwrap();
+        assert_eq!(document["checks"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            invoke_owned(vec![
+                "deshell".into(),
+                "migrate".into(),
+                "evidence".into(),
+                "import".into(),
+                "--root".into(),
+                root.clone(),
+                "--plan".into(),
+                digest.clone(),
+                path(&evidence),
+            ])
+            .0,
+            0
+        );
+        let applied = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "apply".into(),
+            "--root".into(),
+            root,
+            "--plan".into(),
+            digest,
+        ]);
+        assert_eq!(applied.0, 0, "{}", String::from_utf8_lossy(&applied.2));
+        assert!(!directory.path().join("branch.sh").exists());
+        assert!(directory.path().join("src/bin/deshell_branch.rs").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn structured_host_generator_rewrites_docker_run_and_archives_only_the_snippet() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        let snippet = b"/usr/bin/printf '%s\\n' docker";
+        let dockerfile = b"FROM scratch\nRUN /usr/bin/printf '%s\\n' docker\n";
+        configure(directory.path(), "Dockerfile", dockerfile);
+        approve_oracle_inputs(directory.path());
+        let config_path = directory.path().join(".deshell/project.toml");
+        let config = std::fs::read_to_string(&config_path)
+            .unwrap()
+            .replacen("generator = \"rust\"", "generator = \"host\"", 1)
+            .replacen("target = \"rust\"", "target = \"host\"", 1);
+        std::fs::write(config_path, config).unwrap();
+        let root = path(directory.path());
+        let planned = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "plan".into(),
+            "--root".into(),
+            root.clone(),
+        ]);
+        assert_eq!(planned.0, 0, "{}", String::from_utf8_lossy(&planned.2));
+        assert!(
+            !String::from_utf8_lossy(&planned.1).contains("blocker"),
+            "{}",
+            String::from_utf8_lossy(&planned.1)
+        );
+        let digest = String::from_utf8(planned.1)
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("plan ").map(str::to_owned))
+            .unwrap();
+        let evidence = directory.path().join("docker-evidence.json");
+        let verified = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "verify".into(),
+            "--root".into(),
+            root.clone(),
+            "--plan".into(),
+            digest.clone(),
+            "--cell".into(),
+            "host".into(),
+            "--output".into(),
+            path(&evidence),
+        ]);
+        assert_eq!(verified.0, 0, "{}", String::from_utf8_lossy(&verified.2));
+        assert_eq!(
+            invoke_owned(vec![
+                "deshell".into(),
+                "migrate".into(),
+                "evidence".into(),
+                "import".into(),
+                "--root".into(),
+                root.clone(),
+                "--plan".into(),
+                digest.clone(),
+                path(&evidence),
+            ])
+            .0,
+            0
+        );
+        let applied = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "apply".into(),
+            "--root".into(),
+            root.clone(),
+            "--plan".into(),
+            digest,
+        ]);
+        assert_eq!(applied.0, 0, "{}", String::from_utf8_lossy(&applied.2));
+        let rewritten = std::fs::read_to_string(directory.path().join("Dockerfile")).unwrap();
+        assert_eq!(
+            rewritten,
+            "FROM scratch\nRUN [\"/usr/bin/printf\",\"%s\\\\n\",\"docker\"]\n"
+        );
+        let snippet_digest = crate::digest::sha256(snippet);
+        assert_eq!(
+            std::fs::read(
+                directory
+                    .path()
+                    .join(format!(".deshell/archive/sha256/{snippet_digest}"))
+            )
+            .unwrap(),
+            snippet
+        );
+        let shell_free = invoke_owned(vec![
+            "deshell".into(),
+            "verify".into(),
+            "--root".into(),
+            root,
+            "--require".into(),
+            "shell-free".into(),
+        ]);
+        assert_eq!(
+            shell_free.0,
+            0,
+            "{}",
+            String::from_utf8_lossy(&shell_free.2)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn structured_host_generator_rewrites_python_subprocess_without_a_shell() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        let snippet = b"/usr/bin/printf python";
+        let host = b"import subprocess\nsubprocess.run(\"/usr/bin/printf python\", shell=True, check=False)\n";
+        configure(directory.path(), "runner.py", host);
+        approve_oracle_inputs(directory.path());
+        let config_path = directory.path().join(".deshell/project.toml");
+        let config = std::fs::read_to_string(&config_path)
+            .unwrap()
+            .replacen("generator = \"rust\"", "generator = \"host\"", 1)
+            .replacen("target = \"rust\"", "target = \"host\"", 1);
+        std::fs::write(config_path, config).unwrap();
+        let root = path(directory.path());
+
+        let planned = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "plan".into(),
+            "--root".into(),
+            root.clone(),
+        ]);
+        assert_eq!(planned.0, 0, "{}", String::from_utf8_lossy(&planned.2));
+        assert!(
+            !String::from_utf8_lossy(&planned.1).contains("blocker"),
+            "{}",
+            String::from_utf8_lossy(&planned.1)
+        );
+        let digest = String::from_utf8(planned.1)
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("plan ").map(str::to_owned))
+            .unwrap();
+        let evidence = directory.path().join("python-evidence.json");
+        let verified = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "verify".into(),
+            "--root".into(),
+            root.clone(),
+            "--plan".into(),
+            digest.clone(),
+            "--cell".into(),
+            "host".into(),
+            "--output".into(),
+            path(&evidence),
+        ]);
+        assert_eq!(verified.0, 0, "{}", String::from_utf8_lossy(&verified.2));
+        let imported = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "evidence".into(),
+            "import".into(),
+            "--root".into(),
+            root.clone(),
+            "--plan".into(),
+            digest.clone(),
+            path(&evidence),
+        ]);
+        assert_eq!(imported.0, 0, "{}", String::from_utf8_lossy(&imported.2));
+        let applied = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "apply".into(),
+            "--root".into(),
+            root.clone(),
+            "--plan".into(),
+            digest,
+        ]);
+        assert_eq!(applied.0, 0, "{}", String::from_utf8_lossy(&applied.2));
+
+        let rewritten = std::fs::read_to_string(directory.path().join("runner.py")).unwrap();
+        assert_eq!(
+            rewritten,
+            "import subprocess\nsubprocess.run([\"/usr/bin/printf\",\"python\"], shell=False, check=False)\n"
+        );
+        let snippet_digest = crate::digest::sha256(snippet);
+        assert_eq!(
+            std::fs::read(
+                directory
+                    .path()
+                    .join(format!(".deshell/archive/sha256/{snippet_digest}"))
+            )
+            .unwrap(),
+            snippet
+        );
+        let shell_free = invoke_owned(vec![
+            "deshell".into(),
+            "verify".into(),
+            "--root".into(),
+            root,
+            "--require".into(),
+            "shell-free".into(),
+        ]);
+        assert_eq!(
+            shell_free.0,
+            0,
+            "{}",
+            String::from_utf8_lossy(&shell_free.2)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn structured_host_generator_rewrites_javascript_exec_sync_without_a_shell() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        let snippet = b"/usr/bin/printf javascript";
+        let host = concat!(
+            "const child_process = require(\"node:child_process\");\n",
+            "child_process.execSync(\"/usr/bin/printf javascript\", {stdio: \"inherit\"});\n",
+        );
+        configure(directory.path(), "runner.js", host.as_bytes());
+        approve_oracle_inputs(directory.path());
+        let config_path = directory.path().join(".deshell/project.toml");
+        let config = std::fs::read_to_string(&config_path)
+            .unwrap()
+            .replacen("generator = \"rust\"", "generator = \"host\"", 1)
+            .replacen("target = \"rust\"", "target = \"host\"", 1);
+        std::fs::write(config_path, config).unwrap();
+        let root = path(directory.path());
+        let planned = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "plan".into(),
+            "--root".into(),
+            root.clone(),
+        ]);
+        assert_eq!(planned.0, 0, "{}", String::from_utf8_lossy(&planned.2));
+        assert!(
+            !String::from_utf8_lossy(&planned.1).contains("blocker"),
+            "{}",
+            String::from_utf8_lossy(&planned.1)
+        );
+        let digest = String::from_utf8(planned.1)
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("plan ").map(str::to_owned))
+            .unwrap();
+        let evidence = directory.path().join("javascript-evidence.json");
+        let verified = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "verify".into(),
+            "--root".into(),
+            root.clone(),
+            "--plan".into(),
+            digest.clone(),
+            "--cell".into(),
+            "host".into(),
+            "--output".into(),
+            path(&evidence),
+        ]);
+        assert_eq!(verified.0, 0, "{}", String::from_utf8_lossy(&verified.2));
+        let imported = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "evidence".into(),
+            "import".into(),
+            "--root".into(),
+            root.clone(),
+            "--plan".into(),
+            digest.clone(),
+            path(&evidence),
+        ]);
+        assert_eq!(imported.0, 0, "{}", String::from_utf8_lossy(&imported.2));
+        let applied = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "apply".into(),
+            "--root".into(),
+            root.clone(),
+            "--plan".into(),
+            digest,
+        ]);
+        assert_eq!(applied.0, 0, "{}", String::from_utf8_lossy(&applied.2));
+
+        let rewritten = std::fs::read_to_string(directory.path().join("runner.js")).unwrap();
+        assert_eq!(
+            rewritten,
+            concat!(
+                "const child_process = require(\"node:child_process\");\n",
+                "child_process.execFileSync(\"/usr/bin/printf\",[\"javascript\"], {stdio: \"inherit\"});\n",
+            )
+        );
+        let snippet_digest = crate::digest::sha256(snippet);
+        assert_eq!(
+            std::fs::read(
+                directory
+                    .path()
+                    .join(format!(".deshell/archive/sha256/{snippet_digest}"))
+            )
+            .unwrap(),
+            snippet
+        );
+        let shell_free = invoke_owned(vec![
+            "deshell".into(),
+            "verify".into(),
+            "--root".into(),
+            root,
+            "--require".into(),
+            "shell-free".into(),
+        ]);
+        assert_eq!(
+            shell_free.0,
+            0,
+            "{}",
+            String::from_utf8_lossy(&shell_free.2)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn structured_host_generator_replaces_github_run_with_a_local_javascript_action() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        std::fs::create_dir_all(directory.path().join(".github/workflows")).unwrap();
+        let snippet = b"/usr/bin/printf workflow";
+        let workflow = concat!(
+            "jobs:\n",
+            "  test:\n",
+            "    runs-on: ubuntu-latest\n",
+            "    steps:\n",
+            "      - run: /usr/bin/printf workflow\n",
+        );
+        configure(
+            directory.path(),
+            ".github/workflows/ci.yml",
+            workflow.as_bytes(),
+        );
+        approve_oracle_inputs(directory.path());
+        let config_path = directory.path().join(".deshell/project.toml");
+        let config = std::fs::read_to_string(&config_path)
+            .unwrap()
+            .replacen("generator = \"rust\"", "generator = \"host\"", 1)
+            .replacen("target = \"rust\"", "target = \"host\"", 1);
+        std::fs::write(config_path, config).unwrap();
+        let root = path(directory.path());
+        let planned = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "plan".into(),
+            "--root".into(),
+            root.clone(),
+        ]);
+        assert_eq!(planned.0, 0, "{}", String::from_utf8_lossy(&planned.2));
+        assert!(
+            !String::from_utf8_lossy(&planned.1).contains("blocker"),
+            "{}",
+            String::from_utf8_lossy(&planned.1)
+        );
+        let digest = String::from_utf8(planned.1)
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("plan ").map(str::to_owned))
+            .unwrap();
+        let evidence = directory.path().join("workflow-evidence.json");
+        let verified = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "verify".into(),
+            "--root".into(),
+            root.clone(),
+            "--plan".into(),
+            digest.clone(),
+            "--cell".into(),
+            "host".into(),
+            "--output".into(),
+            path(&evidence),
+        ]);
+        assert_eq!(verified.0, 0, "{}", String::from_utf8_lossy(&verified.2));
+        let imported = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "evidence".into(),
+            "import".into(),
+            "--root".into(),
+            root.clone(),
+            "--plan".into(),
+            digest.clone(),
+            path(&evidence),
+        ]);
+        assert_eq!(imported.0, 0, "{}", String::from_utf8_lossy(&imported.2));
+        let applied = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "apply".into(),
+            "--root".into(),
+            root.clone(),
+            "--plan".into(),
+            digest,
+        ]);
+        assert_eq!(applied.0, 0, "{}", String::from_utf8_lossy(&applied.2));
+
+        let rewritten =
+            std::fs::read_to_string(directory.path().join(".github/workflows/ci.yml")).unwrap();
+        assert!(rewritten.contains("- uses: ./.github/actions/deshell-"));
+        assert!(!rewritten.contains("run:"));
+        let actions = std::fs::read_dir(directory.path().join(".github/actions"))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(actions.len(), 1);
+        assert!(actions[0].path().join("action.yml").is_file());
+        let action = std::fs::read_to_string(actions[0].path().join("index.js")).unwrap();
+        assert!(action.contains("spawnSync"));
+        assert!(!action.contains("shell: true"));
+        let snippet_digest = crate::digest::sha256(snippet);
+        assert_eq!(
+            std::fs::read(
+                directory
+                    .path()
+                    .join(format!(".deshell/archive/sha256/{snippet_digest}"))
+            )
+            .unwrap(),
+            snippet
+        );
+        let shell_free = invoke_owned(vec![
+            "deshell".into(),
+            "verify".into(),
+            "--root".into(),
+            root,
+            "--require".into(),
+            "shell-free".into(),
+        ]);
+        assert_eq!(
+            shell_free.0,
+            0,
+            "{}",
+            String::from_utf8_lossy(&shell_free.2)
+        );
+    }
+
+    #[test]
+    fn structured_host_generator_preserves_github_block_scalar_siblings() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        std::fs::create_dir_all(directory.path().join(".github/workflows")).unwrap();
+        let workflow = concat!(
+            "jobs:\n",
+            "  test:\n",
+            "    runs-on: ubuntu-latest\n",
+            "    steps:\n",
+            "      - name: generated\n",
+            "        run: |-\n",
+            "          /usr/bin/printf workflow\n",
+            "        env:\n",
+            "          KEEP: yes\n",
+        );
+        configure(
+            directory.path(),
+            ".github/workflows/block.yml",
+            workflow.as_bytes(),
+        );
+        approve_oracle_inputs(directory.path());
+        let config_path = directory.path().join(".deshell/project.toml");
+        let config = std::fs::read_to_string(&config_path)
+            .unwrap()
+            .replacen("generator = \"rust\"", "generator = \"host\"", 1)
+            .replacen("target = \"rust\"", "target = \"host\"", 1);
+        std::fs::write(config_path, config).unwrap();
+
+        let planned = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "plan".into(),
+            "--root".into(),
+            path(directory.path()),
+        ]);
+        assert_eq!(planned.0, 0, "{}", String::from_utf8_lossy(&planned.2));
+        let output = String::from_utf8(planned.1).unwrap();
+        assert!(!output.contains("blocker"), "{output}");
+        let digest = output
+            .lines()
+            .find_map(|line| line.strip_prefix("plan "))
+            .unwrap();
+        let migration_root = directory
+            .path()
+            .join(format!(".deshell/migrations/sha256/{digest}"));
+        let plan: crate::migration::MigrationPlan =
+            crate::strict_json::decode(&std::fs::read(migration_root.join("plan.json")).unwrap())
+                .unwrap();
+        let proposal: crate::migration::Proposal = crate::strict_json::decode(
+            &std::fs::read(migration_root.join(format!("proposals/{}.json", plan.proposals[0])))
+                .unwrap(),
+        )
+        .unwrap();
+        let workflow_patch = proposal
+            .patches
+            .iter()
+            .find(|patch| patch.path == ".github/workflows/block.yml")
+            .unwrap();
+        let rewritten = String::from_utf8(workflow_patch.contents().unwrap()).unwrap();
+        assert!(
+            rewritten.contains("      - name: generated\n"),
+            "{rewritten}"
+        );
+        assert!(
+            rewritten.contains("        uses: ./.github/actions/deshell-"),
+            "{rewritten}"
+        );
+        assert!(
+            rewritten.contains("        env:\n          KEEP: yes\n"),
+            "{rewritten}"
+        );
+        assert!(!rewritten.contains("run:"), "{rewritten}");
     }
 
     #[test]
@@ -3028,6 +6945,107 @@ mod tests {
         assert_eq!(std::fs::read(manifest_path).unwrap(), manifest_before);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn harden_uses_a_separate_approved_plan_evidence_and_atomic_apply_series() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        configure(
+            directory.path(),
+            "build.sh",
+            b"#!/bin/sh\n/usr/bin/printf hardened\n",
+        );
+        let config_path = directory.path().join(".deshell/project.toml");
+        let config = std::fs::read_to_string(&config_path).unwrap().replace(
+            "validation_commands = []",
+            "validation_commands = [{ name = \"smoke\", kind = \"test\", argv = [\"/usr/bin/true\"] }]",
+        );
+        std::fs::write(config_path, config).unwrap();
+        let root = path(directory.path());
+
+        let planned = invoke_owned(vec![
+            "deshell".into(),
+            "harden".into(),
+            "plan".into(),
+            "--root".into(),
+            root.clone(),
+        ]);
+        assert_eq!(planned.0, 0, "{}", String::from_utf8_lossy(&planned.2));
+        let output = String::from_utf8(planned.1).unwrap();
+        let digest = output
+            .lines()
+            .find_map(|line| line.strip_prefix("harden plan ").map(str::to_owned))
+            .unwrap();
+        assert!(crate::digest::valid_sha256(&digest));
+        assert!(output.contains("+set -eu"), "{output}");
+        assert_eq!(
+            std::fs::read(directory.path().join("build.sh")).unwrap(),
+            b"#!/bin/sh\n/usr/bin/printf hardened\n"
+        );
+
+        let unapproved = invoke_owned(vec![
+            "deshell".into(),
+            "harden".into(),
+            "verify".into(),
+            "--root".into(),
+            root.clone(),
+            "--plan".into(),
+            digest.clone(),
+        ]);
+        assert_eq!(unapproved.0, 4);
+        assert!(
+            String::from_utf8_lossy(&unapproved.2).contains("DESHELL_HARDEN_APPROVAL_REQUIRED")
+        );
+
+        let approval_path = directory
+            .path()
+            .join(format!(".deshell/hardening/approvals/{digest}.json"));
+        let mut approval: serde_json::Value =
+            crate::strict_json::parse(&std::fs::read(&approval_path).unwrap()).unwrap();
+        approval["approval"] = serde_json::json!("approved");
+        approval["owner"] = serde_json::json!("release-engineering");
+        approval["reason"] = serde_json::json!("reviewed strict failure semantics");
+        std::fs::write(
+            &approval_path,
+            crate::canonical_json::pretty_bytes(&approval).unwrap(),
+        )
+        .unwrap();
+
+        let verified = invoke_owned(vec![
+            "deshell".into(),
+            "harden".into(),
+            "verify".into(),
+            "--root".into(),
+            root.clone(),
+            "--plan".into(),
+            digest.clone(),
+        ]);
+        assert_eq!(verified.0, 0, "{}", String::from_utf8_lossy(&verified.2));
+        let evidence_path = directory
+            .path()
+            .join(format!(".deshell/hardening/sha256/{digest}/evidence.json"));
+        let evidence: serde_json::Value =
+            crate::strict_json::parse(&std::fs::read(evidence_path).unwrap()).unwrap();
+        assert_eq!(evidence["plan_digest"], digest);
+        assert_eq!(evidence["status"], "verified");
+
+        let applied = invoke_owned(vec![
+            "deshell".into(),
+            "harden".into(),
+            "apply".into(),
+            "--root".into(),
+            root,
+            "--plan".into(),
+            digest,
+        ]);
+        assert_eq!(applied.0, 0, "{}", String::from_utf8_lossy(&applied.2));
+        assert_eq!(
+            std::fs::read(directory.path().join("build.sh")).unwrap(),
+            b"#!/bin/sh\nset -eu\n/usr/bin/printf hardened\n"
+        );
+        assert!(!directory.path().join(".deshell/migrations").exists());
+    }
+
     #[test]
     fn verify_reports_unobserved_scenarios_and_explain_reports_static_guarantees() {
         let directory = tempfile::tempdir().unwrap();
@@ -3155,67 +7173,21 @@ mod tests {
     }
 
     #[test]
-    fn migrate_reports_unavailable_observer_and_writes_exports_only_with_apply() {
+    fn migrate_rejects_the_removed_legacy_export_surface() {
         let directory = tempfile::tempdir().unwrap();
         crate::project::init(directory.path()).unwrap();
         configure(directory.path(), "build.sh", b"/usr/bin/printf hello\n");
-        let root = path(directory.path());
-        let unavailable = invoke_owned(vec![
+        let result = invoke_owned(vec![
             "deshell".into(),
             "migrate".into(),
             "--root".into(),
-            root.clone(),
-            "--target".into(),
-            "cwl".into(),
-            "--observe".into(),
-        ]);
-        assert_eq!(unavailable.0, 6);
-        assert!(unavailable.1.is_empty());
-        assert!(
-            !directory
-                .path()
-                .join(".deshell/export/deshell.cwl")
-                .exists()
-        );
-        let (_, evidence) = crate::project::load_artifacts(directory.path()).unwrap();
-        assert_eq!(evidence.observations.len(), 1);
-        assert_eq!(
-            evidence.observations[0].status,
-            crate::evidence::ObservationStatus::Unavailable
-        );
-        let preview = invoke_owned(vec![
-            "deshell".into(),
-            "migrate".into(),
-            "--root".into(),
-            root.clone(),
+            path(directory.path()),
             "--target".into(),
             "cwl".into(),
         ]);
-        assert_eq!(preview.0, 0);
-        let preview_bytes = String::from_utf8(preview.1).unwrap();
-        let preview_document: serde_json::Value = serde_json::from_str(&preview_bytes).unwrap();
-        assert_eq!(preview_document["cwlVersion"], "v1.2");
-        assert!(
-            !directory
-                .path()
-                .join(".deshell/export/deshell.cwl")
-                .exists()
-        );
-        let applied = invoke_owned(vec![
-            "deshell".into(),
-            "migrate".into(),
-            "--root".into(),
-            root,
-            "--target".into(),
-            "cwl".into(),
-            "--apply".into(),
-        ]);
-        assert_eq!(applied.0, 0);
-        assert!(
-            directory
-                .path()
-                .join(".deshell/export/deshell.cwl")
-                .is_file()
-        );
+        assert_eq!(result.0, 2);
+        assert!(result.1.is_empty());
+        assert!(String::from_utf8_lossy(&result.2).contains("unexpected argument '--root'"));
+        assert!(!directory.path().join(".deshell/export").exists());
     }
 }

@@ -574,15 +574,26 @@ fn configure_unix_limits(command: &mut std::process::Command, limits: Limits) {
     use std::os::unix::process::CommandExt as _;
     command.process_group(0);
 
-    // Keep Darwin on Rust's posix_spawn path. Lowering a resource limit in a
-    // pre-exec child can be rejected when the child inherits a larger live
-    // address space, and RLIMIT_NPROC is scoped to the runner's entire user ID
-    // rather than this command tree. Disposable providers enforce their own
-    // memory and PID limits; host-local execution remains explicitly opt-in.
-    #[cfg(target_os = "macos")]
+    // Keep Darwin on Rust's posix_spawn path. Coverage and AddressSanitizer
+    // instrumentation also expand the harness address space and create runtime
+    // threads that are unrelated to the command under test; applying per-UID
+    // RLIMIT_NPROC or a production-sized RLIMIT_AS there produces false
+    // `cannot fork` failures. Ordinary builds still exercise these limits, and
+    // disposable providers enforce their own memory and PID boundaries.
+    #[cfg(any(
+        target_os = "macos",
+        coverage,
+        deshell_sanitizer_address,
+        deshell_sanitizer_undefined
+    ))]
     let _ = limits;
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(
+        not(target_os = "macos"),
+        not(coverage),
+        not(deshell_sanitizer_address),
+        not(deshell_sanitizer_undefined)
+    ))]
     unsafe {
         command.pre_exec(move || {
             let memory_limit = libc::rlimit {

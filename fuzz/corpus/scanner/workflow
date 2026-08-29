@@ -1,0 +1,4 @@
+jobs:
+  seed:
+    steps:
+      - run: /usr/bin/printf scanner
