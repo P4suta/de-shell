@@ -679,10 +679,14 @@ fn migration_embedded_fixture(interpreter: &str) -> Result<EmbeddedMigrationFixt
             "& '.\\target\\deshell-corpus-helper.exe' 'branch'".into(),
         ),
         "powershell" => ("pwsh", "& './target/deshell-corpus-helper' 'branch'".into()),
-        "cmd" => ("cmd", "@target\\deshell-corpus-helper.exe branch".into()),
+        "cmd" => (
+            "cmd",
+            "@echo off\ntarget\\deshell-corpus-helper.exe branch".into(),
+        ),
         "nu" => ("nu {0}", format!("^{unix_helper} branch")),
         other => return Err(format!("unsupported embedded interpreter: {other}")),
     };
+    let indented_command = command.replace('\n', "\n          ");
     let source = format!(
         concat!(
             "defaults:\n",
@@ -697,7 +701,7 @@ fn migration_embedded_fixture(interpreter: &str) -> Result<EmbeddedMigrationFixt
             "          {command}\n",
         ),
         shell = shell,
-        command = command,
+        command = indented_command,
     );
     Ok(EmbeddedMigrationFixture {
         path: ".github/workflows/embedded.yml",
@@ -770,6 +774,15 @@ fn powershell_runtime_path() -> Result<String, String> {
         .map_err(|_| "PowerShell runtime PATH is not valid Unicode".into())
 }
 
+fn migration_interpreter_supported_on(interpreter: &str, operating_system: &str) -> bool {
+    match interpreter {
+        "powershell" => true,
+        "cmd" => operating_system == "windows",
+        "sh" | "bash" | "zsh" | "fish" | "nu" => operating_system != "windows",
+        _ => false,
+    }
+}
+
 fn run_migration_e2e(
     repository: &Path,
     interpreter: &str,
@@ -780,7 +793,7 @@ fn run_migration_e2e(
             "unsupported migration E2E generator: {generator}"
         )]);
     }
-    if (interpreter == "cmd") != cfg!(windows) {
+    if !migration_interpreter_supported_on(interpreter, std::env::consts::OS) {
         return Err(vec![format!(
             "migration E2E interpreter {interpreter} is assigned to the wrong operating system"
         )]);
@@ -818,7 +831,8 @@ fn run_migration_e2e(
         .source
         .find("        run: |-")
         .ok_or_else(|| vec!["embedded migration fixture omitted its run span".into()])?;
-    if !embedded.source.contains(&embedded.command) {
+    let encoded_command = embedded.command.replace('\n', "\n          ");
+    if !embedded.source.contains(&encoded_command) {
         return Err(vec![
             "embedded migration fixture source map omitted its decoded command".into(),
         ]);
@@ -1795,6 +1809,16 @@ fn main() {
         assert!(cmd_source.contains("%CORPUS_ENV%"));
         assert!(cmd_source.contains("&&"));
         assert!(cmd_source.contains("deshell-corpus-helper.exe"));
+        let embedded_cmd = migration_embedded_fixture("cmd").unwrap();
+        assert_eq!(
+            embedded_cmd.command,
+            "@echo off\ntarget\\deshell-corpus-helper.exe branch"
+        );
+        assert!(
+            embedded_cmd.source.contains(
+                "          @echo off\n          target\\deshell-corpus-helper.exe branch\n"
+            )
+        );
         for interpreter in ["sh", "bash", "zsh", "fish", "powershell", "cmd", "nu"] {
             let embedded = migration_embedded_fixture(interpreter).unwrap();
             assert!(embedded.path.starts_with(".github/workflows/"));
@@ -1802,6 +1826,19 @@ fn main() {
             assert!(embedded.source.contains("shell:"));
             assert!(!embedded.command.is_empty());
         }
+    }
+
+    #[test]
+    fn migration_e2e_platform_assignment_allows_powershell_on_both_host_families() {
+        for interpreter in ["sh", "bash", "zsh", "fish", "nu"] {
+            assert!(migration_interpreter_supported_on(interpreter, "linux"));
+            assert!(migration_interpreter_supported_on(interpreter, "macos"));
+            assert!(!migration_interpreter_supported_on(interpreter, "windows"));
+        }
+        assert!(migration_interpreter_supported_on("powershell", "linux"));
+        assert!(migration_interpreter_supported_on("powershell", "windows"));
+        assert!(!migration_interpreter_supported_on("cmd", "linux"));
+        assert!(migration_interpreter_supported_on("cmd", "windows"));
     }
 
     #[test]

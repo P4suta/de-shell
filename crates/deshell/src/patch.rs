@@ -88,6 +88,7 @@ pub(crate) fn prepare_create(
     _replacement: Vec<u8>,
     _permissions: u32,
 ) -> Result<Proposal, String> {
+    checked_parent_directory(_path, "create target")?;
     match _path.symlink_metadata() {
         Ok(_) => return Err(format!("create target already exists: {}", _path.display())),
         Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
@@ -98,18 +99,6 @@ pub(crate) fn prepare_create(
         }
         Err(_) => {}
     }
-    let parent = _path
-        .parent()
-        .ok_or_else(|| format!("create target has no parent: {}", _path.display()))?;
-    let metadata = parent
-        .symlink_metadata()
-        .map_err(|error| format!("cannot inspect create parent {}: {error}", parent.display()))?;
-    if !metadata.file_type().is_dir() {
-        return Err(format!(
-            "create target parent is not a directory: {}",
-            parent.display()
-        ));
-    }
     Ok(Proposal {
         path: _path.to_path_buf(),
         expected: Expectation::Missing,
@@ -117,6 +106,25 @@ pub(crate) fn prepare_create(
         permissions: _permissions,
         mutation: Mutation::Write,
     })
+}
+
+fn checked_parent_directory<'a>(path: &'a Path, label: &str) -> Result<&'a Path, String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{label} has no parent: {}", path.display()))?;
+    let metadata = parent.symlink_metadata().map_err(|error| {
+        format!(
+            "cannot inspect {label} parent {}: {error}",
+            parent.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+        return Err(format!(
+            "{label} parent is not a directory: {}",
+            parent.display()
+        ));
+    }
+    Ok(parent)
 }
 
 pub(crate) fn prepare_delete(path: &Path) -> Result<Proposal, String> {
@@ -323,6 +331,7 @@ fn validate_proposal(proposal: &Proposal) -> Result<PathBuf, String> {
             Ok(canonical)
         }
         Expectation::Missing => {
+            let parent = checked_parent_directory(&proposal.path, "create target")?;
             match proposal.path.symlink_metadata() {
                 Ok(_) => {
                     return Err(format!(
@@ -338,9 +347,6 @@ fn validate_proposal(proposal: &Proposal) -> Result<PathBuf, String> {
                 }
                 Err(_) => {}
             }
-            let parent = proposal.path.parent().ok_or_else(|| {
-                format!("create target has no parent: {}", proposal.path.display())
-            })?;
             let parent = parent.canonicalize().map_err(|error| {
                 format!("cannot resolve create parent {}: {error}", parent.display())
             })?;
@@ -404,6 +410,10 @@ fn restore_backups(backups: &[(PathBuf, PathBuf)]) -> Vec<String> {
 fn remove_committed(committed: &[(PathBuf, String)]) -> Vec<String> {
     let mut errors = Vec::new();
     for (target, expected) in committed.iter().rev() {
+        if let Err(error) = checked_parent_directory(target, "rollback target") {
+            errors.push(error);
+            continue;
+        }
         let metadata = match target.symlink_metadata() {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -717,7 +727,7 @@ mod tests {
         assert!(
             validate_proposal(&absent_parent)
                 .unwrap_err()
-                .contains("create parent")
+                .contains("create target parent")
         );
         let no_parent = Proposal {
             path: PathBuf::new(),
@@ -742,10 +752,10 @@ mod tests {
         let parent_file = temporary.path().join("parent-file");
         fs::write(&parent_file, b"not a directory").unwrap();
         let inaccessible_child = parent_file.join("child");
+        let prepare_error = prepare_create(&inaccessible_child, vec![], 0o644).unwrap_err();
         assert!(
-            prepare_create(&inaccessible_child, vec![], 0o644)
-                .unwrap_err()
-                .contains("cannot inspect create target")
+            prepare_error.contains("create target parent is not a directory"),
+            "unexpected platform-specific prepare error: {prepare_error}"
         );
         let invalid_create = Proposal {
             path: inaccessible_child.clone(),
@@ -754,14 +764,18 @@ mod tests {
             permissions: 0o644,
             mutation: Mutation::Write,
         };
+        let validation_error = validate_proposal(&invalid_create).unwrap_err();
         assert!(
-            validate_proposal(&invalid_create)
-                .unwrap_err()
-                .contains("cannot inspect")
+            validation_error.contains("create target parent is not a directory"),
+            "unexpected platform-specific validation error: {validation_error}"
         );
+        let rollback_errors =
+            remove_committed(&[(inaccessible_child, crate::digest::sha256(b"anything"))]);
         assert!(
-            !remove_committed(&[(inaccessible_child, crate::digest::sha256(b"anything"))])
-                .is_empty()
+            rollback_errors
+                .iter()
+                .any(|error| error.contains("rollback target parent is not a directory")),
+            "unexpected platform-specific rollback result: {rollback_errors:?}"
         );
 
         let canonical = existing.canonicalize().unwrap();
@@ -780,6 +794,45 @@ mod tests {
         };
         assert!(validate_current(&[concurrent]).is_err());
         assert!(validate_all(&[]).unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inaccessible_create_and_rollback_targets_fail_closed() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let inaccessible_parent = temporary.path().join("inaccessible");
+        fs::create_dir(&inaccessible_parent).unwrap();
+        let target = inaccessible_parent.join("target");
+        let proposal = Proposal {
+            path: target.clone(),
+            expected: Expectation::Missing,
+            replacement: vec![],
+            permissions: 0o644,
+            mutation: Mutation::Write,
+        };
+
+        fs::set_permissions(&inaccessible_parent, fs::Permissions::from_mode(0o000)).unwrap();
+        let prepare_error = prepare_create(&target, vec![], 0o644).err();
+        let validation_error = validate_proposal(&proposal).err();
+        let rollback_errors = remove_committed(&[(target, crate::digest::sha256(b"expected"))]);
+        fs::set_permissions(&inaccessible_parent, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(
+            prepare_error.is_some_and(|error| error.contains("cannot inspect create target")),
+            "an inaccessible create target must not be treated as missing"
+        );
+        assert!(
+            validation_error.is_some_and(|error| error.contains("cannot inspect")),
+            "validation must preserve an inaccessible target as an error"
+        );
+        assert!(
+            rollback_errors
+                .iter()
+                .any(|error| error.contains("for rollback")),
+            "rollback must not silently skip an inaccessible target"
+        );
     }
 
     #[test]

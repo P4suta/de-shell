@@ -152,7 +152,10 @@ fn serve_one(
     stream
         .write_all(&response)
         .and_then(|()| stream.flush())
-        .map_err(|error| format!("cannot write replay response body: {error}"))
+        .map_err(|error| format!("cannot write replay response body: {error}"))?;
+    stream
+        .shutdown(std::net::Shutdown::Write)
+        .map_err(|error| format!("cannot close replay response cleanly: {error}"))
 }
 
 #[derive(Debug)]

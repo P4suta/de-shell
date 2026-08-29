@@ -1737,11 +1737,8 @@ fn external_target_hint(
     }
 }
 
-fn rust_build_argv(target: &str, output: &str, operating_system: &str) -> Vec<String> {
+fn rust_build_argv(target: &str, output: &str, _operating_system: &str) -> Vec<String> {
     let mut argv = vec!["rustc".into(), target.into(), "-Ccodegen-units=1".into()];
-    if operating_system == "linux" {
-        argv.push("-Clink-arg=-Wl,--threads=1".into());
-    }
     argv.extend(["-o".into(), output.into()]);
     argv
 }
@@ -6722,10 +6719,16 @@ mod tests {
             ]
         );
         let linux = rust_build_argv("src/bin/build.rs", ".deshell/verification/build", "linux");
-        assert!(
-            linux
-                .iter()
-                .any(|argument| argument.contains("--threads=1"))
+        assert_eq!(
+            linux,
+            [
+                "rustc",
+                "src/bin/build.rs",
+                "-Ccodegen-units=1",
+                "-o",
+                ".deshell/verification/build"
+            ],
+            "generator build argv must not assume a target linker's private thread flag"
         );
     }
 
