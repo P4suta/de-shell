@@ -572,6 +572,26 @@ fn add_essential_environment_with(
         // these roots after env_clear; neither value carries user credentials.
         "ProgramFiles",
         "ProgramFiles(x86)",
+        // The MSVC developer environment exposes only toolchain paths and
+        // versions through these names. Preserve that narrow allowlist so
+        // rustc can select link.exe and the Windows SDK after env_clear
+        // without inheriting credentials or the user's profile.
+        "INCLUDE",
+        "LIB",
+        "LIBPATH",
+        "TEMP",
+        "TMP",
+        "UniversalCRTSdkDir",
+        "UCRTVersion",
+        "VCINSTALLDIR",
+        "VCToolsInstallDir",
+        "VCToolsVersion",
+        "VSCMD_ARG_HOST_ARCH",
+        "VSCMD_ARG_TGT_ARCH",
+        "VSINSTALLDIR",
+        "VisualStudioVersion",
+        "WindowsSdkDir",
+        "WindowsSDKVersion",
         "WINDIR",
     ] {
         if let Some(value) = lookup(name) {
@@ -762,6 +782,30 @@ mod tests {
             environment.get("ProgramFiles(x86)").map(String::as_str),
             Some("value:ProgramFiles(x86)")
         );
+        for name in [
+            "INCLUDE",
+            "LIB",
+            "LIBPATH",
+            "TEMP",
+            "TMP",
+            "UniversalCRTSdkDir",
+            "UCRTVersion",
+            "VCINSTALLDIR",
+            "VCToolsInstallDir",
+            "VCToolsVersion",
+            "VSCMD_ARG_HOST_ARCH",
+            "VSCMD_ARG_TGT_ARCH",
+            "VSINSTALLDIR",
+            "VisualStudioVersion",
+            "WindowsSdkDir",
+            "WindowsSDKVersion",
+        ] {
+            assert_eq!(
+                environment.get(name).map(String::as_str),
+                Some(format!("value:{name}").as_str()),
+                "missing isolated MSVC environment entry {name}"
+            );
+        }
         assert!(!environment.contains_key("USERPROFILE"));
         assert!(!environment.contains_key("GITHUB_TOKEN"));
     }

@@ -109,6 +109,12 @@ fn serve_one(
     observations: &Mutex<Vec<crate::replay::NetworkExchange>>,
     timeout: Duration,
 ) -> Result<(), String> {
+    // Darwin propagates O_NONBLOCK from a nonblocking listener to accepted
+    // sockets. Request IO is deliberately blocking with bounded timeouts, so
+    // normalize the accepted stream on every platform before its first read.
+    stream
+        .set_nonblocking(false)
+        .map_err(|error| format!("cannot configure replay proxy blocking IO: {error}"))?;
     stream
         .set_read_timeout(Some(timeout))
         .map_err(|error| format!("cannot configure replay proxy read timeout: {error}"))?;
@@ -328,6 +334,42 @@ mod tests {
             observations[0].response_body_sha256,
             crate::digest::sha256(b"response")
         );
+    }
+
+    #[test]
+    fn accepted_nonblocking_stream_is_restored_before_request_io() {
+        let replay = crate::replay::ReplayStore {
+            schema_version: 1,
+            entries: vec![crate::replay::ReplayEntry {
+                method: "GET".into(),
+                uri: "http://example.test/data".into(),
+                request_body_sha256: crate::digest::sha256(b""),
+                status: 200,
+                headers: vec![],
+                body: crate::ir::SourceBytes::from_bytes(b"response"),
+            }],
+        };
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+            stream
+                .write_all(b"GET http://example.test/data HTTP/1.1\r\nHost: example.test\r\n\r\n")
+                .unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).unwrap();
+            response
+        });
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.set_nonblocking(true).unwrap();
+        let observations = Mutex::new(Vec::new());
+
+        serve_one(&mut stream, &replay, &observations, Duration::from_secs(2)).unwrap();
+
+        let response = client.join().unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 200 Replay\r\n"));
+        assert_eq!(observations.lock().unwrap().len(), 1);
     }
 
     #[test]

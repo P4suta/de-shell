@@ -4580,24 +4580,12 @@ fn observe_original(
     let environment = replay_environment(scenario_environment(scenario), proxy.as_ref());
     if source.kind == SourceKind::EmbeddedShell {
         let (snippet, interpreter) = current_embedded_source(workspace.path(), source)?;
-        let snippet = String::from_utf8(snippet)
-            .map_err(|_| "embedded shell verification requires UTF-8 source")?;
-        let (executable, flag) = match interpreter.as_str() {
-            "sh" => ("sh", "-c"),
-            "bash" => ("bash", "-c"),
-            "zsh" => ("zsh", "-c"),
-            "fish" => ("fish", "-c"),
-            "powershell" => ("pwsh", "-Command"),
-            "cmd" => ("cmd", "/C"),
-            "nu" => ("nu", "-c"),
-            other => return Err(format!("unknown embedded interpreter: {other}")),
-        };
-        let mut argv = vec![executable.into(), flag.into(), snippet];
-        argv.extend(scenario.argv.clone());
+        let mut invocation = embedded_original_invocation(&interpreter, snippet)?;
+        invocation.argv.extend(scenario.argv.clone());
         let outcome = crate::agent_process::execute(
             workspace.path(),
             crate::agent_process::Request {
-                argv,
+                argv: invocation.argv,
                 environment,
                 working_directory: scenario.cwd.clone(),
                 stdin: scenario_stdin(scenario)?,
@@ -4629,6 +4617,52 @@ fn observe_original(
     validate_expectations(scenario, &outcome)?;
     let network = finish_replay_proxy(proxy)?;
     observation_from_outcome(workspace.path(), &before, outcome, network)
+}
+
+struct EmbeddedOriginalInvocation {
+    argv: Vec<String>,
+    _script_directory: Option<tempfile::TempDir>,
+}
+
+fn embedded_original_invocation(
+    interpreter: &str,
+    snippet: Vec<u8>,
+) -> Result<EmbeddedOriginalInvocation, String> {
+    let snippet = String::from_utf8(snippet)
+        .map_err(|_| "embedded shell verification requires UTF-8 source")?;
+    if interpreter == "cmd" {
+        // cmd.exe does not reliably treat embedded newlines in its /C command
+        // argument as batch separators. Host runners execute multiline `run:`
+        // content through a temporary script as well, so preserve the decoded
+        // bytes in an isolated .cmd file and use the exact batch argv contract.
+        let directory = tempfile::Builder::new()
+            .prefix("deshell-original-cmd-")
+            .tempdir()
+            .map_err(|error| format!("cannot create embedded cmd script directory: {error}"))?;
+        let script = directory.path().join("snippet.cmd");
+        std::fs::write(&script, snippet.as_bytes())
+            .map_err(|error| format!("cannot write embedded cmd script: {error}"))?;
+        let script = script
+            .to_str()
+            .ok_or("embedded cmd script path is not UTF-8")?;
+        return Ok(EmbeddedOriginalInvocation {
+            argv: original_script_argv("cmd", script)?,
+            _script_directory: Some(directory),
+        });
+    }
+    let (executable, flag) = match interpreter {
+        "sh" => ("sh", "-c"),
+        "bash" => ("bash", "-c"),
+        "zsh" => ("zsh", "-c"),
+        "fish" => ("fish", "-c"),
+        "powershell" => ("pwsh", "-Command"),
+        "nu" => ("nu", "-c"),
+        other => return Err(format!("unknown embedded interpreter: {other}")),
+    };
+    Ok(EmbeddedOriginalInvocation {
+        argv: vec![executable.into(), flag.into(), snippet],
+        _script_directory: None,
+    })
 }
 
 fn original_script_argv(interpreter: &str, source: &str) -> Result<Vec<String>, String> {
@@ -6738,6 +6772,21 @@ mod tests {
             original_script_argv("cmd", r"C:\workspace\corpus.cmd").unwrap(),
             ["cmd", "/D", "/S", "/C", r"C:\workspace\corpus.cmd"]
         );
+    }
+
+    #[test]
+    fn embedded_cmd_snippet_is_materialized_as_an_exact_batch_file() {
+        let snippet = b"@echo off\ntarget\\deshell-corpus-helper.exe branch".to_vec();
+        let invocation = embedded_original_invocation("cmd", snippet.clone()).unwrap();
+        assert!(invocation._script_directory.is_some());
+        assert_eq!(&invocation.argv[..4], ["cmd", "/D", "/S", "/C"]);
+        assert_eq!(invocation.argv.len(), 5);
+        let script = Path::new(&invocation.argv[4]);
+        assert_eq!(
+            script.extension().and_then(|value| value.to_str()),
+            Some("cmd")
+        );
+        assert_eq!(std::fs::read(script).unwrap(), snippet);
     }
 
     #[test]
