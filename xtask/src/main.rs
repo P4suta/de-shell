@@ -1217,7 +1217,12 @@ fn apply_migration() {
     let workflow = std::fs::read_to_string(workflow_path).unwrap();
     let mut lines = workflow.lines();
     while lines.next().is_some_and(|line| line.trim() != "run: |-") {}
-    let command = lines.next().unwrap().trim();
+    let command = lines
+        .take_while(|line| line.starts_with("          "))
+        .map(|line| line.strip_prefix("          ").unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!command.is_empty());
     std::fs::create_dir_all(".deshell/archive").unwrap();
     std::fs::write(".deshell/archive/source.bin", std::fs::read(&source).unwrap()).unwrap();
     std::fs::write(".deshell/archive/snippet.bin", command.as_bytes()).unwrap();
@@ -2128,6 +2133,47 @@ fn main() {
         assert!(run_migration_e2e(missing.path(), interpreter, "rust").is_err());
         assert!(migration_embedded_fixture("unknown").is_err());
         assert!(!powershell_runtime_path().unwrap().is_empty());
+    }
+
+    #[test]
+    fn fake_oracle_archives_the_complete_multiline_embedded_snippet() {
+        let repository = tempfile::tempdir().unwrap();
+        let mut binary = repository.path().join("target/debug/deshell");
+        if cfg!(windows) {
+            binary.set_extension("exe");
+        }
+        compile_fake_deshell(&binary);
+        std::fs::write(repository.path().join("corpus.sh"), b"#!/bin/sh\ntrue\n").unwrap();
+        let workflow = repository.path().join(".github/workflows/embedded.yml");
+        std::fs::create_dir_all(workflow.parent().unwrap()).unwrap();
+        std::fs::write(
+            &workflow,
+            concat!(
+                "jobs:\n",
+                "  embedded:\n",
+                "    steps:\n",
+                "      - name: embedded\n",
+                "        run: |-\n",
+                "          @one.exe\n",
+                "          @two.exe\n",
+            ),
+        )
+        .unwrap();
+
+        let output = std::process::Command::new(binary)
+            .args(["migrate", "apply"])
+            .current_dir(repository.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read(repository.path().join(".deshell/archive/snippet.bin")).unwrap(),
+            b"@one.exe\n@two.exe"
+        );
     }
 
     #[test]

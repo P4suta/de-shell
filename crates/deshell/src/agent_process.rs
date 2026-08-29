@@ -554,6 +554,13 @@ fn valid_environment_name(name: &str) -> bool {
 }
 
 fn add_essential_environment(command: &mut std::process::Command) {
+    add_essential_environment_with(command, |name| std::env::var_os(name));
+}
+
+fn add_essential_environment_with(
+    command: &mut std::process::Command,
+    lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
+) {
     for name in [
         "PATH",
         "SystemRoot",
@@ -561,9 +568,13 @@ fn add_essential_environment(command: &mut std::process::Command) {
         "ComSpec",
         "COMSPEC",
         "PATHEXT",
+        // rustc's pinned find-msvc-tools fallback resolves vswhere.exe from
+        // these roots after env_clear; neither value carries user credentials.
+        "ProgramFiles",
+        "ProgramFiles(x86)",
         "WINDIR",
     ] {
-        if let Some(value) = std::env::var_os(name) {
+        if let Some(value) = lookup(name) {
             command.env(name, value);
         }
     }
@@ -728,6 +739,67 @@ fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn essential_environment_supports_isolated_msvc_discovery_without_ambient_secrets() {
+        let mut command = std::process::Command::new("unused");
+        add_essential_environment_with(&mut command, |name| Some(format!("value:{name}").into()));
+        let environment = command
+            .get_envs()
+            .map(|(name, value)| {
+                (
+                    name.to_string_lossy().into_owned(),
+                    value.unwrap().to_string_lossy().into_owned(),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+
+        assert_eq!(
+            environment.get("ProgramFiles").map(String::as_str),
+            Some("value:ProgramFiles")
+        );
+        assert_eq!(
+            environment.get("ProgramFiles(x86)").map(String::as_str),
+            Some("value:ProgramFiles(x86)")
+        );
+        assert!(!environment.contains_key("USERPROFILE"));
+        assert!(!environment.contains_key("GITHUB_TOKEN"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn isolated_rustc_discovers_the_msvc_linker_after_environment_clear() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("main.rs"), b"fn main() {}\n").unwrap();
+        let outcome = execute(
+            directory.path(),
+            Request {
+                argv: vec![
+                    "rustc".into(),
+                    "main.rs".into(),
+                    "-o".into(),
+                    "isolated.exe".into(),
+                ],
+                environment: Vec::new(),
+                working_directory: None,
+                stdin: Vec::new(),
+                limits: Limits {
+                    timeout_ms: 60_000,
+                    memory_bytes: 8 * 1024 * 1024 * 1024,
+                    processes: 60_000,
+                    ..Limits::default()
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.exit_code,
+            0,
+            "{}",
+            String::from_utf8_lossy(&outcome.stderr)
+        );
+        assert!(directory.path().join("isolated.exe").is_file());
+    }
 
     #[cfg(unix)]
     #[test]

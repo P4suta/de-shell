@@ -183,13 +183,9 @@ pub(crate) fn lower(
             Interpreter::Fish => {
                 validate_fish_cst(&normalized, text).and_then(|()| lower_fish(&normalized, text))
             }
-            Interpreter::Cmd => validate_tree_sitter_cst(
-                &normalized,
-                text,
-                tree_sitter_batch::LANGUAGE.into(),
-                "tree-sitter-batch/0.11.1",
-            )
-            .and_then(|()| lower_cmd(&normalized, text)),
+            Interpreter::Cmd => {
+                validate_cmd_cst(&normalized, text).and_then(|()| lower_cmd(&normalized, text))
+            }
             Interpreter::Powershell => validate_powershell_syntax(&normalized, text)
                 .and_then(|()| lower_powershell(&normalized, text)),
             Interpreter::Nushell => validate_nushell_syntax(&normalized, text)
@@ -875,6 +871,31 @@ fn validate_fish_cst(path: &str, source: &str) -> Result<(), String> {
         path,
         &parser_source,
         tree_sitter_fish::language(),
+        PARSER_NAME,
+    )
+}
+
+fn validate_cmd_cst(path: &str, source: &str) -> Result<(), String> {
+    const PARSER_NAME: &str = "tree-sitter-batch/0.11.1";
+    if source.ends_with('\n') || source.ends_with('\r') {
+        return validate_tree_sitter_cst(
+            path,
+            source,
+            tree_sitter_batch::LANGUAGE.into(),
+            PARSER_NAME,
+        );
+    }
+
+    // cmd.exe accepts EOF as a command terminator, while the pinned grammar
+    // requires the final command in a multi-line program to be newline-ended.
+    // Normalize only the parser view so spans and archived bytes stay exact.
+    let mut parser_source = String::with_capacity(source.len() + 1);
+    parser_source.push_str(source);
+    parser_source.push('\n');
+    validate_tree_sitter_cst(
+        path,
+        &parser_source,
+        tree_sitter_batch::LANGUAGE.into(),
         PARSER_NAME,
     )
 }
@@ -3402,6 +3423,26 @@ mod tests {
             }]
         );
         assert!(matches!(nodes[1].operation, Operation::Condition { .. }));
+        plan.validate().unwrap();
+    }
+
+    #[test]
+    fn cmd_embedded_lf_script_with_echo_prologue_lowers_natively() {
+        let plan = lower(
+            "embedded.cmd",
+            concat!("@echo off\n", "target\\deshell-corpus-helper.exe branch",).as_bytes(),
+            UnknownInterpreter::Reject,
+        )
+        .unwrap();
+        let Operation::Exec { argv, .. } = &plan.tasks[0].body.operation else {
+            panic!("expected native cmd exec: {:#?}", plan.tasks[0].body)
+        };
+        assert_eq!(
+            argv[0].parts,
+            [TextPart::Literal {
+                value: "target\\deshell-corpus-helper.exe".into()
+            }]
+        );
         plan.validate().unwrap();
     }
 
