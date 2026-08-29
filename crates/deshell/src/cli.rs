@@ -4397,6 +4397,218 @@ mod tests {
     }
 
     #[test]
+    fn report_families_cover_review_approval_and_active_plan_states() {
+        fn json_report(result: &(i32, Vec<u8>, Vec<u8>)) -> serde_json::Value {
+            assert!(
+                result.2.is_empty(),
+                "{}",
+                String::from_utf8_lossy(&result.2)
+            );
+            crate::strict_json::parse(&result.1).unwrap()
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::fs::write(
+            directory.path().join("build.sh"),
+            "#!/bin/sh\n/usr/bin/printf report\n",
+        )
+        .unwrap();
+        let root = path(directory.path());
+        let initialized = invoke_owned(vec![
+            "deshell".into(),
+            "init".into(),
+            "--root".into(),
+            root.clone(),
+            "--format".into(),
+            "json".into(),
+        ]);
+        assert_eq!(initialized.0, 0);
+
+        let scenarios = invoke_owned(vec![
+            "deshell".into(),
+            "scenario".into(),
+            "list".into(),
+            "--root".into(),
+            root.clone(),
+            "--format".into(),
+            "json".into(),
+        ]);
+        assert_eq!(scenarios.0, 0);
+        let scenarios = json_report(&scenarios);
+        assert_eq!(scenarios["status"], "not_ready");
+        let scenario_line = scenarios["details"]["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .find(|line| line.contains("\tdraft\t"))
+            .unwrap();
+        let scenario_fields = scenario_line.split('\t').collect::<Vec<_>>();
+        let scenario = scenario_fields[0].to_owned();
+        let scenario_digest = scenario_fields[2].to_owned();
+
+        let shown = invoke_owned(vec![
+            "deshell".into(),
+            "scenario".into(),
+            "show".into(),
+            "--root".into(),
+            root.clone(),
+            "--name".into(),
+            scenario.clone(),
+            "--format".into(),
+            "json".into(),
+        ]);
+        assert_eq!(shown.0, 0);
+        assert_eq!(json_report(&shown)["status"], "not_ready");
+
+        let rejected = invoke_owned(vec![
+            "deshell".into(),
+            "scenario".into(),
+            "approve".into(),
+            "--root".into(),
+            root.clone(),
+            "--name".into(),
+            scenario.clone(),
+            "--digest".into(),
+            format!("sha256:{}", "0".repeat(64)),
+            "--format".into(),
+            "json".into(),
+        ]);
+        assert_eq!(rejected.0, 4);
+        assert_eq!(json_report(&rejected)["status"], "blocked");
+
+        let approved = invoke_owned(vec![
+            "deshell".into(),
+            "scenario".into(),
+            "approve".into(),
+            "--root".into(),
+            root.clone(),
+            "--name".into(),
+            scenario,
+            "--digest".into(),
+            scenario_digest,
+            "--format".into(),
+            "json".into(),
+        ]);
+        assert_eq!(approved.0, 0);
+        assert_eq!(json_report(&approved)["status"], "ok");
+
+        let matrix = invoke_owned(vec![
+            "deshell".into(),
+            "matrix".into(),
+            "list".into(),
+            "--root".into(),
+            root.clone(),
+            "--format".into(),
+            "json".into(),
+        ]);
+        assert_eq!(matrix.0, 0);
+        let matrix = json_report(&matrix);
+        assert_eq!(matrix["status"], "not_ready");
+        let matrix_line = matrix["details"]["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .find(|line| line.contains("\tdraft\t"))
+            .unwrap();
+        let matrix_fields = matrix_line.split('\t').collect::<Vec<_>>();
+        let cell = matrix_fields[0].to_owned();
+        let cell_digest = matrix_fields[2].to_owned();
+        let approved = invoke_owned(vec![
+            "deshell".into(),
+            "matrix".into(),
+            "approve".into(),
+            "--root".into(),
+            root.clone(),
+            "--cell".into(),
+            cell,
+            "--digest".into(),
+            cell_digest,
+            "--format".into(),
+            "json".into(),
+        ]);
+        assert_eq!(approved.0, 0);
+        assert_eq!(json_report(&approved)["status"], "ok");
+
+        for arguments in [
+            vec!["analyze", "--root", root.as_str(), "--format", "json"],
+            vec!["check", "--root", root.as_str(), "--format", "json"],
+            vec!["audit", "--root", root.as_str(), "--format", "json"],
+            vec!["explain", "--root", root.as_str(), "--format", "json"],
+            vec![
+                "rewrite",
+                "--root",
+                root.as_str(),
+                "--equivalent",
+                "--format",
+                "json",
+            ],
+            vec![
+                "modernize",
+                "--root",
+                root.as_str(),
+                "--profile",
+                "secure",
+                "--format",
+                "json",
+            ],
+            vec!["doctor", "--root", root.as_str(), "--format", "json"],
+            vec![
+                "harden",
+                "plan",
+                "--root",
+                root.as_str(),
+                "--format",
+                "json",
+            ],
+        ] {
+            let mut argv = vec!["deshell".to_owned()];
+            argv.extend(arguments.into_iter().map(str::to_owned));
+            let result = invoke_owned(argv);
+            assert_eq!(result.0, 0, "{}", String::from_utf8_lossy(&result.2));
+            assert_eq!(json_report(&result)["schema_version"], 1);
+        }
+
+        let planned = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "plan".into(),
+            "--root".into(),
+            root.clone(),
+            "--format".into(),
+            "json".into(),
+        ]);
+        assert_eq!(planned.0, 0, "{}", String::from_utf8_lossy(&planned.2));
+        let planned = json_report(&planned);
+        assert_eq!(planned["status"], "ok");
+        assert!(
+            planned["details"]["paths"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|path| path
+                    .as_str()
+                    .is_some_and(|path| path.ends_with("/plan.json")))
+        );
+
+        let status = invoke_owned(vec![
+            "deshell".into(),
+            "migrate".into(),
+            "status".into(),
+            "--root".into(),
+            root,
+            "--format".into(),
+            "json".into(),
+        ]);
+        assert_eq!(status.0, 0);
+        let status = json_report(&status);
+        assert_eq!(status["details"]["values"]["state"], "planned");
+        assert!(!status["next_actions"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
     fn ambiguous_init_returns_three_exact_argv_actions_without_writes() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(directory.path().join("build.sh"), "#!/bin/sh\ntrue\n").unwrap();
