@@ -2,6 +2,8 @@
 
 #[path = "../../crates/deshell/src/agent_process.rs"]
 mod agent_process;
+#[path = "../../crates/deshell/src/approval.rs"]
+mod approval;
 #[path = "../../crates/deshell/src/audit.rs"]
 mod audit;
 #[path = "../../crates/deshell/src/canonical_json.rs"]
@@ -42,6 +44,8 @@ mod protocol;
 mod replay;
 #[path = "../../crates/deshell/src/replay_proxy.rs"]
 mod replay_proxy;
+#[path = "../../crates/deshell/src/report.rs"]
+mod report;
 #[path = "../../crates/deshell/src/rewrite.rs"]
 mod rewrite;
 #[path = "../../crates/deshell/src/runner.rs"]

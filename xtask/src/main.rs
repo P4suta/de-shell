@@ -1959,6 +1959,15 @@ fn main() {
     #[test]
     fn release_dynamic_analysis_uses_real_saved_corpus_targets_and_blocks_publish() {
         let root = repository_root();
+        let fuzz_library = std::fs::read_to_string(root.join("fuzz/src/lib.rs")).unwrap();
+        for module in ["approval", "report"] {
+            assert!(
+                fuzz_library.contains(&format!(
+                    "#[path = \"../../crates/deshell/src/{module}.rs\"]"
+                )),
+                "fuzz library omitted the production {module} module"
+            );
+        }
         for target in ["frontend", "scanner", "protocol", "schema"] {
             assert!(
                 root.join(format!("fuzz/fuzz_targets/{target}.rs"))
