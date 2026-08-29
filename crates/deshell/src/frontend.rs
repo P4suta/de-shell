@@ -39,26 +39,10 @@ pub(crate) fn detect(path: &str, source: &[u8]) -> Interpreter {
 pub(crate) fn resolve_interpreter(path: &str, source: &[u8]) -> Result<Interpreter, String> {
     let extension = interpreter_from_extension(path);
     let shell_hint = path.to_ascii_lowercase().ends_with(".sh");
-    let first_line = source
-        .split(|byte| *byte == b'\n')
-        .next()
-        .unwrap_or_default();
-    let Some(command) = first_line.strip_prefix(b"#!") else {
+    let Some(program) = shebang_program(source) else {
         return Ok(extension.unwrap_or_else(|| Interpreter::Unknown("unknown".into())));
     };
-    let command = String::from_utf8_lossy(command);
-    let words: Vec<&str> = command.split_ascii_whitespace().collect();
-    let executable = words.first().map(|word| basename(word));
-    let program = if executable.as_deref() == Some("env") {
-        words
-            .iter()
-            .skip(1)
-            .find(|word| !word.starts_with('-'))
-            .map(|word| basename(word))
-    } else {
-        executable
-    };
-    let shebang = interpreter_from_name(program.as_deref().unwrap_or("unknown"));
+    let shebang = interpreter_from_name(&program);
     if let Interpreter::Unknown(name) = &shebang {
         return Err(format!(
             "DESHELL_BLOCKER_UNKNOWN_INTERPRETER: unknown shebang interpreter {name} in {path}"
@@ -86,6 +70,32 @@ pub(crate) fn resolve_interpreter(path: &str, source: &[u8]) -> Result<Interpret
         ));
     }
     Ok(shebang)
+}
+
+pub(crate) fn resolve_scanned_interpreter(
+    path: &str,
+    source: &[u8],
+) -> Result<Option<Interpreter>, String> {
+    if interpreter_from_extension(path).is_some() {
+        return resolve_interpreter(path, source).map(Some);
+    }
+    let first_line = source
+        .split(|byte| *byte == b'\n')
+        .next()
+        .unwrap_or_default();
+    if first_line.starts_with(b"#![") {
+        return Ok(None);
+    }
+    let Some(program) = shebang_program(source) else {
+        return Ok(None);
+    };
+    if !matches!(interpreter_from_name(&program), Interpreter::Unknown(_)) {
+        return resolve_interpreter(path, source).map(Some);
+    }
+    if is_recognized_non_shell_interpreter(&program) {
+        return Ok(None);
+    }
+    resolve_interpreter(path, source).map(Some)
 }
 
 pub(crate) fn resolve_configured_interpreter(
@@ -408,6 +418,60 @@ fn interpreter_from_name(name: &str) -> Interpreter {
         "nu" | "nushell" => Interpreter::Nushell,
         other => Interpreter::Unknown(other.to_owned()),
     }
+}
+
+fn shebang_program(source: &[u8]) -> Option<String> {
+    let first_line = source.split(|byte| *byte == b'\n').next()?;
+    let command = first_line.strip_prefix(b"#!")?;
+    let command = String::from_utf8_lossy(command);
+    let words: Vec<&str> = command.split_ascii_whitespace().collect();
+    let executable = words.first().map(|word| basename(word));
+    if executable.as_deref() == Some("env") {
+        words
+            .iter()
+            .skip(1)
+            .find(|word| !word.starts_with('-'))
+            .map(|word| basename(word))
+    } else {
+        executable
+    }
+}
+
+fn is_recognized_non_shell_interpreter(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    if name == "python"
+        || name.strip_prefix("python").is_some_and(|version| {
+            !version.is_empty()
+                && version
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || byte == b'.')
+        })
+    {
+        return true;
+    }
+    matches!(
+        name.trim_end_matches(".exe"),
+        "awk"
+            | "bun"
+            | "cargo"
+            | "deno"
+            | "elixir"
+            | "escript"
+            | "groovy"
+            | "julia"
+            | "lua"
+            | "luajit"
+            | "node"
+            | "osascript"
+            | "perl"
+            | "php"
+            | "racket"
+            | "ruby"
+            | "rust-script"
+            | "swift"
+            | "tclsh"
+            | "wish"
+    )
 }
 
 fn basename(value: &str) -> String {

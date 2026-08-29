@@ -20,10 +20,7 @@ type source_bytes = Utf8 of string | Base64 of string
 
 type operation =
   | Exec of text_expression list
-  | Pipeline of {
-      nodes : node list;
-      status : string;
-    }
+  | Pipeline of { nodes : node list; status : string }
   | Sequence of node list
   | Set_variable of {
       name : string;
@@ -525,7 +522,8 @@ let lower_posix path source interpreter =
                   source = Some (source_span path source first last);
                 }
               in
-              if List.length ranges = 1 then Some (command_node (List.hd ranges))
+              if List.length ranges = 1 then
+                Some (command_node (List.hd ranges))
               else
                 Some
                   {

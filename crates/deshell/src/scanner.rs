@@ -686,11 +686,11 @@ fn findings_for_file(relative: &str, absolute: &Path) -> FileScan {
         Ok(source) => source,
         Err(error) => return FileScan::error(relative, "read", error.to_string()),
     };
-    let detected = match crate::frontend::resolve_interpreter(relative, &source) {
+    let detected = match crate::frontend::resolve_scanned_interpreter(relative, &source) {
         Ok(detected) => detected,
         Err(message) => return FileScan::error(relative, "interpreter", message),
     };
-    if !matches!(detected, crate::frontend::Interpreter::Unknown(_)) {
+    if let Some(detected) = detected {
         let interpreter = detected.name().to_owned();
         return FileScan::findings(vec![finding(
             relative,
@@ -1996,6 +1996,54 @@ mod tests {
             findings
                 .iter()
                 .all(|finding| finding.content_digest.len() == 64)
+        );
+    }
+
+    #[test]
+    fn non_shell_preambles_do_not_become_shell_interpreter_blockers() {
+        let temporary = tempfile::tempdir().unwrap();
+        write(
+            temporary.path(),
+            "src/lib.rs",
+            b"#![forbid(unsafe_code)]\npub fn value() -> u8 { 1 }\n",
+        );
+        write(
+            temporary.path(),
+            "tools/check.py",
+            b"#!/usr/bin/env python3\nimport os\nos.system('printf python')\n",
+        );
+        write(
+            temporary.path(),
+            "tools/check.mjs",
+            b"#!/usr/bin/env node\nimport { exec } from 'node:child_process';\nexec('printf node');\n",
+        );
+
+        let inventory = scan(temporary.path()).unwrap();
+        assert!(inventory.errors.is_empty(), "{:#?}", inventory.errors);
+        assert_eq!(inventory.findings.len(), 2, "{:#?}", inventory.findings);
+        assert!(inventory.findings.iter().all(|finding| {
+            finding.kind == FindingKind::EmbeddedShell
+                && (finding.source == b"printf python" || finding.source == b"printf node")
+        }));
+    }
+
+    #[test]
+    fn an_unrecognized_executable_shebang_remains_an_inventory_blocker() {
+        let temporary = tempfile::tempdir().unwrap();
+        write(
+            temporary.path(),
+            "tools/custom",
+            b"#!/opt/project/bin/custom-language\nrun task\n",
+        );
+
+        let inventory = scan(temporary.path()).unwrap();
+        assert!(inventory.findings.is_empty());
+        assert_eq!(inventory.errors.len(), 1, "{:#?}", inventory.errors);
+        assert_eq!(inventory.errors[0].stage, "interpreter");
+        assert!(
+            inventory.errors[0]
+                .message
+                .contains("DESHELL_BLOCKER_UNKNOWN_INTERPRETER")
         );
     }
 
