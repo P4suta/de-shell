@@ -419,6 +419,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn snapshot_error(root: &Path) -> String {
         match private_snapshot(root) {
             Ok(_) => panic!("snapshot unexpectedly accepted {}", root.display()),
@@ -600,9 +601,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn snapshots_and_capture_reject_symlinks_non_regular_and_non_utf8_entries() {
-        use std::os::unix::ffi::OsStringExt as _;
-
+    fn snapshots_and_capture_reject_symlinks_and_non_regular_entries() {
         let source = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink("missing", source.path().join("link")).unwrap();
         assert!(snapshot_error(source.path()).contains("symlink"));
@@ -615,7 +614,14 @@ mod tests {
         assert!(snapshot_error(source.path()).contains("non-regular"));
         assert!(capture(source.path()).unwrap_err().contains("non-regular"));
         std::fs::remove_file(&fifo).unwrap();
+    }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn capture_rejects_non_utf8_entries() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let source = tempfile::tempdir().unwrap();
         let invalid = std::ffi::OsString::from_vec(vec![b'b', b'a', b'd', 0xff]);
         std::fs::write(source.path().join(invalid), b"bytes").unwrap();
         assert!(

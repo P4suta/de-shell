@@ -1432,7 +1432,9 @@ fn main() {
         assert!(ci.contains("mise run reference:setup"));
         assert!(ci.contains("mise run reference:build"));
         assert!(ci.contains("mise run reference:test"));
-        assert!(ci.contains("install_args: rust@1.98.0 actionlint@1.7.12 powershell@7.6.5"));
+        assert!(
+            ci.contains("install_args: rust@1.98.0 go@1.27.0 actionlint@1.7.12 powershell@7.6.5")
+        );
         assert!(ci.contains("install_args: opam@2.5.2"));
         assert!(ci.contains("install_args: rust@1.98.0 powershell@7.6.5 dagger@0.21.8"));
         assert!(ci.contains("mise run test:official-exporters"));
@@ -1566,6 +1568,95 @@ fn main() {
         assert!(mise.contains("actionlint .github/workflows/ci.yml .github/workflows/release.yml"));
         assert!(mise.contains("pipx:check-jsonschema"));
         assert!(mise.contains("scripts/validate-json-contracts.py"));
+    }
+
+    #[test]
+    fn release_signing_action_is_present_in_the_selected_action_allowlist() {
+        let root = repository_root();
+        let release = std::fs::read_to_string(root.join(".github/workflows/release.yml")).unwrap();
+        let selected: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(root.join(".github/settings/selected-actions.json")).unwrap(),
+        )
+        .unwrap();
+        let installer = "sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6";
+        assert!(release.contains(installer));
+        assert!(
+            selected["patterns_allowed"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|pattern| pattern == installer),
+            "the pinned release signing action must be executable under repository policy"
+        );
+    }
+
+    #[test]
+    fn ci_installs_the_exact_external_runtimes_exercised_by_the_test_suite() {
+        let root = repository_root();
+        let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
+        let release = std::fs::read_to_string(root.join(".github/workflows/release.yml")).unwrap();
+        let nightly = std::fs::read_to_string(root.join(".github/workflows/nightly.yml")).unwrap();
+        let installer_path = root.join("scripts/install-nushell.ps1");
+        let installer = std::fs::read_to_string(&installer_path).unwrap();
+
+        assert!(ci.matches("go@1.27.0").count() >= 2);
+        assert!(release.matches("go@1.27.0").count() >= 3);
+        for (name, workflow, minimum) in [
+            ("ci", ci.as_str(), 4),
+            ("release", release.as_str(), 3),
+            ("nightly", nightly.as_str(), 1),
+        ] {
+            assert!(
+                workflow.matches("scripts/install-nushell.ps1").count() >= minimum,
+                "{name} must provision pinned Nushell for every parser/test job"
+            );
+        }
+        for (asset, digest) in [
+            (
+                "nu-0.115.1-x86_64-unknown-linux-gnu.tar.gz",
+                "d11d825241f6504a3617c535fa725a9dd6d009c86d7b19fb3168b47635b9d8b0",
+            ),
+            (
+                "nu-0.115.1-x86_64-apple-darwin.tar.gz",
+                "0292f4b92af29cfe5d9c4b2ec06eeb325b705d1d6c19536a8bec2b75859b3485",
+            ),
+            (
+                "nu-0.115.1-aarch64-apple-darwin.tar.gz",
+                "2e6ed1eb043869ff05b5f2448a8c443e4d3a93557ba4303b21008a0523c96734",
+            ),
+            (
+                "nu-0.115.1-x86_64-pc-windows-msvc.zip",
+                "b83009cbc88021f4dc293c49320118886b78363f9a4bb14933d33c8803241f46",
+            ),
+            (
+                "nu-0.115.1-aarch64-pc-windows-msvc.zip",
+                "8f185bc965828208fc9824de32a2e65aa39fa59ebf0a3927dbd0bad1daeb24a1",
+            ),
+        ] {
+            assert!(installer.contains(asset), "installer omitted {asset}");
+            assert!(
+                installer.contains(digest),
+                "installer omitted digest for {asset}"
+            );
+        }
+        assert!(installer.contains("Get-FileHash"));
+        assert!(installer.contains("github.com/nushell/nushell/releases/download/0.115.1"));
+        assert!(installer.contains("GITHUB_PATH"));
+    }
+
+    #[test]
+    fn executable_corpus_fixtures_use_portable_system_paths() {
+        let root = repository_root();
+        for relative in [
+            "crates/deshell/src/cli.rs",
+            "crates/deshell/src/frontend.rs",
+        ] {
+            let source = std::fs::read_to_string(root.join(relative)).unwrap();
+            assert!(
+                !source.contains("/usr/bin/test"),
+                "{relative} contains a fixture path absent on macOS"
+            );
+        }
     }
 
     #[test]
@@ -1720,20 +1811,32 @@ fn main() {
             "ASan and UBSan must serialize resource-limit tests"
         );
         assert!(release.contains("nightly-2026-07-15"));
-        assert!(release.contains("cargo-fuzz@0.13.2"));
         let publish = &release[release.find("  publish:").unwrap()..];
         assert!(publish.contains("- dynamic-analysis"));
         let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
         assert!(ci.contains("fuzz-smoke:"));
         assert!(ci.contains("cargo fuzz run"));
         assert!(ci.contains("nightly-2026-07-15"));
-        assert!(ci.contains("cargo-fuzz@0.13.2"));
         assert!(ci.contains("- fuzz-smoke"));
         let nightly = std::fs::read_to_string(root.join(".github/workflows/nightly.yml")).unwrap();
         assert!(nightly.contains("schedule:"));
         assert!(nightly.contains("cargo fuzz run"));
         assert!(nightly.contains("nightly-2026-07-15"));
-        assert!(nightly.contains("cargo-fuzz@0.13.2"));
+        let install = "cargo install --locked --version 0.13.2 cargo-fuzz";
+        for (name, workflow) in [
+            ("release", release.as_str()),
+            ("ci", ci.as_str()),
+            ("nightly", nightly.as_str()),
+        ] {
+            assert!(
+                workflow.contains(install),
+                "{name} must install the exact cargo-fuzz crate through Cargo's checksummed registry"
+            );
+            assert!(
+                !workflow.contains("tool: cargo-fuzz"),
+                "{name} must not ask install-action for an unsupported tool"
+            );
+        }
         for target in ["frontend", "scanner", "protocol", "schema"] {
             assert!(
                 nightly.contains(&format!("fuzz/corpus/{target}")),

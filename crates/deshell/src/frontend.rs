@@ -3243,7 +3243,7 @@ mod tests {
             concat!(
                 "#!/usr/bin/env fish\n",
                 "command /usr/bin/printf '%s:%s\\n' \"$argv[1]\" \"$CORPUS_ENV\"\n",
-                "command /usr/bin/test \"$argv[1]\" = pass && command /usr/bin/printf '%s\\n' branch\n",
+                "command /bin/test \"$argv[1]\" = pass && command /usr/bin/printf '%s\\n' branch\n",
             )
             .as_bytes(),
             UnknownInterpreter::Reject,
@@ -3303,7 +3303,7 @@ mod tests {
             concat!(
                 "def main [value: string] {\n",
                 "  ^/usr/bin/printf '%s:%s\\n' $value $env.CORPUS_ENV\n",
-                "  ^/usr/bin/test $value '=' pass\n",
+                "  ^/bin/test $value '=' pass\n",
                 "  if $env.LAST_EXIT_CODE == 0 {\n",
                 "    ^/usr/bin/printf '%s\\n' branch\n",
                 "  } else {\n",

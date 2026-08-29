@@ -427,6 +427,7 @@ mod tests {
     use super::*;
     use std::fs;
 
+    #[cfg(unix)]
     fn request(argv: &[&str]) -> ProcessRequest {
         ProcessRequest {
             argv: argv.iter().map(|value| (*value).to_owned()).collect(),
@@ -436,6 +437,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn interpreter_pins() -> crate::config::InterpreterPins {
         crate::config::Lockfile::decode(&crate::config::Lockfile::default_text())
             .unwrap()

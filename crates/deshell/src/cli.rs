@@ -6064,7 +6064,7 @@ for line in sys.stdin:
         configure(
             directory.path(),
             "branch.sh",
-            b"#!/usr/bin/env bash\n/usr/bin/printf 'hello\\n' | /usr/bin/tr a-z A-Z\n/usr/bin/test \"$1\" = yes && /usr/bin/printf 'branch\\n'\n",
+            b"#!/usr/bin/env bash\n/usr/bin/printf 'hello\\n' | /usr/bin/tr a-z A-Z\n/bin/test \"$1\" = yes && /usr/bin/printf 'branch\\n'\n",
         );
         approve_oracle_inputs(directory.path());
         let default_path = directory.path().join(".deshell/scenarios/default.toml");

@@ -4701,12 +4701,22 @@ fn verification_build_environment(root: &Path, argv: &[String]) -> Vec<(String, 
                     .to_string_lossy()
                     .into_owned(),
             ),
+            (
+                "GOMODCACHE".into(),
+                root.join(".deshell/verification/go-mod-cache")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
             ("GOENV".into(), "off".into()),
             ("GOMAXPROCS".into(), "2".into()),
         ]
     } else {
         Vec::new()
     }
+}
+
+fn verification_validation_environment(root: &Path) -> Vec<(String, String)> {
+    verification_build_environment(root, &["go".into()])
 }
 
 fn verification_build_limits(
@@ -5243,18 +5253,10 @@ fn verify_validation_commands(
     crate::patch::apply_all(&retirement)?;
     require_shell_free_tree(workspace.path(), "validation")?;
     ensure_safe_directory(workspace.path(), ".deshell/verification")?;
-    let validation_environment = vec![
-        (
-            "GOCACHE".into(),
-            workspace
-                .path()
-                .join(".deshell/verification/go-cache")
-                .to_string_lossy()
-                .into_owned(),
-        ),
-        ("GOENV".into(), "off".into()),
-        ("GOMAXPROCS".into(), "2".into()),
-    ];
+    // A project-native validation entrypoint can transitively invoke the generated Go
+    // command (for example a rewritten Python call site), so the isolated Go caches
+    // belong to the validation cell rather than only commands whose argv starts with Go.
+    let validation_environment = verification_validation_environment(workspace.path());
     let mut output = Vec::new();
     for command in &plan.validation_commands {
         let outcome = execute_exact(
@@ -6182,7 +6184,7 @@ std::thread_local! {
     static FORCE_POST_SCAN_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn force_post_scan_failure_once() {
     FORCE_POST_SCAN_FAILURE.with(|flag| flag.set(true));
 }
@@ -6611,6 +6613,49 @@ fn archive_executable(_metadata: &std::fs::Metadata) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn go_build_environment_is_private_complete_and_not_applied_to_other_tools() {
+        let root = tempfile::tempdir().unwrap();
+        let environment = verification_build_environment(
+            root.path(),
+            &["go".into(), "build".into(), "./...".into()],
+        );
+        let values: BTreeMap<_, _> = environment.into_iter().collect();
+        assert_eq!(values.get("GOENV").map(String::as_str), Some("off"));
+        assert_eq!(values.get("GOMAXPROCS").map(String::as_str), Some("2"));
+        assert_eq!(
+            values.get("GOCACHE").map(String::as_str),
+            Some(
+                root.path()
+                    .join(".deshell/verification/go-cache")
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
+        assert_eq!(
+            values.get("GOMODCACHE").map(String::as_str),
+            Some(
+                root.path()
+                    .join(".deshell/verification/go-mod-cache")
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
+        assert!(verification_build_environment(root.path(), &["cargo".into()]).is_empty());
+        assert_eq!(
+            verification_validation_environment(root.path())
+                .into_iter()
+                .find(|(name, _)| name == "GOMODCACHE")
+                .map(|(_, value)| value),
+            Some(
+                root.path()
+                    .join(".deshell/verification/go-mod-cache")
+                    .to_string_lossy()
+                    .into_owned()
+            )
+        );
+    }
 
     fn signed_proposal(contents: Vec<u8>) -> Proposal {
         let digest = crate::digest::sha256(&contents);

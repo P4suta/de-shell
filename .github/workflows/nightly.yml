@@ -30,13 +30,14 @@ jobs:
         with:
           version: 2026.8.6
           cache: true
-          install_args: rust@nightly-2026-07-15
+          install_args: rust@nightly-2026-07-15 powershell@7.6.5
 
-      - name: Install checksum-verified cargo-fuzz
-        uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad # v2.85.10
-        with:
-          tool: cargo-fuzz@0.13.2
-          fallback: none
+      - name: Install checksum-pinned Nushell
+        shell: pwsh
+        run: ./scripts/install-nushell.ps1
+
+      - name: Install registry-checksummed cargo-fuzz
+        run: cargo install --locked --version 0.13.2 cargo-fuzz
 
       - name: Fuzz each boundary for fifteen minutes
         env:

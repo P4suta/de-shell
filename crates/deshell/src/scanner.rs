@@ -2710,7 +2710,7 @@ spawn(dynamicProgram, dynamicArguments);
                 .any(|error| error.stage == "interpreter")
         );
 
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         {
             use std::os::unix::ffi::OsStringExt as _;
             let invalid = std::ffi::OsString::from_vec(vec![b'b', b'a', b'd', 0xff]);

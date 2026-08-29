@@ -40,7 +40,11 @@ jobs:
         with:
           version: 2026.8.6
           cache: true
-          install_args: rust@1.98.0 actionlint@1.7.12 powershell@7.6.5
+          install_args: rust@1.98.0 go@1.27.0 actionlint@1.7.12 powershell@7.6.5
+
+      - name: Install checksum-pinned Nushell
+        shell: pwsh
+        run: ./scripts/install-nushell.ps1
 
       - name: Materialize mise Rust toolchain
         run: |
@@ -82,7 +86,11 @@ jobs:
         with:
           version: 2026.8.6
           cache: true
-          install_args: rust@1.98.0 pipx:check-jsonschema@0.38.0
+          install_args: rust@1.98.0 go@1.27.0 powershell@7.6.5 pipx:check-jsonschema@0.38.0
+
+      - name: Install checksum-pinned Nushell
+        shell: pwsh
+        run: ./scripts/install-nushell.ps1
 
       - name: Install coverage instrumentation
         run: rustup component add llvm-tools-preview
@@ -131,23 +139,8 @@ jobs:
         run: docker version
 
       - name: Install checksum-pinned Nushell
-        shell: bash
-        run: |
-          archive="$RUNNER_TEMP/nu-0.115.1-x86_64-unknown-linux-gnu.tar.gz"
-          install_root="$RUNNER_TEMP/nushell-0.115.1"
-          curl --fail --location --silent --show-error \
-            --output "$archive" \
-            https://github.com/nushell/nushell/releases/download/0.115.1/nu-0.115.1-x86_64-unknown-linux-gnu.tar.gz
-          echo 'd11d825241f6504a3617c535fa725a9dd6d009c86d7b19fb3168b47635b9d8b0  '"$archive" | sha256sum --check --strict
-          mkdir "$install_root"
-          tar --extract --gzip --file "$archive" --directory "$install_root"
-          nu_binary="$(find "$install_root" -type f -name nu -print -quit)"
-          if [ -z "$nu_binary" ]; then
-            echo 'Nushell archive did not contain nu' >&2
-            exit 1
-          fi
-          chmod +x "$nu_binary"
-          dirname "$nu_binary" >> "$GITHUB_PATH"
+        shell: pwsh
+        run: ./scripts/install-nushell.ps1
 
       - name: Validate and run CWL, Dagger, and Nushell artifacts with official tools
         run: mise run test:official-exporters
@@ -196,13 +189,14 @@ jobs:
         with:
           version: 2026.8.6
           cache: true
-          install_args: rust@nightly-2026-07-15
+          install_args: rust@nightly-2026-07-15 powershell@7.6.5
 
-      - name: Install checksum-verified cargo-fuzz
-        uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad # v2.85.10
-        with:
-          tool: cargo-fuzz@0.13.2
-          fallback: none
+      - name: Install checksum-pinned Nushell
+        shell: pwsh
+        run: ./scripts/install-nushell.ps1
+
+      - name: Install registry-checksummed cargo-fuzz
+        run: cargo install --locked --version 0.13.2 cargo-fuzz
 
       - name: Exercise every saved corpus under AddressSanitizer
         env:
