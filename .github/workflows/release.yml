@@ -75,7 +75,7 @@ jobs:
         run: ./scripts/install-nushell.ps1
 
       - name: Install Miri and Rust sources
-        run: rustup component add miri rust-src
+        run: rustup component add --toolchain nightly-2026-07-15 miri rust-src
 
       - name: Install registry-checksummed cargo-fuzz
         run: cargo install --locked --version 0.13.2 cargo-fuzz
@@ -85,23 +85,23 @@ jobs:
           ASAN_OPTIONS: detect_leaks=0
         shell: bash
         run: |
-          cargo fuzz run frontend fuzz/corpus/frontend -- -runs=512 -max_len=65536
-          cargo fuzz run scanner fuzz/corpus/scanner -- -runs=512 -max_len=65536
-          cargo fuzz run protocol fuzz/corpus/protocol -- -runs=512 -max_len=65536
-          cargo fuzz run schema fuzz/corpus/schema -- -runs=512 -max_len=65536
+          cargo +nightly-2026-07-15 fuzz run frontend fuzz/corpus/frontend -- -runs=512 -max_len=65536
+          cargo +nightly-2026-07-15 fuzz run scanner fuzz/corpus/scanner -- -runs=512 -max_len=65536
+          cargo +nightly-2026-07-15 fuzz run protocol fuzz/corpus/protocol -- -runs=512 -max_len=65536
+          cargo +nightly-2026-07-15 fuzz run schema fuzz/corpus/schema -- -runs=512 -max_len=65536
 
       - name: Interpret strict document decoding with Miri
         env:
           CARGO_TARGET_DIR: ${{ runner.temp }}/deshell-miri-target
           XDG_CACHE_HOME: ${{ runner.temp }}/deshell-miri-cache
-        run: cargo miri test -p deshell strict_json::tests::decodes_a_strict_document -- --exact
+        run: cargo +nightly-2026-07-15 miri test -p deshell strict_json::tests::decodes_a_strict_document -- --exact
 
       - name: Run the complete implementation under AddressSanitizer
         env:
           ASAN_OPTIONS: detect_leaks=0
           CARGO_TARGET_DIR: ${{ runner.temp }}/deshell-asan-target
           RUSTFLAGS: -Zsanitizer=address --cfg deshell_sanitizer_address
-        run: cargo test --locked -p deshell --target x86_64-unknown-linux-gnu -- --test-threads=1
+        run: cargo +nightly-2026-07-15 test --locked -p deshell --target x86_64-unknown-linux-gnu -- --test-threads=1
 
       - name: Run native parser code under UndefinedBehaviorSanitizer
         env:
@@ -115,7 +115,7 @@ jobs:
           CARGO_TARGET_DIR: ${{ runner.temp }}/deshell-ubsan-target
           RUSTFLAGS: -Clink-arg=-fsanitize=undefined --cfg deshell_sanitizer_undefined
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
-        run: cargo test --locked -p deshell --target x86_64-unknown-linux-gnu -- --test-threads=1
+        run: cargo +nightly-2026-07-15 test --locked -p deshell --target x86_64-unknown-linux-gnu -- --test-threads=1
 
   migration-e2e:
     name: Migration E2E (${{ matrix.interpreter }}, ${{ matrix.generator }})
@@ -238,7 +238,11 @@ jobs:
         with:
           version: 2026.8.6
           cache: true
-          install_args: rust@1.98.0
+          install_args: rust@1.98.0 go@1.27.0 powershell@7.6.5
+
+      - name: Install checksum-pinned Nushell
+        shell: pwsh
+        run: ./scripts/install-nushell.ps1
 
       - name: Install musl development tools
         if: runner.os == 'Linux'

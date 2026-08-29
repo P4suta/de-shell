@@ -2,6 +2,7 @@
 opam = "2.5.2"
 actionlint = "1.7.12"
 rust = "1.98.0"
+go = "1.27.0"
 powershell = "7.6.5"
 gh = "2.96.0"
 dagger = "0.21.8"

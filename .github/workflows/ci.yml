@@ -203,10 +203,10 @@ jobs:
           ASAN_OPTIONS: detect_leaks=0
         shell: bash
         run: |
-          cargo fuzz run frontend fuzz/corpus/frontend -- -runs=64 -max_len=65536
-          cargo fuzz run scanner fuzz/corpus/scanner -- -runs=64 -max_len=65536
-          cargo fuzz run protocol fuzz/corpus/protocol -- -runs=64 -max_len=65536
-          cargo fuzz run schema fuzz/corpus/schema -- -runs=64 -max_len=65536
+          cargo +nightly-2026-07-15 fuzz run frontend fuzz/corpus/frontend -- -runs=64 -max_len=65536
+          cargo +nightly-2026-07-15 fuzz run scanner fuzz/corpus/scanner -- -runs=64 -max_len=65536
+          cargo +nightly-2026-07-15 fuzz run protocol fuzz/corpus/protocol -- -runs=64 -max_len=65536
+          cargo +nightly-2026-07-15 fuzz run schema fuzz/corpus/schema -- -runs=64 -max_len=65536
 
   required-gate:
     name: Required gate

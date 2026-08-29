@@ -1596,14 +1596,36 @@ fn main() {
         let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
         let release = std::fs::read_to_string(root.join(".github/workflows/release.yml")).unwrap();
         let nightly = std::fs::read_to_string(root.join(".github/workflows/nightly.yml")).unwrap();
+        let mise = std::fs::read_to_string(root.join("mise.toml")).unwrap();
+        let mise_lock = std::fs::read_to_string(root.join("mise.lock")).unwrap();
         let installer_path = root.join("scripts/install-nushell.ps1");
         let installer = std::fs::read_to_string(&installer_path).unwrap();
 
         assert!(ci.matches("go@1.27.0").count() >= 2);
-        assert!(release.matches("go@1.27.0").count() >= 3);
+        assert!(release.matches("go@1.27.0").count() >= 4);
+        assert!(mise.contains("go = \"1.27.0\""));
+        assert!(mise_lock.contains("[[tools.go]]"));
+        assert!(mise_lock.contains("version = \"1.27.0\""));
+        for platform in [
+            "linux-arm64",
+            "linux-x64",
+            "macos-arm64",
+            "macos-x64",
+            "windows-arm64",
+            "windows-x64",
+        ] {
+            assert!(
+                mise_lock.contains(&format!("[tools.go.\"platforms.{platform}\"]")),
+                "mise.lock omitted the Go artifact for {platform}"
+            );
+            assert!(
+                mise_lock.contains(&format!("[tools.powershell.\"platforms.{platform}\"]")),
+                "mise.lock omitted the PowerShell artifact for {platform}"
+            );
+        }
         for (name, workflow, minimum) in [
             ("ci", ci.as_str(), 4),
-            ("release", release.as_str(), 3),
+            ("release", release.as_str(), 4),
             ("nightly", nightly.as_str(), 1),
         ] {
             assert!(
@@ -1615,6 +1637,10 @@ fn main() {
             (
                 "nu-0.115.1-x86_64-unknown-linux-gnu.tar.gz",
                 "d11d825241f6504a3617c535fa725a9dd6d009c86d7b19fb3168b47635b9d8b0",
+            ),
+            (
+                "nu-0.115.1-aarch64-unknown-linux-gnu.tar.gz",
+                "5c4a5bca0af5b070e903a68fa014cc24e6419d0ac9cec03a2948494b2d310e08",
             ),
             (
                 "nu-0.115.1-x86_64-apple-darwin.tar.gz",
@@ -1794,8 +1820,12 @@ fn main() {
         }
         let release = std::fs::read_to_string(root.join(".github/workflows/release.yml")).unwrap();
         assert!(release.contains("dynamic-analysis:"));
-        assert!(release.contains("cargo fuzz run"));
-        assert!(release.contains("cargo miri test"));
+        let nightly_fuzz = "cargo +nightly-2026-07-15 fuzz run";
+        assert!(release.contains(nightly_fuzz));
+        assert!(
+            release.contains("rustup component add --toolchain nightly-2026-07-15 miri rust-src")
+        );
+        assert!(release.contains("cargo +nightly-2026-07-15 miri test"));
         assert!(release.contains("-Zsanitizer=address"));
         assert!(release.contains("--cfg deshell_sanitizer_address"));
         assert!(release.contains("-fsanitize=undefined"));
@@ -1804,7 +1834,7 @@ fn main() {
         assert_eq!(
             release
                 .matches(
-                    "cargo test --locked -p deshell --target x86_64-unknown-linux-gnu -- --test-threads=1"
+                    "cargo +nightly-2026-07-15 test --locked -p deshell --target x86_64-unknown-linux-gnu -- --test-threads=1"
                 )
                 .count(),
             2,
@@ -1815,12 +1845,12 @@ fn main() {
         assert!(publish.contains("- dynamic-analysis"));
         let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
         assert!(ci.contains("fuzz-smoke:"));
-        assert!(ci.contains("cargo fuzz run"));
+        assert!(ci.contains(nightly_fuzz));
         assert!(ci.contains("nightly-2026-07-15"));
         assert!(ci.contains("- fuzz-smoke"));
         let nightly = std::fs::read_to_string(root.join(".github/workflows/nightly.yml")).unwrap();
         assert!(nightly.contains("schedule:"));
-        assert!(nightly.contains("cargo fuzz run"));
+        assert!(nightly.contains(nightly_fuzz));
         assert!(nightly.contains("nightly-2026-07-15"));
         let install = "cargo install --locked --version 0.13.2 cargo-fuzz";
         for (name, workflow) in [

@@ -44,10 +44,10 @@ jobs:
           ASAN_OPTIONS: detect_leaks=0
         shell: bash
         run: |
-          cargo fuzz run frontend fuzz/corpus/frontend -- -max_total_time=900 -timeout=10 -max_len=65536
-          cargo fuzz run scanner fuzz/corpus/scanner -- -max_total_time=900 -timeout=10 -max_len=65536
-          cargo fuzz run protocol fuzz/corpus/protocol -- -max_total_time=900 -timeout=10 -max_len=65536
-          cargo fuzz run schema fuzz/corpus/schema -- -max_total_time=900 -timeout=10 -max_len=65536
+          cargo +nightly-2026-07-15 fuzz run frontend fuzz/corpus/frontend -- -max_total_time=900 -timeout=10 -max_len=65536
+          cargo +nightly-2026-07-15 fuzz run scanner fuzz/corpus/scanner -- -max_total_time=900 -timeout=10 -max_len=65536
+          cargo +nightly-2026-07-15 fuzz run protocol fuzz/corpus/protocol -- -max_total_time=900 -timeout=10 -max_len=65536
+          cargo +nightly-2026-07-15 fuzz run schema fuzz/corpus/schema -- -max_total_time=900 -timeout=10 -max_len=65536
 
       - name: Preserve reproducer inputs
         if: ${{ failure() }}
