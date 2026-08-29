@@ -554,12 +554,14 @@ fn valid_environment_name(name: &str) -> bool {
 }
 
 fn add_essential_environment(command: &mut std::process::Command) {
-    add_essential_environment_with(command, |name| std::env::var_os(name));
+    let toolchain = msvc_toolchain_environment();
+    add_essential_environment_with(command, |name| std::env::var_os(name), toolchain);
 }
 
 fn add_essential_environment_with(
     command: &mut std::process::Command,
     lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
+    msvc_toolchain: &[(std::ffi::OsString, std::ffi::OsString)],
 ) {
     for name in [
         "PATH",
@@ -572,32 +574,77 @@ fn add_essential_environment_with(
         // these roots after env_clear; neither value carries user credentials.
         "ProgramFiles",
         "ProgramFiles(x86)",
-        // The MSVC developer environment exposes only toolchain paths and
-        // versions through these names. Preserve that narrow allowlist so
-        // rustc can select link.exe and the Windows SDK after env_clear
-        // without inheriting credentials or the user's profile.
-        "INCLUDE",
-        "LIB",
-        "LIBPATH",
-        "TEMP",
-        "TMP",
-        "UniversalCRTSdkDir",
-        "UCRTVersion",
-        "VCINSTALLDIR",
-        "VCToolsInstallDir",
-        "VCToolsVersion",
-        "VSCMD_ARG_HOST_ARCH",
-        "VSCMD_ARG_TGT_ARCH",
-        "VSINSTALLDIR",
-        "VisualStudioVersion",
-        "WindowsSdkDir",
-        "WindowsSDKVersion",
         "WINDIR",
     ] {
         if let Some(value) = lookup(name) {
             command.env(name, value);
         }
     }
+    // `find-msvc-tools` derives only these toolchain search paths. They are
+    // applied after the ambient allowlist so an unrelated Git `link.exe`
+    // cannot win PATH resolution after env_clear.
+    for expected in ["PATH", "LIB", "INCLUDE"] {
+        if let Some((_, value)) = msvc_toolchain
+            .iter()
+            .find(|(name, _)| name.to_string_lossy().eq_ignore_ascii_case(expected))
+        {
+            command.env(expected, value);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn msvc_toolchain_environment() -> &'static [(std::ffi::OsString, std::ffi::OsString)] {
+    // COM-based Visual Studio discovery is process-global and the toolchain is
+    // immutable for one deshell invocation. Resolve it once even when a plan
+    // launches many commands or pipeline stages.
+    static ENVIRONMENT: std::sync::OnceLock<Vec<(std::ffi::OsString, std::ffi::OsString)>> =
+        std::sync::OnceLock::new();
+    ENVIRONMENT.get_or_init(discover_msvc_toolchain_environment)
+}
+
+#[cfg(windows)]
+fn discover_msvc_toolchain_environment() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    let Some(tool) = find_msvc_tools::find_tool(std::env::consts::ARCH, "link.exe") else {
+        return Vec::new();
+    };
+    let mut entries = tool
+        .env()
+        .into_iter()
+        .filter(|(name, _)| {
+            matches!(
+                name.to_string_lossy().to_ascii_uppercase().as_str(),
+                "PATH" | "LIB" | "INCLUDE"
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    // A developer-command-prompt discovery may return no explicit PATH
+    // override. Always bind the exact discovered linker directory first.
+    let inherited_path = entries
+        .iter()
+        .find(|(name, _)| name.to_string_lossy().eq_ignore_ascii_case("PATH"))
+        .map(|(_, value)| value.clone())
+        .or_else(|| std::env::var_os("PATH"))
+        .unwrap_or_default();
+    let mut paths = tool
+        .path()
+        .parent()
+        .into_iter()
+        .map(Path::to_path_buf)
+        .collect::<Vec<_>>();
+    paths.extend(std::env::split_paths(&inherited_path));
+    if let Ok(path) = std::env::join_paths(paths) {
+        entries.retain(|(name, _)| !name.to_string_lossy().eq_ignore_ascii_case("PATH"));
+        entries.push(("PATH".into(), path));
+    }
+    entries
+}
+
+#[cfg(not(windows))]
+fn msvc_toolchain_environment() -> &'static [(std::ffi::OsString, std::ffi::OsString)] {
+    &[]
 }
 
 #[cfg(unix)]
@@ -763,7 +810,17 @@ mod tests {
     #[test]
     fn essential_environment_supports_isolated_msvc_discovery_without_ambient_secrets() {
         let mut command = std::process::Command::new("unused");
-        add_essential_environment_with(&mut command, |name| Some(format!("value:{name}").into()));
+        let toolchain = vec![
+            ("PATH".into(), "msvc:path".into()),
+            ("LIB".into(), "msvc:lib".into()),
+            ("INCLUDE".into(), "msvc:include".into()),
+            ("GITHUB_TOKEN".into(), "must-not-leak".into()),
+        ];
+        add_essential_environment_with(
+            &mut command,
+            |name| Some(format!("value:{name}").into()),
+            &toolchain,
+        );
         let environment = command
             .get_envs()
             .map(|(name, value)| {
@@ -782,28 +839,15 @@ mod tests {
             environment.get("ProgramFiles(x86)").map(String::as_str),
             Some("value:ProgramFiles(x86)")
         );
-        for name in [
-            "INCLUDE",
-            "LIB",
-            "LIBPATH",
-            "TEMP",
-            "TMP",
-            "UniversalCRTSdkDir",
-            "UCRTVersion",
-            "VCINSTALLDIR",
-            "VCToolsInstallDir",
-            "VCToolsVersion",
-            "VSCMD_ARG_HOST_ARCH",
-            "VSCMD_ARG_TGT_ARCH",
-            "VSINSTALLDIR",
-            "VisualStudioVersion",
-            "WindowsSdkDir",
-            "WindowsSDKVersion",
+        for (name, expected) in [
+            ("PATH", "msvc:path"),
+            ("LIB", "msvc:lib"),
+            ("INCLUDE", "msvc:include"),
         ] {
             assert_eq!(
                 environment.get(name).map(String::as_str),
-                Some(format!("value:{name}").as_str()),
-                "missing isolated MSVC environment entry {name}"
+                Some(expected),
+                "missing derived MSVC environment entry {name}"
             );
         }
         assert!(!environment.contains_key("USERPROFILE"));

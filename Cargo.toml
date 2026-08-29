@@ -33,6 +33,7 @@ repository = "https://github.com/P4suta/de-shell"
 [workspace.dependencies]
 base64 = "0.23.1"
 clap = { version = "4.6.6", features = ["derive"] }
+find-msvc-tools = "=0.1.11"
 libc = "0.2.189"
 regex = "1.13.1"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -63,6 +64,9 @@ tree-sitter-bash.workspace = true
 tree-sitter-batch.workspace = true
 tree-sitter-fish.workspace = true
 walkdir.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+find-msvc-tools.workspace = true
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage)", "cfg(deshell_sanitizer_address)", "cfg(deshell_sanitizer_undefined)"] }
