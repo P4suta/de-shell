@@ -92,8 +92,8 @@ jobs:
         shell: pwsh
         run: ./scripts/install-nushell.ps1
 
-      - name: Install coverage instrumentation
-        run: rustup component add llvm-tools-preview
+      - name: Install generation and coverage components
+        run: rustup component add clippy rustfmt llvm-tools-preview
 
       - name: Install checksum-verified security and coverage tools
         uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad # v2.85.10

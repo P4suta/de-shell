@@ -1578,6 +1578,33 @@ fn main() {
     }
 
     #[test]
+    fn schema_and_exporter_ci_follow_the_v1_init_and_generation_contracts() {
+        let root = repository_root();
+        let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
+        let security = ci
+            .find("security-and-coverage:")
+            .expect("CI must define the supply-chain and coverage job");
+        let security = &ci[security..];
+        let components = security
+            .find("rustup component add clippy rustfmt llvm-tools-preview")
+            .expect("schema and coverage CI must install official generator components");
+        let validator = security
+            .find("mise run test:schema-validator")
+            .expect("supply-chain CI must run the independent schema validator");
+        assert!(
+            components < validator,
+            "official Rust generation components must be installed before schema validation"
+        );
+
+        let exporters =
+            std::fs::read_to_string(root.join("scripts/validate-official-exporters.ps1")).unwrap();
+        assert!(
+            exporters.contains("'init', '--root', $validationRoot, '--target', 'rust'"),
+            "the marker-free exporter fixture must select an explicit v1 init target"
+        );
+    }
+
+    #[test]
     fn solo_repository_ruleset_keeps_pr_checks_without_independent_approval() {
         let root = repository_root();
         let ruleset: serde_json::Value = serde_json::from_slice(
