@@ -1,0 +1,25 @@
+{
+  "$id": "https://deshell.dev/contracts/generator-protocol/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "generator": {
+      "additionalProperties": false,
+      "properties": {
+        "capabilities": { "items": { "enum": ["rust", "go", "host", "agent"] }, "type": "array", "uniqueItems": true },
+        "digest": { "$ref": "#/$defs/pinnedDigest" },
+        "name": { "minLength": 1, "type": "string" },
+        "version": { "minLength": 1, "type": "string" }
+      },
+      "required": ["name", "version", "digest", "capabilities"],
+      "type": "object"
+    },
+    "max_frame_bytes": { "maximum": 4194304, "minimum": 1024, "type": "integer" },
+    "protocol": { "const": "deshell.generator.v1" },
+    "schema_version": { "const": 1 }
+  },
+  "required": ["schema_version", "protocol", "generator", "max_frame_bytes"],
+  "title": "de-shell Generator Protocol v1 handshake",
+  "type": "object",
+  "$defs": { "pinnedDigest": { "pattern": "^sha256:[0-9a-f]{64}$", "type": "string" } }
+}

@@ -1,0 +1,139 @@
+{
+  "$id": "https://deshell.dev/contracts/migration-evidence/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "approval_digests": { "items": { "$ref": "#/$defs/pinnedDigest" }, "minItems": 1, "type": "array", "uniqueItems": true },
+    "cell": { "minLength": 1, "type": "string" },
+    "checks": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "comparisons": {
+            "items": { "$ref": "#/$defs/comparison" },
+            "type": "array"
+          },
+          "covered_nodes": {
+            "items": { "pattern": "^[0-9a-f]{32}$", "type": "string" },
+            "type": "array",
+            "uniqueItems": true
+          },
+          "error": { "oneOf": [{ "minLength": 1, "type": "string" }, { "type": "null" }] },
+          "key": { "$ref": "#/$defs/key" },
+          "scenario": { "minLength": 1, "type": "string" },
+          "source": { "$ref": "#/$defs/location" },
+          "status": { "$ref": "#/$defs/status" }
+        },
+        "required": ["source", "scenario", "key", "status", "error", "covered_nodes", "comparisons"],
+        "type": "object"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "plan_digest": { "$ref": "#/$defs/digest" },
+    "repetitions": { "minimum": 2, "type": "integer" },
+    "schema_version": { "const": 1 },
+    "status": { "$ref": "#/$defs/status" },
+    "validation": {
+      "items": { "$ref": "#/$defs/validationEvidence" },
+      "type": "array"
+    }
+  },
+  "required": ["schema_version", "plan_digest", "approval_digests", "cell", "status", "repetitions", "checks", "validation"],
+  "title": "de-shell Migration Evidence v1",
+  "type": "object",
+  "$defs": {
+    "comparison": {
+      "additionalProperties": false,
+      "properties": {
+        "differences": { "items": { "minLength": 1, "type": "string" }, "type": "array" },
+        "ir": { "$ref": "#/$defs/observation" },
+        "original": { "$ref": "#/$defs/observation" },
+        "replacement": { "$ref": "#/$defs/observation" }
+      },
+      "required": ["original", "ir", "replacement", "differences"],
+      "type": "object"
+    },
+    "digest": { "pattern": "^[0-9a-f]{64}$", "type": "string" },
+    "fileChange": {
+      "additionalProperties": false,
+      "properties": {
+        "after_executable": { "oneOf": [{ "type": "boolean" }, { "type": "null" }] },
+        "after_sha256": { "oneOf": [{ "$ref": "#/$defs/digest" }, { "type": "null" }] },
+        "before_executable": { "oneOf": [{ "type": "boolean" }, { "type": "null" }] },
+        "before_sha256": { "oneOf": [{ "$ref": "#/$defs/digest" }, { "type": "null" }] },
+        "kind": { "enum": ["created", "modified", "removed"] },
+        "path": { "$ref": "#/$defs/path" }
+      },
+      "required": ["path", "kind", "before_sha256", "after_sha256", "before_executable", "after_executable"],
+      "type": "object"
+    },
+    "key": {
+      "additionalProperties": false,
+      "properties": {
+        "generator_digest": { "$ref": "#/$defs/digest" },
+        "ir_digest": { "$ref": "#/$defs/digest" },
+        "platform_fingerprint": { "$ref": "#/$defs/digest" },
+        "proposal_digest": { "$ref": "#/$defs/digest" },
+        "runtime_fingerprint": { "$ref": "#/$defs/digest" },
+        "scenario_digest": { "$ref": "#/$defs/digest" },
+        "source_digest": { "$ref": "#/$defs/digest" },
+        "toolchain_digest": { "$ref": "#/$defs/digest" }
+      },
+      "required": ["source_digest", "ir_digest", "proposal_digest", "generator_digest", "toolchain_digest", "scenario_digest", "platform_fingerprint", "runtime_fingerprint"],
+      "type": "object"
+    },
+    "location": {
+      "additionalProperties": false,
+      "properties": {
+        "end_byte": { "minimum": 0, "type": "integer" },
+        "path": { "$ref": "#/$defs/path" },
+        "start_byte": { "minimum": 0, "type": "integer" }
+      },
+      "required": ["path", "start_byte", "end_byte"],
+      "type": "object"
+    },
+    "observation": {
+      "additionalProperties": false,
+      "properties": {
+        "exit_code": { "type": "integer" },
+        "files": { "items": { "$ref": "#/$defs/fileChange" }, "type": "array" },
+        "network": { "items": { "$ref": "#/$defs/networkExchange" }, "type": "array" },
+        "signal": { "oneOf": [{ "type": "integer" }, { "type": "null" }] },
+        "stderr_base64": { "contentEncoding": "base64", "type": "string" },
+        "stdout_base64": { "contentEncoding": "base64", "type": "string" },
+        "timed_out": { "type": "boolean" }
+      },
+      "required": ["exit_code", "signal", "timed_out", "stdout_base64", "stderr_base64", "files", "network"],
+      "type": "object"
+    },
+    "networkExchange": {
+      "additionalProperties": false,
+      "properties": {
+        "method": { "minLength": 1, "type": "string" },
+        "request_body_sha256": { "$ref": "#/$defs/digest" },
+        "response_body_sha256": { "$ref": "#/$defs/digest" },
+        "sequence": { "minimum": 0, "type": "integer" },
+        "status": { "maximum": 599, "minimum": 100, "type": "integer" },
+        "uri": { "minLength": 1, "type": "string" }
+      },
+      "required": ["sequence", "method", "uri", "request_body_sha256", "status", "response_body_sha256"],
+      "type": "object"
+    },
+    "path": { "pattern": "^(?!/)(?!\\.{1,2}(?:/|$))(?!.*//)(?!.*\\/\\.{1,2}(?:/|$))(?!.*\\/$)[^\\\\:\\u0000]+$", "type": "string" },
+    "pinnedDigest": { "pattern": "^sha256:[0-9a-f]{64}$", "type": "string" },
+    "status": { "enum": ["verified", "different", "unavailable", "failed", "nondeterministic"] },
+    "validationEvidence": {
+      "additionalProperties": false,
+      "properties": {
+        "argv": { "items": { "type": "string" }, "minItems": 1, "type": "array" },
+        "exit_code": { "type": "integer" },
+        "name": { "minLength": 1, "type": "string" },
+        "stderr_digest": { "$ref": "#/$defs/digest" },
+        "stdout_digest": { "$ref": "#/$defs/digest" }
+      },
+      "required": ["name", "argv", "exit_code", "stdout_digest", "stderr_digest"],
+      "type": "object"
+    }
+  }
+}

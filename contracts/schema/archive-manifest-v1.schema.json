@@ -1,0 +1,37 @@
+{
+  "$id": "https://deshell.dev/contracts/archive-manifest/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "entries": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "archive_path": { "$ref": "#/$defs/path" },
+          "content_digest": { "$ref": "#/$defs/digest" },
+          "kind": { "enum": ["shell_file", "embedded_shell"] },
+          "original": { "$ref": "#/$defs/location" },
+          "plan_digest": { "$ref": "#/$defs/digest" }
+        },
+        "required": ["original", "plan_digest", "kind", "content_digest", "archive_path"],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "plan_digest": { "$ref": "#/$defs/digest" },
+    "schema_version": { "const": 1 }
+  },
+  "required": ["schema_version", "plan_digest", "entries"],
+  "title": "de-shell Archive Manifest v1",
+  "type": "object",
+  "$defs": {
+    "digest": { "pattern": "^[0-9a-f]{64}$", "type": "string" },
+    "location": {
+      "additionalProperties": false,
+      "properties": { "end_byte": { "minimum": 0, "type": "integer" }, "path": { "$ref": "#/$defs/path" }, "start_byte": { "minimum": 0, "type": "integer" } },
+      "required": ["path", "start_byte", "end_byte"],
+      "type": "object"
+    },
+    "path": { "pattern": "^(?!/)(?!\\.{1,2}(?:/|$))(?!.*//)(?!.*\\/\\.{1,2}(?:/|$))(?!.*\\/$)[^\\\\:\\u0000]+$", "type": "string" }
+  }
+}

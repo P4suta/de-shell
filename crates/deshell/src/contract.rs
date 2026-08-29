@@ -50,15 +50,35 @@ mod tests {
         assert!(guarantee_source.contains("residual"));
 
         let operations = serde_json::to_string(&schema["$defs"]["operation"]).unwrap();
-        assert!(operations.contains("interpreter_call"));
-
-        let value_types = serde_json::to_string(&schema["$defs"]["valueType"]).unwrap();
-        for forbidden in ["bytes", "list", "stream", "record"] {
+        for required in [
+            "expand_words",
+            "redirect",
+            "scope",
+            "set_environment",
+            "set_working_directory",
+            "spawn",
+            "wait",
+            "send_signal",
+            "file_metadata",
+            "file_set_metadata",
+            "clock_read",
+            "random_bytes",
+            "interpreter_call",
+        ] {
             assert!(
-                !value_types.contains(forbidden),
-                "unexpected public type {forbidden}"
+                operations.contains(required),
+                "missing typed effect operation {required}"
             );
         }
+
+        let value_types = serde_json::to_string(&schema["$defs"]["valueType"]).unwrap();
+        for required in ["bytes", "list", "record", "secret"] {
+            assert!(
+                value_types.contains(required),
+                "missing typed effect value {required}"
+            );
+        }
+        assert!(!value_types.contains("stream"));
     }
 
     #[test]
@@ -91,6 +111,23 @@ mod tests {
             "contracts/project-v1.md",
             "contracts/cli/cases.json",
             "contracts/schema/diagnostic-v1.schema.json",
+            "contracts/schema/approval-v1.schema.json",
+            "contracts/schema/migration-index-v1.schema.json",
+            "contracts/schema/init-report-v1.schema.json",
+            "contracts/schema/scan-report-v1.schema.json",
+            "contracts/schema/scenario-report-v1.schema.json",
+            "contracts/schema/matrix-report-v1.schema.json",
+            "contracts/schema/audit-report-v1.schema.json",
+            "contracts/schema/analyze-report-v1.schema.json",
+            "contracts/schema/check-report-v1.schema.json",
+            "contracts/schema/verify-report-v1.schema.json",
+            "contracts/schema/observe-report-v1.schema.json",
+            "contracts/schema/doctor-report-v1.schema.json",
+            "contracts/schema/explain-report-v1.schema.json",
+            "contracts/schema/rewrite-report-v1.schema.json",
+            "contracts/schema/modernize-report-v1.schema.json",
+            "contracts/schema/harden-report-v1.schema.json",
+            "contracts/schema/migrate-report-v1.schema.json",
             "contracts/schema/inventory-v1.schema.json",
             "contracts/schema/manifest-v1.schema.json",
             "contracts/schema/bundle-v1.schema.json",
@@ -100,11 +137,198 @@ mod tests {
             "contracts/schema/lock-v1.schema.json",
             "contracts/schema/replay-v1.schema.json",
             "contracts/schema/corpus-audit-v1.schema.json",
+            "contracts/schema/generator-protocol-v1.schema.json",
+            "contracts/schema/migration-request-v1.schema.json",
+            "contracts/schema/proposal-v1.schema.json",
+            "contracts/schema/migration-plan-v1.schema.json",
+            "contracts/schema/migration-evidence-v1.schema.json",
+            "contracts/schema/archive-manifest-v1.schema.json",
+            "contracts/schema/audit-finding-v1.schema.json",
+            "contracts/schema/harden-plan-v1.schema.json",
+            "contracts/schema/harden-approval-v1.schema.json",
+            "contracts/schema/harden-evidence-v1.schema.json",
             "contracts/golden/frontend-v1.json",
             "contracts/golden/transform-export-v1.json",
         ] {
             assert!(root().join(relative).is_file(), "missing {relative}");
         }
+    }
+
+    #[test]
+    fn migration_oracle_public_contract_and_cli_golden_are_synchronized() {
+        let readme = fs::read_to_string(root().join("contracts/README.md")).unwrap();
+        for required in [
+            "Migration Request v1",
+            "Proposal v1",
+            "Migration Plan v1",
+            "Migration Evidence v1",
+            "Archive Manifest v1",
+            "Audit Finding v1",
+        ] {
+            assert!(
+                readme.contains(required),
+                "contract README omitted {required}"
+            );
+        }
+        assert!(!readme.contains("no migration contract"));
+        assert!(readme.contains("production runtime"));
+        assert!(readme.contains("migration oracle"));
+        assert!(!readme.contains("behavioral compiler"));
+
+        let cli = json("contracts/cli/cases.json");
+        let cases = cli["cases"].as_array().unwrap();
+        for schema in [
+            "generator-protocol",
+            "migration-request",
+            "proposal",
+            "migration-plan",
+            "migration-evidence",
+            "archive-manifest",
+            "audit-finding",
+            "harden-plan",
+            "harden-approval",
+            "harden-evidence",
+        ] {
+            let argv = serde_json::json!(["schema", schema]);
+            assert!(
+                cases.iter().any(|case| case["argv"] == argv),
+                "CLI golden omitted schema {schema}"
+            );
+        }
+    }
+
+    #[test]
+    fn migration_oracle_schemas_are_strict_fresh_v1_contracts() {
+        for name in [
+            "generator-protocol",
+            "migration-request",
+            "proposal",
+            "migration-plan",
+            "migration-evidence",
+            "archive-manifest",
+            "audit-finding",
+        ] {
+            let schema = json(&format!("contracts/schema/{name}-v1.schema.json"));
+            assert_eq!(schema["additionalProperties"], false, "{name}");
+            assert_eq!(schema["properties"]["schema_version"]["const"], 1, "{name}");
+        }
+    }
+
+    #[test]
+    fn migration_schemas_match_the_persisted_aggregate_documents() {
+        let proposal = json("contracts/schema/proposal-v1.schema.json");
+        for field in ["build_argv", "run_argv"] {
+            assert!(
+                proposal["required"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|value| value == field),
+                "proposal schema omitted {field}"
+            );
+            assert_eq!(proposal["properties"][field]["minItems"], 1);
+        }
+        assert_eq!(
+            proposal["properties"]["patches"]["items"]["properties"]["permissions"]["maximum"],
+            0o777
+        );
+
+        let plan = json("contracts/schema/migration-plan-v1.schema.json");
+        assert_eq!(
+            plan["properties"]["required_scenarios"]["items"]["required"],
+            serde_json::json!(["name", "digest", "approval_digest"])
+        );
+        assert_eq!(
+            plan["properties"]["required_cells"]["items"]["required"],
+            serde_json::json!([
+                "id",
+                "platform_fingerprint",
+                "runtime_fingerprint",
+                "approval_digest"
+            ])
+        );
+        assert_eq!(
+            plan["properties"]["validation_commands"]["items"]["required"],
+            serde_json::json!(["name", "kind", "argv"])
+        );
+        assert_eq!(
+            plan["properties"]["validation_limits"]["$ref"],
+            "#/$defs/resourceLimits"
+        );
+        assert_eq!(
+            plan["properties"]["sources"]["items"]["properties"]["proposal_digest"]["oneOf"][1]["type"],
+            "null"
+        );
+        assert!(
+            plan["properties"]["sources"]["items"]["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|field| field == "interpreter")
+        );
+
+        let evidence = json("contracts/schema/migration-evidence-v1.schema.json");
+        assert!(evidence["properties"].get("checks").is_some());
+        assert!(evidence["properties"].get("validation").is_some());
+        assert!(evidence["properties"].get("comparison").is_none());
+        assert_eq!(
+            evidence["properties"]["checks"]["items"]["required"],
+            serde_json::json!([
+                "source",
+                "scenario",
+                "key",
+                "status",
+                "error",
+                "covered_nodes",
+                "comparisons"
+            ])
+        );
+        assert_eq!(
+            evidence["$defs"]["fileChange"]["required"],
+            serde_json::json!([
+                "path",
+                "kind",
+                "before_sha256",
+                "after_sha256",
+                "before_executable",
+                "after_executable"
+            ])
+        );
+
+        let archive = json("contracts/schema/archive-manifest-v1.schema.json");
+        assert!(
+            archive["properties"]["entries"]["items"]["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|field| field == "plan_digest")
+        );
+    }
+
+    #[test]
+    fn harden_schemas_keep_approval_and_evidence_separate_from_migration() {
+        for name in ["harden-plan", "harden-approval", "harden-evidence"] {
+            let schema = json(&format!("contracts/schema/{name}-v1.schema.json"));
+            assert_eq!(schema["additionalProperties"], false, "{name}");
+            assert_eq!(schema["properties"]["schema_version"]["const"], 1, "{name}");
+            assert!(
+                !serde_json::to_string(&schema)
+                    .unwrap()
+                    .contains("migration")
+            );
+        }
+        let plan = json("contracts/schema/harden-plan-v1.schema.json");
+        assert_eq!(plan["properties"]["kind"]["const"], "harden");
+        let approval = json("contracts/schema/harden-approval-v1.schema.json");
+        assert_eq!(approval["properties"]["approval"]["enum"][0], "draft");
+        let evidence = json("contracts/schema/harden-evidence-v1.schema.json");
+        assert!(
+            evidence["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|field| field == "approval_digest")
+        );
     }
 
     #[test]
@@ -168,6 +392,13 @@ mod tests {
             "lock",
             "replay",
             "corpus-audit",
+            "generator-protocol",
+            "migration-request",
+            "proposal",
+            "migration-plan",
+            "migration-evidence",
+            "archive-manifest",
+            "audit-finding",
         ] {
             let schema = json(&format!("contracts/schema/{name}-v1.schema.json"));
             let mut references = Vec::new();
@@ -358,6 +589,7 @@ mod tests {
             "unknown",
             "non_utf8",
             "int_boundary",
+            "pipeline",
         ];
         for required in required {
             assert!(

@@ -1,0 +1,78 @@
+{
+  "$id": "https://deshell.dev/contracts/harden-plan/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "blockers": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "code": { "pattern": "^DESHELL_HARDEN_[A-Z0-9_]+$", "type": "string" },
+          "end_byte": { "oneOf": [{ "minimum": 0, "type": "integer" }, { "type": "null" }] },
+          "message": { "minLength": 1, "type": "string" },
+          "path": { "oneOf": [{ "$ref": "#/$defs/path" }, { "type": "null" }] },
+          "start_byte": { "oneOf": [{ "minimum": 0, "type": "integer" }, { "type": "null" }] }
+        },
+        "required": ["code", "message", "path", "start_byte", "end_byte"],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "changes": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "after_digest": { "$ref": "#/$defs/digest" },
+          "before_digest": { "$ref": "#/$defs/digest" },
+          "path": { "$ref": "#/$defs/path" },
+          "permissions": { "maximum": 511, "minimum": 0, "type": "integer" },
+          "replacement_base64": { "contentEncoding": "base64", "type": "string" },
+          "rules": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "end_byte": { "minimum": 0, "type": "integer" },
+                "reason": { "minLength": 1, "type": "string" },
+                "rule": { "minLength": 1, "type": "string" },
+                "start_byte": { "minimum": 0, "type": "integer" }
+              },
+              "required": ["rule", "start_byte", "end_byte", "reason"],
+              "type": "object"
+            },
+            "minItems": 1,
+            "type": "array"
+          }
+        },
+        "required": ["path", "before_digest", "after_digest", "replacement_base64", "permissions", "rules"],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "kind": { "const": "harden" },
+    "plan_digest": { "$ref": "#/$defs/digest" },
+    "profile": { "const": "secure" },
+    "schema_version": { "const": 1 },
+    "validation_commands": {
+      "items": { "$ref": "#/$defs/command" },
+      "type": "array"
+    }
+  },
+  "required": ["schema_version", "kind", "plan_digest", "profile", "changes", "validation_commands", "blockers"],
+  "title": "de-shell Harden Plan v1",
+  "type": "object",
+  "$defs": {
+    "command": {
+      "additionalProperties": false,
+      "properties": {
+        "argv": { "$ref": "#/$defs/exactArgv" },
+        "kind": { "enum": ["build", "test"] },
+        "name": { "minLength": 1, "type": "string" }
+      },
+      "required": ["name", "kind", "argv"],
+      "type": "object"
+    },
+    "digest": { "pattern": "^[0-9a-f]{64}$", "type": "string" },
+    "exactArgv": { "items": { "type": "string" }, "minItems": 1, "type": "array" },
+    "path": { "minLength": 1, "pattern": "^(?!/)(?!\\.{1,2}(?:/|$))(?!.*//)(?!.*\\/\\.{1,2}(?:/|$))(?!.*\\/$)[^\\\\:\\u0000]+$", "type": "string" }
+  }
+}

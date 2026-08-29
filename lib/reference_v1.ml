@@ -20,6 +20,7 @@ type source_bytes = Utf8 of string | Base64 of string
 
 type operation =
   | Exec of text_expression list
+  | Pipeline of { nodes : node list; status : string }
   | Sequence of node list
   | Set_variable of {
       name : string;
@@ -134,6 +135,7 @@ let framed value = int64_be (Int64.of_int (String.length value)) ^ value
 
 let operation_name = function
   | Exec _ -> "exec"
+  | Pipeline _ -> "pipeline"
   | Sequence _ -> "sequence"
   | Set_variable _ -> "set_variable"
   | Interpreter_call _ -> "interpreter_call"
@@ -205,6 +207,13 @@ let rec json_node preorder node =
             ("argv", `List (List.map json_expression argv));
             ("environment", `List []);
             ("working_directory", `Null);
+          ]
+    | Pipeline { nodes; status } ->
+        `Assoc
+          [
+            ("type", `String "pipeline");
+            ("nodes", `List (List.map (json_node preorder) nodes));
+            ("status", `String status);
           ]
     | Sequence nodes ->
         `Assoc
@@ -446,6 +455,31 @@ let variables expressions =
   |> List.filter_map (function Variable name -> Some name | _ -> None)
   |> List.sort_uniq String.compare
 
+let pipeline_ranges source start_byte end_byte =
+  let ranges = ref [] in
+  let start = ref start_byte in
+  let quote = ref None in
+  let escaped = ref false in
+  for index = start_byte to end_byte - 1 do
+    let current = source.[index] in
+    if !escaped then escaped := false
+    else if current = '\\' && !quote <> Some '\'' then escaped := true
+    else
+      match !quote with
+      | Some delimiter when current = delimiter -> quote := None
+      | Some _ -> ()
+      | None when current = '\'' || current = '"' -> quote := Some current
+      | None when current = '|' ->
+          let first, last = trim_range source !start index in
+          if first = last then fail "pipeline operand is empty";
+          ranges := (first, last) :: !ranges;
+          start := index + 1
+      | None -> ()
+  done;
+  let first, last = trim_range source !start end_byte in
+  if first = last then fail "pipeline operand is empty";
+  List.rev ((first, last) :: !ranges)
+
 let lower_posix path source interpreter =
   let locals = ref [] in
   let environment = ref [] in
@@ -477,14 +511,31 @@ let lower_posix path source interpreter =
                   source = Some (source_span path source start_byte end_byte);
                 }
           | _ ->
-              let argv = tokenize line in
-              environment := variables argv @ !environment;
-              Some
+              let ranges = pipeline_ranges source start_byte end_byte in
+              let command_node (first, last) =
+                let command = String.sub source first (last - first) in
+                let argv = tokenize command in
+                environment := variables argv @ !environment;
                 {
                   operation = Exec argv;
                   guarantee = Native (interpreter ^ "-explicit-command-v1");
-                  source = Some (source_span path source start_byte end_byte);
-                })
+                  source = Some (source_span path source first last);
+                }
+              in
+              if List.length ranges = 1 then
+                Some (command_node (List.hd ranges))
+              else
+                Some
+                  {
+                    operation =
+                      Pipeline
+                        {
+                          nodes = List.map command_node ranges;
+                          status = "last";
+                        };
+                    guarantee = Native "posix-static-pipeline-v1";
+                    source = Some (source_span path source start_byte end_byte);
+                  })
   in
   match nodes with
   | [] -> fail "no lowerable POSIX operation"
@@ -533,6 +584,7 @@ let lower_literal path source interpreter =
     | _ -> List.hd ranges
   in
   let start_byte, end_byte = range in
+  let source_start_byte = if interpreter = "cmd" then 0 else start_byte in
   let line = String.sub source start_byte (end_byte - start_byte) in
   let argv =
     match interpreter with
@@ -567,7 +619,7 @@ let lower_literal path source interpreter =
       {
         operation = Exec argv;
         guarantee = Native basis;
-        source = Some (source_span path source start_byte end_byte);
+        source = Some (source_span path source source_start_byte end_byte);
       };
     environment = variables argv;
   }
@@ -666,7 +718,7 @@ let rec counts node =
     | Residual _ -> (0, 0, 1)
   in
   match node.operation with
-  | Sequence nodes ->
+  | Pipeline { nodes; _ } | Sequence nodes ->
       List.fold_left
         (fun (native, delegated, residual) node ->
           let next_native, next_delegated, next_residual = counts node in
@@ -843,7 +895,7 @@ let rec literal_commands node =
           argv;
       ]
   | Sequence nodes -> List.concat_map literal_commands nodes
-  | Set_variable _ | Interpreter_call _ | Opaque_capsule _ ->
+  | Pipeline _ | Set_variable _ | Interpreter_call _ | Opaque_capsule _ ->
       fail "strict reference exporter received %s"
         (operation_name node.operation)
 

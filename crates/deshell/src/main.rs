@@ -1,4 +1,6 @@
 mod agent_process;
+mod approval;
+mod audit;
 mod canonical_json;
 mod cli;
 mod config;
@@ -9,16 +11,20 @@ mod digest;
 mod evidence;
 mod exporter;
 mod frontend;
+mod harden;
 mod ir;
 #[allow(dead_code)]
 mod lab;
 mod local_backend;
+mod migration;
 mod patch;
 mod project;
 #[cfg(test)]
 mod properties;
 mod protocol;
 mod replay;
+mod replay_proxy;
+mod report;
 mod rewrite;
 mod runner;
 mod scanner;

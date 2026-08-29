@@ -211,6 +211,17 @@ pub(crate) fn execute(
     provider: Provider,
     request: &Request,
 ) -> Result<crate::runner::RunResult, ExecutionFailure> {
+    execute_with(provider, request, crate::agent_process::execute)
+}
+
+fn execute_with(
+    provider: Provider,
+    request: &Request,
+    transport: impl FnOnce(
+        &Path,
+        crate::agent_process::Request,
+    ) -> Result<crate::agent_process::Outcome, String>,
+) -> Result<crate::runner::RunResult, ExecutionFailure> {
     if !execution_connected(provider) {
         return Err(ExecutionFailure {
             kind: ExecutionFailureKind::Unavailable,
@@ -233,7 +244,7 @@ pub(crate) fn execute(
         .stdout_bytes
         .saturating_mul(2)
         .saturating_add(1024 * 1024);
-    let outcome = crate::agent_process::execute(
+    let outcome = transport(
         root,
         crate::agent_process::Request {
             argv: std::iter::once(specification.program)
@@ -1075,5 +1086,373 @@ mod tests {
         assert_eq!(spec.host_write, "deny");
         assert_eq!(spec.network, "deny");
         assert_eq!(spec.payload["method"], "observer.observe");
+    }
+
+    #[test]
+    fn observer_results_decode_raw_streams_and_file_changes_strictly() {
+        let response = |result: serde_json::Value| {
+            crate::canonical_json::canonical_bytes(&serde_json::json!({
+                "id": 1,
+                "jsonrpc": "2.0",
+                "result": result
+            }))
+            .unwrap()
+        };
+        let limits = crate::config::ResourceLimits::DEFAULT;
+        let valid = response(serde_json::json!({
+            "exit_code": 7,
+            "files": [
+                {"kind": "created", "path": "created"},
+                {"kind": "modified", "path": "modified"},
+                {"kind": "removed", "path": "removed"}
+            ],
+            "stderr_base64": "ZXJy",
+            "stdout_base64": "AP8="
+        }));
+        let result = decode_run_result(&valid, limits).unwrap();
+        assert_eq!(result.exit_code, 7);
+        assert_eq!(result.stdout, [0, 0xff]);
+        assert_eq!(result.stderr, b"err");
+        assert!(matches!(
+            result.trace[0],
+            crate::runner::TraceEvent::FileWrite { .. }
+        ));
+        assert!(matches!(
+            result.trace[1],
+            crate::runner::TraceEvent::FileWrite { .. }
+        ));
+        assert!(matches!(
+            result.trace[2],
+            crate::runner::TraceEvent::FileRemove { .. }
+        ));
+
+        for (label, result) in [
+            (
+                "exit_code",
+                serde_json::json!({"stderr_base64": "", "stdout_base64": ""}),
+            ),
+            (
+                "stdout_base64",
+                serde_json::json!({"exit_code": 0, "stderr_base64": ""}),
+            ),
+            (
+                "invalid base64",
+                serde_json::json!({"exit_code": 0, "stderr_base64": "", "stdout_base64": "?"}),
+            ),
+            (
+                "files array",
+                serde_json::json!({"exit_code": 0, "files": {}, "stderr_base64": "", "stdout_base64": ""}),
+            ),
+            (
+                "file object",
+                serde_json::json!({"exit_code": 0, "files": [1], "stderr_base64": "", "stdout_base64": ""}),
+            ),
+            (
+                "file path",
+                serde_json::json!({"exit_code": 0, "files": [{"kind": "created"}], "stderr_base64": "", "stdout_base64": ""}),
+            ),
+            (
+                "file kind",
+                serde_json::json!({"exit_code": 0, "files": [{"kind": "future", "path": "x"}], "stderr_base64": "", "stdout_base64": ""}),
+            ),
+        ] {
+            assert!(
+                decode_run_result(&response(result), limits).is_err(),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn connected_provider_execution_classifies_every_transport_outcome() {
+        let rpc_response = |result: serde_json::Value| {
+            crate::canonical_json::canonical_bytes(&serde_json::json!({
+                "id": 1,
+                "jsonrpc": "2.0",
+                "result": result
+            }))
+            .unwrap()
+        };
+        let success = rpc_response(serde_json::json!({
+            "exit_code": 0,
+            "stderr_base64": "",
+            "stdout_base64": "b2s="
+        }));
+        let observed = execute_with(
+            Provider::Podman,
+            &request(Network::Deny),
+            |root, process| {
+                assert_eq!(root, Path::new("/tmp/staged/workspace"));
+                assert_eq!(process.argv[0], "podman");
+                assert!(process.limits.timeout_ms > 5_000);
+                assert!(process.limits.memory_bytes > request(Network::Deny).limits.memory_bytes);
+                Ok(crate::agent_process::Outcome {
+                    exit_code: 0,
+                    stdout: success.clone(),
+                    stderr: vec![],
+                    timed_out: false,
+                    limit_exceeded: None,
+                    signal: None,
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(observed.stdout, b"ok");
+
+        let transport = execute_with(Provider::DockerRootless, &request(Network::Deny), |_, _| {
+            Err("spawn denied".into())
+        })
+        .unwrap_err();
+        assert_eq!(transport.kind, ExecutionFailureKind::Failed);
+        assert!(transport.message.contains("spawn denied"));
+
+        for (outcome, expected) in [
+            (
+                crate::agent_process::Outcome {
+                    exit_code: 0,
+                    stdout: vec![],
+                    stderr: vec![],
+                    timed_out: false,
+                    limit_exceeded: Some("stdout".into()),
+                    signal: None,
+                },
+                "limit_exceeded",
+            ),
+            (
+                crate::agent_process::Outcome {
+                    exit_code: 9,
+                    stdout: vec![],
+                    stderr: b"provider failed".to_vec(),
+                    timed_out: false,
+                    limit_exceeded: None,
+                    signal: None,
+                },
+                "provider failed",
+            ),
+            (
+                crate::agent_process::Outcome {
+                    exit_code: 0,
+                    stdout: b"not json".to_vec(),
+                    stderr: vec![],
+                    timed_out: false,
+                    limit_exceeded: None,
+                    signal: None,
+                },
+                "JSON",
+            ),
+        ] {
+            let error = execute_with(Provider::Podman, &request(Network::Deny), |_, _| {
+                Ok(outcome.clone())
+            })
+            .unwrap_err();
+            assert_eq!(error.kind, ExecutionFailureKind::Failed);
+            assert!(error.message.contains(expected), "{}", error.message);
+        }
+    }
+
+    #[test]
+    fn request_validation_rejects_every_unbounded_or_ambiguous_input() {
+        let mut valid_plan = request(Network::Deny);
+        valid_plan.target = Target::Plan {
+            entrypoint: "build.sh".into(),
+            node_id: Some("node".into()),
+        };
+        valid_plan.named_inputs = vec![("name".into(), "value".into())];
+        valid_plan.working_directory = Some("work".into());
+        assert!(validate_request(&valid_plan).is_ok());
+
+        let mut cases = Vec::new();
+        let mut value = valid_plan.clone();
+        value.target = Target::Plan {
+            entrypoint: "../escape".into(),
+            node_id: None,
+        };
+        cases.push(value);
+        let mut value = valid_plan.clone();
+        value.target = Target::Plan {
+            entrypoint: "build.sh".into(),
+            node_id: Some("".into()),
+        };
+        cases.push(value);
+        let mut value = valid_plan.clone();
+        value.target = Target::Original {
+            interpreter: "".into(),
+            script: "build.sh".into(),
+        };
+        cases.push(value);
+        let mut value = valid_plan.clone();
+        value.workspace.clear();
+        cases.push(value);
+        let mut value = valid_plan.clone();
+        value.arguments.push("nul\0value".into());
+        cases.push(value);
+        let mut value = valid_plan.clone();
+        value.working_directory = Some("../escape".into());
+        cases.push(value);
+        let mut value = valid_plan.clone();
+        value.environment = vec![("1BAD".into(), "x".into())];
+        cases.push(value);
+        let mut value = valid_plan.clone();
+        value.environment = vec![("MODE".into(), "a".into()), ("MODE".into(), "b".into())];
+        cases.push(value);
+        let mut value = valid_plan.clone();
+        value.named_inputs = vec![("".into(), "x".into())];
+        cases.push(value);
+        let mut value = valid_plan.clone();
+        value.named_inputs = vec![("name".into(), "a".into()), ("name".into(), "b".into())];
+        cases.push(value);
+        let mut value = valid_plan.clone();
+        value.fixtures = vec![crate::config::Fixture {
+            path: "../escape".into(),
+            contents: crate::config::BinaryData {
+                utf8: Some("value".into()),
+                base64: None,
+            },
+            executable: false,
+        }];
+        cases.push(value);
+        let mut value = valid_plan.clone();
+        value.network = Network::Replay {
+            proxy: "".into(),
+            tape: "tape".into(),
+        };
+        cases.push(value);
+        for (index, invalid) in cases.into_iter().enumerate() {
+            assert!(validate_request(&invalid).is_err(), "case {index}");
+        }
+    }
+
+    #[test]
+    fn provider_validation_and_launch_variants_are_exhaustive() {
+        for (platform, provider, probe, expected) in [
+            (
+                Platform::Linux,
+                Provider::Podman,
+                probe(&["podman"], &[], false),
+                true,
+            ),
+            (
+                Platform::Linux,
+                Provider::Podman,
+                probe(&[], &[], false),
+                false,
+            ),
+            (
+                Platform::Linux,
+                Provider::DockerRootless,
+                probe(&[], &[], false),
+                false,
+            ),
+            (
+                Platform::Linux,
+                Provider::DockerRootless,
+                probe(&["docker"], &[], true),
+                true,
+            ),
+            (
+                Platform::Windows,
+                Provider::WindowsSandbox,
+                probe(&[], &["Containers-DisposableClientVM"], false),
+                true,
+            ),
+            (
+                Platform::Windows,
+                Provider::HyperV,
+                probe(&[], &["Microsoft-Hyper-V-All"], false),
+                true,
+            ),
+            (
+                Platform::Macos,
+                Provider::VirtualizationFramework,
+                probe(&["deshell-vz-agent"], &[], false),
+                true,
+            ),
+            (
+                Platform::Macos,
+                Provider::WindowsSandbox,
+                probe(&[], &[], false),
+                false,
+            ),
+        ] {
+            assert_eq!(
+                validate_provider(platform, &probe, provider).is_ok(),
+                expected
+            );
+        }
+        assert!(select(Platform::Windows, &probe(&[], &[], false)).is_err());
+        assert!(select(Platform::Macos, &probe(&[], &[], false)).is_err());
+        assert!(matches!(
+            platform_of_host(),
+            Platform::Linux | Platform::Macos | Platform::Windows
+        ));
+
+        let mut replay = request(Network::Replay {
+            proxy: "http://proxy".into(),
+            tape: "tape".into(),
+        });
+        assert!(launch_spec(Provider::WindowsSandbox, &replay).is_err());
+        let LaunchSpec::AgentRequest(vz) =
+            launch_spec(Provider::VirtualizationFramework, &replay).unwrap()
+        else {
+            panic!("Virtualization.framework must use the agent request");
+        };
+        assert_eq!(vz.provider, "virtualization-framework");
+        assert_eq!(vz.network, "record-replay");
+        assert_eq!(vz.payload["params"]["network"], "record-replay");
+
+        replay.image = "latest".into();
+        let failure = execute(Provider::Podman, &replay).unwrap_err();
+        assert_eq!(failure.kind, ExecutionFailureKind::Unavailable);
+        let failure = execute(Provider::HyperV, &request(Network::Deny)).unwrap_err();
+        assert_eq!(failure.kind, ExecutionFailureKind::Unavailable);
+        assert!(failure.message.contains("not connected"));
+    }
+
+    #[test]
+    fn interpreter_argv_pins_noninteractive_forms_and_rejects_command_injection() {
+        for (interpreter, prefix) in [
+            ("sh", "sh"),
+            ("posix_sh", "sh"),
+            ("bash", "bash"),
+            ("zsh", "zsh"),
+            ("fish", "fish"),
+            ("nu", "nu"),
+            ("nushell", "nu"),
+            ("powershell", "pwsh"),
+            ("pwsh", "pwsh"),
+            ("cmd", "cmd.exe"),
+            ("deshell", "deshell"),
+            ("custom-runtime", "custom-runtime"),
+        ] {
+            let argv = interpreter_argv(interpreter, "build.script", &["arg".into()]).unwrap();
+            assert_eq!(argv[0], prefix);
+            assert_eq!(argv.last().unwrap(), "arg");
+        }
+        assert!(interpreter_argv("bad/value", "build", &[]).is_err());
+        assert_eq!(network_name(&Network::Deny), "deny");
+        assert_eq!(
+            network_name(&Network::Replay {
+                proxy: "proxy".into(),
+                tape: "tape".into(),
+            }),
+            "record-replay"
+        );
+        assert!(digest_pinned(&format!(
+            "registry/image@sha256:{}",
+            "a".repeat(64)
+        )));
+        for invalid in [
+            "",
+            "image:latest",
+            "@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--image@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "image@tag@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ] {
+            assert!(!digest_pinned(invalid), "{invalid}");
+        }
+        assert!(command_path("").is_none());
+        assert!(command_path("bad/path").is_none());
+        assert!(command_path("sh").is_some());
+        assert_eq!(xml_escape("<&>\"'"), "&lt;&amp;&gt;&quot;&apos;");
     }
 }

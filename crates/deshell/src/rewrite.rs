@@ -105,7 +105,7 @@ pub(crate) fn equivalent(path: &str, source: &str) -> RewriteResult {
 /// Returns byte ranges whose text is data rather than shell code. Conservatively
 /// protecting every heredoc body also protects quoted heredocs without trying to
 /// reinterpret expansion rules.
-fn protected_ranges(source: &str) -> Vec<(usize, usize)> {
+pub(crate) fn protected_ranges(source: &str) -> Vec<(usize, usize)> {
     let mut ranges = comment_ranges(source);
     let lines = source_lines(source);
     let mut pending: std::collections::VecDeque<(String, bool)> = std::collections::VecDeque::new();

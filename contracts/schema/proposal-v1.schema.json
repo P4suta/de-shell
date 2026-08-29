@@ -1,0 +1,70 @@
+{
+  "$id": "https://deshell.dev/contracts/proposal/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "build_argv": { "$ref": "#/$defs/exactArgv", "minItems": 1 },
+    "dependencies": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "ecosystem": { "enum": ["cargo", "go"] },
+          "name": { "minLength": 1, "type": "string" },
+          "version": { "minLength": 1, "type": "string" }
+        },
+        "required": ["ecosystem", "name", "version"],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "generator_digest": { "$ref": "#/$defs/pinnedDigest" },
+    "patches": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "content_base64": { "contentEncoding": "base64", "type": "string" },
+          "content_digest": { "$ref": "#/$defs/digest" },
+          "expected_digest": { "oneOf": [{ "$ref": "#/$defs/digest" }, { "type": "null" }] },
+          "operation": { "enum": ["create", "update"] },
+          "path": { "$ref": "#/$defs/path" },
+          "permissions": { "maximum": 511, "minimum": 0, "type": "integer" }
+        },
+        "required": ["operation", "path", "expected_digest", "content_base64", "content_digest", "permissions"],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "proposal_digest": { "$ref": "#/$defs/digest" },
+    "request_digest": { "$ref": "#/$defs/digest" },
+    "run_argv": { "$ref": "#/$defs/exactArgv", "minItems": 1 },
+    "schema_version": { "const": 1 },
+    "source_map": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "generated": { "$ref": "#/$defs/location" },
+          "ir_node": { "pattern": "^[0-9a-f]{32}$", "type": "string" }
+        },
+        "required": ["ir_node", "generated"],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "validation": { "items": { "$ref": "#/$defs/exactArgv" }, "type": "array" }
+  },
+  "required": ["schema_version", "proposal_digest", "request_digest", "generator_digest", "patches", "build_argv", "run_argv", "validation", "dependencies", "source_map"],
+  "title": "de-shell Generator Proposal v1",
+  "type": "object",
+  "$defs": {
+    "digest": { "pattern": "^[0-9a-f]{64}$", "type": "string" },
+    "exactArgv": { "items": { "type": "string" }, "minItems": 1, "type": "array" },
+    "location": {
+      "additionalProperties": false,
+      "properties": { "end_byte": { "minimum": 0, "type": "integer" }, "path": { "$ref": "#/$defs/path" }, "start_byte": { "minimum": 0, "type": "integer" } },
+      "required": ["path", "start_byte", "end_byte"],
+      "type": "object"
+    },
+    "path": { "pattern": "^(?!/)(?!\\.{1,2}(?:/|$))(?!.*//)(?!.*\\/\\.{1,2}(?:/|$))(?!.*\\/$)[^\\\\:\\u0000]+$", "type": "string" },
+    "pinnedDigest": { "pattern": "^sha256:[0-9a-f]{64}$", "type": "string" }
+  }
+}

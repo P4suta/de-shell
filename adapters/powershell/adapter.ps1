@@ -69,6 +69,7 @@ function Invoke-Parse {
     [ordered]@{
         valid = ($diagnostics.Count -eq 0)
         parser = 'System.Management.Automation.Language.Parser'
+        runtime_version = $PSVersionTable.PSVersion.ToString()
         ast_kind = $ast.GetType().FullName
         diagnostics = $diagnostics
         tokens = $encodedTokens

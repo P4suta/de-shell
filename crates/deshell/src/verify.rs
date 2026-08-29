@@ -248,18 +248,31 @@ fn visit_children<'a>(node: &'a Node, mut visit: impl FnMut(&'a Node)) {
                 visit(child);
             }
         }
-        Operation::Foreach { body, .. } | Operation::CaptureStdout { body, .. } => visit(body),
+        Operation::Foreach { body, .. }
+        | Operation::Scope { body, .. }
+        | Operation::Redirect { body, .. }
+        | Operation::CaptureStdout { body, .. }
+        | Operation::Spawn { body, .. } => visit(body),
         Operation::TryFinally { body, finalizer } => {
             visit(body);
             visit(finalizer);
         }
         Operation::Exec { .. }
+        | Operation::ExpandWords { .. }
         | Operation::TaskCall { .. }
         | Operation::SetVariable { .. }
+        | Operation::SetEnvironment { .. }
+        | Operation::SetWorkingDirectory { .. }
+        | Operation::Wait { .. }
+        | Operation::SendSignal { .. }
         | Operation::FileRead { .. }
         | Operation::FileWrite { .. }
         | Operation::FileRemove { .. }
+        | Operation::FileMetadata { .. }
+        | Operation::FileSetMetadata { .. }
         | Operation::NetworkRequest { .. }
+        | Operation::ClockRead { .. }
+        | Operation::RandomBytes { .. }
         | Operation::InterpreterCall { .. }
         | Operation::OpaqueCapsule { .. } => {}
     }

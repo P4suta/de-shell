@@ -26,6 +26,17 @@ pub(crate) struct Header {
     pub value: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NetworkExchange {
+    pub sequence: u64,
+    pub method: String,
+    pub uri: String,
+    pub request_body_sha256: String,
+    pub status: u16,
+    pub response_body_sha256: String,
+}
+
 impl ReplayStore {
     pub(crate) fn decode(input: &[u8]) -> Result<Self, Vec<String>> {
         let store: Self = crate::strict_json::decode(input).map_err(|error| vec![error])?;
@@ -56,17 +67,25 @@ impl ReplayStore {
         uri: &str,
         request_body: &[u8],
     ) -> Result<Vec<u8>, String> {
+        let entry = self.lookup_entry_prevalidated(method, uri, request_body)?;
+        entry.body.to_bytes()
+    }
+
+    pub(crate) fn lookup_entry_prevalidated(
+        &self,
+        method: &str,
+        uri: &str,
+        request_body: &[u8],
+    ) -> Result<&ReplayEntry, String> {
         let digest = crate::digest::sha256(request_body);
-        let entry = self
-            .entries
+        self.entries
             .iter()
             .find(|entry| {
                 entry.method == method && entry.uri == uri && entry.request_body_sha256 == digest
             })
             .ok_or_else(|| {
                 format!("network replay miss for {method} {uri} with request body sha256:{digest}")
-            })?;
-        entry.body.to_bytes()
+            })
     }
 
     fn validate(&self) -> Result<(), Vec<String>> {

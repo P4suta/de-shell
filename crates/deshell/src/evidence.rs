@@ -175,11 +175,31 @@ impl Evidence {
         }
         let mut node_ids = std::collections::BTreeSet::new();
         for node in &self.nodes {
+            if node.id.len() != 32
+                || !node
+                    .id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+            {
+                errors.push(format!("evidence node id is invalid: {}", node.id));
+            }
             if !node_ids.insert(&node.id) {
                 errors.push(format!("duplicate evidence node id: {}", node.id));
             }
             if node.operation.is_empty() {
                 errors.push(format!("evidence operation is empty for node {}", node.id));
+            }
+            match &node.guarantee {
+                Guarantee::Native { semantic_model } if semantic_model.trim().is_empty() => {
+                    errors.push("evidence native semantic model must not be empty".into())
+                }
+                Guarantee::Delegated { reason } if reason.trim().is_empty() => {
+                    errors.push("evidence delegation reason must not be empty".into());
+                }
+                Guarantee::Residual { reason } if reason.trim().is_empty() => {
+                    errors.push("evidence residual reason must not be empty".into());
+                }
+                _ => {}
             }
         }
         for observation in &self.observations {
@@ -236,18 +256,30 @@ fn collect_nodes(node: &crate::ir::Node, output: &mut Vec<NodeEvidence>) {
             }
         }
         crate::ir::Operation::Foreach { body, .. }
-        | crate::ir::Operation::CaptureStdout { body, .. } => collect_nodes(body, output),
+        | crate::ir::Operation::Scope { body, .. }
+        | crate::ir::Operation::Redirect { body, .. }
+        | crate::ir::Operation::CaptureStdout { body, .. }
+        | crate::ir::Operation::Spawn { body, .. } => collect_nodes(body, output),
         crate::ir::Operation::TryFinally { body, finalizer } => {
             collect_nodes(body, output);
             collect_nodes(finalizer, output);
         }
         crate::ir::Operation::Exec { .. }
+        | crate::ir::Operation::ExpandWords { .. }
         | crate::ir::Operation::TaskCall { .. }
         | crate::ir::Operation::SetVariable { .. }
+        | crate::ir::Operation::SetEnvironment { .. }
+        | crate::ir::Operation::SetWorkingDirectory { .. }
+        | crate::ir::Operation::Wait { .. }
+        | crate::ir::Operation::SendSignal { .. }
         | crate::ir::Operation::FileRead { .. }
         | crate::ir::Operation::FileWrite { .. }
         | crate::ir::Operation::FileRemove { .. }
+        | crate::ir::Operation::FileMetadata { .. }
+        | crate::ir::Operation::FileSetMetadata { .. }
         | crate::ir::Operation::NetworkRequest { .. }
+        | crate::ir::Operation::ClockRead { .. }
+        | crate::ir::Operation::RandomBytes { .. }
         | crate::ir::Operation::InterpreterCall { .. }
         | crate::ir::Operation::OpaqueCapsule { .. } => {}
     }
@@ -313,7 +345,7 @@ fn observation_result(observation: &ObservationEvidence) -> (ObservationStatus, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{Node, Operation, SourceSpan, Task, TextExpression};
+    use crate::ir::{MatchCase, Node, Operation, SourceSpan, Task, TextExpression};
 
     fn plan() -> Plan {
         let mut plan = Plan {
@@ -360,6 +392,28 @@ mod tests {
             scenario_digest: "1".repeat(64),
             provider_fingerprint: "2".repeat(64),
             runtime_lock_digest: "3".repeat(64),
+        }
+    }
+
+    fn native(operation: Operation) -> Node {
+        Node {
+            id: String::new(),
+            operation,
+            guarantee: Guarantee::Native {
+                semantic_model: "test-v1".into(),
+            },
+            source: None,
+        }
+    }
+
+    fn observation(status: ObservationStatus) -> ObservationEvidence {
+        ObservationEvidence {
+            scenario: "default".into(),
+            key: key(),
+            status,
+            provider: "test".into(),
+            reason: None,
+            digest: None,
         }
     }
 
@@ -446,5 +500,185 @@ mod tests {
         assert!(decoded.validate_against(&plan, b"true\n").is_err());
         let unknown = encoded.replacen("{\n", "{\n  \"future\": true,\n", 1);
         assert!(Evidence::decode(unknown.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn decoded_evidence_enforces_node_id_and_guarantee_schema_constraints() {
+        let plan = plan();
+        let mut evidence = Evidence::from_plan(&plan, "build.sh", b"true\n").unwrap();
+        evidence.nodes[0].id = "not-a-node-id".into();
+        evidence.nodes[0].guarantee = Guarantee::Native {
+            semantic_model: String::new(),
+        };
+        let encoded =
+            crate::canonical_json::pretty_bytes(&serde_json::to_value(evidence).unwrap()).unwrap();
+        let errors = Evidence::decode(&encoded).unwrap_err().join("; ");
+        assert!(errors.contains("evidence node id is invalid"), "{errors}");
+        assert!(
+            errors.contains("evidence native semantic model must not be empty"),
+            "{errors}"
+        );
+    }
+
+    #[test]
+    fn document_validation_aggregates_all_unbound_evidence_and_observation_fields() {
+        let plan = plan();
+        let mut evidence = Evidence::from_plan(&plan, "build.sh", b"true\n").unwrap();
+        evidence.schema_version = 2;
+        evidence.plan_digest = "bad".into();
+        evidence.source.path = r"scripts\build.sh".into();
+        evidence.source.content_hash = "bad".into();
+        evidence.nodes[0].id = "bad".into();
+        evidence.nodes[0].operation.clear();
+        evidence.nodes.push(evidence.nodes[0].clone());
+
+        let mut verified = observation(ObservationStatus::Verified);
+        verified.scenario.clear();
+        verified.provider.clear();
+        verified.key.scenario_digest = "bad".into();
+        verified.key.provider_fingerprint = "bad".into();
+        verified.key.runtime_lock_digest = "bad".into();
+        let mut different = observation(ObservationStatus::Different);
+        different.digest = Some("a".repeat(64));
+        let mut unavailable = observation(ObservationStatus::Unavailable);
+        unavailable.digest = Some("b".repeat(64));
+        let failed = observation(ObservationStatus::Failed);
+        let nondeterministic = observation(ObservationStatus::Nondeterministic);
+        evidence.observations = vec![verified, different, unavailable, failed, nondeterministic];
+
+        let errors = evidence.validate_document().unwrap_err().join("; ");
+        for expected in [
+            "schema_version",
+            "plan_digest",
+            "content_hash",
+            "not normalized",
+            "node id is invalid",
+            "duplicate evidence node id",
+            "operation is empty",
+            "scenario must not be empty",
+            "scenario_digest",
+            "provider_fingerprint",
+            "runtime_lock_digest",
+            "provider must not be empty",
+            "requires a SHA-256 digest",
+            "different observation requires a reason",
+            "requires a reason",
+            "must not have a digest",
+        ] {
+            assert!(
+                errors.contains(expected),
+                "missing {expected:?} in {errors}"
+            );
+        }
+
+        evidence.source.path = "../escape".into();
+        let errors = evidence.validate_document().unwrap_err().join("; ");
+        assert!(errors.contains("invalid evidence source path"), "{errors}");
+    }
+
+    #[test]
+    fn evidence_binding_and_append_cover_invalid_plans_paths_nodes_and_identical_results() {
+        let plan = plan();
+        assert!(
+            Evidence::from_plan(&plan, r"scripts\build.sh", b"true")
+                .unwrap_err()
+                .contains("not normalized")
+        );
+        let mut evidence = Evidence::from_plan(&plan, "build.sh", b"true\n").unwrap();
+        let verified = ObservationEvidence {
+            digest: Some("a".repeat(64)),
+            ..observation(ObservationStatus::Verified)
+        };
+        assert_eq!(
+            evidence.append_observation(verified.clone()).unwrap(),
+            ObservationStatus::Verified
+        );
+        assert_eq!(
+            evidence.append_observation(verified).unwrap(),
+            ObservationStatus::Verified
+        );
+        assert_eq!(evidence.observations.len(), 1);
+
+        let mut invalid_plan = plan.clone();
+        invalid_plan.generator.clear();
+        evidence.nodes.clear();
+        let errors = evidence
+            .validate_against(&invalid_plan, b"different")
+            .unwrap_err()
+            .join("; ");
+        assert!(errors.contains("generator must not be empty"), "{errors}");
+        assert!(errors.contains("source digest mismatch"), "{errors}");
+        assert!(errors.contains("node inventory"), "{errors}");
+    }
+
+    #[test]
+    fn node_inventory_walks_every_recursive_effect_shape_in_preorder() {
+        let leaf = || {
+            native(Operation::Exec {
+                argv: vec![TextExpression::literal("true")],
+                environment: vec![],
+                working_directory: None,
+            })
+        };
+        let root = native(Operation::Sequence {
+            nodes: vec![
+                native(Operation::Pipeline {
+                    nodes: vec![leaf()],
+                    status: crate::ir::PipelineStatus::Last,
+                }),
+                native(Operation::Parallel {
+                    nodes: vec![leaf()],
+                }),
+                native(Operation::Condition {
+                    predicate: Box::new(leaf()),
+                    if_true: Box::new(leaf()),
+                    if_false: Some(Box::new(leaf())),
+                }),
+                native(Operation::Match {
+                    value: TextExpression::literal("value"),
+                    cases: vec![MatchCase {
+                        pattern: TextExpression::literal("value"),
+                        body: leaf(),
+                    }],
+                    default: Some(Box::new(leaf())),
+                }),
+                native(Operation::Foreach {
+                    variable: "item".into(),
+                    items: vec![TextExpression::literal("one")],
+                    body: Box::new(leaf()),
+                }),
+                native(Operation::Scope {
+                    variables: vec![],
+                    environment: vec![],
+                    working_directory: None,
+                    body: Box::new(leaf()),
+                }),
+                native(Operation::Redirect {
+                    redirections: vec![],
+                    body: Box::new(leaf()),
+                }),
+                native(Operation::CaptureStdout {
+                    name: "output".into(),
+                    value_type: crate::ir::PrimitiveType::Text,
+                    body: Box::new(leaf()),
+                }),
+                native(Operation::Spawn {
+                    handle: "job".into(),
+                    body: Box::new(leaf()),
+                }),
+                native(Operation::TryFinally {
+                    body: Box::new(leaf()),
+                    finalizer: Box::new(leaf()),
+                }),
+            ],
+        });
+        let mut nodes = Vec::new();
+        collect_nodes(&root, &mut nodes);
+        assert_eq!(nodes.first().unwrap().operation, "sequence");
+        assert_eq!(
+            nodes.iter().filter(|node| node.operation == "exec").count(),
+            14
+        );
+        assert_eq!(nodes.len(), 25);
     }
 }

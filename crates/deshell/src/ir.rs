@@ -58,7 +58,17 @@ impl TextExpression {
 #[serde(untagged)]
 pub(crate) enum ValueType {
     Primitive(PrimitiveType),
+    List { list: Box<ValueType> },
+    Record { record: Vec<RecordField> },
     Secret { secret: Box<ValueType> },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecordField {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub value_type: ValueType,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -68,6 +78,7 @@ pub(crate) enum PrimitiveType {
     Bool,
     Int,
     Path,
+    Bytes,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -147,12 +158,83 @@ pub(crate) struct MatchCase {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case", tag = "kind")]
+pub(crate) enum FieldSplitting {
+    None,
+    PosixIfs { ifs: TextExpression },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum GlobBehavior {
+    Disabled,
+    LiteralIfNoMatch,
+    FailIfNoMatch,
+    DropIfNoMatch,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case", tag = "kind")]
+pub(crate) enum Redirection {
+    Read {
+        fd: u32,
+        path: TextExpression,
+    },
+    Write {
+        fd: u32,
+        path: TextExpression,
+        append: bool,
+    },
+    Duplicate {
+        fd: u32,
+        target_fd: u32,
+    },
+    Close {
+        fd: u32,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StateBinding {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub value_type: ValueType,
+    pub value: TextExpression,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct EnvironmentBinding {
+    pub name: String,
+    pub value: Option<TextExpression>,
+    pub secret: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ClockKind {
+    Realtime,
+    Monotonic,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "snake_case", tag = "type")]
 pub(crate) enum Operation {
     Exec {
         argv: Vec<TextExpression>,
         environment: Vec<NamedExpression>,
         working_directory: Option<TextExpression>,
+    },
+    ExpandWords {
+        name: String,
+        value: TextExpression,
+        field_splitting: FieldSplitting,
+        glob: GlobBehavior,
+    },
+    Redirect {
+        redirections: Vec<Redirection>,
+        body: Box<Node>,
     },
     Pipeline {
         nodes: Vec<Node>,
@@ -179,6 +261,12 @@ pub(crate) enum Operation {
         items: Vec<TextExpression>,
         body: Box<Node>,
     },
+    Scope {
+        variables: Vec<StateBinding>,
+        environment: Vec<EnvironmentBinding>,
+        working_directory: Option<TextExpression>,
+        body: Box<Node>,
+    },
     TryFinally {
         body: Box<Node>,
         finalizer: Box<Node>,
@@ -192,10 +280,30 @@ pub(crate) enum Operation {
         value_type: ValueType,
         value: TextExpression,
     },
+    SetEnvironment {
+        name: String,
+        value: Option<TextExpression>,
+        secret: bool,
+    },
+    SetWorkingDirectory {
+        path: TextExpression,
+    },
     CaptureStdout {
         name: String,
         value_type: PrimitiveType,
         body: Box<Node>,
+    },
+    Spawn {
+        handle: String,
+        body: Box<Node>,
+    },
+    Wait {
+        handle: String,
+    },
+    SendSignal {
+        handle: String,
+        signal: u32,
+        process_group: bool,
     },
     FileRead {
         path: TextExpression,
@@ -208,9 +316,28 @@ pub(crate) enum Operation {
     FileRemove {
         path: TextExpression,
     },
+    FileMetadata {
+        path: TextExpression,
+        output: String,
+        follow_symlinks: bool,
+    },
+    FileSetMetadata {
+        path: TextExpression,
+        permissions: Option<u32>,
+        executable: Option<bool>,
+        follow_symlinks: bool,
+    },
     NetworkRequest {
         method: TextExpression,
         uri: TextExpression,
+    },
+    ClockRead {
+        clock: ClockKind,
+        output: String,
+    },
+    RandomBytes {
+        output: String,
+        length: u64,
     },
     InterpreterCall {
         interpreter: String,
@@ -231,20 +358,32 @@ impl Operation {
     pub(crate) fn name(&self) -> &'static str {
         match self {
             Self::Exec { .. } => "exec",
+            Self::ExpandWords { .. } => "expand_words",
+            Self::Redirect { .. } => "redirect",
             Self::Pipeline { .. } => "pipeline",
             Self::Sequence { .. } => "sequence",
             Self::Parallel { .. } => "parallel",
             Self::Condition { .. } => "condition",
             Self::Match { .. } => "match",
             Self::Foreach { .. } => "foreach",
+            Self::Scope { .. } => "scope",
             Self::TryFinally { .. } => "try_finally",
             Self::TaskCall { .. } => "task_call",
             Self::SetVariable { .. } => "set_variable",
+            Self::SetEnvironment { .. } => "set_environment",
+            Self::SetWorkingDirectory { .. } => "set_working_directory",
             Self::CaptureStdout { .. } => "capture_stdout",
+            Self::Spawn { .. } => "spawn",
+            Self::Wait { .. } => "wait",
+            Self::SendSignal { .. } => "send_signal",
             Self::FileRead { .. } => "file_read",
             Self::FileWrite { .. } => "file_write",
             Self::FileRemove { .. } => "file_remove",
+            Self::FileMetadata { .. } => "file_metadata",
+            Self::FileSetMetadata { .. } => "file_set_metadata",
             Self::NetworkRequest { .. } => "network_request",
+            Self::ClockRead { .. } => "clock_read",
+            Self::RandomBytes { .. } => "random_bytes",
             Self::InterpreterCall { .. } => "interpreter_call",
             Self::OpaqueCapsule { .. } => "opaque_capsule",
         }
@@ -512,18 +651,31 @@ fn visit_children_mut<E>(
                 visit(node)?;
             }
         }
-        Operation::Foreach { body, .. } | Operation::CaptureStdout { body, .. } => visit(body)?,
+        Operation::Foreach { body, .. }
+        | Operation::Scope { body, .. }
+        | Operation::Redirect { body, .. }
+        | Operation::CaptureStdout { body, .. }
+        | Operation::Spawn { body, .. } => visit(body)?,
         Operation::TryFinally { body, finalizer } => {
             visit(body)?;
             visit(finalizer)?;
         }
         Operation::Exec { .. }
+        | Operation::ExpandWords { .. }
         | Operation::TaskCall { .. }
         | Operation::SetVariable { .. }
+        | Operation::SetEnvironment { .. }
+        | Operation::SetWorkingDirectory { .. }
+        | Operation::Wait { .. }
+        | Operation::SendSignal { .. }
         | Operation::FileRead { .. }
         | Operation::FileWrite { .. }
         | Operation::FileRemove { .. }
+        | Operation::FileMetadata { .. }
+        | Operation::FileSetMetadata { .. }
         | Operation::NetworkRequest { .. }
+        | Operation::ClockRead { .. }
+        | Operation::RandomBytes { .. }
         | Operation::InterpreterCall { .. }
         | Operation::OpaqueCapsule { .. } => {}
     }
@@ -560,6 +712,7 @@ fn validate_task<'a>(
     );
     for binding in task.inputs.iter().chain(&task.outputs) {
         require_nonempty("binding name", &binding.name, errors);
+        validate_value_type(&binding.value_type, 0, errors);
     }
     for name in &task.environment {
         if !valid_identifier(name) {
@@ -734,6 +887,47 @@ fn validate_node<'a>(
                 expression(directory, errors);
             }
         }
+        Operation::ExpandWords {
+            name,
+            value,
+            field_splitting,
+            ..
+        } => {
+            if !valid_identifier(name) {
+                errors.push(format!("expanded word binding is invalid: {name}"));
+            }
+            expression(value, errors);
+            if let FieldSplitting::PosixIfs { ifs } = field_splitting {
+                expression(ifs, errors);
+            }
+        }
+        Operation::Redirect { redirections, body } => {
+            if redirections.is_empty() {
+                errors.push("redirect must contain at least one ordered redirection".into());
+            }
+            for redirection in redirections {
+                match redirection {
+                    Redirection::Read { fd, path } | Redirection::Write { fd, path, .. } => {
+                        if *fd > 1024 {
+                            errors.push(format!("redirection file descriptor is too large: {fd}"));
+                        }
+                        expression(path, errors);
+                    }
+                    Redirection::Duplicate { fd, target_fd } => {
+                        if *fd > 1024 || *target_fd > 1024 {
+                            errors
+                                .push("redirection duplicate file descriptor is too large".into());
+                        }
+                    }
+                    Redirection::Close { fd } => {
+                        if *fd > 1024 {
+                            errors.push(format!("redirection file descriptor is too large: {fd}"));
+                        }
+                    }
+                }
+            }
+            validate_node(body, inputs, task_table, seen_ids, preorder, errors);
+        }
         Operation::Pipeline { nodes, .. } | Operation::Parallel { nodes } => {
             if nodes.is_empty() {
                 errors.push(format!(
@@ -803,6 +997,45 @@ fn validate_node<'a>(
             }
             validate_node(body, inputs, task_table, seen_ids, preorder, errors);
         }
+        Operation::Scope {
+            variables,
+            environment,
+            working_directory,
+            body,
+        } => {
+            duplicate_strings(
+                "scope variable",
+                variables.iter().map(|binding| binding.name.as_str()),
+                errors,
+            );
+            for binding in variables {
+                if !valid_identifier(&binding.name) {
+                    errors.push(format!("scope variable is invalid: {}", binding.name));
+                }
+                validate_value_type(&binding.value_type, 0, errors);
+                expression(&binding.value, errors);
+            }
+            duplicate_strings(
+                "scope environment",
+                environment.iter().map(|binding| binding.name.as_str()),
+                errors,
+            );
+            for binding in environment {
+                if !valid_identifier(&binding.name) {
+                    errors.push(format!(
+                        "scope environment name is invalid: {}",
+                        binding.name
+                    ));
+                }
+                if let Some(value) = &binding.value {
+                    expression(value, errors);
+                }
+            }
+            if let Some(directory) = working_directory {
+                expression(directory, errors);
+            }
+            validate_node(body, inputs, task_table, seen_ids, preorder, errors);
+        }
         Operation::TryFinally { body, finalizer } => {
             if contains_state_mutation(body) || contains_state_mutation(finalizer) {
                 errors.push("try/finally state mutation is undefined across failure paths".into());
@@ -836,12 +1069,26 @@ fn validate_node<'a>(
                 errors.push(format!("task not found: {task}"));
             }
         }
-        Operation::SetVariable { name, value, .. } => {
+        Operation::SetVariable {
+            name,
+            value_type,
+            value,
+        } => {
             if !valid_identifier(name) {
                 errors.push(format!("runtime variable name is invalid: {name}"));
             }
+            validate_value_type(value_type, 0, errors);
             expression(value, errors);
         }
+        Operation::SetEnvironment { name, value, .. } => {
+            if !valid_identifier(name) {
+                errors.push(format!("runtime environment name is invalid: {name}"));
+            }
+            if let Some(value) = value {
+                expression(value, errors);
+            }
+        }
+        Operation::SetWorkingDirectory { path } => expression(path, errors),
         Operation::CaptureStdout {
             name,
             value_type,
@@ -855,14 +1102,69 @@ fn validate_node<'a>(
             }
             validate_node(body, inputs, task_table, seen_ids, preorder, errors);
         }
+        Operation::Spawn { handle, body } => {
+            if !valid_identifier(handle) {
+                errors.push(format!("spawn handle is invalid: {handle}"));
+            }
+            if contains_state_mutation(body) {
+                errors.push("spawned state mutation is undefined".into());
+            }
+            validate_node(body, inputs, task_table, seen_ids, preorder, errors);
+        }
+        Operation::Wait { handle } => {
+            if !valid_identifier(handle) {
+                errors.push(format!("wait handle is invalid: {handle}"));
+            }
+        }
+        Operation::SendSignal { handle, signal, .. } => {
+            if !valid_identifier(handle) {
+                errors.push(format!("signal handle is invalid: {handle}"));
+            }
+            if !(1..=64).contains(signal) {
+                errors.push(format!("signal number is outside 1..64: {signal}"));
+            }
+        }
         Operation::FileRead { path } | Operation::FileRemove { path } => expression(path, errors),
         Operation::FileWrite { path, contents, .. } => {
             expression(path, errors);
             expression(contents, errors);
         }
+        Operation::FileMetadata { path, output, .. } => {
+            expression(path, errors);
+            if !valid_identifier(output) {
+                errors.push(format!("file metadata output is invalid: {output}"));
+            }
+        }
+        Operation::FileSetMetadata {
+            path,
+            permissions,
+            executable,
+            ..
+        } => {
+            expression(path, errors);
+            if permissions.is_none() && executable.is_none() {
+                errors.push("file_set_metadata must change permissions or executable state".into());
+            }
+            if permissions.is_some_and(|mode| mode > 0o777) {
+                errors.push("file_set_metadata permissions exceed 0777".into());
+            }
+        }
         Operation::NetworkRequest { method, uri } => {
             expression(method, errors);
             expression(uri, errors);
+        }
+        Operation::ClockRead { output, .. } => {
+            if !valid_identifier(output) {
+                errors.push(format!("clock output is invalid: {output}"));
+            }
+        }
+        Operation::RandomBytes { output, length } => {
+            if !valid_identifier(output) {
+                errors.push(format!("random output is invalid: {output}"));
+            }
+            if *length == 0 || *length > 1024 * 1024 {
+                errors.push("random_bytes length must be between 1 and 1048576".into());
+            }
         }
         Operation::InterpreterCall {
             interpreter,
@@ -923,7 +1225,16 @@ fn validate_node<'a>(
 
 fn contains_state_mutation(node: &Node) -> bool {
     match &node.operation {
-        Operation::SetVariable { .. } | Operation::CaptureStdout { .. } => true,
+        Operation::ExpandWords { .. }
+        | Operation::SetVariable { .. }
+        | Operation::SetEnvironment { .. }
+        | Operation::SetWorkingDirectory { .. }
+        | Operation::CaptureStdout { .. }
+        | Operation::Wait { .. }
+        | Operation::SendSignal { .. }
+        | Operation::FileMetadata { .. }
+        | Operation::ClockRead { .. }
+        | Operation::RandomBytes { .. } => true,
         Operation::Pipeline { nodes, .. }
         | Operation::Sequence { nodes }
         | Operation::Parallel { nodes } => nodes.iter().any(contains_state_mutation),
@@ -940,7 +1251,10 @@ fn contains_state_mutation(node: &Node) -> bool {
             cases.iter().any(|case| contains_state_mutation(&case.body))
                 || default.as_deref().is_some_and(contains_state_mutation)
         }
-        Operation::Foreach { body, .. } => contains_state_mutation(body),
+        Operation::Foreach { body, .. }
+        | Operation::Scope { body, .. }
+        | Operation::Redirect { body, .. }
+        | Operation::Spawn { body, .. } => contains_state_mutation(body),
         Operation::TryFinally { body, finalizer } => {
             contains_state_mutation(body) || contains_state_mutation(finalizer)
         }
@@ -949,6 +1263,7 @@ fn contains_state_mutation(node: &Node) -> bool {
         | Operation::FileRead { .. }
         | Operation::FileWrite { .. }
         | Operation::FileRemove { .. }
+        | Operation::FileSetMetadata { .. }
         | Operation::NetworkRequest { .. }
         | Operation::InterpreterCall { .. }
         | Operation::OpaqueCapsule { .. } => false,
@@ -1023,6 +1338,34 @@ fn valid_pin(value: &str) -> bool {
     value
         .strip_prefix("sha256:")
         .is_some_and(crate::digest::valid_sha256)
+}
+
+fn validate_value_type(value: &ValueType, depth: usize, errors: &mut Vec<String>) {
+    if depth >= 32 {
+        errors.push("value type nesting exceeds 32 levels".into());
+        return;
+    }
+    match value {
+        ValueType::Primitive(_) => {}
+        ValueType::List { list } | ValueType::Secret { secret: list } => {
+            validate_value_type(list, depth + 1, errors);
+        }
+        ValueType::Record { record } => {
+            if record.is_empty() {
+                errors.push("record value type must contain at least one field".into());
+            }
+            let mut names = BTreeSet::new();
+            for field in record {
+                if !valid_identifier(&field.name) {
+                    errors.push(format!("record field name is invalid: {}", field.name));
+                }
+                if !names.insert(field.name.as_str()) {
+                    errors.push(format!("duplicate record field: {}", field.name));
+                }
+                validate_value_type(&field.value_type, depth + 1, errors);
+            }
+        }
+    }
 }
 
 fn require_nonempty(label: &str, value: &str, errors: &mut Vec<String>) {
@@ -1102,6 +1445,47 @@ mod tests {
         }
     }
 
+    fn native(operation: Operation) -> Node {
+        Node {
+            id: String::new(),
+            operation,
+            guarantee: Guarantee::Native {
+                semantic_model: "test-v1".into(),
+            },
+            source: None,
+        }
+    }
+
+    fn delegated(operation: Operation) -> Node {
+        Node {
+            id: String::new(),
+            operation,
+            guarantee: Guarantee::Delegated {
+                reason: "test delegation".into(),
+            },
+            source: None,
+        }
+    }
+
+    fn residual(operation: Operation) -> Node {
+        Node {
+            id: String::new(),
+            operation,
+            guarantee: Guarantee::Residual {
+                reason: "test residual".into(),
+            },
+            source: None,
+        }
+    }
+
+    fn exec() -> Node {
+        native(Operation::Exec {
+            argv: vec![TextExpression::literal("true")],
+            environment: vec![],
+            working_directory: None,
+        })
+    }
+
     #[test]
     fn expression_evaluation_never_reparses_expanded_text() {
         let expression = expression(vec![
@@ -1176,6 +1560,172 @@ mod tests {
     }
 
     #[test]
+    fn bytes_list_record_and_secret_types_round_trip_and_validate_recursively() {
+        let mut plan = sample_plan();
+        plan.tasks[0].inputs[0].value_type = ValueType::Secret {
+            secret: Box::new(ValueType::List {
+                list: Box::new(ValueType::Record {
+                    record: vec![RecordField {
+                        name: "payload".into(),
+                        value_type: ValueType::Primitive(PrimitiveType::Bytes),
+                    }],
+                }),
+            }),
+        };
+        plan.assign_node_ids().unwrap();
+        let encoded = plan.encode_pretty().unwrap();
+        assert_eq!(Plan::decode(&encoded).unwrap(), plan);
+
+        let ValueType::Secret { secret } = &mut plan.tasks[0].inputs[0].value_type else {
+            unreachable!()
+        };
+        let ValueType::List { list } = secret.as_mut() else {
+            unreachable!()
+        };
+        let ValueType::Record { record } = list.as_mut() else {
+            unreachable!()
+        };
+        record.push(record[0].clone());
+        assert!(
+            plan.validate()
+                .unwrap_err()
+                .iter()
+                .any(|error| error == "duplicate record field: payload")
+        );
+    }
+
+    #[test]
+    fn effect_algebra_round_trips_expansion_redirection_state_async_metadata_and_entropy() {
+        fn native(operation: Operation) -> Node {
+            Node {
+                id: String::new(),
+                operation,
+                guarantee: Guarantee::Native {
+                    semantic_model: "effect-algebra-v1".into(),
+                },
+                source: None,
+            }
+        }
+
+        let mut plan = sample_plan();
+        plan.tasks[0].body = native(Operation::Sequence {
+            nodes: vec![
+                native(Operation::ExpandWords {
+                    name: "words".into(),
+                    value: TextExpression::literal("$value/*.txt"),
+                    field_splitting: FieldSplitting::PosixIfs {
+                        ifs: TextExpression::literal(" \t\n"),
+                    },
+                    glob: GlobBehavior::LiteralIfNoMatch,
+                }),
+                native(Operation::Redirect {
+                    redirections: vec![
+                        Redirection::Read {
+                            fd: 0,
+                            path: TextExpression::literal("input.txt"),
+                        },
+                        Redirection::Write {
+                            fd: 1,
+                            path: TextExpression::literal("output.txt"),
+                            append: false,
+                        },
+                        Redirection::Duplicate {
+                            fd: 2,
+                            target_fd: 1,
+                        },
+                    ],
+                    body: Box::new(native(Operation::Exec {
+                        argv: vec![TextExpression::literal("filter")],
+                        environment: vec![],
+                        working_directory: None,
+                    })),
+                }),
+                native(Operation::Scope {
+                    variables: vec![StateBinding {
+                        name: "local".into(),
+                        value_type: ValueType::Primitive(PrimitiveType::Text),
+                        value: TextExpression::literal("value"),
+                    }],
+                    environment: vec![EnvironmentBinding {
+                        name: "MODE".into(),
+                        value: Some(TextExpression::literal("strict")),
+                        secret: false,
+                    }],
+                    working_directory: Some(TextExpression::literal("workspace")),
+                    body: Box::new(native(Operation::SetVariable {
+                        name: "local".into(),
+                        value_type: ValueType::Primitive(PrimitiveType::Text),
+                        value: TextExpression::literal("updated"),
+                    })),
+                }),
+                native(Operation::SetEnvironment {
+                    name: "MODE".into(),
+                    value: Some(TextExpression::literal("release")),
+                    secret: false,
+                }),
+                native(Operation::SetWorkingDirectory {
+                    path: TextExpression::literal("workspace"),
+                }),
+                native(Operation::Spawn {
+                    handle: "job".into(),
+                    body: Box::new(native(Operation::Exec {
+                        argv: vec![TextExpression::literal("worker")],
+                        environment: vec![],
+                        working_directory: None,
+                    })),
+                }),
+                native(Operation::Wait {
+                    handle: "job".into(),
+                }),
+                native(Operation::SendSignal {
+                    handle: "job".into(),
+                    signal: 15,
+                    process_group: true,
+                }),
+                native(Operation::FileMetadata {
+                    path: TextExpression::literal("artifact"),
+                    output: "metadata".into(),
+                    follow_symlinks: false,
+                }),
+                native(Operation::FileSetMetadata {
+                    path: TextExpression::literal("artifact"),
+                    permissions: Some(0o755),
+                    executable: Some(true),
+                    follow_symlinks: false,
+                }),
+                native(Operation::ClockRead {
+                    clock: ClockKind::Monotonic,
+                    output: "now".into(),
+                }),
+                native(Operation::RandomBytes {
+                    output: "nonce".into(),
+                    length: 16,
+                }),
+            ],
+        });
+        plan.assign_node_ids().unwrap();
+        let encoded = plan.encode_pretty().unwrap();
+        assert_eq!(Plan::decode(&encoded).unwrap(), plan);
+        let text = String::from_utf8(encoded).unwrap();
+        for operation in [
+            "expand_words",
+            "redirect",
+            "scope",
+            "set_environment",
+            "set_working_directory",
+            "spawn",
+            "wait",
+            "send_signal",
+            "file_metadata",
+            "file_set_metadata",
+            "clock_read",
+            "random_bytes",
+        ] {
+            assert!(text.contains(&format!("\"type\": \"{operation}\"")));
+        }
+    }
+
+    #[test]
     fn rejects_legacy_versions_and_duplicate_named_values() {
         let legacy = br#"{"schema_version":3,"generator":"old","entrypoint":"main","tasks":[]}"#;
         let error = Plan::decode(legacy).unwrap_err().join("; ");
@@ -1212,5 +1762,627 @@ mod tests {
         });
         let differential = crate::canonical_json::pretty_bytes(&value).unwrap();
         assert!(Plan::decode(&differential).is_err());
+    }
+
+    #[test]
+    fn node_id_expression_source_and_value_type_boundaries_fail_closed() {
+        for (path, start, end, operation, expected) in [
+            ("build.sh", 2, 1, "exec", "reversed"),
+            (r"scripts\build.sh", 0, 1, "exec", "not normalized"),
+            ("build.sh", 0, 1, "", "operation name"),
+            ("build.sh", 0, 1, "Exec", "operation name"),
+        ] {
+            let error = node_id(path, start, end, operation, 0).unwrap_err();
+            assert!(error.contains(expected), "unexpected {error:?}");
+        }
+
+        assert!(
+            SourceBytes::Base64 { base64: "!".into() }
+                .to_bytes()
+                .unwrap_err()
+                .contains("invalid capsule base64")
+        );
+        assert!(
+            SourceBytes::Base64 {
+                base64: "Zh==".into()
+            }
+            .to_bytes()
+            .is_err()
+        );
+
+        let inputs = BTreeSet::from(["known".to_owned()]);
+        let invalid_expressions = [
+            expression(vec![]),
+            expression(vec![
+                TextPart::Literal {
+                    value: String::new(),
+                },
+                TextPart::Variable { name: "A".into() },
+            ]),
+            expression(vec![
+                TextPart::Literal { value: "a".into() },
+                TextPart::Literal { value: "b".into() },
+            ]),
+            expression(vec![TextPart::Variable {
+                name: "bad-name".into(),
+            }]),
+            expression(vec![TextPart::Argument {
+                name: String::new(),
+            }]),
+            expression(vec![TextPart::Argument {
+                name: "unknown".into(),
+            }]),
+        ];
+        for invalid in invalid_expressions {
+            assert!(validate_expression(&invalid, Some(&inputs)).is_err());
+        }
+        assert_eq!(
+            literal_value(&TextExpression::literal("value")),
+            Some("value".into())
+        );
+        assert_eq!(
+            literal_value(&expression(vec![TextPart::Variable { name: "A".into() }])),
+            None
+        );
+        assert!(
+            expression(vec![TextPart::Variable {
+                name: "MISSING".into()
+            }])
+            .evaluate(&BTreeMap::new(), &BTreeMap::new())
+            .unwrap_err()
+            .contains("runtime variable")
+        );
+        assert!(
+            expression(vec![TextPart::Argument {
+                name: "missing".into()
+            }])
+            .evaluate(&BTreeMap::new(), &BTreeMap::new())
+            .unwrap_err()
+            .contains("task argument")
+        );
+
+        let mut errors = Vec::new();
+        validate_value_type(&ValueType::Record { record: vec![] }, 0, &mut errors);
+        validate_value_type(
+            &ValueType::Record {
+                record: vec![
+                    RecordField {
+                        name: "bad-name".into(),
+                        value_type: ValueType::Primitive(PrimitiveType::Text),
+                    },
+                    RecordField {
+                        name: "bad-name".into(),
+                        value_type: ValueType::Primitive(PrimitiveType::Text),
+                    },
+                ],
+            },
+            0,
+            &mut errors,
+        );
+        let mut deeply_nested = ValueType::Primitive(PrimitiveType::Text);
+        for _ in 0..33 {
+            deeply_nested = ValueType::List {
+                list: Box::new(deeply_nested),
+            };
+        }
+        validate_value_type(&deeply_nested, 0, &mut errors);
+        let errors = errors.join("; ");
+        for expected in [
+            "at least one field",
+            "field name is invalid",
+            "duplicate record",
+            "nesting",
+        ] {
+            assert!(
+                errors.contains(expected),
+                "missing {expected:?} in {errors}"
+            );
+        }
+    }
+
+    #[test]
+    fn task_invocation_source_and_guarantee_validation_aggregate_all_contract_errors() {
+        let mut plan = sample_plan();
+        let mut worker = plan.tasks[0].clone();
+        worker.name = "worker".into();
+        worker.inputs = vec![Binding {
+            name: "needed".into(),
+            value_type: ValueType::Primitive(PrimitiveType::Text),
+        }];
+        worker.environment.clear();
+        worker.body = exec();
+        plan.tasks.push(worker);
+        plan.assign_node_ids().unwrap();
+
+        plan.schema_version = 2;
+        plan.generator.clear();
+        plan.entrypoint = "missing".into();
+        plan.tasks[0].outputs = vec![
+            Binding {
+                name: String::new(),
+                value_type: ValueType::Record { record: vec![] },
+            },
+            Binding {
+                name: String::new(),
+                value_type: ValueType::Primitive(PrimitiveType::Text),
+            },
+        ];
+        plan.tasks[0].environment = vec!["BAD-NAME".into(), "BAD-NAME".into()];
+        plan.tasks[0].secrets = vec!["unbound".into(), "unbound".into()];
+        plan.tasks[0].platform_capabilities = vec!["process".into(), "process".into()];
+        plan.tasks[0].invocation = Some(Invocation {
+            style: InvocationStyle::Powershell,
+            accepts_common_parameters: false,
+            parameters: vec![
+                InvocationParameter {
+                    input: "ghost".into(),
+                    position: Some(0),
+                    required: false,
+                    is_switch: false,
+                    default: None,
+                    validations: vec![
+                        InvocationValidation::StringSet {
+                            values: vec![],
+                            ignore_case: false,
+                        },
+                        InvocationValidation::IntRange {
+                            minimum: 2,
+                            maximum: 1,
+                        },
+                    ],
+                },
+                InvocationParameter {
+                    input: "ghost".into(),
+                    position: Some(1),
+                    required: false,
+                    is_switch: false,
+                    default: None,
+                    validations: vec![InvocationValidation::StringSet {
+                        values: vec!["same".into(), "same".into()],
+                        ignore_case: false,
+                    }],
+                },
+            ],
+        });
+        plan.tasks[0].body.guarantee = Guarantee::Native {
+            semantic_model: String::new(),
+        };
+        plan.tasks[0].body.source = Some(SourceSpan {
+            file: r"scripts\build.sh".into(),
+            start_line: 0,
+            start_column: 4,
+            end_line: 0,
+            end_column: 3,
+            start_byte: 9,
+            end_byte: i64::MAX as u64 + 1,
+        });
+        plan.tasks[1].body.id = plan.tasks[0].body.id.clone();
+        plan.tasks[1].body.source = Some(SourceSpan {
+            file: "../escape.sh".into(),
+            start_line: 1,
+            start_column: 0,
+            end_line: 1,
+            end_column: 1,
+            start_byte: 0,
+            end_byte: 1,
+        });
+        let errors = plan.validate().unwrap_err().join("; ");
+        for expected in [
+            "schema_version",
+            "generator must not be empty",
+            "entrypoint task not found",
+            "duplicate output",
+            "binding name must not be empty",
+            "record value type",
+            "duplicate task environment",
+            "task environment name is invalid",
+            "duplicate secret",
+            "not a task input or environment",
+            "duplicate platform capability",
+            "duplicate invocation parameter",
+            "missing invocation metadata",
+            "unknown input",
+            "string_set validation requires values",
+            "duplicate validation value",
+            "int range is reversed",
+            "source path is not normalized",
+            "invalid source path",
+            "source span is not well formed",
+            "duplicate node id",
+            "native semantic model must not be empty",
+        ] {
+            assert!(
+                errors.contains(expected),
+                "missing {expected:?} in {errors}"
+            );
+        }
+    }
+
+    #[test]
+    fn operation_validation_rejects_every_ambiguous_effect_boundary() {
+        let invalid_expression = || TextExpression { parts: vec![] };
+        let state_mutation = || {
+            native(Operation::SetVariable {
+                name: "value".into(),
+                value_type: ValueType::Primitive(PrimitiveType::Text),
+                value: TextExpression::literal("changed"),
+            })
+        };
+        let source_span = SourceSpan {
+            file: "build.sh".into(),
+            start_line: 1,
+            start_column: 0,
+            end_line: 1,
+            end_column: 4,
+            start_byte: 0,
+            end_byte: 4,
+        };
+        let interpreter = delegated(Operation::InterpreterCall {
+            interpreter: String::new(),
+            interpreter_pin: "bad".into(),
+            source: SourceBytes::Base64 { base64: "!".into() },
+            source_span: source_span.clone(),
+            capabilities: vec![String::new(), String::new()],
+            reason: String::new(),
+        });
+        let short_interpreter = Node {
+            source: Some(source_span.clone()),
+            ..delegated(Operation::InterpreterCall {
+                interpreter: "sh".into(),
+                interpreter_pin: format!("sha256:{}", "a".repeat(64)),
+                source: SourceBytes::from_bytes(b"true"),
+                source_span: SourceSpan {
+                    end_byte: 3,
+                    ..source_span.clone()
+                },
+                capabilities: vec![],
+                reason: "pinned".into(),
+            })
+        };
+        let invalid_native_guarantee = Node {
+            guarantee: Guarantee::Delegated {
+                reason: "wrong".into(),
+            },
+            ..exec()
+        };
+        let invalid_interpreter_guarantee = Node {
+            guarantee: Guarantee::Native {
+                semantic_model: "wrong".into(),
+            },
+            ..delegated(Operation::InterpreterCall {
+                interpreter: "sh".into(),
+                interpreter_pin: format!("sha256:{}", "a".repeat(64)),
+                source: SourceBytes::from_bytes(b"true"),
+                source_span: source_span.clone(),
+                capabilities: vec![],
+                reason: "pinned".into(),
+            })
+        };
+        let invalid_capsule_guarantee = Node {
+            guarantee: Guarantee::Native {
+                semantic_model: "wrong".into(),
+            },
+            ..residual(Operation::OpaqueCapsule {
+                interpreter: "sh".into(),
+                source: SourceBytes::from_bytes(b"true"),
+                path: None,
+            })
+        };
+
+        let mut plan = sample_plan();
+        plan.tasks[0].body = native(Operation::Sequence {
+            nodes: vec![
+                native(Operation::Exec {
+                    argv: vec![],
+                    environment: vec![
+                        NamedExpression {
+                            name: "BAD-NAME".into(),
+                            value: invalid_expression(),
+                        },
+                        NamedExpression {
+                            name: "BAD-NAME".into(),
+                            value: TextExpression::literal("duplicate"),
+                        },
+                    ],
+                    working_directory: Some(invalid_expression()),
+                }),
+                native(Operation::ExpandWords {
+                    name: "bad-name".into(),
+                    value: invalid_expression(),
+                    field_splitting: FieldSplitting::PosixIfs {
+                        ifs: invalid_expression(),
+                    },
+                    glob: GlobBehavior::Disabled,
+                }),
+                native(Operation::Redirect {
+                    redirections: vec![],
+                    body: Box::new(exec()),
+                }),
+                native(Operation::Redirect {
+                    redirections: vec![
+                        Redirection::Read {
+                            fd: 1025,
+                            path: invalid_expression(),
+                        },
+                        Redirection::Write {
+                            fd: 1025,
+                            path: invalid_expression(),
+                            append: false,
+                        },
+                        Redirection::Duplicate {
+                            fd: 1025,
+                            target_fd: 1025,
+                        },
+                        Redirection::Close { fd: 1025 },
+                    ],
+                    body: Box::new(exec()),
+                }),
+                native(Operation::Pipeline {
+                    nodes: vec![state_mutation()],
+                    status: PipelineStatus::Pipefail,
+                }),
+                native(Operation::Parallel {
+                    nodes: vec![native(Operation::ClockRead {
+                        clock: ClockKind::Realtime,
+                        output: "now".into(),
+                    })],
+                }),
+                native(Operation::Pipeline {
+                    nodes: vec![],
+                    status: PipelineStatus::Last,
+                }),
+                native(Operation::Parallel { nodes: vec![] }),
+                native(Operation::Sequence { nodes: vec![] }),
+                native(Operation::Condition {
+                    predicate: Box::new(exec()),
+                    if_true: Box::new(exec()),
+                    if_false: Some(Box::new(exec())),
+                }),
+                native(Operation::Match {
+                    value: invalid_expression(),
+                    cases: vec![
+                        MatchCase {
+                            pattern: TextExpression::literal("same"),
+                            body: exec(),
+                        },
+                        MatchCase {
+                            pattern: TextExpression::literal("same"),
+                            body: exec(),
+                        },
+                    ],
+                    default: Some(Box::new(exec())),
+                }),
+                native(Operation::Foreach {
+                    variable: "bad-name".into(),
+                    items: vec![invalid_expression()],
+                    body: Box::new(exec()),
+                }),
+                native(Operation::Scope {
+                    variables: vec![
+                        StateBinding {
+                            name: "bad-name".into(),
+                            value_type: ValueType::Record { record: vec![] },
+                            value: invalid_expression(),
+                        },
+                        StateBinding {
+                            name: "bad-name".into(),
+                            value_type: ValueType::Primitive(PrimitiveType::Text),
+                            value: TextExpression::literal("duplicate"),
+                        },
+                    ],
+                    environment: vec![
+                        EnvironmentBinding {
+                            name: "BAD-NAME".into(),
+                            value: Some(invalid_expression()),
+                            secret: false,
+                        },
+                        EnvironmentBinding {
+                            name: "BAD-NAME".into(),
+                            value: None,
+                            secret: false,
+                        },
+                    ],
+                    working_directory: Some(invalid_expression()),
+                    body: Box::new(exec()),
+                }),
+                native(Operation::TryFinally {
+                    body: Box::new(state_mutation()),
+                    finalizer: Box::new(exec()),
+                }),
+                native(Operation::TaskCall {
+                    task: String::new(),
+                    arguments: vec![],
+                }),
+                native(Operation::TaskCall {
+                    task: "missing".into(),
+                    arguments: vec![
+                        NamedExpression {
+                            name: "arg".into(),
+                            value: invalid_expression(),
+                        },
+                        NamedExpression {
+                            name: "arg".into(),
+                            value: TextExpression::literal("duplicate"),
+                        },
+                    ],
+                }),
+                native(Operation::SetVariable {
+                    name: "bad-name".into(),
+                    value_type: ValueType::Record { record: vec![] },
+                    value: invalid_expression(),
+                }),
+                native(Operation::SetEnvironment {
+                    name: "bad-name".into(),
+                    value: Some(invalid_expression()),
+                    secret: false,
+                }),
+                native(Operation::SetWorkingDirectory {
+                    path: invalid_expression(),
+                }),
+                native(Operation::CaptureStdout {
+                    name: "bad-name".into(),
+                    value_type: PrimitiveType::Bytes,
+                    body: Box::new(exec()),
+                }),
+                native(Operation::Spawn {
+                    handle: "bad-handle".into(),
+                    body: Box::new(state_mutation()),
+                }),
+                native(Operation::Wait {
+                    handle: "bad-handle".into(),
+                }),
+                native(Operation::SendSignal {
+                    handle: "bad-handle".into(),
+                    signal: 0,
+                    process_group: false,
+                }),
+                native(Operation::FileRead {
+                    path: invalid_expression(),
+                }),
+                native(Operation::FileWrite {
+                    path: invalid_expression(),
+                    contents: invalid_expression(),
+                    append: false,
+                }),
+                native(Operation::FileRemove {
+                    path: invalid_expression(),
+                }),
+                native(Operation::FileMetadata {
+                    path: invalid_expression(),
+                    output: "bad-name".into(),
+                    follow_symlinks: false,
+                }),
+                native(Operation::FileSetMetadata {
+                    path: invalid_expression(),
+                    permissions: None,
+                    executable: None,
+                    follow_symlinks: false,
+                }),
+                native(Operation::FileSetMetadata {
+                    path: TextExpression::literal("file"),
+                    permissions: Some(0o1000),
+                    executable: None,
+                    follow_symlinks: false,
+                }),
+                native(Operation::NetworkRequest {
+                    method: invalid_expression(),
+                    uri: invalid_expression(),
+                }),
+                native(Operation::ClockRead {
+                    clock: ClockKind::Realtime,
+                    output: "bad-name".into(),
+                }),
+                native(Operation::RandomBytes {
+                    output: "bad-name".into(),
+                    length: 0,
+                }),
+                native(Operation::RandomBytes {
+                    output: "nonce".into(),
+                    length: 1024 * 1024 + 1,
+                }),
+                interpreter,
+                short_interpreter,
+                residual(Operation::OpaqueCapsule {
+                    interpreter: String::new(),
+                    source: SourceBytes::Base64 { base64: "!".into() },
+                    path: Some(r"scripts\capsule.sh".into()),
+                }),
+                residual(Operation::OpaqueCapsule {
+                    interpreter: "sh".into(),
+                    source: SourceBytes::from_bytes(b"true"),
+                    path: Some("../capsule.sh".into()),
+                }),
+                invalid_native_guarantee,
+                invalid_interpreter_guarantee,
+                invalid_capsule_guarantee,
+            ],
+        });
+        let mut worker = Task {
+            name: "worker".into(),
+            inputs: vec![Binding {
+                name: "needed".into(),
+                value_type: ValueType::Primitive(PrimitiveType::Text),
+            }],
+            outputs: vec![],
+            environment: vec![],
+            secrets: vec![],
+            platform_capabilities: vec![],
+            cacheable: false,
+            invocation: None,
+            body: exec(),
+        };
+        if let Operation::Sequence { nodes } = &mut plan.tasks[0].body.operation {
+            nodes.push(native(Operation::TaskCall {
+                task: "worker".into(),
+                arguments: vec![NamedExpression {
+                    name: "unknown".into(),
+                    value: TextExpression::literal("value"),
+                }],
+            }));
+        } else {
+            unreachable!()
+        }
+        worker.body = exec();
+        plan.tasks.push(worker);
+        plan.assign_node_ids().unwrap();
+        let errors = plan.validate().unwrap_err().join("; ");
+        for expected in [
+            "Exec argv must not be empty",
+            "duplicate Exec environment name",
+            "Exec environment name is invalid",
+            "text expression must contain",
+            "expanded word binding is invalid",
+            "redirect must contain",
+            "file descriptor is too large",
+            "pipeline state mutation",
+            "parallel state mutation",
+            "must contain at least one node",
+            "sequence must contain",
+            "duplicate literal match case",
+            "foreach variable is invalid",
+            "duplicate scope variable",
+            "scope variable is invalid",
+            "duplicate scope environment",
+            "scope environment name is invalid",
+            "try/finally state mutation",
+            "task call target must not be empty",
+            "duplicate task argument",
+            "task not found",
+            "unknown argument unknown for task worker",
+            "missing argument needed for task worker",
+            "runtime variable name is invalid",
+            "runtime environment name is invalid",
+            "stdout capture value_type must be text",
+            "spawn handle is invalid",
+            "spawned state mutation",
+            "wait handle is invalid",
+            "signal handle is invalid",
+            "signal number is outside",
+            "file metadata output is invalid",
+            "must change permissions",
+            "permissions exceed",
+            "clock output is invalid",
+            "random output is invalid",
+            "random_bytes length",
+            "delegated interpreter must not be empty",
+            "interpreter_pin",
+            "delegated source encoding",
+            "duplicate delegated capability",
+            "delegated capability must not be empty",
+            "source_span must equal",
+            "source bytes must exactly cover",
+            "capsule interpreter must not be empty",
+            "capsule source encoding",
+            "capsule path is not normalized",
+            "invalid capsule path",
+            "exec must use a native guarantee",
+            "interpreter_call must use a delegated guarantee",
+            "opaque_capsule must use a residual guarantee",
+        ] {
+            assert!(
+                errors.contains(expected),
+                "missing {expected:?} in {errors}"
+            );
+        }
     }
 }

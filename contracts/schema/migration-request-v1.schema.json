@@ -1,0 +1,61 @@
+{
+  "$id": "https://deshell.dev/contracts/migration-request/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "call_sites": { "items": { "$ref": "#/$defs/location" }, "type": "array" },
+    "effect_ir": { "type": "object" },
+    "effect_ir_digest": { "$ref": "#/$defs/digest" },
+    "interface": {
+      "additionalProperties": false,
+      "properties": {
+        "arguments": { "items": { "type": "string" }, "type": "array" },
+        "environment": { "items": { "type": "string" }, "type": "array", "uniqueItems": true },
+        "secrets": { "items": { "type": "string" }, "type": "array", "uniqueItems": true }
+      },
+      "required": ["arguments", "environment", "secrets"],
+      "type": "object"
+    },
+    "module_root": { "$ref": "#/$defs/path" },
+    "policy": {
+      "additionalProperties": false,
+      "properties": {
+        "allow_network": { "type": "boolean" },
+        "allow_source_send": { "type": "boolean" },
+        "context": { "const": "minimal" }
+      },
+      "required": ["context", "allow_network", "allow_source_send"],
+      "type": "object"
+    },
+    "request_id": { "$ref": "#/$defs/digest" },
+    "schema_version": { "const": 1 },
+    "source": {
+      "additionalProperties": false,
+      "properties": {
+        "content_digest": { "$ref": "#/$defs/digest" },
+        "interpreter": { "minLength": 1, "type": "string" },
+        "location": { "$ref": "#/$defs/location" }
+      },
+      "required": ["location", "content_digest", "interpreter"],
+      "type": "object"
+    },
+    "target": { "enum": ["rust", "go", "host", "agent"] }
+  },
+  "required": ["schema_version", "request_id", "source", "effect_ir_digest", "effect_ir", "interface", "call_sites", "target", "module_root", "policy"],
+  "title": "de-shell Migration Request v1",
+  "type": "object",
+  "$defs": {
+    "digest": { "pattern": "^[0-9a-f]{64}$", "type": "string" },
+    "location": {
+      "additionalProperties": false,
+      "properties": {
+        "end_byte": { "minimum": 0, "type": "integer" },
+        "path": { "$ref": "#/$defs/path" },
+        "start_byte": { "minimum": 0, "type": "integer" }
+      },
+      "required": ["path", "start_byte", "end_byte"],
+      "type": "object"
+    },
+    "path": { "pattern": "^(?!/)(?!\\.{1,2}(?:/|$))(?!.*//)(?!.*\\/\\.{1,2}(?:/|$))(?!.*\\/$)[^\\\\:\\u0000]+$", "type": "string" }
+  }
+}

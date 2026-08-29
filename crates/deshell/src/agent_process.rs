@@ -554,6 +554,15 @@ fn valid_environment_name(name: &str) -> bool {
 }
 
 fn add_essential_environment(command: &mut std::process::Command) {
+    let toolchain = msvc_toolchain_environment();
+    add_essential_environment_with(command, |name| std::env::var_os(name), toolchain);
+}
+
+fn add_essential_environment_with(
+    command: &mut std::process::Command,
+    lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
+    msvc_toolchain: &[(std::ffi::OsString, std::ffi::OsString)],
+) {
     for name in [
         "PATH",
         "SystemRoot",
@@ -561,12 +570,81 @@ fn add_essential_environment(command: &mut std::process::Command) {
         "ComSpec",
         "COMSPEC",
         "PATHEXT",
+        // rustc's pinned find-msvc-tools fallback resolves vswhere.exe from
+        // these roots after env_clear; neither value carries user credentials.
+        "ProgramFiles",
+        "ProgramFiles(x86)",
         "WINDIR",
     ] {
-        if let Some(value) = std::env::var_os(name) {
+        if let Some(value) = lookup(name) {
             command.env(name, value);
         }
     }
+    // `find-msvc-tools` derives only these toolchain search paths. They are
+    // applied after the ambient allowlist so an unrelated Git `link.exe`
+    // cannot win PATH resolution after env_clear.
+    for expected in ["PATH", "LIB", "INCLUDE"] {
+        if let Some((_, value)) = msvc_toolchain
+            .iter()
+            .find(|(name, _)| name.to_string_lossy().eq_ignore_ascii_case(expected))
+        {
+            command.env(expected, value);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn msvc_toolchain_environment() -> &'static [(std::ffi::OsString, std::ffi::OsString)] {
+    // COM-based Visual Studio discovery is process-global and the toolchain is
+    // immutable for one deshell invocation. Resolve it once even when a plan
+    // launches many commands or pipeline stages.
+    static ENVIRONMENT: std::sync::OnceLock<Vec<(std::ffi::OsString, std::ffi::OsString)>> =
+        std::sync::OnceLock::new();
+    ENVIRONMENT.get_or_init(discover_msvc_toolchain_environment)
+}
+
+#[cfg(windows)]
+fn discover_msvc_toolchain_environment() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    let Some(tool) = find_msvc_tools::find_tool(std::env::consts::ARCH, "link.exe") else {
+        return Vec::new();
+    };
+    let mut entries = tool
+        .env()
+        .into_iter()
+        .filter(|(name, _)| {
+            matches!(
+                name.to_string_lossy().to_ascii_uppercase().as_str(),
+                "PATH" | "LIB" | "INCLUDE"
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    // A developer-command-prompt discovery may return no explicit PATH
+    // override. Always bind the exact discovered linker directory first.
+    let inherited_path = entries
+        .iter()
+        .find(|(name, _)| name.to_string_lossy().eq_ignore_ascii_case("PATH"))
+        .map(|(_, value)| value.clone())
+        .or_else(|| std::env::var_os("PATH"))
+        .unwrap_or_default();
+    let mut paths = tool
+        .path()
+        .parent()
+        .into_iter()
+        .map(Path::to_path_buf)
+        .collect::<Vec<_>>();
+    paths.extend(std::env::split_paths(&inherited_path));
+    if let Ok(path) = std::env::join_paths(paths) {
+        entries.retain(|(name, _)| !name.to_string_lossy().eq_ignore_ascii_case("PATH"));
+        entries.push(("PATH".into(), path));
+    }
+    entries
+}
+
+#[cfg(not(windows))]
+fn msvc_toolchain_environment() -> &'static [(std::ffi::OsString, std::ffi::OsString)] {
+    &[]
 }
 
 #[cfg(unix)]
@@ -574,15 +652,26 @@ fn configure_unix_limits(command: &mut std::process::Command, limits: Limits) {
     use std::os::unix::process::CommandExt as _;
     command.process_group(0);
 
-    // Keep Darwin on Rust's posix_spawn path. Lowering a resource limit in a
-    // pre-exec child can be rejected when the child inherits a larger live
-    // address space, and RLIMIT_NPROC is scoped to the runner's entire user ID
-    // rather than this command tree. Disposable providers enforce their own
-    // memory and PID limits; host-local execution remains explicitly opt-in.
-    #[cfg(target_os = "macos")]
+    // Keep Darwin on Rust's posix_spawn path. Coverage and AddressSanitizer
+    // instrumentation also expand the harness address space and create runtime
+    // threads that are unrelated to the command under test; applying per-UID
+    // RLIMIT_NPROC or a production-sized RLIMIT_AS there produces false
+    // `cannot fork` failures. Ordinary builds still exercise these limits, and
+    // disposable providers enforce their own memory and PID boundaries.
+    #[cfg(any(
+        target_os = "macos",
+        coverage,
+        deshell_sanitizer_address,
+        deshell_sanitizer_undefined
+    ))]
     let _ = limits;
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(
+        not(target_os = "macos"),
+        not(coverage),
+        not(deshell_sanitizer_address),
+        not(deshell_sanitizer_undefined)
+    ))]
     unsafe {
         command.pre_exec(move || {
             let memory_limit = libc::rlimit {
@@ -717,6 +806,88 @@ fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn essential_environment_supports_isolated_msvc_discovery_without_ambient_secrets() {
+        let mut command = std::process::Command::new("unused");
+        let toolchain = vec![
+            ("PATH".into(), "msvc:path".into()),
+            ("LIB".into(), "msvc:lib".into()),
+            ("INCLUDE".into(), "msvc:include".into()),
+            ("GITHUB_TOKEN".into(), "must-not-leak".into()),
+        ];
+        add_essential_environment_with(
+            &mut command,
+            |name| Some(format!("value:{name}").into()),
+            &toolchain,
+        );
+        let environment = command
+            .get_envs()
+            .map(|(name, value)| {
+                (
+                    name.to_string_lossy().into_owned(),
+                    value.unwrap().to_string_lossy().into_owned(),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+
+        assert_eq!(
+            environment.get("ProgramFiles").map(String::as_str),
+            Some("value:ProgramFiles")
+        );
+        assert_eq!(
+            environment.get("ProgramFiles(x86)").map(String::as_str),
+            Some("value:ProgramFiles(x86)")
+        );
+        for (name, expected) in [
+            ("PATH", "msvc:path"),
+            ("LIB", "msvc:lib"),
+            ("INCLUDE", "msvc:include"),
+        ] {
+            assert_eq!(
+                environment.get(name).map(String::as_str),
+                Some(expected),
+                "missing derived MSVC environment entry {name}"
+            );
+        }
+        assert!(!environment.contains_key("USERPROFILE"));
+        assert!(!environment.contains_key("GITHUB_TOKEN"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn isolated_rustc_discovers_the_msvc_linker_after_environment_clear() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("main.rs"), b"fn main() {}\n").unwrap();
+        let outcome = execute(
+            directory.path(),
+            Request {
+                argv: vec![
+                    "rustc".into(),
+                    "main.rs".into(),
+                    "-o".into(),
+                    "isolated.exe".into(),
+                ],
+                environment: Vec::new(),
+                working_directory: None,
+                stdin: Vec::new(),
+                limits: Limits {
+                    timeout_ms: 60_000,
+                    memory_bytes: 8 * 1024 * 1024 * 1024,
+                    processes: 60_000,
+                    ..Limits::default()
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.exit_code,
+            0,
+            "{}",
+            String::from_utf8_lossy(&outcome.stderr)
+        );
+        assert!(directory.path().join("isolated.exe").is_file());
+    }
 
     #[cfg(unix)]
     #[test]

@@ -4,7 +4,7 @@ resolver = "3"
 
 [package]
 name = "deshell"
-description = "Behavioral compiler for migrating shell automation"
+description = "Shell retirement migration oracle with independent equivalence evidence"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -33,6 +33,7 @@ repository = "https://github.com/P4suta/de-shell"
 [workspace.dependencies]
 base64 = "0.23.1"
 clap = { version = "4.6.6", features = ["derive"] }
+find-msvc-tools = "=0.1.11"
 libc = "0.2.189"
 regex = "1.13.1"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -41,6 +42,10 @@ serde_yaml_ng = "0.10.0"
 sha2 = "0.11.0"
 tempfile = "3.27.0"
 toml = "1.1.4"
+tree-sitter = "=0.26.11"
+tree-sitter-bash = "=0.25.1"
+tree-sitter-batch = "=0.11.1"
+tree-sitter-fish = "=3.6.0"
 walkdir = "2.5.0"
 
 [dependencies]
@@ -54,7 +59,17 @@ serde_yaml_ng.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
 toml.workspace = true
+tree-sitter.workspace = true
+tree-sitter-bash.workspace = true
+tree-sitter-batch.workspace = true
+tree-sitter-fish.workspace = true
 walkdir.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+find-msvc-tools.workspace = true
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage)", "cfg(deshell_sanitizer_address)", "cfg(deshell_sanitizer_undefined)"] }
 
 [profile.release]
 lto = "thin"

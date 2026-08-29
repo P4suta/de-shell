@@ -153,7 +153,9 @@ try {
   Copy-Item -LiteralPath (Join-Path $repositoryRoot 'examples/static-printf.sh') `
     -Destination (Join-Path $validationRoot 'static-printf.sh')
 
-  Invoke-Checked -FilePath $deshell -ArgumentList @('init', '--root', $validationRoot)
+  Invoke-Checked -FilePath $deshell -ArgumentList @(
+    'init', '--root', $validationRoot, '--target', 'rust'
+  )
   $lockPath = Join-Path $validationRoot 'deshell.lock'
   $lockText = [IO.File]::ReadAllText($lockPath).Replace(
     'dagger_image = "unconfigured"',

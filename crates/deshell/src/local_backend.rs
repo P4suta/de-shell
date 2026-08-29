@@ -62,8 +62,13 @@ impl LocalBackend {
                     )
                 })?;
                 Some(
-                    crate::replay::ReplayStore::decode(&bytes)
-                        .map_err(|errors| errors.join("; "))?,
+                    crate::replay::ReplayStore::decode(&bytes).map_err(|errors| {
+                        format!(
+                            "invalid network replay store {}: {}",
+                            replay_path.display(),
+                            errors.join("; ")
+                        )
+                    })?,
                 )
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -422,6 +427,30 @@ mod tests {
     use super::*;
     use std::fs;
 
+    #[cfg(unix)]
+    fn request(argv: &[&str]) -> ProcessRequest {
+        ProcessRequest {
+            argv: argv.iter().map(|value| (*value).to_owned()).collect(),
+            environment: vec![],
+            working_directory: None,
+            stdin: vec![],
+        }
+    }
+
+    #[cfg(unix)]
+    fn interpreter_pins() -> crate::config::InterpreterPins {
+        crate::config::Lockfile::decode(&crate::config::Lockfile::default_text())
+            .unwrap()
+            .interpreters
+    }
+
+    fn backend_error(root: &Path) -> String {
+        match LocalBackend::new(root) {
+            Ok(_) => panic!("backend unexpectedly accepted {}", root.display()),
+            Err(error) => error,
+        }
+    }
+
     #[test]
     fn filesystem_effects_are_project_scoped() {
         let temporary = tempfile::tempdir().unwrap();
@@ -548,6 +577,177 @@ mod tests {
                 .network_request("GET", "https://example.test/missing")
                 .unwrap_err()
                 .contains("replay miss")
+        );
+    }
+
+    #[test]
+    fn constructor_rejects_every_ambiguous_root_and_replay_shape() {
+        let missing = tempfile::tempdir().unwrap().path().join("missing");
+        assert!(backend_error(&missing).contains("cannot inspect"));
+
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("file");
+        fs::write(&file, b"not a directory").unwrap();
+        assert!(backend_error(&file).contains("not a regular"));
+
+        fs::write(root.path().join(".deshell"), b"not a directory").unwrap();
+        assert!(backend_error(root.path()).contains("metadata root"));
+        fs::remove_file(root.path().join(".deshell")).unwrap();
+        fs::create_dir(root.path().join(".deshell")).unwrap();
+        fs::create_dir(root.path().join(".deshell/replay.json")).unwrap();
+        assert!(backend_error(root.path()).contains("replay store"));
+        fs::remove_dir(root.path().join(".deshell/replay.json")).unwrap();
+        fs::write(root.path().join(".deshell/replay.json"), b"not-json").unwrap();
+        assert!(backend_error(root.path()).contains("invalid network replay store"));
+
+        #[cfg(unix)]
+        {
+            let link = root.path().join("root-link");
+            std::os::unix::fs::symlink(root.path(), &link).unwrap();
+            assert!(backend_error(&link).contains("non-symlink"));
+        }
+    }
+
+    #[test]
+    fn filesystem_resolution_rejects_missing_and_wrong_kind_components() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("directory")).unwrap();
+        fs::write(root.path().join("parent-file"), b"value").unwrap();
+        let backend = LocalBackend::new(root.path()).unwrap();
+
+        assert!(
+            backend
+                .read_file("missing")
+                .unwrap_err()
+                .contains("inspect")
+        );
+        assert!(
+            backend
+                .read_file("parent-file/child")
+                .unwrap_err()
+                .contains("not a directory")
+        );
+        assert!(
+            backend
+                .read_file("directory")
+                .unwrap_err()
+                .contains("not a regular file")
+        );
+        assert!(
+            backend
+                .write_file("parent-file/child", b"value", false)
+                .unwrap_err()
+                .contains("regular directories")
+        );
+        assert!(
+            backend
+                .write_file("missing/child", b"value", false)
+                .unwrap_err()
+                .contains("write parent")
+        );
+        assert!(
+            backend
+                .write_file("directory", b"value", false)
+                .unwrap_err()
+                .contains("write target")
+        );
+        for path in ["", ".", "double//slash", "trailing/"] {
+            assert!(backend.read_file(path).is_err(), "read accepted {path:?}");
+            assert!(
+                backend.write_file(path, b"value", false).is_err(),
+                "write accepted {path:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pipeline_preserves_stage_results_and_enforces_aggregate_limits() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = LocalBackend::new(root.path()).unwrap();
+        let outcomes = backend
+            .execute_pipeline(vec![
+                request(&["/bin/sh", "-c", "printf first; printf warning >&2"]),
+                request(&["/bin/sh", "-c", "cat; printf second"]),
+            ])
+            .unwrap();
+        assert_eq!(outcomes.len(), 2);
+        assert!(outcomes[0].stdout.is_empty());
+        assert_eq!(outcomes[0].stderr, b"warning");
+        assert_eq!(outcomes[1].stdout, b"firstsecond");
+
+        let mut limits = crate::config::ResourceLimits::DEFAULT;
+        limits.stdout_bytes = 2;
+        let limited = LocalBackend::with_limits(root.path(), limits).unwrap();
+        assert!(
+            limited
+                .execute_pipeline(vec![request(&["/bin/sh", "-c", "printf overflow"])])
+                .unwrap_err()
+                .contains("limit_exceeded")
+        );
+        assert!(
+            limited
+                .execute(request(&["/bin/sh", "-c", "printf overflow"]))
+                .unwrap_err()
+                .contains("limit_exceeded")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delegated_interpreters_require_exact_pins_and_a_safe_runtime_directory() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join(".deshell")).unwrap();
+        let pins = interpreter_pins();
+        let request_for = |interpreter: &str, pin: &str| InterpreterRequest {
+            interpreter: interpreter.into(),
+            interpreter_pin: pin.into(),
+            source: b"printf '%s:%s:' \"$1\" \"$VALUE\"; cat".to_vec(),
+            capabilities: vec![],
+            arguments: vec!["argument".into()],
+            environment: vec![("VALUE".into(), "environment".into())],
+            stdin: b"stdin".to_vec(),
+        };
+
+        let unpinned = LocalBackend::new(root.path()).unwrap();
+        assert!(
+            unpinned
+                .execute_interpreter(request_for("sh", &pins.posix_sh))
+                .unwrap_err()
+                .contains("unavailable")
+        );
+
+        let backend = LocalBackend::with_pinned_interpreters(
+            root.path(),
+            crate::config::ResourceLimits::DEFAULT,
+            pins.clone(),
+        )
+        .unwrap();
+        assert!(
+            backend
+                .execute_interpreter(request_for("unknown", "pin"))
+                .unwrap_err()
+                .contains("unknown pinned interpreter")
+        );
+        assert!(
+            backend
+                .execute_interpreter(request_for("sh", "wrong"))
+                .unwrap_err()
+                .contains("pin mismatch")
+        );
+        let result = backend
+            .execute_interpreter(request_for("posix_sh", &pins.posix_sh))
+            .unwrap();
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, b"argument:environment:stdin");
+
+        fs::remove_dir(root.path().join(".deshell/runtime")).unwrap();
+        fs::write(root.path().join(".deshell/runtime"), b"unsafe").unwrap();
+        assert!(
+            backend
+                .execute_interpreter(request_for("bash", &pins.bash))
+                .unwrap_err()
+                .contains("not a regular directory")
         );
     }
 }

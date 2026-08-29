@@ -6,12 +6,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 static PYTHON_OS_SYSTEM: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r#"os\.system\s*\(\s*([^\)]*)\)"#).expect("static scanner regex")
 });
-static PYTHON_SUBPROCESS: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r#"subprocess\.(?:run|call|Popen)\s*\(\s*([^,\)]*)"#)
+static PYTHON_SUBPROCESS_START: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r#"subprocess\.(?:run|call|Popen)\s*\("#).expect("static scanner regex")
+});
+static JAVASCRIPT_EXEC_START: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r#"(?:child_process\.)?(?:exec|execSync)\s*\("#)
         .expect("static scanner regex")
 });
-static JAVASCRIPT_EXEC: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r#"(?:child_process\.)?(?:exec|execSync)\s*\(\s*([^\)]*)\)"#)
+static JAVASCRIPT_PROCESS_START: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r#"(?:child_process\.)?(?:spawn|spawnSync|execFile|execFileSync)\s*\("#)
         .expect("static scanner regex")
 });
 
@@ -39,6 +42,13 @@ impl std::ops::Deref for Inventory {
 pub(crate) struct ByteSpan {
     pub start_byte: u64,
     pub end_byte: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ScriptReference {
+    pub path: String,
+    pub target: String,
+    pub span: ByteSpan,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -179,6 +189,280 @@ pub(crate) fn scan(_root: &Path) -> Result<Inventory, String> {
         skipped,
         errors,
     })
+}
+
+pub(crate) fn scan_with_interpreters(
+    root: &Path,
+    overrides: &[crate::config::InterpreterOverride],
+) -> Result<Inventory, String> {
+    let mut inventory = scan(root)?;
+    for configured in overrides {
+        inventory
+            .findings
+            .retain(|finding| finding.path != configured.path);
+        let source =
+            match crate::project::resolve_entry(root, &configured.path).and_then(|(_, path)| {
+                std::fs::read(&path).map_err(|error| {
+                    format!(
+                        "cannot read interpreter override {}: {error}",
+                        configured.path
+                    )
+                })
+            }) {
+                Ok(source) => source,
+                Err(message) => {
+                    push_interpreter_error(&mut inventory.errors, &configured.path, message);
+                    continue;
+                }
+            };
+        match crate::frontend::resolve_configured_interpreter(
+            &configured.path,
+            &source,
+            configured.interpreter.name(),
+        ) {
+            Ok(interpreter) => inventory.findings.push(finding(
+                &configured.path,
+                FindingKind::ShellFile,
+                Some(interpreter.name().into()),
+                InterpreterConfidence::High,
+                None,
+                ByteSpan::whole(&source),
+                source,
+            )),
+            Err(message) => {
+                push_interpreter_error(&mut inventory.errors, &configured.path, message)
+            }
+        }
+    }
+    sort_inventory(&mut inventory);
+    Ok(inventory)
+}
+
+fn push_interpreter_error(errors: &mut Vec<ScanError>, path: &str, message: String) {
+    if errors.iter().any(|error| {
+        error.path.as_deref() == Some(path)
+            && error.stage == "interpreter"
+            && error.message == message
+    }) {
+        return;
+    }
+    errors.push(ScanError {
+        path: Some(path.into()),
+        stage: "interpreter".into(),
+        message,
+    });
+}
+
+fn sort_inventory(inventory: &mut Inventory) {
+    inventory.findings.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.span.start_byte.cmp(&right.span.start_byte))
+            .then_with(|| left.span.end_byte.cmp(&right.span.end_byte))
+            .then_with(|| kind_order(&left.kind).cmp(&kind_order(&right.kind)))
+            .then_with(|| left.locator.cmp(&right.locator))
+    });
+    inventory.skipped.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.reason.cmp(&right.reason))
+    });
+    inventory.errors.sort_by(scan_error_order);
+}
+
+pub(crate) fn static_script_references(
+    root: &Path,
+    targets: &std::collections::BTreeSet<String>,
+) -> Result<Vec<ScriptReference>, String> {
+    if targets.is_empty() {
+        return Ok(Vec::new());
+    }
+    let root = root
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve reference graph root: {error}"))?;
+    let walk = inventory(&root)?;
+    if !walk.errors.is_empty() {
+        return Err(walk
+            .errors
+            .into_iter()
+            .map(|error| error.message)
+            .collect::<Vec<_>>()
+            .join("; "));
+    }
+    let mut output = Vec::new();
+    let shell_inventory = scan(&root)?;
+    if !shell_inventory.errors.is_empty() || !shell_inventory.skipped.is_empty() {
+        return Err("reference graph requires a complete structured-host scan".into());
+    }
+    for finding in shell_inventory.findings {
+        if !matches!(
+            finding.kind,
+            FindingKind::EmbeddedShell | FindingKind::Candidate
+        ) || targets.contains(&finding.path)
+        {
+            continue;
+        }
+        if let Some(target) = direct_invoked_target(&finding.source, targets) {
+            output.push(ScriptReference {
+                path: finding.path,
+                target,
+                span: finding.span,
+            });
+        }
+    }
+    for (relative, absolute) in walk.files {
+        if targets.contains(&relative) {
+            continue;
+        }
+        let lower = relative.to_ascii_lowercase();
+        let filename = lower.rsplit('/').next().unwrap_or(&lower);
+        let dockerfile = is_dockerfile(&lower, filename);
+        let syntax = if lower.ends_with(".py") {
+            Some(ProcessSyntax::Python)
+        } else if [".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx"]
+            .iter()
+            .any(|extension| lower.ends_with(extension))
+        {
+            Some(ProcessSyntax::Javascript)
+        } else {
+            None
+        };
+        if syntax.is_none() && !dockerfile {
+            continue;
+        }
+        let metadata = absolute
+            .symlink_metadata()
+            .map_err(|error| format!("cannot inspect reference source {relative}: {error}"))?;
+        if metadata.file_type().is_symlink()
+            || !metadata.file_type().is_file()
+            || metadata.len() > 4 * 1024 * 1024
+        {
+            continue;
+        }
+        let bytes = std::fs::read(&absolute)
+            .map_err(|error| format!("cannot read reference source {relative}: {error}"))?;
+        let Ok(source) = std::str::from_utf8(&bytes) else {
+            continue;
+        };
+        if dockerfile {
+            append_docker_exec_references(&mut output, &relative, source, targets);
+            continue;
+        }
+        let syntax = syntax.expect("a non-Docker reference source has process syntax");
+        let start_regex = match syntax {
+            ProcessSyntax::Python => &*PYTHON_SUBPROCESS_START,
+            ProcessSyntax::Javascript => &*JAVASCRIPT_PROCESS_START,
+        };
+        for start in start_regex.find_iter(source) {
+            let Some((end, arguments)) = balanced_call_arguments(source, start.end()) else {
+                continue;
+            };
+            let values = split_top_level_arguments(arguments);
+            let arguments = match syntax {
+                ProcessSyntax::Python => values
+                    .first()
+                    .and_then(|value| static_argv_literals(value.trim()))
+                    .unwrap_or_default(),
+                ProcessSyntax::Javascript => {
+                    let mut arguments = values
+                        .first()
+                        .and_then(|value| quoted_literal(value.trim()))
+                        .into_iter()
+                        .collect::<Vec<_>>();
+                    arguments.extend(
+                        values
+                            .get(1)
+                            .and_then(|value| static_argv_literals(value.trim()))
+                            .unwrap_or_default(),
+                    );
+                    arguments
+                }
+            };
+            for argument in arguments {
+                let normalized = argument.strip_prefix("./").unwrap_or(&argument);
+                if let Some(target) = targets.get(normalized) {
+                    output.push(ScriptReference {
+                        path: relative.clone(),
+                        target: target.clone(),
+                        span: ByteSpan {
+                            start_byte: start.start() as u64,
+                            end_byte: end as u64,
+                        },
+                    });
+                }
+            }
+        }
+    }
+    output.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.span.start_byte.cmp(&right.span.start_byte))
+            .then_with(|| left.target.cmp(&right.target))
+    });
+    output.dedup();
+    Ok(output)
+}
+
+fn direct_invoked_target(
+    source: &[u8],
+    targets: &std::collections::BTreeSet<String>,
+) -> Option<String> {
+    let source = std::str::from_utf8(source).ok()?.trim_start();
+    let mut words = source.split_ascii_whitespace();
+    let mut executable = words.next()?;
+    executable = executable.trim_start_matches(['@', '-', '+']);
+    executable = executable.trim_matches(['\'', '"']);
+    let name = executable.rsplit(['/', '\\']).next().unwrap_or(executable);
+    if matches!(
+        name,
+        "exec" | "command" | "sh" | "bash" | "zsh" | "fish" | "pwsh" | "powershell" | "cmd" | "nu"
+    ) {
+        executable = words.next()?.trim_matches(['\'', '"']);
+    }
+    let normalized = executable.strip_prefix("./").unwrap_or(executable);
+    targets.get(normalized).cloned()
+}
+
+fn append_docker_exec_references(
+    output: &mut Vec<ScriptReference>,
+    path: &str,
+    source: &str,
+    targets: &std::collections::BTreeSet<String>,
+) {
+    let offsets = line_offsets(source);
+    for (index, line) in source.lines().enumerate() {
+        let trimmed = line.trim_start();
+        let Some((instruction, value)) = trimmed.split_once(char::is_whitespace) else {
+            continue;
+        };
+        if !["run", "cmd", "entrypoint"]
+            .iter()
+            .any(|expected| instruction.eq_ignore_ascii_case(expected))
+        {
+            continue;
+        }
+        let value = value.trim_start();
+        if !value.starts_with('[') {
+            continue;
+        }
+        let Ok(arguments) = serde_json::from_str::<Vec<String>>(value) else {
+            continue;
+        };
+        for argument in arguments {
+            let normalized = argument.strip_prefix("./").unwrap_or(&argument);
+            if let Some(target) = targets.get(normalized) {
+                let start = offsets[index] + line.len() - trimmed.len();
+                output.push(ScriptReference {
+                    path: path.into(),
+                    target: target.clone(),
+                    span: ByteSpan {
+                        start_byte: start as u64,
+                        end_byte: (offsets[index] + line.len()) as u64,
+                    },
+                });
+            }
+        }
+    }
 }
 
 fn scan_files(files: &[(String, PathBuf)], next: &AtomicUsize) -> FileScan {
@@ -402,19 +686,11 @@ fn findings_for_file(relative: &str, absolute: &Path) -> FileScan {
         Ok(source) => source,
         Err(error) => return FileScan::error(relative, "read", error.to_string()),
     };
-    if let Some(interpreter) = extension_interpreter {
-        return FileScan::findings(vec![finding(
-            relative,
-            FindingKind::ShellFile,
-            Some(interpreter.into()),
-            InterpreterConfidence::High,
-            None,
-            ByteSpan::whole(&source),
-            source,
-        )]);
-    }
-    let detected = crate::frontend::detect(relative, &source);
-    if !matches!(detected, crate::frontend::Interpreter::Unknown(_)) {
+    let detected = match crate::frontend::resolve_scanned_interpreter(relative, &source) {
+        Ok(detected) => detected,
+        Err(message) => return FileScan::error(relative, "interpreter", message),
+    };
+    if let Some(detected) = detected {
         let interpreter = detected.name().to_owned();
         return FileScan::findings(vec![finding(
             relative,
@@ -715,17 +991,20 @@ fn package_findings(path: &str, source: &str) -> Result<Vec<Finding>, String> {
     Ok(scripts
         .iter()
         .filter_map(|(name, value)| {
-            value.as_str().map(|script| {
-                finding(
-                    path,
-                    FindingKind::EmbeddedShell,
-                    Some("package-shell".into()),
-                    InterpreterConfidence::Medium,
-                    Some(format!("scripts.{name}")),
-                    span_of(source, script),
-                    script.as_bytes().to_vec(),
-                )
-            })
+            value
+                .as_str()
+                .filter(|script| !script.is_empty())
+                .map(|script| {
+                    finding(
+                        path,
+                        FindingKind::EmbeddedShell,
+                        Some("package-shell".into()),
+                        InterpreterConfidence::Medium,
+                        Some(format!("scripts.{name}")),
+                        span_of(source, script),
+                        script.as_bytes().to_vec(),
+                    )
+                })
         })
         .collect())
 }
@@ -736,21 +1015,23 @@ fn makefile_findings(path: &str, source: &str) -> Vec<Finding> {
         .lines()
         .enumerate()
         .filter_map(|(index, line)| {
-            line.strip_prefix('\t').map(|command| {
-                let start = offsets[index] + 1;
-                finding(
-                    path,
-                    FindingKind::EmbeddedShell,
-                    Some("sh".into()),
-                    InterpreterConfidence::High,
-                    Some(format!("recipe:{}", index + 1)),
-                    ByteSpan {
-                        start_byte: start as u64,
-                        end_byte: (start + command.len()) as u64,
-                    },
-                    command.as_bytes().to_vec(),
-                )
-            })
+            line.strip_prefix('\t')
+                .filter(|command| !command.trim().is_empty())
+                .map(|command| {
+                    let start = offsets[index] + 1;
+                    finding(
+                        path,
+                        FindingKind::EmbeddedShell,
+                        Some("sh".into()),
+                        InterpreterConfidence::High,
+                        Some(format!("recipe:{}", index + 1)),
+                        ByteSpan {
+                            start_byte: start as u64,
+                            end_byte: (start + command.len()) as u64,
+                        },
+                        command.as_bytes().to_vec(),
+                    )
+                })
         })
         .collect()
 }
@@ -1318,21 +1599,237 @@ fn host_findings(path: &str, source: &str, lower: &str) -> Vec<Finding> {
     let mut output = Vec::new();
     if lower.ends_with(".py") {
         append_host_findings(&mut output, path, source, &offsets, &PYTHON_OS_SYSTEM, "sh");
-        append_host_findings(
+        append_process_reference_findings(
             &mut output,
             path,
             source,
             &offsets,
-            &PYTHON_SUBPROCESS,
-            "sh",
+            &PYTHON_SUBPROCESS_START,
+            ProcessSyntax::Python,
         );
     } else if [".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx"]
         .iter()
         .any(|extension| lower.ends_with(extension))
     {
-        append_host_findings(&mut output, path, source, &offsets, &JAVASCRIPT_EXEC, "sh");
+        append_javascript_shell_findings(&mut output, path, source, &offsets);
+        append_process_reference_findings(
+            &mut output,
+            path,
+            source,
+            &offsets,
+            &JAVASCRIPT_PROCESS_START,
+            ProcessSyntax::Javascript,
+        );
     }
     output
+}
+
+fn append_javascript_shell_findings(
+    output: &mut Vec<Finding>,
+    path: &str,
+    source: &str,
+    line_offsets: &[usize],
+) {
+    for start in JAVASCRIPT_EXEC_START.find_iter(source) {
+        let Some((end, arguments)) = balanced_call_arguments(source, start.end()) else {
+            continue;
+        };
+        let first = split_top_level_arguments(arguments)
+            .first()
+            .map(|value| value.trim().to_owned());
+        let (kind, command, confidence) = match first.as_deref().and_then(quoted_literal) {
+            Some(command) => (
+                FindingKind::EmbeddedShell,
+                command,
+                InterpreterConfidence::High,
+            ),
+            None => (
+                FindingKind::Candidate,
+                arguments.trim().to_owned(),
+                InterpreterConfidence::Low,
+            ),
+        };
+        let line_index = line_offsets
+            .partition_point(|offset| *offset <= start.start())
+            .saturating_sub(1);
+        let line_start = line_offsets[line_index];
+        let line = line_index + 1;
+        let column = source[line_start..start.start()].chars().count();
+        output.push(finding(
+            path,
+            kind,
+            Some("sh".into()),
+            confidence,
+            Some(format!("line:{line}:column:{column}")),
+            ByteSpan {
+                start_byte: start.start() as u64,
+                end_byte: end as u64,
+            },
+            command.into_bytes(),
+        ));
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ProcessSyntax {
+    Python,
+    Javascript,
+}
+
+fn append_process_reference_findings(
+    output: &mut Vec<Finding>,
+    path: &str,
+    source: &str,
+    line_offsets: &[usize],
+    start_regex: &regex::Regex,
+    syntax: ProcessSyntax,
+) {
+    for start in start_regex.find_iter(source) {
+        let Some((end, arguments)) = balanced_call_arguments(source, start.end()) else {
+            continue;
+        };
+        let values = split_top_level_arguments(arguments);
+        let Some(first) = values.first().map(|value| value.trim()) else {
+            continue;
+        };
+        let shell_true = matches!(syntax, ProcessSyntax::Python)
+            && values.iter().skip(1).any(|value| {
+                value
+                    .split_once('=')
+                    .is_some_and(|(name, value)| name.trim() == "shell" && value.trim() == "True")
+            });
+        let safe = match syntax {
+            ProcessSyntax::Python => !shell_true && static_argv_collection(first),
+            ProcessSyntax::Javascript => {
+                quoted_literal(first).is_some()
+                    && values
+                        .get(1)
+                        .is_none_or(|value| static_argv_collection(value.trim()))
+            }
+        };
+        if safe {
+            continue;
+        }
+        let quoted = quoted_literal(first);
+        let quoted_command = quoted.is_some();
+        let (kind, command) = if matches!(syntax, ProcessSyntax::Python) {
+            quoted
+                .map(|value| (FindingKind::EmbeddedShell, value))
+                .unwrap_or_else(|| (FindingKind::Candidate, first.into()))
+        } else {
+            (FindingKind::Candidate, arguments.trim().to_owned())
+        };
+        let line_index = line_offsets
+            .partition_point(|offset| *offset <= start.start())
+            .saturating_sub(1);
+        let line_start = line_offsets[line_index];
+        let line = line_index + 1;
+        let column = source[line_start..start.start()].chars().count();
+        output.push(finding(
+            path,
+            kind,
+            Some("sh".into()),
+            if quoted_command {
+                InterpreterConfidence::High
+            } else {
+                InterpreterConfidence::Low
+            },
+            Some(format!("line:{line}:column:{column}")),
+            ByteSpan {
+                start_byte: start.start() as u64,
+                end_byte: end as u64,
+            },
+            command.into_bytes(),
+        ));
+    }
+}
+
+fn balanced_call_arguments(source: &str, start: usize) -> Option<(usize, &str)> {
+    let bytes = source.as_bytes();
+    let mut index = start;
+    let mut depth = 1_u32;
+    let mut quote = None;
+    let mut escaped = false;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if let Some(delimiter) = quote {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == delimiter {
+                quote = None;
+            }
+        } else {
+            match byte {
+                b'\'' | b'"' | b'`' => quote = Some(byte),
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some((index + 1, &source[start..index]));
+                    }
+                }
+                _ => {}
+            }
+        }
+        index += 1;
+    }
+    None
+}
+
+pub(crate) fn split_top_level_arguments(arguments: &str) -> Vec<&str> {
+    let bytes = arguments.as_bytes();
+    let mut output = Vec::new();
+    let mut start = 0;
+    let mut nesting = 0_u32;
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        if let Some(delimiter) = quote {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == delimiter {
+                quote = None;
+            }
+            continue;
+        }
+        match byte {
+            b'\'' | b'"' | b'`' => quote = Some(byte),
+            b'[' | b'(' | b'{' => nesting += 1,
+            b']' | b')' | b'}' => nesting = nesting.saturating_sub(1),
+            b',' if nesting == 0 => {
+                output.push(&arguments[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    if !arguments[start..].trim().is_empty() {
+        output.push(&arguments[start..]);
+    }
+    output
+}
+
+fn static_argv_collection(value: &str) -> bool {
+    static_argv_literals(value).is_some()
+}
+
+pub(crate) fn static_argv_literals(value: &str) -> Option<Vec<String>> {
+    let value = value.trim();
+    let inner = if value.starts_with('[') && value.ends_with(']')
+        || value.starts_with('(') && value.ends_with(')')
+    {
+        &value[1..value.len() - 1]
+    } else {
+        return None;
+    };
+    split_top_level_arguments(inner)
+        .iter()
+        .map(|argument| quoted_literal(argument.trim()))
+        .collect()
 }
 
 fn append_host_findings(
@@ -1380,7 +1877,7 @@ fn append_host_findings(
     }
 }
 
-fn quoted_literal(value: &str) -> Option<String> {
+pub(crate) fn quoted_literal(value: &str) -> Option<String> {
     if value.len() < 2 {
         return None;
     }
@@ -1427,12 +1924,23 @@ fn executable_field(name: &str) -> bool {
 
 fn looks_like_shell(value: &str) -> bool {
     let first = value.split_ascii_whitespace().next().unwrap_or("");
+    let executable = first
+        .trim_start_matches(['@', '-', '+'])
+        .trim_matches(['\'', '"'])
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    let shell_path = [
+        ".sh", ".bash", ".zsh", ".fish", ".ps1", ".psm1", ".cmd", ".bat", ".nu",
+    ]
+    .iter()
+    .any(|extension| executable.ends_with(extension));
     [
         "bash", "cat", "cd", "chmod", "cmd", "cp", "curl", "echo", "env", "exec", "fish", "git",
         "mkdir", "mv", "nu", "printf", "pwsh", "rm", "sh", "test", "wget", "zsh",
     ]
     .iter()
     .any(|command| first.eq_ignore_ascii_case(command))
+        || shell_path
         || ["&&", "||", "$(", "${", " | ", " > "]
             .iter()
             .any(|marker| value.contains(marker))
@@ -1488,6 +1996,73 @@ mod tests {
             findings
                 .iter()
                 .all(|finding| finding.content_digest.len() == 64)
+        );
+    }
+
+    #[test]
+    fn non_shell_preambles_do_not_become_shell_interpreter_blockers() {
+        let temporary = tempfile::tempdir().unwrap();
+        write(
+            temporary.path(),
+            "src/lib.rs",
+            b"#![forbid(unsafe_code)]\npub fn value() -> u8 { 1 }\n",
+        );
+        write(
+            temporary.path(),
+            "tools/check.py",
+            b"#!/usr/bin/env python3\nimport os\nos.system('printf python')\n",
+        );
+        write(
+            temporary.path(),
+            "tools/check.mjs",
+            b"#!/usr/bin/env node\nimport { exec } from 'node:child_process';\nexec('printf node');\n",
+        );
+
+        let inventory = scan(temporary.path()).unwrap();
+        assert!(inventory.errors.is_empty(), "{:#?}", inventory.errors);
+        assert_eq!(inventory.findings.len(), 2, "{:#?}", inventory.findings);
+        assert!(inventory.findings.iter().all(|finding| {
+            finding.kind == FindingKind::EmbeddedShell
+                && (finding.source == b"printf python" || finding.source == b"printf node")
+        }));
+    }
+
+    #[test]
+    fn an_unrecognized_executable_shebang_remains_an_inventory_blocker() {
+        let temporary = tempfile::tempdir().unwrap();
+        write(
+            temporary.path(),
+            "tools/custom",
+            b"#!/opt/project/bin/custom-language\nrun task\n",
+        );
+
+        let inventory = scan(temporary.path()).unwrap();
+        assert!(inventory.findings.is_empty());
+        assert_eq!(inventory.errors.len(), 1, "{:#?}", inventory.errors);
+        assert_eq!(inventory.errors[0].stage, "interpreter");
+        assert!(
+            inventory.errors[0]
+                .message
+                .contains("DESHELL_BLOCKER_UNKNOWN_INTERPRETER")
+        );
+    }
+
+    #[test]
+    fn interpreter_conflicts_are_inventory_blockers_not_shell_findings() {
+        let temporary = tempfile::tempdir().unwrap();
+        write(
+            temporary.path(),
+            "conflict.ps1",
+            b"#!/usr/bin/env bash\nprintf conflict\n",
+        );
+        let inventory = scan(temporary.path()).unwrap();
+        assert!(inventory.findings.is_empty());
+        assert_eq!(inventory.errors.len(), 1);
+        assert_eq!(inventory.errors[0].stage, "interpreter");
+        assert!(
+            inventory.errors[0]
+                .message
+                .contains("DESHELL_BLOCKER_INTERPRETER_CONFLICT")
         );
     }
 
@@ -1560,6 +2135,136 @@ mod tests {
     }
 
     #[test]
+    fn docker_exec_form_is_not_shell_but_remains_in_the_reference_graph() {
+        let temporary = tempfile::tempdir().unwrap();
+        write(
+            temporary.path(),
+            "scripts/build.sh",
+            b"#!/bin/sh\n/usr/bin/printf build\n",
+        );
+        let dockerfile = b"FROM scratch\nRUN [\"./scripts/build.sh\",\"--release\"]\n";
+        write(temporary.path(), "Dockerfile", dockerfile);
+
+        let inventory = scan(temporary.path()).unwrap();
+        assert_eq!(inventory.findings.len(), 1);
+        assert_eq!(inventory.findings[0].path, "scripts/build.sh");
+        let references = static_script_references(
+            temporary.path(),
+            &["scripts/build.sh".to_owned()].into_iter().collect(),
+        )
+        .unwrap();
+        let start = dockerfile
+            .windows(b"RUN".len())
+            .position(|window| window == b"RUN")
+            .unwrap();
+        assert_eq!(
+            references,
+            vec![ScriptReference {
+                path: "Dockerfile".into(),
+                target: "scripts/build.sh".into(),
+                span: ByteSpan {
+                    start_byte: start as u64,
+                    end_byte: (dockerfile.len() - 1) as u64,
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn structured_entrypoints_remain_in_the_static_reference_graph() {
+        let temporary = tempfile::tempdir().unwrap();
+        write(
+            temporary.path(),
+            "scripts/build.sh",
+            b"#!/bin/sh\n/usr/bin/printf build\n",
+        );
+        write(
+            temporary.path(),
+            "Makefile",
+            b"build:\n\t./scripts/build.sh --make\n",
+        );
+        write(
+            temporary.path(),
+            "package.json",
+            br#"{"scripts":{"build":"./scripts/build.sh --package","label":"printf scripts/build.sh"}}"#,
+        );
+        write(
+            temporary.path(),
+            ".github/workflows/ci.yml",
+            b"jobs:\n  build:\n    steps:\n      - run: ./scripts/build.sh --github\n",
+        );
+
+        let references = static_script_references(
+            temporary.path(),
+            &["scripts/build.sh".to_owned()].into_iter().collect(),
+        )
+        .unwrap();
+        assert_eq!(
+            references
+                .iter()
+                .map(|reference| reference.path.as_str())
+                .collect::<Vec<_>>(),
+            [".github/workflows/ci.yml", "Makefile", "package.json"]
+        );
+        assert!(
+            references
+                .iter()
+                .all(|reference| reference.target == "scripts/build.sh")
+        );
+        assert_eq!(
+            references
+                .iter()
+                .filter(|reference| reference.path == "package.json")
+                .count(),
+            1,
+            "a non-executable argument must not become a reference"
+        );
+    }
+
+    #[test]
+    fn json_toml_and_yaml_task_candidates_remain_in_the_reference_graph() {
+        let temporary = tempfile::tempdir().unwrap();
+        write(
+            temporary.path(),
+            "scripts/build.sh",
+            b"#!/bin/sh\n/usr/bin/printf build\n",
+        );
+        write(
+            temporary.path(),
+            "tasks.json",
+            br#"{"tasks":{"build":{"command":"./scripts/build.sh"}}}"#,
+        );
+        write(
+            temporary.path(),
+            "tasks.toml",
+            b"[tasks.build]\nrun = \"./scripts/build.sh\"\n",
+        );
+        write(
+            temporary.path(),
+            "taskfile.yml",
+            b"tasks:\n  build:\n    command: ./scripts/build.sh\n",
+        );
+
+        let references = static_script_references(
+            temporary.path(),
+            &["scripts/build.sh".to_owned()].into_iter().collect(),
+        )
+        .unwrap();
+        assert_eq!(
+            references
+                .iter()
+                .map(|reference| reference.path.as_str())
+                .collect::<Vec<_>>(),
+            ["taskfile.yml", "tasks.json", "tasks.toml"]
+        );
+        assert!(
+            references
+                .iter()
+                .all(|reference| reference.target == "scripts/build.sh")
+        );
+    }
+
+    #[test]
     fn reports_dynamic_host_calls_as_candidates_without_claiming_static_shell() {
         let temporary = tempfile::tempdir().unwrap();
         write(
@@ -1578,6 +2283,57 @@ mod tests {
                 .iter()
                 .any(|finding| finding.kind == FindingKind::EmbeddedShell
                     && finding.source == b"printf static")
+        );
+    }
+
+    #[test]
+    fn safe_process_argv_arrays_are_excluded_but_dynamic_references_remain_candidates() {
+        let temporary = tempfile::tempdir().unwrap();
+        write(
+            temporary.path(),
+            "safe.py",
+            br#"import subprocess
+subprocess.run(["printf", "safe"], check=True)
+subprocess.Popen(("git", "status"), shell=False)
+subprocess.run(dynamic_command, shell=True)
+"#,
+        );
+        write(
+            temporary.path(),
+            "safe.js",
+            br#"const {spawn, execFile} = require('node:child_process');
+spawn('printf', ['safe']);
+execFile('/usr/bin/git', ['status']);
+spawn(dynamicProgram, dynamicArguments);
+"#,
+        );
+        let inventory = scan(temporary.path()).unwrap();
+        assert!(inventory.errors.is_empty(), "{:#?}", inventory.errors);
+        assert_eq!(inventory.findings.len(), 2, "{:#?}", inventory.findings);
+        assert!(inventory.findings.iter().all(|finding| {
+            finding.kind == FindingKind::Candidate
+                && (finding.source == b"dynamic_command"
+                    || finding.source == b"dynamicProgram, dynamicArguments")
+        }));
+    }
+
+    #[test]
+    fn javascript_exec_sync_with_inherited_stdio_keeps_the_exact_call_span() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = concat!(
+            "const child_process = require(\"node:child_process\");\n",
+            "  child_process.execSync(\"/usr/bin/printf javascript\", {stdio: \"inherit\"});\n",
+        );
+        write(temporary.path(), "runner.js", source.as_bytes());
+        let inventory = scan(temporary.path()).unwrap();
+        assert!(inventory.errors.is_empty(), "{:#?}", inventory.errors);
+        assert_eq!(inventory.findings.len(), 1, "{:#?}", inventory.findings);
+        let finding = &inventory.findings[0];
+        assert_eq!(finding.kind, FindingKind::EmbeddedShell);
+        assert_eq!(finding.source, b"/usr/bin/printf javascript");
+        assert_eq!(
+            &source[finding.span.start_byte as usize..finding.span.end_byte as usize],
+            "child_process.execSync(\"/usr/bin/printf javascript\", {stdio: \"inherit\"})"
         );
     }
 
@@ -1650,7 +2406,7 @@ mod tests {
             (
                 "a.py",
                 python_a,
-                "subprocess.run(dynamic_a",
+                "subprocess.run(dynamic_a)",
                 "dynamic_a",
                 FindingKind::Candidate,
                 InterpreterConfidence::Low,
@@ -1658,7 +2414,7 @@ mod tests {
             (
                 "b.py",
                 python_b,
-                "subprocess.call(\"printf py-b\"",
+                "subprocess.call(\"printf py-b\")",
                 "printf py-b",
                 FindingKind::EmbeddedShell,
                 InterpreterConfidence::High,
@@ -1848,5 +2604,162 @@ mod tests {
         let start = inventory.findings[0].span.start_byte as usize;
         let end = inventory.findings[0].span.end_byte as usize;
         assert_eq!(&source[start..end], b"printf jsonc");
+    }
+
+    #[test]
+    fn git_inventory_combines_tracked_and_untracked_files_but_honors_exclusions() {
+        let temporary = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(temporary.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        write(temporary.path(), ".gitignore", b"ignored.sh\n");
+        write(
+            temporary.path(),
+            "build/tracked.sh",
+            b"#!/bin/sh\n/bin/true\n",
+        );
+        write(temporary.path(), "untracked.sh", b"#!/bin/sh\n/bin/true\n");
+        write(temporary.path(), "ignored.sh", b"#!/bin/sh\n/bin/true\n");
+        write(
+            temporary.path(),
+            "target/generated.sh",
+            b"#!/bin/sh\n/bin/true\n",
+        );
+        let output = std::process::Command::new("git")
+            .args(["add", ".gitignore", "build/tracked.sh"])
+            .current_dir(temporary.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let inventory = scan(temporary.path()).unwrap();
+        let paths = inventory
+            .findings
+            .iter()
+            .map(|finding| finding.path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(paths, ["build/tracked.sh", "untracked.sh"]);
+        assert!(inventory.errors.is_empty());
+
+        let broken = tempfile::tempdir().unwrap();
+        write(broken.path(), ".git/HEAD", b"ref: refs/heads/main\n");
+        write(broken.path(), "live.sh", b"#!/bin/sh\n/bin/true\n");
+        let inventory = scan(broken.path()).unwrap();
+        assert!(
+            inventory
+                .findings
+                .iter()
+                .any(|finding| finding.path == "live.sh")
+        );
+        assert!(
+            inventory
+                .errors
+                .iter()
+                .any(|error| error.stage == "inventory")
+        );
+        let targets = std::collections::BTreeSet::from(["live.sh".to_owned()]);
+        assert!(static_script_references(broken.path(), &targets).is_err());
+    }
+
+    #[test]
+    fn scanner_bounds_large_files_and_preserves_path_and_override_errors() {
+        let temporary = tempfile::tempdir().unwrap();
+        let large_shell = temporary.path().join("large.sh");
+        let large_irrelevant = temporary.path().join("large.txt");
+        fs::File::create(&large_shell)
+            .unwrap()
+            .set_len(4 * 1024 * 1024 + 1)
+            .unwrap();
+        fs::File::create(&large_irrelevant)
+            .unwrap()
+            .set_len(4 * 1024 * 1024 + 1)
+            .unwrap();
+        let inventory = scan(temporary.path()).unwrap();
+        assert_eq!(inventory.skipped.len(), 1);
+        assert_eq!(inventory.skipped[0].path, "large.sh");
+        assert_eq!(inventory.skipped[0].reason, "size_limit_exceeded");
+
+        let missing = temporary.path().join("missing");
+        assert_eq!(
+            findings_for_file("missing.sh", &missing).errors[0].stage,
+            "metadata"
+        );
+        assert_eq!(
+            findings_for_file("directory.sh", temporary.path()).skipped[0].reason,
+            "not_regular_file"
+        );
+        let overridden = scan_with_interpreters(
+            temporary.path(),
+            &[crate::config::InterpreterOverride {
+                path: "missing-entry".into(),
+                interpreter: crate::config::ConfiguredInterpreter::Bash,
+            }],
+        )
+        .unwrap();
+        assert!(
+            overridden
+                .errors
+                .iter()
+                .any(|error| error.stage == "interpreter")
+        );
+
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::ffi::OsStringExt as _;
+            let invalid = std::ffi::OsString::from_vec(vec![b'b', b'a', b'd', 0xff]);
+            fs::write(temporary.path().join(invalid), b"data").unwrap();
+            let inventory = scan(temporary.path()).unwrap();
+            assert!(
+                inventory
+                    .errors
+                    .iter()
+                    .any(|error| error.stage == "path_encoding")
+            );
+        }
+    }
+
+    #[test]
+    fn structured_host_helpers_cover_folded_scalars_and_ambiguous_literals() {
+        assert_eq!(yaml_scalar(&["one", "two"], ">-"), "one two");
+        assert_eq!(yaml_scalar(&["one", "", "two"], ">+"), "one\n\ntwo\n");
+        assert_eq!(yaml_scalar(&["one"], "|"), "one\n");
+        for (shell, expected) in [
+            ("pwsh -File {0}", "powershell"),
+            ("cmd.exe /d /c", "cmd"),
+            ("fish {0}", "fish"),
+            ("nushell {0}", "nu"),
+            ("zsh {0}", "zsh"),
+            ("bash {0}", "bash"),
+            ("dash {0}", "sh"),
+        ] {
+            assert_eq!(yaml_shell_name(shell), expected);
+        }
+        assert!(normalize_jsonc("{ /* unterminated").is_err());
+        assert_eq!(
+            normalize_jsonc("{\"run\": \"echo // literal\",}").unwrap(),
+            b"{\"run\": \"echo // literal\" }"
+        );
+        let findings = toml_candidate_findings(
+            "tasks.toml",
+            "[[tasks]]\ncommand = 'sh build.sh'\n[[tasks]]\ncommand = 'plain-value'\n",
+        )
+        .unwrap();
+        assert_eq!(findings.len(), 1);
+        assert!(quoted_literal("'embedded'quote'").is_none());
+        assert_eq!(quoted_literal("\"value\"").as_deref(), Some("value"));
+        assert!(executable_field("preDeployCommand"));
+        assert!(looks_like_shell("tool.sh argument"));
+        assert!(looks_like_shell("unknown ${VALUE}"));
+        assert!(!looks_like_shell("plain-value"));
+        assert_eq!(kind_order(&FindingKind::ShellFile), 0);
+        assert_eq!(kind_order(&FindingKind::EmbeddedShell), 1);
+        assert_eq!(kind_order(&FindingKind::Candidate), 2);
     }
 }

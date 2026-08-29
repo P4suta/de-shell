@@ -1,0 +1,165 @@
+{
+  "$id": "https://deshell.dev/contracts/analyze-report/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "command": {
+      "const": "analyze"
+    },
+    "details": {
+      "additionalProperties": false,
+      "properties": {
+        "counts": {
+          "additionalProperties": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "object"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/$defs/item"
+          },
+          "type": "array"
+        },
+        "output": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "paths": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "values": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        }
+      },
+      "required": [
+        "counts",
+        "values",
+        "paths",
+        "items",
+        "output"
+      ],
+      "type": "object"
+    },
+    "next_actions": {
+      "items": {
+        "$ref": "#/$defs/action"
+      },
+      "type": "array"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "status": {
+      "enum": [
+        "ok",
+        "not_ready",
+        "blocked",
+        "different",
+        "unavailable",
+        "failed"
+      ]
+    },
+    "summary": {
+      "minLength": 1,
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "command",
+    "status",
+    "summary",
+    "next_actions",
+    "details"
+  ],
+  "title": "de-shell analyze report v1",
+  "type": "object",
+  "$defs": {
+    "action": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "action": {
+              "const": "command"
+            },
+            "argv": {
+              "items": {
+                "type": "string"
+              },
+              "minItems": 1,
+              "type": "array"
+            }
+          },
+          "required": [
+            "action",
+            "argv"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "action": {
+              "const": "review"
+            },
+            "paths": {
+              "items": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "minItems": 1,
+              "type": "array"
+            }
+          },
+          "required": [
+            "action",
+            "paths"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "item": {
+      "additionalProperties": false,
+      "properties": {
+        "argv": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "digest": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  }
+}

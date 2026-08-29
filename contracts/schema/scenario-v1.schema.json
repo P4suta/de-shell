@@ -3,6 +3,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "properties": {
+    "approval": { "const": "draft" },
     "arguments": { "items": { "$ref": "#/$defs/namedValue" }, "type": "array" },
     "argv": { "items": { "type": "string" }, "type": "array" },
     "environment": { "items": { "$ref": "#/$defs/namedValue" }, "type": "array" },
@@ -27,7 +28,7 @@
     },
     "version": { "const": 1 }
   },
-  "required": ["version", "name", "limits", "expect"],
+  "required": ["version", "name", "approval", "limits", "expect"],
   "title": "de-shell scenario v1",
   "type": "object",
   "$defs": {

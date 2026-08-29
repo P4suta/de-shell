@@ -25,7 +25,7 @@
             ]
           },
           "stage": {
-            "enum": ["inventory", "walk", "path_encoding", "metadata", "read", "parse_json", "parse_toml", "parse_dockerfile", "worker"]
+            "enum": ["inventory", "walk", "path_encoding", "metadata", "read", "interpreter", "parse_json", "parse_toml", "parse_yaml", "parse_dockerfile", "worker"]
           }
         },
         "required": ["path", "stage", "message"],
