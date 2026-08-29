@@ -1,0 +1,40 @@
+{
+  "$id": "https://deshell.dev/contracts/approval/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "approval_digest": { "$ref": "#/$defs/pinnedDigest" },
+    "schema_version": { "const": 1 },
+    "subject": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "name": { "minLength": 1, "type": "string" },
+            "path": { "$ref": "#/$defs/path" },
+            "type": { "const": "scenario" }
+          },
+          "required": ["type", "name", "path"],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "id": { "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$", "type": "string" },
+            "type": { "const": "matrix" }
+          },
+          "required": ["type", "id"],
+          "type": "object"
+        }
+      ]
+    },
+    "subject_digest": { "$ref": "#/$defs/pinnedDigest" }
+  },
+  "required": ["schema_version", "approval_digest", "subject", "subject_digest"],
+  "title": "de-shell Approval v1",
+  "type": "object",
+  "$defs": {
+    "path": { "pattern": "^(?!/)(?!\\.{1,2}(?:/|$))(?!.*//)(?!.*\\/\\.{1,2}(?:/|$))(?!.*\\/$)[^\\\\:\\u0000]+$", "type": "string" },
+    "pinnedDigest": { "pattern": "^sha256:[0-9a-f]{64}$", "type": "string" }
+  }
+}

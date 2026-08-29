@@ -8,11 +8,37 @@
       "additionalProperties": { "type": "string" },
       "type": "object"
     },
+    "help": { "minLength": 1, "type": "string" },
     "message": { "minLength": 1, "type": "string" },
+    "next_actions": {
+      "items": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "action": { "const": "command" },
+              "argv": { "items": { "type": "string" }, "minItems": 1, "type": "array" }
+            },
+            "required": ["action", "argv"],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "action": { "const": "review" },
+              "paths": { "items": { "minLength": 1, "type": "string" }, "minItems": 1, "type": "array" }
+            },
+            "required": ["action", "paths"],
+            "type": "object"
+          }
+        ]
+      },
+      "type": "array"
+    },
     "schema_version": { "const": 1 },
     "severity": { "enum": ["error", "warning", "note"] }
   },
-  "required": ["schema_version", "severity", "code", "message", "context"],
+  "required": ["schema_version", "severity", "code", "message", "help", "next_actions", "context"],
   "title": "de-shell diagnostic v1",
   "type": "object"
 }

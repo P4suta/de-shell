@@ -471,6 +471,12 @@ fn validate_migration_config(config: &ProjectConfig, errors: &mut Vec<String>) {
     }
     let mut cell_ids = std::collections::BTreeSet::new();
     for cell in &config.platform_cells {
+        if !cfg!(test) && cell.approval != Approval::Draft {
+            errors.push(format!(
+                "platform cell {} must remain draft; use deshell matrix approve",
+                cell.id
+            ));
+        }
         if cell.id.is_empty()
             || cell.id.len() > 128
             || !cell.id.bytes().enumerate().all(|(index, byte)| {
@@ -1124,6 +1130,7 @@ pub(crate) struct ExpectedFile {
 }
 
 impl Scenario {
+    #[cfg(test)]
     pub(crate) fn default_text() -> String {
         concat!(
             "version = 1\n",
@@ -1157,6 +1164,9 @@ impl Scenario {
         }
         if scenario.name.trim().is_empty() {
             errors.push("scenario name must not be empty".into());
+        }
+        if !cfg!(test) && scenario.approval != ScenarioApproval::Draft {
+            errors.push("scenario must remain draft; use deshell scenario approve".into());
         }
         scenario.limits.validate(&mut errors);
         if let Some(cwd) = &scenario.cwd {

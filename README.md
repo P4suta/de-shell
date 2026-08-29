@@ -16,6 +16,86 @@ Its supported interfaces are the CLI, generated files, the JSON Schemas under
 unpublished OCaml reference implementation are private, unstable implementation
 details.
 
+## First retirement
+
+`init` inventories repository content without executing it, chooses one target,
+and fixes that decision in `.deshell/project.toml`. With standalone shell it
+chooses Rust for a lone `Cargo.toml` and Go for a lone `go.mod`; embedded-only
+and shell-free repositories use the structured-host generator. If standalone
+shell has no unique target, `init` writes nothing and exits 2 with exact Rust,
+Go, and host retry argv.
+
+```console
+deshell init
+deshell check
+
+# Copy each displayed digest into its exact approval command.
+deshell scenario list
+deshell scenario approve --name synthesized-build --digest sha256:REVIEW_DIGEST
+deshell matrix list
+deshell matrix approve --cell linux-x86_64-native --digest sha256:REVIEW_DIGEST
+
+deshell migrate plan
+deshell migrate status
+deshell migrate verify --plan PLAN_DIGEST --cell linux-x86_64-native --output evidence.json
+deshell migrate evidence import --plan PLAN_DIGEST evidence.json
+deshell migrate apply --plan PLAN_DIGEST
+
+deshell audit --format human
+deshell verify --require shell-free
+```
+
+The names and cell above are examples; `scenario list`, `matrix list`, and
+`migrate status` print the exact argv for the current repository. Approval is
+content-addressed: changing a scenario or matrix cell makes its approval stale,
+so it must be reviewed and approved again. The immutable Approval v1 files are
+implementation artifacts under `.deshell/approvals/`; ordinary workflows use
+only review digests and `approve` commands.
+
+`migrate plan` always saves its immutable artifact and atomically selects it in
+`.deshell/migrations/active.json`. A plan with blockers is a completed report
+and exits 4; correct the reported source or policy, then run `migrate plan`
+again. `migrate status` derives the next action only from the active plan and
+reports older plans separately as history/superseded state. Apply is atomic and
+has no partial mode. CI should retain `deshell verify --require shell-free`
+after retirement.
+
+Fresh drafts and an empty manifest are valid but not ready: `deshell check`
+reports the reasons and exits 0. It exits 3 only for malformed, corrupt, stale,
+or otherwise invalid contracts. To gate a particular runtime capability rather
+than merely inspect it, use (for example) `deshell doctor --require planning`
+or `deshell doctor --require disposable`; plain `deshell doctor` is an exit-0
+capability report.
+
+## Advanced contracts
+
+Reporting commands accept `--format human|json`. Both forms are rendered from
+the same strict `*-report-v1` value with `schema_version`, `command`, `status`,
+`summary`, and typed `next_actions`. Command actions contain exact argv arrays;
+review actions contain project paths. A blocked or not-ready completed command
+writes its report to stdout and leaves stderr empty. Syntax, I/O, invalid
+contract, and internal failures write Diagnostic v1 to stderr instead.
+
+`audit` additionally supports Finding-only JSONL, SARIF, and GitHub annotation
+streams. With no findings, human and JSON still return a summary while JSONL is
+empty. `run`, stdout export, and `schema` remain raw-byte interfaces and never
+receive a report envelope. All report, Approval, and Migration Index schemas
+are embedded and can be retrieved with `deshell schema NAME`.
+
+The lower-level `deshell analyze` command writes immutable plan/evidence pairs
+below `.deshell/artifacts/<source-sha256>/<plan-sha256>/` and atomically updates
+the manifest. Reanalysis never overwrites Evidence for older content. Name/value
+arrays reject duplicates, paths are normalized project-relative paths, and
+persisted JSON rejects unknown fields.
+
+`export --mode strict` uses only target runtime pins from `deshell.lock` and
+rejects unconfigured or unrepresentable targets. The
+`export --mode bundle --output PATH` form additionally requires an exact
+runtime asset for the current
+OS/architecture. Its deterministic tar binds the executable, active source,
+plans, Evidence, lock, scenarios, assets, capabilities, entrypoint, and run
+command in Bundle v1.
+
 ## Status
 
 The Rust implementation is the repository default and is exercised on Linux,
@@ -75,6 +155,12 @@ The public implementation uses Rust 1.98 and edition 2024. `mise.toml` pins the
 development tools; Cargo uses a locked dependency graph and a bounded build job
 count.
 
+Generated Rust is gated by rustfmt, rustc, and Clippy with `-D warnings`;
+generated Go by gofmt, build/test, and vet. Structured JavaScript and Python
+rewrites use the official `node --check` and `py_compile` syntax checks. Node
+and Python are pinned in the same mise toolchain; no third-party language lint
+dependency is required.
+
 ```console
 mise trust
 mise install
@@ -127,57 +213,6 @@ The report is recording evidence only. The task has no time-based CI failure
 threshold and does not complete the separate release-runner regression gate in
 the roadmap.
 
-## First retirement
-
-```console
-mise run deshell -- init --entry scripts/build.sh
-mise run deshell -- audit --format human
-mise run deshell -- scenario synthesize
-# Review the draft, fill its boundaries, then set approval = "approved".
-mise run deshell -- migrate plan
-mise run deshell -- migrate verify --plan PLAN_DIGEST --cell CELL --output evidence.json
-mise run deshell -- migrate evidence import --plan PLAN_DIGEST evidence.json
-mise run deshell -- migrate apply --plan PLAN_DIGEST
-mise run deshell -- migrate status --format human
-mise run deshell -- verify --require shell-free
-```
-
-Scenario synthesis and migration planning are preview-first. A scenario is not
-retirement evidence until a human changes it to `approval = "approved"`.
-Start a repository proposal with `deshell migrate plan`; after retirement, CI
-must keep `deshell verify --require shell-free` enabled.
-`migrate apply` has no partial mode: one blocker, missing cell, stale digest,
-difference, nondeterminism, delegated/residual byte, validation failure, or
-remaining shell candidate refuses the whole repository transaction. Intentional
-behavior changes use `deshell harden`, never migration equivalence. Project
-files are fresh v1 contracts; 0.1.0 intentionally provides no legacy project,
-IR, or lock migration path.
-
-`deshell init` creates:
-
-- `.deshell/project.toml`, containing entrypoints and policy;
-- `.deshell/scenarios/default.toml`, containing named inputs and expectations;
-- `.deshell/manifest.json`, initially containing no analyzed entries;
-- `deshell.lock`, containing protocol, interpreter, and provider pins.
-
-The lower-level `deshell analyze` command writes immutable plan/evidence pairs below
-`.deshell/artifacts/<source-sha256>/<plan-sha256>/` and atomically updates the
-manifest. Reanalysis never overwrites Evidence for older content. Name/value
-arrays reject duplicates, paths are normalized project-relative paths, and
-persisted JSON rejects unknown fields.
-
-`export --mode strict` uses only target runtime pins from `deshell.lock` (for
-example `targets.dagger_image`) and rejects unconfigured or unrepresentable
-targets. The current external-target strict contract accepts one literal `Exec`
-with no hidden task interface, environment, or working-directory effect; it
-rejects multi-command sequence status semantics instead of approximating them.
-`export --mode bundle --output PATH` additionally requires an exact runtime
-asset for the current OS/architecture in `lab.assets`; its deterministic tar
-contains the exact `deshell` binary, every active manifest entry and its source,
-plan and Evidence, the lock, scenarios, assets at their exact locked project
-paths, minimal capabilities, and a digest-bound Bundle v1 manifest. The manifest
-also fixes the selected entrypoint and extraction-relative run command.
-
 ## Diagnostics and exit behavior
 
 `--diagnostics human|jsonl` controls stderr only. It never changes stdout
@@ -195,7 +230,10 @@ categories:
 | 6 | Provider unavailable |
 | 70 | Internal invariant violation |
 
-Once `run` starts the selected plan, it returns the plan's exit code unchanged.
+Completed policy refusals, differences, and unavailable capabilities use the
+same stdout report as success and leave stderr empty. Only diagnostics use
+stderr. Once `run` starts the selected plan, it returns the plan's exit code
+unchanged.
 
 ## Runtime boundary
 

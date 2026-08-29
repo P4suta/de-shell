@@ -9,6 +9,28 @@ use std::path::{Path, PathBuf};
 pub(crate) struct InitResult {
     pub created: Vec<PathBuf>,
     pub entrypoints: Vec<String>,
+    pub target: InitTarget,
+    pub reason: String,
+    pub module_root: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InitTarget {
+    Auto,
+    Rust,
+    Go,
+    Host,
+}
+
+impl InitTarget {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Rust => "rust",
+            Self::Go => "go",
+            Self::Host => "host",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -17,6 +39,13 @@ pub(crate) struct AnalysisResult {
     pub evidence: Evidence,
     pub plan_path: PathBuf,
     pub evidence_path: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProjectReadiness {
+    pub ready: bool,
+    pub reasons: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -361,10 +390,12 @@ impl Manifest {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn init(root: &Path) -> Result<InitResult, String> {
     init_with_entries(root, &[])
 }
 
+#[cfg(test)]
 pub(crate) fn init_with_entries(root: &Path, requested: &[String]) -> Result<InitResult, String> {
     ensure_directory(root)?;
     let metadata = root
@@ -468,9 +499,435 @@ pub(crate) fn init_with_entries(root: &Path, requested: &[String]) -> Result<Ini
     Ok(InitResult {
         created,
         entrypoints,
+        target: InitTarget::Rust,
+        reason: "legacy library initialization default".into(),
+        module_root: "src/bin".into(),
     })
 }
 
+/// User-facing v1 initialization. Detection and every fallible review step run
+/// before `.deshell` is created so an ambiguous `auto` selection is read-only.
+pub(crate) fn init_cli(
+    root: &Path,
+    requested: &[String],
+    requested_target: InitTarget,
+) -> Result<InitResult, String> {
+    ensure_directory(root)?;
+    let metadata = root
+        .symlink_metadata()
+        .map_err(|error| format!("cannot inspect project root {}: {error}", root.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+        return Err(format!(
+            "project root is not a regular directory: {}",
+            root.display()
+        ));
+    }
+    let config_path = root.join(".deshell/project.toml");
+    if config_path.is_file() {
+        let config = load_config(root).map_err(|errors| errors.join("; "))?;
+        let existing_target = match config.migration.target {
+            crate::config::MigrationTarget::Rust => InitTarget::Rust,
+            crate::config::MigrationTarget::Go => InitTarget::Go,
+            crate::config::MigrationTarget::Host => InitTarget::Host,
+            crate::config::MigrationTarget::Agent => {
+                return Err("existing project uses an external agent target".into());
+            }
+        };
+        if requested_target != InitTarget::Auto && requested_target != existing_target {
+            return Err(format!(
+                "project is already initialized with target {}; --target {} cannot replace it",
+                existing_target.as_str(),
+                requested_target.as_str()
+            ));
+        }
+        if !requested.is_empty() {
+            let mut entries = requested.to_vec();
+            entries.sort();
+            entries.dedup();
+            if entries != config.entrypoints {
+                return Err(
+                    "project is already initialized; --entry cannot replace existing entrypoints"
+                        .into(),
+                );
+            }
+        }
+        return Ok(InitResult {
+            created: Vec::new(),
+            entrypoints: config.entrypoints,
+            target: existing_target,
+            reason: "target is fixed by .deshell/project.toml".into(),
+            module_root: config.migration.module_root,
+        });
+    }
+
+    let inventory = crate::scanner::scan(root)?;
+    if !inventory.errors.is_empty() {
+        return Err(format!(
+            "target detection scan failed: {}",
+            inventory
+                .errors
+                .iter()
+                .map(|error| format!("{}: {}", error.stage, error.message))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+    }
+    let standalone = inventory
+        .findings
+        .iter()
+        .any(|finding| finding.kind == crate::scanner::FindingKind::ShellFile);
+    let embedded = inventory
+        .findings
+        .iter()
+        .any(|finding| finding.kind == crate::scanner::FindingKind::EmbeddedShell);
+    let cargo = regular_marker(root, "Cargo.toml")?;
+    let go = regular_marker(root, "go.mod")?;
+    let (target, reason) = match requested_target {
+        InitTarget::Rust => (
+            InitTarget::Rust,
+            "selected explicitly by --target rust".into(),
+        ),
+        InitTarget::Go => (InitTarget::Go, "selected explicitly by --target go".into()),
+        InitTarget::Host => (
+            InitTarget::Host,
+            "selected explicitly by --target host".into(),
+        ),
+        InitTarget::Auto if !standalone => (
+            InitTarget::Host,
+            if embedded {
+                "only embedded shell was found; structured host rewrites are required".into()
+            } else {
+                "no standalone shell was found; host is the inert default".into()
+            },
+        ),
+        InitTarget::Auto if cargo && !go => (
+            InitTarget::Rust,
+            "Cargo.toml was found and go.mod was not found".into(),
+        ),
+        InitTarget::Auto if go && !cargo => (
+            InitTarget::Go,
+            "go.mod was found and Cargo.toml was not found".into(),
+        ),
+        InitTarget::Auto => {
+            let candidates = if cargo && go {
+                "rust, go, host"
+            } else {
+                "rust, go, host (no Cargo.toml or go.mod was found)"
+            };
+            return Err(format!(
+                "cannot choose a unique migration target for standalone shell; candidates: {candidates}; rerun exactly one of: deshell init --root {} --target rust | deshell init --root {} --target go | deshell init --root {} --target host",
+                root.display(),
+                root.display(),
+                root.display()
+            ));
+        }
+    };
+    let module_root = match target {
+        InitTarget::Rust => "src/bin",
+        InitTarget::Go => "cmd",
+        InitTarget::Host => ".deshell/host",
+        InitTarget::Auto => unreachable!(),
+    }
+    .to_owned();
+
+    let entrypoints = if requested.is_empty() {
+        let mut entries = inventory
+            .findings
+            .iter()
+            .filter(|finding| {
+                finding.kind == crate::scanner::FindingKind::ShellFile
+                    && finding.interpreter_confidence == crate::scanner::InterpreterConfidence::High
+            })
+            .map(|finding| finding.path.clone())
+            .collect::<Vec<_>>();
+        entries.sort();
+        entries.dedup();
+        entries
+    } else {
+        let mut entries = requested.to_vec();
+        entries.sort();
+        entries.dedup();
+        if entries.len() != requested.len() {
+            return Err("duplicate --entry value".into());
+        }
+        for entry in &entries {
+            resolve_entry(root, entry)?;
+        }
+        entries
+    };
+
+    let mut config = ProjectConfig::decode(&ProjectConfig::default_text())
+        .map_err(|errors| errors.join("; "))?;
+    config.entrypoints = entrypoints.clone();
+    config.migration.target = match target {
+        InitTarget::Rust => crate::config::MigrationTarget::Rust,
+        InitTarget::Go => crate::config::MigrationTarget::Go,
+        InitTarget::Host => crate::config::MigrationTarget::Host,
+        InitTarget::Auto => unreachable!(),
+    };
+    config.migration.generator = target.as_str().into();
+    config.migration.module_root = module_root.clone();
+    config.location_overrides = inventory
+        .findings
+        .iter()
+        .filter(|finding| {
+            finding.kind == crate::scanner::FindingKind::EmbeddedShell && target != InitTarget::Host
+        })
+        .map(|finding| crate::config::LocationOverride {
+            path: finding.path.clone(),
+            start_byte: finding.span.start_byte,
+            end_byte: finding.span.end_byte,
+            generator: "host".into(),
+            target: crate::config::MigrationTarget::Host,
+            module_root: ".deshell/host".into(),
+        })
+        .collect();
+    config.platform_cells = vec![crate::config::PlatformCell {
+        id: format!(
+            "{}-{}-native",
+            portable_component(std::env::consts::OS),
+            portable_component(std::env::consts::ARCH)
+        ),
+        operating_system: std::env::consts::OS.into(),
+        architecture: std::env::consts::ARCH.into(),
+        runtime: "native".into(),
+        approval: crate::config::Approval::Draft,
+    }];
+    let config_bytes = config.encode_pretty()?;
+    let scenario_values =
+        synthesized_initial_scenarios(root, &entrypoints, &inventory, config.limits)?;
+
+    // Mutation begins only after target selection, source parsing, and every
+    // generated contract has succeeded.
+    let deshell = root.join(".deshell");
+    let scenarios = deshell.join("scenarios");
+    ensure_directory(&deshell)?;
+    ensure_directory(&scenarios)?;
+    let mut candidates = vec![
+        (deshell.join("project.toml"), config_bytes),
+        (
+            root.join("deshell.lock"),
+            Lockfile::default_text().into_bytes(),
+        ),
+        (
+            deshell.join("manifest.json"),
+            Manifest::empty().encode_pretty()?,
+        ),
+    ];
+    for (name, scenario) in scenario_values {
+        let mut text = toml::to_string_pretty(&scenario)
+            .map_err(|error| format!("cannot encode scenario draft: {error}"))?;
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        Scenario::decode(&text).map_err(|errors| errors.join("; "))?;
+        candidates.push((scenarios.join(format!("{name}.toml")), text.into_bytes()));
+    }
+    let mut created = Vec::new();
+    let mut proposals = Vec::new();
+    for (path, contents) in candidates {
+        match path.symlink_metadata() {
+            Ok(metadata)
+                if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => {
+                return Err(format!(
+                    "project artifact is not a regular non-symlink file: {}",
+                    path.display()
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                proposals.push(crate::patch::prepare_create(&path, contents, 0o644)?);
+                created.push(path);
+            }
+            Err(error) => {
+                return Err(format!(
+                    "cannot inspect project artifact {}: {error}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    crate::patch::apply_all(&proposals)?;
+    Ok(InitResult {
+        created,
+        entrypoints,
+        target,
+        reason,
+        module_root,
+    })
+}
+
+fn regular_marker(root: &Path, name: &str) -> Result<bool, String> {
+    let path = root.join(name);
+    match path.symlink_metadata() {
+        Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {
+            Ok(true)
+        }
+        Ok(_) => Err(format!(
+            "target marker is not a regular file: {}",
+            path.display()
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!("cannot inspect {}: {error}", path.display())),
+    }
+}
+
+fn portable_component(value: &str) -> String {
+    let mut output = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() {
+            output.push((byte as char).to_ascii_lowercase());
+        } else if !output.ends_with('-') {
+            output.push('-');
+        }
+    }
+    output.trim_matches('-').to_owned()
+}
+
+fn synthesized_initial_scenarios(
+    root: &Path,
+    entrypoints: &[String],
+    inventory: &Inventory,
+    limits: crate::config::ResourceLimits,
+) -> Result<Vec<(String, Scenario)>, String> {
+    #[derive(Clone)]
+    struct Source<'a> {
+        path: String,
+        key: String,
+        finding: Option<&'a crate::scanner::Finding>,
+    }
+
+    let mut sources = entrypoints
+        .iter()
+        .map(|path| Source {
+            path: path.clone(),
+            key: path.clone(),
+            finding: None,
+        })
+        .collect::<Vec<_>>();
+    sources.extend(
+        inventory
+            .findings
+            .iter()
+            .filter(|finding| finding.kind == crate::scanner::FindingKind::EmbeddedShell)
+            .map(|finding| {
+                let location = finding.locator.clone().unwrap_or_else(|| {
+                    format!("{}-{}", finding.span.start_byte, finding.span.end_byte)
+                });
+                Source {
+                    path: finding.path.clone(),
+                    key: format!("{}#{location}", finding.path),
+                    finding: Some(finding),
+                }
+            }),
+    );
+    sources.sort_by(|left, right| left.key.cmp(&right.key));
+    sources.dedup_by(|left, right| left.key == right.key);
+    if sources.is_empty() {
+        sources.push(Source {
+            path: "repository".into(),
+            key: "repository".into(),
+            finding: None,
+        });
+    }
+    let stems = sources
+        .iter()
+        .map(|source| scenario_stem(&source.path))
+        .collect::<Vec<_>>();
+    let mut counts = std::collections::BTreeMap::new();
+    for stem in &stems {
+        *counts.entry(stem.clone()).or_insert(0_usize) += 1;
+    }
+    let mut output = Vec::new();
+    for (source, stem) in sources.into_iter().zip(stems) {
+        let mut arguments = std::collections::BTreeSet::new();
+        let mut environment = std::collections::BTreeSet::new();
+        if let Some(finding) = source.finding {
+            if let Some(interpreter) = finding.interpreter.as_deref()
+                && let Ok(plan) = crate::frontend::lower_with_interpreter(
+                    &source.path,
+                    &finding.source,
+                    crate::config::UnknownInterpreter::Reject,
+                    interpreter,
+                )
+                && let Some(task) = plan.tasks.iter().find(|task| task.name == plan.entrypoint)
+            {
+                arguments.extend(task.inputs.iter().map(|input| input.name.clone()));
+                environment.extend(task.environment.iter().cloned());
+            }
+        } else if entrypoints.contains(&source.path) {
+            let (_, path) = resolve_entry(root, &source.path)?;
+            let bytes = std::fs::read(&path)
+                .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+            if let Ok(plan) = crate::frontend::lower(
+                &source.path,
+                &bytes,
+                crate::config::UnknownInterpreter::Reject,
+            ) && let Some(task) = plan.tasks.iter().find(|task| task.name == plan.entrypoint)
+            {
+                arguments.extend(task.inputs.iter().map(|input| input.name.clone()));
+                environment.extend(task.environment.iter().cloned());
+            }
+        }
+        let suffix = if counts.get(&stem).copied().unwrap_or(0) > 1 {
+            let digest = crate::digest::sha256(source.key.as_bytes());
+            format!("-{}", &digest[..8])
+        } else {
+            String::new()
+        };
+        let name = format!("synthesized-{stem}{suffix}");
+        output.push((
+            name.clone(),
+            Scenario {
+                version: 1,
+                name,
+                approval: crate::config::ScenarioApproval::Draft,
+                arguments: arguments
+                    .into_iter()
+                    .map(|name| crate::config::NamedValue {
+                        name,
+                        value: String::new(),
+                    })
+                    .collect(),
+                argv: Vec::new(),
+                environment: environment
+                    .into_iter()
+                    .map(|name| crate::config::NamedValue {
+                        name,
+                        value: String::new(),
+                    })
+                    .collect(),
+                fixtures: Vec::new(),
+                stdin: None,
+                cwd: None,
+                limits,
+                expect: crate::config::Expectation::default(),
+            },
+        ));
+    }
+    Ok(output)
+}
+
+fn scenario_stem(path: &str) -> String {
+    let filename = path.rsplit('/').next().unwrap_or(path);
+    let stem = filename.rsplit_once('.').map_or(filename, |(stem, _)| stem);
+    let mut output = String::new();
+    for character in stem.chars() {
+        if character.is_ascii_alphanumeric() {
+            output.push(character.to_ascii_lowercase());
+        } else if !output.ends_with('-') {
+            output.push('-');
+        }
+    }
+    let output = output.trim_matches('-');
+    if output.is_empty() {
+        "entry".into()
+    } else {
+        output.into()
+    }
+}
+
+#[cfg(test)]
 fn discover_entrypoints(root: &Path) -> Result<Vec<String>, String> {
     let inventory = crate::scanner::scan(root)?;
     if !inventory.errors.is_empty() {
@@ -792,8 +1249,56 @@ fn load_validated_entry_with_reader(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn check(root: &Path) -> Result<(), Vec<String>> {
     ValidatedProject::load(root).map(|_| ())
+}
+
+pub(crate) fn check_readiness(root: &Path) -> Result<ProjectReadiness, Vec<String>> {
+    let mut reasons = Vec::new();
+    match ValidatedProject::load(root) {
+        Ok(_) => {}
+        Err(mut errors) => {
+            let empty_manifest = "manifest contains no analyzed entrypoint";
+            if errors.iter().any(|error| error == empty_manifest) {
+                errors.retain(|error| error != empty_manifest);
+                reasons.push("manifest has no analyzed entrypoint".into());
+            }
+            if !errors.is_empty() {
+                return Err(errors);
+            }
+        }
+    }
+    let scenarios = crate::approval::scenario_reviews(root).map_err(|error| vec![error])?;
+    let pending_scenarios = scenarios
+        .iter()
+        .filter(|review| review.status != crate::approval::ReviewStatus::Approved)
+        .count();
+    if scenarios.is_empty() {
+        reasons.push("no scenario is available for approval".into());
+    } else if pending_scenarios != 0 {
+        reasons.push(format!(
+            "{pending_scenarios} of {} scenario approval(s) are draft or stale",
+            scenarios.len()
+        ));
+    }
+    let cells = crate::approval::matrix_reviews(root).map_err(|error| vec![error])?;
+    let pending_cells = cells
+        .iter()
+        .filter(|review| review.status != crate::approval::ReviewStatus::Approved)
+        .count();
+    if cells.is_empty() {
+        reasons.push("no matrix cell is available for approval".into());
+    } else if pending_cells != 0 {
+        reasons.push(format!(
+            "{pending_cells} of {} matrix approval(s) are draft or stale",
+            cells.len()
+        ));
+    }
+    Ok(ProjectReadiness {
+        ready: reasons.is_empty(),
+        reasons,
+    })
 }
 
 pub(crate) fn save_evidence(root: &Path, evidence: &Evidence) -> Result<PathBuf, String> {
@@ -1157,6 +1662,117 @@ mod tests {
             std::fs::read_to_string(directory.path().join(".deshell/project.toml")).unwrap(),
             "user-owned\n"
         );
+    }
+
+    #[test]
+    fn cli_init_auto_fixes_unique_targets_and_host_routes_embedded_shell() {
+        let rust = tempfile::tempdir().unwrap();
+        write(
+            rust.path(),
+            "Cargo.toml",
+            b"[package]\nname='fixture'\nversion='0.1.0'\n",
+        );
+        write(rust.path(), "build.sh", b"#!/bin/sh\n/usr/bin/printf ok\n");
+        let initialized = init_cli(rust.path(), &[], InitTarget::Auto).unwrap();
+        assert_eq!(initialized.target, InitTarget::Rust);
+        assert_eq!(initialized.module_root, "src/bin");
+        assert_eq!(initialized.entrypoints, ["build.sh"]);
+        assert!(!rust.path().join("src/bin").exists());
+
+        let go = tempfile::tempdir().unwrap();
+        write(
+            go.path(),
+            "go.mod",
+            b"module example.test/fixture\n\ngo 1.25\n",
+        );
+        write(go.path(), "build.sh", b"#!/bin/sh\n/usr/bin/printf ok\n");
+        let initialized = init_cli(go.path(), &[], InitTarget::Auto).unwrap();
+        assert_eq!(initialized.target, InitTarget::Go);
+        assert_eq!(initialized.module_root, "cmd");
+
+        let embedded = tempfile::tempdir().unwrap();
+        write(embedded.path(), "Cargo.toml", b"[workspace]\n");
+        write(embedded.path(), "go.mod", b"module example.test/fixture\n");
+        write(
+            embedded.path(),
+            ".github/workflows/ci.yml",
+            b"jobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo one\n      - run: echo two\n",
+        );
+        let initialized = init_cli(embedded.path(), &[], InitTarget::Auto).unwrap();
+        assert_eq!(initialized.target, InitTarget::Host);
+        assert!(initialized.entrypoints.is_empty());
+        assert!(initialized.reason.contains("embedded shell"));
+        assert_eq!(
+            std::fs::read_dir(embedded.path().join(".deshell/scenarios"))
+                .unwrap()
+                .count(),
+            2
+        );
+
+        let mixed = tempfile::tempdir().unwrap();
+        write(mixed.path(), "Cargo.toml", b"[workspace]\n");
+        write(mixed.path(), "build.sh", b"#!/bin/sh\n/usr/bin/printf ok\n");
+        write(
+            mixed.path(),
+            ".github/workflows/ci.yml",
+            b"jobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo embedded\n",
+        );
+        let initialized = init_cli(mixed.path(), &[], InitTarget::Auto).unwrap();
+        assert_eq!(initialized.target, InitTarget::Rust);
+        let config = load_config(mixed.path()).unwrap();
+        assert_eq!(config.location_overrides.len(), 1);
+        assert_eq!(config.location_overrides[0].generator, "host");
+        assert_eq!(
+            std::fs::read_dir(mixed.path().join(".deshell/scenarios"))
+                .unwrap()
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn ambiguous_auto_target_is_a_no_write_failure_with_exact_retries() {
+        for markers in [0_u8, 3_u8] {
+            let directory = tempfile::tempdir().unwrap();
+            write(directory.path(), "build.sh", b"#!/bin/sh\ntrue\n");
+            if markers & 1 != 0 {
+                write(directory.path(), "Cargo.toml", b"[workspace]\n");
+            }
+            if markers & 2 != 0 {
+                write(directory.path(), "go.mod", b"module example.test/fixture\n");
+            }
+            let error = init_cli(directory.path(), &[], InitTarget::Auto).unwrap_err();
+            assert!(error.contains("cannot choose a unique migration target"));
+            for target in ["rust", "go", "host"] {
+                assert!(error.contains(&format!("--target {target}")), "{error}");
+            }
+            assert!(!directory.path().join(".deshell").exists());
+            assert!(!directory.path().join("deshell.lock").exists());
+        }
+    }
+
+    #[test]
+    fn colliding_scenario_names_use_stable_path_digest_suffixes() {
+        let directory = tempfile::tempdir().unwrap();
+        write(directory.path(), "Cargo.toml", b"[workspace]\n");
+        write(directory.path(), "a/build.sh", b"#!/bin/sh\ntrue\n");
+        write(directory.path(), "b/build.sh", b"#!/bin/sh\nfalse\n");
+        init_cli(directory.path(), &[], InitTarget::Auto).unwrap();
+        let mut names = std::fs::read_dir(directory.path().join(".deshell/scenarios"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>();
+        names.sort();
+        let mut expected = ["a/build.sh", "b/build.sh"]
+            .map(|path| {
+                format!(
+                    "synthesized-build-{}.toml",
+                    &crate::digest::sha256(path.as_bytes())[..8]
+                )
+            })
+            .to_vec();
+        expected.sort();
+        assert_eq!(names, expected);
     }
 
     #[test]

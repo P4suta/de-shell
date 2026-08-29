@@ -1,0 +1,12 @@
+{
+  "$id": "https://deshell.dev/contracts/migration-index/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "active_plan_digest": { "pattern": "^[0-9a-f]{64}$", "type": "string" },
+    "schema_version": { "const": 1 }
+  },
+  "required": ["schema_version", "active_plan_digest"],
+  "title": "de-shell Migration Index v1",
+  "type": "object"
+}

@@ -1,6 +1,7 @@
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 const ZERO_DIGEST: &str = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -73,6 +74,7 @@ pub(crate) struct Location {
 pub(crate) struct ScenarioRequirement {
     pub name: String,
     pub digest: String,
+    pub approval_digest: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -81,6 +83,7 @@ pub(crate) struct CellRequirement {
     pub id: String,
     pub platform_fingerprint: String,
     pub runtime_fingerprint: String,
+    pub approval_digest: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -168,6 +171,7 @@ pub(crate) struct Proposal {
 pub(crate) struct MigrationEvidence {
     pub schema_version: u32,
     pub plan_digest: String,
+    pub approval_digests: Vec<String>,
     pub cell: String,
     pub status: EvidenceStatus,
     pub repetitions: u32,
@@ -351,8 +355,18 @@ pub(crate) struct GeneratedSpan {
 #[derive(Clone, Debug)]
 pub(crate) struct PlanOutput {
     pub digest: String,
+    pub artifact_path: String,
     pub diff: String,
     pub blockers: Vec<Blocker>,
+    pub required_cells: Vec<String>,
+    pub remaining_evidence: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MigrationIndex {
+    pub schema_version: u32,
+    pub active_plan_digest: String,
 }
 
 struct PlannedArtifacts {
@@ -407,6 +421,7 @@ pub(crate) fn create_plan(root: &Path) -> Result<PlanOutput, String> {
         });
     }
 
+    let scenario_reviews = crate::approval::scenario_reviews(root)?;
     let approved_scenario_values = load_approved_scenario_values(root)?;
     let required_scenarios = approved_scenario_values
         .values()
@@ -414,23 +429,58 @@ pub(crate) fn create_plan(root: &Path) -> Result<PlanOutput, String> {
             Ok(ScenarioRequirement {
                 name: scenario.name.clone(),
                 digest: scenario.digest()?,
+                approval_digest: scenario.approval_digest.clone(),
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
-    if !inventory.findings.is_empty() && required_scenarios.is_empty() {
-        blockers.push(Blocker {
-            code: "DESHELL_BLOCKER_UNAPPROVED_SCENARIO".into(),
-            message: "no approved scenario can be used as retirement evidence".into(),
-            location: None,
-        });
+    if !inventory.findings.is_empty() {
+        if scenario_reviews.is_empty() {
+            blockers.push(Blocker {
+                code: "DESHELL_BLOCKER_UNAPPROVED_SCENARIO".into(),
+                message: "no scenario is available for retirement evidence approval".into(),
+                location: None,
+            });
+        } else {
+            for review in scenario_reviews
+                .iter()
+                .filter(|review| review.status != crate::approval::ReviewStatus::Approved)
+            {
+                blockers.push(Blocker {
+                    code: "DESHELL_BLOCKER_UNAPPROVED_SCENARIO".into(),
+                    message: format!(
+                        "scenario {} has no current approval for review digest {}",
+                        review.name, review.digest
+                    ),
+                    location: None,
+                });
+            }
+        }
     }
-    let required_cells = approved_cells(&config);
-    if !inventory.findings.is_empty() && required_cells.is_empty() {
-        blockers.push(Blocker {
-            code: "DESHELL_BLOCKER_PLATFORM_MATRIX_EMPTY".into(),
-            message: "no approved platform/runtime cell can be used as retirement evidence".into(),
-            location: None,
-        });
+    let matrix_reviews = crate::approval::matrix_reviews(root)?;
+    let required_cells = approved_cells(root, &config)?;
+    if !inventory.findings.is_empty() {
+        if matrix_reviews.is_empty() {
+            blockers.push(Blocker {
+                code: "DESHELL_BLOCKER_PLATFORM_MATRIX_EMPTY".into(),
+                message: "no platform/runtime cell is available for retirement evidence approval"
+                    .into(),
+                location: None,
+            });
+        } else {
+            for review in matrix_reviews
+                .iter()
+                .filter(|review| review.status != crate::approval::ReviewStatus::Approved)
+            {
+                blockers.push(Blocker {
+                    code: "DESHELL_BLOCKER_UNAPPROVED_MATRIX_CELL".into(),
+                    message: format!(
+                        "matrix cell {} has no current approval for review digest {}",
+                        review.name, review.digest
+                    ),
+                    location: None,
+                });
+            }
+        }
     }
 
     let retiring_paths = inventory
@@ -776,10 +826,18 @@ pub(crate) fn create_plan(root: &Path) -> Result<PlanOutput, String> {
     plan.validate()?;
     let diff = proposal_diff(&artifacts.proposals)?;
     persist_plan(root, &plan, &artifacts, &diff)?;
+    persist_active_index(root, &plan.plan_digest)?;
     Ok(PlanOutput {
         digest: plan.plan_digest.clone(),
+        artifact_path: format!(".deshell/migrations/sha256/{}/plan.json", plan.plan_digest),
         diff,
         blockers: plan.blockers.clone(),
+        required_cells: plan
+            .required_cells
+            .iter()
+            .map(|cell| cell.id.clone())
+            .collect(),
+        remaining_evidence: plan.required_cells.len(),
     })
 }
 
@@ -979,7 +1037,6 @@ fn build_request_and_proposal(
                     "DESHELL_BLOCKER_GENERATOR_POLICY: external generator {name} is not registered"
                 )
             })?;
-        ensure_module_root(root, selection.module_root)?;
         let target = external_target_hint(
             selection.target,
             selection.module_root,
@@ -1014,11 +1071,9 @@ fn build_request_and_proposal(
     let mut host_additional_files = Vec::new();
     let target = match selection.target {
         crate::config::MigrationTarget::Rust => {
-            ensure_module_root(root, selection.module_root)?;
             format!("{}/{}.rs", selection.module_root, rust_binary_name(&stem))
         }
         crate::config::MigrationTarget::Go => {
-            ensure_module_root(root, selection.module_root)?;
             format!("{}/{stem}.go", selection.module_root)
         }
         crate::config::MigrationTarget::Host => finding.path.clone(),
@@ -1738,7 +1793,14 @@ fn external_target_hint(
 }
 
 fn rust_build_argv(target: &str, output: &str, _operating_system: &str) -> Vec<String> {
-    let mut argv = vec!["rustc".into(), target.into(), "-Ccodegen-units=1".into()];
+    let mut argv = vec![
+        "rustc".into(),
+        target.into(),
+        "--edition=2024".into(),
+        "-D".into(),
+        "warnings".into(),
+        "-Ccodegen-units=1".into(),
+    ];
     argv.extend(["-o".into(), output.into()]);
     argv
 }
@@ -2798,7 +2860,7 @@ fn resolved_finding_interpreter(finding: &crate::scanner::Finding) -> Result<Str
 
 fn add_scenario_input_coverage_blockers(
     plan: &crate::ir::Plan,
-    scenarios: &BTreeMap<String, crate::config::Scenario>,
+    scenarios: &BTreeMap<String, ApprovedScenario>,
     location: &Location,
     blockers: &mut Vec<Blocker>,
 ) {
@@ -2841,12 +2903,16 @@ fn add_scenario_input_coverage_blockers(
     }
 }
 
-fn approved_cells(config: &crate::config::ProjectConfig) -> Vec<CellRequirement> {
-    let mut output = config
-        .platform_cells
-        .iter()
-        .filter(|cell| cell.approval == crate::config::Approval::Approved)
-        .map(|cell| CellRequirement {
+fn approved_cells(
+    root: &Path,
+    config: &crate::config::ProjectConfig,
+) -> Result<Vec<CellRequirement>, String> {
+    let mut output = Vec::new();
+    for cell in &config.platform_cells {
+        let Some(approval_digest) = crate::approval::matrix_approval(root, cell)? else {
+            continue;
+        };
+        output.push(CellRequirement {
             id: cell.id.clone(),
             platform_fingerprint: crate::digest::sha256(
                 format!(
@@ -2858,10 +2924,11 @@ fn approved_cells(config: &crate::config::ProjectConfig) -> Vec<CellRequirement>
             runtime_fingerprint: crate::digest::sha256(
                 format!("deshell-runtime-v1:{}", cell.runtime).as_bytes(),
             ),
-        })
-        .collect::<Vec<_>>();
+            approval_digest,
+        });
+    }
     output.sort_by(|left, right| left.id.cmp(&right.id));
-    output
+    Ok(output)
 }
 
 fn classify_coverage(plan: &crate::ir::Plan, source_bytes: usize) -> Coverage {
@@ -3272,45 +3339,95 @@ fn generate_rust(plan: &crate::ir::Plan) -> Result<Vec<u8>, String> {
     if task.invocation.is_some() || !task.outputs.is_empty() {
         return Err("generator does not support invocation metadata or task outputs".into());
     }
+    let pipeline = rust_node_uses_pipeline(&task.body);
+    let arguments = rust_node_uses_arguments(&task.body);
     let mut body = String::new();
-    emit_rust_node(&task.body, &mut body, 1)?;
-    let source = format!(
+    emit_rust_node(&task.body, &mut body, 2)?;
+    let import = if pipeline {
+        "use std::process::{Command, Stdio};\n\n"
+    } else {
+        "use std::process::Command;\n\n"
+    };
+    let pipeline_helper = if pipeline {
         concat!(
-            "// Generated by de-shell. This file has no de-shell runtime dependency.\n",
-            "use std::process::{{Command, Stdio}};\n\n",
-            "fn deshell_run_pipeline(mut commands: Vec<Command>, pipefail: bool) -> i32 {{\n",
+            "fn deshell_run_pipeline(mut commands: Vec<Command>, pipefail: bool) -> i32 {\n",
             "    let count = commands.len();\n",
             "    let mut children = Vec::with_capacity(count);\n",
             "    let mut previous = None;\n",
-            "    for (index, mut command) in commands.drain(..).enumerate() {{\n",
-            "        if let Some(input) = previous.take() {{ command.stdin(Stdio::from(input)); }}\n",
-            "        if index + 1 < count {{ command.stdout(Stdio::piped()); }}\n",
-            "        match command.spawn() {{\n",
-            "            Ok(mut child) => {{ previous = child.stdout.take(); children.push(child); }}\n",
-            "            Err(error) => {{\n",
-            "                eprintln!(\"{{error}}\");\n",
-            "                for child in &mut children {{ let _ = child.kill(); }}\n",
+            "    for (index, mut command) in commands.drain(..).enumerate() {\n",
+            "        if let Some(input) = previous.take() { command.stdin(Stdio::from(input)); }\n",
+            "        if index + 1 < count { command.stdout(Stdio::piped()); }\n",
+            "        match command.spawn() {\n",
+            "            Ok(mut child) => { previous = child.stdout.take(); children.push(child); }\n",
+            "            Err(error) => {\n",
+            "                eprintln!(\"{error}\");\n",
+            "                for child in &mut children { let _ = child.kill(); }\n",
             "                return 127;\n",
-            "            }}\n",
-            "        }}\n",
-            "    }}\n",
+            "            }\n",
+            "        }\n",
+            "    }\n",
             "    let mut statuses = Vec::with_capacity(count);\n",
-            "    for mut child in children {{\n",
+            "    for mut child in children {\n",
             "        statuses.push(child.wait().map(|status| status.code().unwrap_or(128)).unwrap_or(127));\n",
-            "    }}\n",
-            "    if pipefail {{ statuses.into_iter().rev().find(|status| *status != 0).unwrap_or(0) }}\n",
-            "    else {{ statuses.last().copied().unwrap_or(0) }}\n",
-            "}}\n\n",
+            "    }\n",
+            "    if pipefail { statuses.into_iter().rev().find(|status| *status != 0).unwrap_or(0) }\n",
+            "    else { statuses.last().copied().unwrap_or(0) }\n",
+            "}\n\n"
+        )
+    } else {
+        ""
+    };
+    let argument_binding = if arguments {
+        "    let deshell_args: Vec<String> = std::env::args().skip(1).collect();\n"
+    } else {
+        ""
+    };
+    let source = format!(
+        concat!(
+            "// Generated by de-shell. This file has no de-shell runtime dependency.\n",
+            "{import}",
+            "{pipeline_helper}",
             "fn main() {{\n",
-            "    let deshell_args: Vec<String> = std::env::args().skip(1).collect();\n",
-            "    let mut deshell_last = 0_i32;\n",
+            "{argument_binding}",
+            "    let deshell_status =\n",
             "{body}",
-            "    std::process::exit(deshell_last);\n",
+            ";\n",
+            "    std::process::exit(deshell_status);\n",
             "}}\n"
         ),
-        body = body
+        import = import,
+        pipeline_helper = pipeline_helper,
+        argument_binding = argument_binding,
+        body = body,
     );
-    Ok(source.into_bytes())
+    rustfmt_generated(source.as_bytes())
+}
+
+fn rustfmt_generated(source: &[u8]) -> Result<Vec<u8>, String> {
+    let mut child = std::process::Command::new("rustfmt")
+        .args(["--edition", "2024", "--emit", "stdout"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("official Rust generator requires rustfmt: {error}"))?;
+    child
+        .stdin
+        .take()
+        .ok_or("cannot open rustfmt stdin")?
+        .write_all(source)
+        .map_err(|error| format!("cannot write generated Rust to rustfmt: {error}"))?;
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("cannot wait for rustfmt: {error}"))?;
+    if output.status.success() {
+        Ok(output.stdout)
+    } else {
+        Err(format!(
+            "rustfmt rejected generated Rust: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    }
 }
 
 fn emit_rust_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> Result<(), String> {
@@ -3327,24 +3444,33 @@ fn emit_rust_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> 
                 environment,
                 working_directory.as_ref(),
                 "deshell_command",
+                true,
                 output,
                 depth + 1,
             )?;
             output.push_str(&format!(
                 concat!(
-                    "{indent}    deshell_last = match deshell_command.status() {{\n",
+                    "{indent}    match deshell_command.status() {{\n",
                     "{indent}        Ok(status) => status.code().unwrap_or(128),\n",
                     "{indent}        Err(error) => {{ eprintln!(\"{{error}}\"); 127 }},\n",
-                    "{indent}    }};\n",
-                    "{indent}}}\n"
+                    "{indent}    }}\n",
+                    "{indent}}}"
                 ),
                 indent = indent
             ));
         }
         crate::ir::Operation::Sequence { nodes } => {
-            for child in nodes {
-                emit_rust_node(child, output, depth)?;
+            let Some((last, preceding)) = nodes.split_last() else {
+                return Err("generator received an empty sequence".into());
+            };
+            output.push_str(&format!("{indent}{{\n"));
+            for child in preceding {
+                output.push_str(&format!("{indent}    let _ =\n"));
+                emit_rust_node(child, output, depth + 2)?;
+                output.push_str(";\n");
             }
+            emit_rust_node(last, output, depth + 1)?;
+            output.push_str(&format!("\n{indent}}}"));
         }
         crate::ir::Operation::Pipeline { nodes, status } => {
             output.push_str(&format!("{indent}{{\n"));
@@ -3365,6 +3491,7 @@ fn emit_rust_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> 
                     environment,
                     working_directory.as_ref(),
                     "deshell_stage",
+                    false,
                     output,
                     depth + 1,
                 )?;
@@ -3373,7 +3500,7 @@ fn emit_rust_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> 
                 ));
             }
             output.push_str(&format!(
-                "{indent}    deshell_last = deshell_run_pipeline(deshell_commands, {});\n{indent}}}\n",
+                "{indent}    deshell_run_pipeline(deshell_commands, {})\n{indent}}}",
                 matches!(status, crate::ir::PipelineStatus::Pipefail)
             ));
         }
@@ -3382,14 +3509,23 @@ fn emit_rust_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> 
             if_true,
             if_false,
         } => {
-            emit_rust_node(predicate, output, depth)?;
-            output.push_str(&format!("{indent}if deshell_last == 0 {{\n"));
-            emit_rust_node(if_true, output, depth + 1)?;
+            output.push_str(&format!(
+                "{indent}{{\n{indent}    let deshell_predicate =\n"
+            ));
+            emit_rust_node(predicate, output, depth + 2)?;
+            output.push_str(&format!(";\n{indent}    if deshell_predicate == 0 {{\n"));
+            emit_rust_node(if_true, output, depth + 2)?;
+            output.push('\n');
             if let Some(if_false) = if_false {
-                output.push_str(&format!("{indent}}} else {{\n"));
-                emit_rust_node(if_false, output, depth + 1)?;
+                output.push_str(&format!("{indent}    }} else {{\n"));
+                emit_rust_node(if_false, output, depth + 2)?;
+                output.push('\n');
+            } else {
+                output.push_str(&format!(
+                    "{indent}    }} else {{\n{indent}        deshell_predicate\n"
+                ));
             }
-            output.push_str(&format!("{indent}}}\n"));
+            output.push_str(&format!("{indent}    }}\n{indent}}}"));
         }
         other => {
             return Err(format!(
@@ -3401,11 +3537,62 @@ fn emit_rust_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> 
     Ok(())
 }
 
+fn rust_node_uses_pipeline(node: &crate::ir::Node) -> bool {
+    match &node.operation {
+        crate::ir::Operation::Pipeline { .. } => true,
+        crate::ir::Operation::Sequence { nodes } => nodes.iter().any(rust_node_uses_pipeline),
+        crate::ir::Operation::Condition {
+            predicate,
+            if_true,
+            if_false,
+        } => {
+            rust_node_uses_pipeline(predicate)
+                || rust_node_uses_pipeline(if_true)
+                || if_false.as_deref().is_some_and(rust_node_uses_pipeline)
+        }
+        _ => false,
+    }
+}
+
+fn rust_node_uses_arguments(node: &crate::ir::Node) -> bool {
+    fn expression(value: &crate::ir::TextExpression) -> bool {
+        value
+            .parts
+            .iter()
+            .any(|part| matches!(part, crate::ir::TextPart::Argument { .. }))
+    }
+    match &node.operation {
+        crate::ir::Operation::Exec {
+            argv,
+            environment,
+            working_directory,
+        } => {
+            argv.iter().any(expression)
+                || environment.iter().any(|value| expression(&value.value))
+                || working_directory.as_ref().is_some_and(expression)
+        }
+        crate::ir::Operation::Sequence { nodes } | crate::ir::Operation::Pipeline { nodes, .. } => {
+            nodes.iter().any(rust_node_uses_arguments)
+        }
+        crate::ir::Operation::Condition {
+            predicate,
+            if_true,
+            if_false,
+        } => {
+            rust_node_uses_arguments(predicate)
+                || rust_node_uses_arguments(if_true)
+                || if_false.as_deref().is_some_and(rust_node_uses_arguments)
+        }
+        _ => false,
+    }
+}
+
 fn emit_rust_command(
     argv: &[crate::ir::TextExpression],
     environment: &[crate::ir::NamedExpression],
     working_directory: Option<&crate::ir::TextExpression>,
     variable: &str,
+    force_mutable: bool,
     output: &mut String,
     depth: usize,
 ) -> Result<(), String> {
@@ -3413,9 +3600,12 @@ fn emit_rust_command(
     let program = argv
         .first()
         .ok_or_else(|| "generator received empty Exec argv".to_owned())?;
+    let mutable =
+        force_mutable || argv.len() > 1 || !environment.is_empty() || working_directory.is_some();
     output.push_str(&format!(
-        "{indent}let mut {variable} = Command::new({});\n",
-        rust_expression(program)?
+        "{indent}let {mutable}{variable} = Command::new({});\n",
+        rust_expression(program)?,
+        mutable = if mutable { "mut " } else { "" },
     ));
     for argument in &argv[1..] {
         output.push_str(&format!(
@@ -3457,8 +3647,13 @@ fn rust_expression(expression: &crate::ir::TextExpression) -> Result<String, Str
                     .ok()
                     .and_then(|index| index.checked_sub(1))
                     .ok_or_else(|| format!("generator cannot bind named argument {name}"))?;
+                let lookup = if index == 0 {
+                    "deshell_args.first()".to_owned()
+                } else {
+                    format!("deshell_args.get({index})")
+                };
                 output.push_str(&format!(
-                    " deshell_value.push_str(deshell_args.get({index}).map(String::as_str).unwrap_or(\"\"));"
+                    " deshell_value.push_str({lookup}.map(String::as_str).unwrap_or(\"\"));"
                 ));
             }
         }
@@ -3478,58 +3673,82 @@ fn generate_go(plan: &crate::ir::Plan) -> Result<Vec<u8>, String> {
     }
     let mut body = String::new();
     emit_go_node(&task.body, &mut body, 1)?;
+    let pipeline_helper = if rust_node_uses_pipeline(&task.body) {
+        concat!(
+            "func deshellRunPipeline(commands []*exec.Cmd, pipefail bool) int {\n",
+            "\tif len(commands) == 0 {\n\t\treturn 0\n\t}\n",
+            "\tpipes := make([]*os.File, 0, 2*(len(commands)-1))\n",
+            "\tfor index := 0; index+1 < len(commands); index++ {\n",
+            "\t\treader, writer, err := os.Pipe()\n",
+            "\t\tif err != nil {\n\t\t\tfmt.Fprintln(os.Stderr, err)\n\t\t\treturn 127\n\t\t}\n",
+            "\t\tcommands[index].Stdout = writer\n",
+            "\t\tcommands[index+1].Stdin = reader\n",
+            "\t\tpipes = append(pipes, reader, writer)\n",
+            "\t}\n",
+            "\tif commands[0].Stdin == nil {\n\t\tcommands[0].Stdin = os.Stdin\n\t}\n",
+            "\tif commands[len(commands)-1].Stdout == nil {\n\t\tcommands[len(commands)-1].Stdout = os.Stdout\n\t}\n",
+            "\tfor _, command := range commands {\n\t\tcommand.Stderr = os.Stderr\n\t}\n",
+            "\tstarted := 0\n",
+            "\tfor _, command := range commands {\n",
+            "\t\tif err := command.Start(); err != nil {\n",
+            "\t\t\tfmt.Fprintln(os.Stderr, err)\n",
+            "\t\t\tfor index := 0; index < started; index++ {\n\t\t\t\t_ = commands[index].Process.Kill()\n\t\t\t}\n",
+            "\t\t\tfor _, pipe := range pipes {\n\t\t\t\t_ = pipe.Close()\n\t\t\t}\n",
+            "\t\t\treturn 127\n\t\t}\n",
+            "\t\tstarted++\n\t}\n",
+            "\tfor _, pipe := range pipes {\n\t\t_ = pipe.Close()\n\t}\n",
+            "\tstatuses := make([]int, len(commands))\n",
+            "\tfor index, command := range commands {\n\t\tstatuses[index] = deshellExitCode(command.Wait())\n\t}\n",
+            "\tif pipefail {\n",
+            "\t\tfor index := len(statuses) - 1; index >= 0; index-- {\n",
+            "\t\t\tif statuses[index] != 0 {\n\t\t\t\treturn statuses[index]\n\t\t\t}\n\t\t}\n",
+            "\t\treturn 0\n\t}\n",
+            "\treturn statuses[len(statuses)-1]\n",
+            "}\n\n"
+        )
+    } else {
+        ""
+    };
+    let uses_arguments = rust_node_uses_arguments(&task.body);
+    let argument_helper = if uses_arguments {
+        concat!(
+            "func deshellArgument(arguments []string, index int) string {\n",
+            "\tif len(arguments) > index {\n\t\treturn arguments[index]\n\t}\n",
+            "\treturn \"\"\n",
+            "}\n\n"
+        )
+    } else {
+        ""
+    };
+    let argument_binding = if uses_arguments {
+        "\tdeshellArgs := os.Args[1:]\n"
+    } else {
+        ""
+    };
     let source = format!(
         concat!(
             "// Code generated by de-shell. This file has no de-shell runtime dependency.\n",
             "package main\n\n",
-            "import (\n    \"fmt\"\n    \"os\"\n    \"os/exec\"\n)\n\n",
+            "import (\n\t\"fmt\"\n\t\"os\"\n\t\"os/exec\"\n)\n\n",
             "func deshellExitCode(err error) int {{\n",
-            "    if err == nil {{ return 0 }}\n",
-            "    if exit, ok := err.(*exec.ExitError); ok {{ return exit.ExitCode() }}\n",
-            "    fmt.Fprintln(os.Stderr, err)\n",
-            "    return 127\n",
+            "\tif err == nil {{\n\t\treturn 0\n\t}}\n",
+            "\tif exit, ok := err.(*exec.ExitError); ok {{\n\t\treturn exit.ExitCode()\n\t}}\n",
+            "\tfmt.Fprintln(os.Stderr, err)\n",
+            "\treturn 127\n",
             "}}\n\n",
-            "func deshellRunPipeline(commands []*exec.Cmd, pipefail bool) int {{\n",
-            "    if len(commands) == 0 {{ return 0 }}\n",
-            "    pipes := make([]*os.File, 0, 2*(len(commands)-1))\n",
-            "    for index := 0; index+1 < len(commands); index++ {{\n",
-            "        reader, writer, err := os.Pipe()\n",
-            "        if err != nil {{ fmt.Fprintln(os.Stderr, err); return 127 }}\n",
-            "        commands[index].Stdout = writer\n",
-            "        commands[index+1].Stdin = reader\n",
-            "        pipes = append(pipes, reader, writer)\n",
-            "    }}\n",
-            "    if commands[0].Stdin == nil {{ commands[0].Stdin = os.Stdin }}\n",
-            "    if commands[len(commands)-1].Stdout == nil {{ commands[len(commands)-1].Stdout = os.Stdout }}\n",
-            "    for _, command := range commands {{ command.Stderr = os.Stderr }}\n",
-            "    started := 0\n",
-            "    for _, command := range commands {{\n",
-            "        if err := command.Start(); err != nil {{\n",
-            "            fmt.Fprintln(os.Stderr, err)\n",
-            "            for index := 0; index < started; index++ {{ _ = commands[index].Process.Kill() }}\n",
-            "            for _, pipe := range pipes {{ _ = pipe.Close() }}\n",
-            "            return 127\n",
-            "        }}\n",
-            "        started++\n",
-            "    }}\n",
-            "    for _, pipe := range pipes {{ _ = pipe.Close() }}\n",
-            "    statuses := make([]int, len(commands))\n",
-            "    for index, command := range commands {{ statuses[index] = deshellExitCode(command.Wait()) }}\n",
-            "    if pipefail {{\n",
-            "        for index := len(statuses)-1; index >= 0; index-- {{ if statuses[index] != 0 {{ return statuses[index] }} }}\n",
-            "        return 0\n",
-            "    }}\n",
-            "    return statuses[len(statuses)-1]\n",
-            "}}\n\n",
+            "{pipeline_helper}",
+            "{argument_helper}",
             "func main() {{\n",
-            "    deshellArgs := os.Args[1:]\n",
-            "    _ = deshellArgs\n",
-            "    deshellLast := 0\n",
+            "{argument_binding}",
+            "\tdeshellLast := 0\n",
             "{body}",
-            "    os.Exit(deshellLast)\n",
+            "\tos.Exit(deshellLast)\n",
             "}}\n"
         ),
-        body = body
+        pipeline_helper = pipeline_helper,
+        argument_helper = argument_helper,
+        argument_binding = argument_binding,
+        body = body,
     );
     Ok(source.into_bytes())
 }
@@ -3641,16 +3860,20 @@ fn emit_go_command(
         .map(go_expression)
         .collect::<Result<Vec<_>, _>>()?;
     output.push_str(&format!(
-        "{indent}{variable} := exec.Command({}, []string{{{}}}...)\n",
+        "{indent}{variable} := exec.Command({}{})\n",
         go_expression(program)?,
-        arguments.join(", ")
+        if arguments.is_empty() {
+            String::new()
+        } else {
+            format!(", {}", arguments.join(", "))
+        }
     ));
     if !environment.is_empty() {
         output.push_str(&format!("{indent}{variable}.Env = os.Environ()\n"));
         for value in environment {
             output.push_str(&format!(
-                "{indent}{variable}.Env = append({variable}.Env, {:?} + \"=\" + {})\n",
-                value.name,
+                "{indent}{variable}.Env = append({variable}.Env, {} + \"=\" + {})\n",
+                go_string(&value.name)?,
                 go_expression(&value.value)?
             ));
         }
@@ -3668,15 +3891,17 @@ fn go_expression(expression: &crate::ir::TextExpression) -> Result<String, Strin
     let mut parts = Vec::new();
     for part in &expression.parts {
         parts.push(match part {
-            crate::ir::TextPart::Literal { value } => format!("{value:?}"),
-            crate::ir::TextPart::Variable { name } => format!("os.Getenv({name:?})"),
+            crate::ir::TextPart::Literal { value } => go_string(value)?,
+            crate::ir::TextPart::Variable { name } => {
+                format!("os.Getenv({})", go_string(name)?)
+            }
             crate::ir::TextPart::Argument { name } => {
                 let index = name
                     .parse::<usize>()
                     .ok()
                     .and_then(|index| index.checked_sub(1))
                     .ok_or_else(|| format!("generator cannot bind named argument {name}"))?;
-                format!("func() string {{ if len(deshellArgs) > {index} {{ return deshellArgs[{index}] }}; return \"\" }}()")
+                format!("deshellArgument(deshellArgs, {index})")
             }
         });
     }
@@ -3685,6 +3910,10 @@ fn go_expression(expression: &crate::ir::TextExpression) -> Result<String, Strin
     } else {
         parts.join(" + ")
     })
+}
+
+fn go_string(value: &str) -> Result<String, String> {
+    serde_json::to_string(value).map_err(|error| error.to_string())
 }
 
 fn proposal_diff(proposals: &[Proposal]) -> Result<String, String> {
@@ -3759,6 +3988,60 @@ fn persist_plan(
     }
     persist_immutable(&directory.join("diff.patch"), diff.as_bytes().to_vec())?;
     persist_immutable(&directory.join("plan.json"), pretty_bytes(plan)?)
+}
+
+fn persist_active_index(root: &Path, digest: &str) -> Result<(), String> {
+    if !crate::digest::valid_sha256(digest) {
+        return Err("active migration plan digest is invalid".into());
+    }
+    let root = canonical_root(root)?;
+    let migrations = ensure_safe_directory(&root, ".deshell/migrations")?;
+    let path = migrations.join("active.json");
+    let index = MigrationIndex {
+        schema_version: 1,
+        active_plan_digest: digest.into(),
+    };
+    let bytes = pretty_bytes(&index)?;
+    let proposal = match path.symlink_metadata() {
+        Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {
+            crate::patch::prepare(&path, bytes)?
+        }
+        Ok(_) => {
+            return Err(format!(
+                "migration index is not a regular file: {}",
+                path.display()
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            crate::patch::prepare_create(&path, bytes, 0o644)?
+        }
+        Err(error) => return Err(format!("cannot inspect {}: {error}", path.display())),
+    };
+    crate::patch::apply_all(&[proposal])
+}
+
+fn load_active_index(root: &Path) -> Result<Option<MigrationIndex>, String> {
+    let root = canonical_root(root)?;
+    let path = root.join(".deshell/migrations/active.json");
+    let metadata = match path.symlink_metadata() {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("cannot inspect {}: {error}", path.display())),
+        Ok(metadata) => metadata,
+    };
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(format!(
+            "migration index is not a regular file: {}",
+            path.display()
+        ));
+    }
+    let index: MigrationIndex = crate::strict_json::decode(
+        &std::fs::read(&path)
+            .map_err(|error| format!("cannot read {}: {error}", path.display()))?,
+    )?;
+    if index.schema_version != 1 || !crate::digest::valid_sha256(&index.active_plan_digest) {
+        return Err("migration index must be strict Migration Index v1".into());
+    }
+    Ok(Some(index))
 }
 
 fn pretty_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, String> {
@@ -3856,7 +4139,10 @@ impl MigrationPlan {
         }
         let mut scenario_names = BTreeSet::new();
         for scenario in &self.required_scenarios {
-            if scenario.name.trim().is_empty() || !scenario_names.insert(scenario.name.as_str()) {
+            if scenario.name.trim().is_empty()
+                || !scenario_names.insert(scenario.name.as_str())
+                || !crate::digest::valid_pinned_sha256(&scenario.approval_digest)
+            {
                 return Err("migration plan scenario names must be non-empty and unique".into());
             }
         }
@@ -3872,6 +4158,7 @@ impl MigrationPlan {
                 || !cell_ids.insert(cell.id.as_str())
                 || !crate::digest::valid_sha256(&cell.platform_fingerprint)
                 || !crate::digest::valid_sha256(&cell.runtime_fingerprint)
+                || !crate::digest::valid_pinned_sha256(&cell.approval_digest)
             {
                 return Err(
                     "migration plan platform cells must have unique portable ids and valid fingerprints"
@@ -4124,10 +4411,6 @@ fn canonical_root(root: &Path) -> Result<PathBuf, String> {
         .map_err(|error| format!("cannot resolve project root {}: {error}", root.display()))
 }
 
-fn ensure_module_root(root: &Path, relative: &str) -> Result<(), String> {
-    crate::project::project_directory_path(root, relative).map(|_| ())
-}
-
 fn safe_target(root: &Path, relative: &str) -> Result<PathBuf, String> {
     let normalized = crate::ir::normalize_path(relative)?;
     if normalized != relative {
@@ -4233,8 +4516,26 @@ fn ensure_child_directory(parent: &Path, name: &str) -> Result<PathBuf, String> 
             ));
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::create_dir(&target)
-                .map_err(|error| format!("cannot create {}: {error}", target.display()))?;
+            match std::fs::create_dir(&target) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let metadata = target.symlink_metadata().map_err(|inspect| {
+                        format!(
+                            "cannot inspect {} after concurrent create: {inspect}",
+                            target.display()
+                        )
+                    })?;
+                    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+                        return Err(format!(
+                            "migration directory is not a regular directory: {}",
+                            target.display()
+                        ));
+                    }
+                }
+                Err(error) => {
+                    return Err(format!("cannot create {}: {error}", target.display()));
+                }
+            }
         }
         Err(error) => return Err(format!("cannot inspect {}: {error}", target.display())),
     }
@@ -4258,6 +4559,7 @@ pub(crate) fn verify(
             .join("; "));
     }
     validate_current_plan_policy(root, &plan)?;
+    let approval_digests = plan_approval_digests(&plan);
     let cell = plan
         .required_cells
         .iter()
@@ -4297,6 +4599,7 @@ pub(crate) fn verify(
                     .get(&requirement.name)
                     .filter(|scenario| {
                         scenario.digest().ok().as_deref() == Some(&requirement.digest)
+                            && scenario.approval_digest == requirement.approval_digest
                     })
                     .ok_or_else(|| {
                         format!(
@@ -4331,6 +4634,7 @@ pub(crate) fn verify(
         let evidence = MigrationEvidence {
             schema_version: 1,
             plan_digest: plan.plan_digest,
+            approval_digests,
             cell: cell_id.into(),
             status: EvidenceStatus::Unavailable,
             repetitions: 2,
@@ -4359,7 +4663,10 @@ pub(crate) fn verify(
         for requirement in &plan.required_scenarios {
             let scenario = scenarios
                 .get(&requirement.name)
-                .filter(|scenario| scenario.digest().ok().as_deref() == Some(&requirement.digest))
+                .filter(|scenario| {
+                    scenario.digest().ok().as_deref() == Some(&requirement.digest)
+                        && scenario.approval_digest == requirement.approval_digest
+                })
                 .ok_or_else(|| {
                     format!(
                         "DESHELL_BLOCKER_STALE_SCENARIO: {} no longer matches {}",
@@ -4437,6 +4744,7 @@ pub(crate) fn verify(
     let evidence = MigrationEvidence {
         schema_version: 1,
         plan_digest: plan.plan_digest,
+        approval_digests,
         cell: cell_id.into(),
         status,
         repetitions: 2,
@@ -4447,9 +4755,39 @@ pub(crate) fn verify(
     Ok(evidence)
 }
 
+fn plan_approval_digests(plan: &MigrationPlan) -> Vec<String> {
+    let mut digests = plan
+        .required_scenarios
+        .iter()
+        .map(|scenario| scenario.approval_digest.clone())
+        .chain(
+            plan.required_cells
+                .iter()
+                .map(|cell| cell.approval_digest.clone()),
+        )
+        .collect::<Vec<_>>();
+    digests.sort();
+    digests.dedup();
+    digests
+}
+
+#[derive(Clone, Debug)]
+struct ApprovedScenario {
+    scenario: crate::config::Scenario,
+    approval_digest: String,
+}
+
+impl std::ops::Deref for ApprovedScenario {
+    type Target = crate::config::Scenario;
+
+    fn deref(&self) -> &Self::Target {
+        &self.scenario
+    }
+}
+
 fn load_approved_scenario_values(
     root: &Path,
-) -> Result<BTreeMap<String, crate::config::Scenario>, String> {
+) -> Result<BTreeMap<String, ApprovedScenario>, String> {
     let directory = crate::project::project_directory_path(root, ".deshell/scenarios")?;
     let mut paths = std::fs::read_dir(&directory)
         .map_err(|error| format!("cannot read {}: {error}", directory.display()))?
@@ -4476,10 +4814,21 @@ fn load_approved_scenario_values(
                 .map_err(|error| format!("cannot read {}: {error}", path.display()))?,
         )
         .map_err(|errors| errors.join("; "))?;
-        if scenario.approval == crate::config::ScenarioApproval::Approved
-            && output.insert(scenario.name.clone(), scenario).is_some()
+        let filename = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| format!("scenario filename is not UTF-8: {}", path.display()))?;
+        let relative = format!(".deshell/scenarios/{filename}");
+        if let Some(approval_digest) =
+            crate::approval::scenario_approval(root, &relative, &scenario)?
         {
-            return Err("duplicate approved scenario name".into());
+            let approved = ApprovedScenario {
+                scenario,
+                approval_digest,
+            };
+            if output.insert(approved.name.clone(), approved).is_some() {
+                return Err("duplicate approved scenario name".into());
+            }
         }
     }
     Ok(output)
@@ -5318,6 +5667,21 @@ fn validate_evidence_document(evidence: &MigrationEvidence) -> Result<(), String
     if !crate::digest::valid_sha256(&evidence.plan_digest) || evidence.cell.trim().is_empty() {
         return Err("migration Evidence plan digest or cell is invalid".into());
     }
+    if evidence.approval_digests.is_empty()
+        || evidence
+            .approval_digests
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+        || evidence
+            .approval_digests
+            .iter()
+            .any(|digest| !crate::digest::valid_pinned_sha256(digest))
+    {
+        return Err(
+            "migration Evidence approval digests must be non-empty, sorted, unique, and pinned"
+                .into(),
+        );
+    }
     if evidence.checks.is_empty() {
         return Err("migration Evidence contains no source/scenario check".into());
     }
@@ -5498,6 +5862,9 @@ fn validate_evidence_against(
     if evidence.plan_digest != plan.plan_digest {
         return Err("Evidence plan digest does not match the selected plan".into());
     }
+    if evidence.approval_digests != plan_approval_digests(plan) {
+        return Err("Evidence approval digests do not match the selected plan".into());
+    }
     let cell = plan
         .required_cells
         .iter()
@@ -5522,6 +5889,12 @@ fn validate_evidence_against(
                 .ok_or_else(|| format!("approved scenario disappeared: {}", scenario.name))?;
             if current.digest()? != scenario.digest {
                 return Err(format!("approved scenario became stale: {}", scenario.name));
+            }
+            if current.approval_digest != scenario.approval_digest {
+                return Err(format!(
+                    "approved scenario approval became stale: {}",
+                    scenario.name
+                ));
             }
             expected.insert((source.location.clone(), scenario.name.clone()));
             let check = evidence
@@ -5683,7 +6056,7 @@ fn validate_current_plan_policy(root: &Path, plan: &MigrationPlan) -> Result<(),
                 .into(),
         );
     }
-    if approved_cells(&config) != plan.required_cells {
+    if approved_cells(root, &config)? != plan.required_cells {
         return Err(
             "DESHELL_BLOCKER_STALE_PLATFORM_MATRIX: approved platform/runtime cells changed after plan creation"
                 .into(),
@@ -6332,16 +6705,50 @@ fn retirement_permissions(_metadata: &std::fs::Metadata) -> u32 {
     0o644
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ActiveState {
+    #[default]
+    None,
+    Blocked,
+    Planned,
+    Verified,
+    Retired,
+    Stale,
+}
+
+impl ActiveState {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Blocked => "blocked",
+            Self::Planned => "planned",
+            Self::Verified => "verified",
+            Self::Retired => "retired",
+            Self::Stale => "stale",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Status {
+    pub schema_version: u32,
     pub live: usize,
+    pub active_plan: Option<String>,
+    pub active_state: ActiveState,
     pub blocked: usize,
     pub planned: usize,
     pub verified: usize,
     pub retired: usize,
+    pub stale: usize,
+    pub history: usize,
+    pub superseded: usize,
     pub archived: usize,
+    pub required_cells: Vec<String>,
+    pub remaining_evidence: usize,
     pub next: String,
+    pub next_argv: Vec<String>,
 }
 
 pub(crate) fn status(root: &Path) -> Result<Status, String> {
@@ -6349,14 +6756,15 @@ pub(crate) fn status(root: &Path) -> Result<Status, String> {
     let canonical = canonical_root(root)?;
     let base = canonical.join(".deshell/migrations/sha256");
     let mut status = Status {
+        schema_version: 1,
         live: inventory.findings.len(),
-        next: if inventory.findings.is_empty() {
-            "keep deshell verify --require shell-free in CI".into()
-        } else {
-            "run deshell migrate plan".into()
-        },
+        next: String::new(),
         ..Status::default()
     };
+    let mut next_cell = None;
+    let mut needs_scenario_approval = false;
+    let mut needs_matrix_approval = false;
+    let mut plan_count = 0_usize;
     if let Ok(entries) = std::fs::read_dir(base) {
         for entry in entries {
             let entry = entry.map_err(|error| error.to_string())?;
@@ -6364,21 +6772,68 @@ pub(crate) fn status(root: &Path) -> Result<Status, String> {
             let Ok(bytes) = std::fs::read(path.join("plan.json")) else {
                 continue;
             };
-            let Ok(plan) = MigrationPlan::decode(&bytes) else {
+            let Ok(_plan) = MigrationPlan::decode(&bytes) else {
                 continue;
             };
-            status.planned += 1;
-            status.blocked += usize::from(!plan.blockers.is_empty());
-            let retired = path.join("retired.json").is_file();
-            let verified = path.join("verified.json").is_file()
-                || (!retired
-                    && plan.blockers.is_empty()
-                    && load_complete_evidence(&canonical, &path, &plan)
-                        .and_then(|evidence| validate_node_coverage(&path, &plan, &evidence))
-                        .is_ok());
-            status.verified += usize::from(verified);
-            status.retired += usize::from(retired);
+            plan_count += 1;
         }
+    }
+    status.history = plan_count;
+    if let Some(index) = load_active_index(root)? {
+        let (directory, plan) = load_plan(root, &index.active_plan_digest)?;
+        status.active_plan = Some(plan.plan_digest.clone());
+        status.required_cells = plan
+            .required_cells
+            .iter()
+            .map(|cell| cell.id.clone())
+            .collect();
+        needs_scenario_approval = plan
+            .blockers
+            .iter()
+            .any(|blocker| blocker.code == "DESHELL_BLOCKER_UNAPPROVED_SCENARIO");
+        needs_matrix_approval = plan.blockers.iter().any(|blocker| {
+            matches!(
+                blocker.code.as_str(),
+                "DESHELL_BLOCKER_PLATFORM_MATRIX_EMPTY" | "DESHELL_BLOCKER_UNAPPROVED_MATRIX_CELL"
+            )
+        });
+        status.superseded = plan_count.saturating_sub(1);
+        status.active_state = if directory.join("retired.json").is_file() {
+            ActiveState::Retired
+        } else if !plan.blockers.is_empty() {
+            ActiveState::Blocked
+        } else if active_plan_stale(root, &inventory, &plan) {
+            ActiveState::Stale
+        } else if directory.join("verified.json").is_file()
+            || load_complete_evidence(&canonical, &directory, &plan)
+                .and_then(|evidence| validate_node_coverage(&directory, &plan, &evidence))
+                .is_ok()
+        {
+            ActiveState::Verified
+        } else {
+            ActiveState::Planned
+        };
+        let present = imported_verified_cells(&directory, &plan.plan_digest);
+        status.remaining_evidence = plan
+            .required_cells
+            .iter()
+            .filter(|cell| !present.contains(cell.id.as_str()))
+            .count();
+        if status.active_state == ActiveState::Planned {
+            next_cell = plan
+                .required_cells
+                .iter()
+                .find(|cell| !present.contains(cell.id.as_str()))
+                .or_else(|| plan.required_cells.first())
+                .map(|cell| cell.id.clone());
+        }
+        status.blocked = usize::from(status.active_state == ActiveState::Blocked);
+        status.planned = usize::from(status.active_state == ActiveState::Planned);
+        status.verified = usize::from(status.active_state == ActiveState::Verified);
+        status.retired = usize::from(status.active_state == ActiveState::Retired);
+        status.stale = usize::from(status.active_state == ActiveState::Stale);
+    } else {
+        status.superseded = plan_count;
     }
     let archive = canonical.join(".deshell/archive/manifest.json");
     if archive.is_file()
@@ -6386,20 +6841,148 @@ pub(crate) fn status(root: &Path) -> Result<Status, String> {
     {
         status.archived = value["entries"].as_array().map_or(0, Vec::len);
     }
-    status.next = if status.live == 0 {
-        "keep deshell verify --require shell-free in CI".into()
-    } else if status.blocked != 0 {
-        "resolve every migration blocker, then run deshell migrate plan".into()
-    } else if status.planned == 0 {
-        "run deshell migrate plan".into()
-    } else if status.verified < status.planned {
-        "run deshell migrate verify in each approved cell and import Evidence".into()
-    } else if status.retired < status.verified {
-        "run deshell migrate apply with the verified plan digest".into()
+    let root_value = root.to_string_lossy().into_owned();
+    let pending_approval_argv = if needs_scenario_approval {
+        crate::approval::scenario_reviews(root)
+            .ok()
+            .and_then(|reviews| {
+                reviews
+                    .into_iter()
+                    .find(|review| review.status != crate::approval::ReviewStatus::Approved)
+            })
+            .map(|review| {
+                vec![
+                    "deshell".into(),
+                    "scenario".into(),
+                    "approve".into(),
+                    "--root".into(),
+                    root_value.clone(),
+                    "--name".into(),
+                    review.name,
+                    "--digest".into(),
+                    review.digest,
+                ]
+            })
     } else {
-        "run deshell migrate plan for the remaining live shell".into()
+        None
+    }
+    .or_else(|| {
+        needs_matrix_approval
+            .then(|| crate::approval::matrix_reviews(root).ok())
+            .flatten()
+            .and_then(|reviews| {
+                reviews
+                    .into_iter()
+                    .find(|review| review.status != crate::approval::ReviewStatus::Approved)
+            })
+            .map(|review| {
+                vec![
+                    "deshell".into(),
+                    "matrix".into(),
+                    "approve".into(),
+                    "--root".into(),
+                    root_value.clone(),
+                    "--cell".into(),
+                    review.name,
+                    "--digest".into(),
+                    review.digest,
+                ]
+            })
+    });
+    status.next_argv = if status.live == 0 {
+        vec![
+            "deshell".into(),
+            "verify".into(),
+            "--root".into(),
+            root_value,
+            "--require".into(),
+            "shell-free".into(),
+        ]
+    } else if status.active_state == ActiveState::Blocked && pending_approval_argv.is_some() {
+        pending_approval_argv.expect("checked pending approval argv")
+    } else {
+        match status.active_state {
+            ActiveState::Blocked
+            | ActiveState::Stale
+            | ActiveState::None
+            | ActiveState::Retired => {
+                vec![
+                    "deshell".into(),
+                    "migrate".into(),
+                    "plan".into(),
+                    "--root".into(),
+                    root_value,
+                ]
+            }
+            ActiveState::Planned => {
+                let digest = status.active_plan.clone().unwrap_or_default();
+                let cell = next_cell.unwrap_or_else(|| "<approved-cell>".into());
+                let output = format!(".deshell/{digest}-{cell}-evidence.json");
+                vec![
+                    "deshell".into(),
+                    "migrate".into(),
+                    "verify".into(),
+                    "--root".into(),
+                    root_value,
+                    "--plan".into(),
+                    digest,
+                    "--cell".into(),
+                    cell,
+                    "--output".into(),
+                    output,
+                ]
+            }
+            ActiveState::Verified => vec![
+                "deshell".into(),
+                "migrate".into(),
+                "apply".into(),
+                "--root".into(),
+                root_value,
+                "--plan".into(),
+                status.active_plan.clone().unwrap_or_default(),
+            ],
+        }
     };
+    status.next = status.next_argv.join(" ");
     Ok(status)
+}
+
+fn imported_verified_cells(directory: &Path, plan_digest: &str) -> BTreeSet<String> {
+    let evidence = directory.join("evidence");
+    let Ok(entries) = std::fs::read_dir(evidence) else {
+        return BTreeSet::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| std::fs::read(entry.path()).ok())
+        .filter_map(|bytes| MigrationEvidence::decode(&bytes).ok())
+        .filter(|evidence| {
+            evidence.plan_digest == plan_digest && evidence.status == EvidenceStatus::Verified
+        })
+        .map(|evidence| evidence.cell)
+        .collect()
+}
+
+fn active_plan_stale(
+    root: &Path,
+    inventory: &crate::scanner::Inventory,
+    plan: &MigrationPlan,
+) -> bool {
+    if canonical_digest(inventory).ok().as_deref() != Some(&plan.inventory_digest) {
+        return true;
+    }
+    if validate_current_plan_policy(root, plan).is_err() {
+        return true;
+    }
+    let Ok(scenarios) = load_approved_scenario_values(root) else {
+        return true;
+    };
+    plan.required_scenarios.iter().any(|requirement| {
+        scenarios.get(&requirement.name).is_none_or(|scenario| {
+            scenario.digest().ok().as_deref() != Some(&requirement.digest)
+                || scenario.approval_digest != requirement.approval_digest
+        })
+    })
 }
 
 pub(crate) fn verify_integrity(root: &Path) -> Result<(), String> {
@@ -6747,6 +7330,9 @@ mod tests {
             [
                 "rustc",
                 "src/bin/build.rs",
+                "--edition=2024",
+                "-D",
+                "warnings",
                 "-Ccodegen-units=1",
                 "-o",
                 ".deshell/verification/build"
@@ -6758,6 +7344,9 @@ mod tests {
             [
                 "rustc",
                 "src/bin/build.rs",
+                "--edition=2024",
+                "-D",
+                "warnings",
                 "-Ccodegen-units=1",
                 "-o",
                 ".deshell/verification/build"
@@ -7396,11 +7985,11 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
         let go = String::from_utf8(generate_go(&plan).unwrap()).unwrap();
         for expected in [
             "VALUE",
-            "deshell_args.get(0)",
+            "deshell_args.first()",
             ".env(\"LOCAL\"",
             ".current_dir",
             "deshell_run_pipeline",
-            "if deshell_last == 0",
+            "if deshell_predicate == 0",
         ] {
             assert!(
                 rust.contains(expected),
@@ -7409,7 +7998,7 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
         }
         for expected in [
             "os.Getenv(\"VALUE\")",
-            "deshellArgs[0]",
+            "deshellArgument(deshellArgs, 0)",
             ".Env = append",
             ".Dir =",
             "deshellRunPipeline",
@@ -7504,6 +8093,151 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
     }
 
     #[test]
+    fn official_rust_and_go_generators_pass_formatter_build_and_lint_gates() {
+        let literal_plan = plan_with_body(exec(vec![
+            crate::ir::TextExpression::literal("/usr/bin/printf"),
+            crate::ir::TextExpression::literal("literal"),
+        ]));
+        let literal_rust = generate_rust(&literal_plan).unwrap();
+        let literal_go = generate_go(&literal_plan).unwrap();
+        let literal_rust_text = String::from_utf8(literal_rust.clone()).unwrap();
+        let literal_go_text = String::from_utf8(literal_go.clone()).unwrap();
+        assert!(!literal_rust_text.contains("Stdio"));
+        assert!(!literal_rust_text.contains("deshell_args"));
+        assert!(!literal_rust_text.contains("deshell_run_pipeline"));
+        assert!(!literal_go_text.contains("deshellArgs"));
+        assert!(!literal_go_text.contains("deshellRunPipeline"));
+
+        let simple = exec(vec![
+            crate::ir::TextExpression::literal("/usr/bin/printf"),
+            crate::ir::TextExpression {
+                parts: vec![crate::ir::TextPart::Argument { name: "1".into() }],
+            },
+        ]);
+        let pipeline = node(crate::ir::Operation::Pipeline {
+            nodes: vec![
+                exec(vec![crate::ir::TextExpression::literal("first")]),
+                exec(vec![crate::ir::TextExpression::literal("second")]),
+            ],
+            status: crate::ir::PipelineStatus::Pipefail,
+        });
+        let condition = node(crate::ir::Operation::Condition {
+            predicate: Box::new(exec(vec![crate::ir::TextExpression::literal("predicate")])),
+            if_true: Box::new(exec(vec![crate::ir::TextExpression::literal("yes")])),
+            if_false: Some(Box::new(exec(vec![crate::ir::TextExpression::literal(
+                "no",
+            )]))),
+        });
+        let plan = plan_with_body(node(crate::ir::Operation::Sequence {
+            nodes: vec![simple, pipeline, condition],
+        }));
+        let directory = tempfile::tempdir().unwrap();
+        let literal_rust_path = directory.path().join("literal.rs");
+        let literal_go_path = directory.path().join("literal.go");
+        std::fs::write(&literal_rust_path, literal_rust).unwrap();
+        std::fs::write(&literal_go_path, literal_go).unwrap();
+        let literal_rustc = std::process::Command::new("rustc")
+            .arg(&literal_rust_path)
+            .args(["--edition=2024", "-D", "warnings", "-o"])
+            .arg(directory.path().join("literal-rust"))
+            .output()
+            .unwrap();
+        assert!(
+            literal_rustc.status.success(),
+            "rustc rejected simple generated source:\n{}",
+            String::from_utf8_lossy(&literal_rustc.stderr)
+        );
+        let literal_gofmt = std::process::Command::new("gofmt")
+            .arg("-d")
+            .arg(&literal_go_path)
+            .output()
+            .unwrap();
+        assert!(literal_gofmt.status.success() && literal_gofmt.stdout.is_empty());
+        let literal_vet = std::process::Command::new("go")
+            .args(["vet", "literal.go"])
+            .current_dir(directory.path())
+            .output()
+            .unwrap();
+        assert!(
+            literal_vet.status.success(),
+            "go vet rejected simple generated source:\n{}",
+            String::from_utf8_lossy(&literal_vet.stderr)
+        );
+        let rust = directory.path().join("generated.rs");
+        let go = directory.path().join("generated.go");
+        std::fs::write(&rust, generate_rust(&plan).unwrap()).unwrap();
+        std::fs::write(&go, generate_go(&plan).unwrap()).unwrap();
+
+        let rustfmt = std::process::Command::new("rustfmt")
+            .args(["--edition", "2024", "--check"])
+            .arg(&rust)
+            .output()
+            .unwrap();
+        assert!(
+            rustfmt.status.success(),
+            "rustfmt rejected generated source:\n{}",
+            String::from_utf8_lossy(&rustfmt.stdout)
+        );
+        let rustc = std::process::Command::new("rustc")
+            .arg(&rust)
+            .args(["--edition=2024", "-D", "warnings", "-o"])
+            .arg(directory.path().join("generated-rust"))
+            .output()
+            .unwrap();
+        assert!(
+            rustc.status.success(),
+            "rustc rejected generated source:\n{}",
+            String::from_utf8_lossy(&rustc.stderr)
+        );
+        let cargo_root = directory.path().join("rust-project");
+        std::fs::create_dir_all(cargo_root.join("src")).unwrap();
+        std::fs::write(
+            cargo_root.join("Cargo.toml"),
+            b"[package]\nname = \"deshell-generated-gate\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[workspace]\n",
+        )
+        .unwrap();
+        std::fs::copy(&rust, cargo_root.join("src/main.rs")).unwrap();
+        let clippy = std::process::Command::new("cargo")
+            .args(["clippy", "--offline", "--quiet", "--", "-D", "warnings"])
+            .current_dir(&cargo_root)
+            .output()
+            .unwrap();
+        assert!(
+            clippy.status.success(),
+            "clippy rejected generated source:\n{}",
+            String::from_utf8_lossy(&clippy.stderr)
+        );
+
+        let gofmt = std::process::Command::new("gofmt")
+            .arg("-d")
+            .arg(&go)
+            .output()
+            .unwrap();
+        assert!(
+            gofmt.status.success() && gofmt.stdout.is_empty(),
+            "generated Go source was not gofmt canonical:\n{}",
+            String::from_utf8_lossy(&gofmt.stdout)
+        );
+        for arguments in [
+            vec!["build", "-o", "generated-go", "generated.go"],
+            vec!["test", "generated.go"],
+            vec!["vet", "generated.go"],
+        ] {
+            let output = std::process::Command::new("go")
+                .args(&arguments)
+                .current_dir(directory.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "go {} rejected generated source:\n{}",
+                arguments[0],
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[test]
     fn proposal_diff_and_literal_reference_helpers_preserve_exact_bytes() {
         let mut proposal = signed_proposal(b"created\n".to_vec());
         let updated = b"updated-without-newline".to_vec();
@@ -7562,11 +8296,13 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
             required_scenarios: vec![ScenarioRequirement {
                 name: "default".into(),
                 digest: digest.clone(),
+                approval_digest: format!("sha256:{digest}"),
             }],
             required_cells: vec![CellRequirement {
                 id: "linux-x86_64".into(),
                 platform_fingerprint: digest.clone(),
                 runtime_fingerprint: digest.clone(),
+                approval_digest: format!("sha256:{digest}"),
             }],
             validation_commands: vec![ExactCommand {
                 name: "test".into(),
@@ -7758,6 +8494,7 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
         MigrationEvidence {
             schema_version: 1,
             plan_digest: digest.clone(),
+            approval_digests: vec![format!("sha256:{digest}")],
             cell: "linux".into(),
             status: EvidenceStatus::Verified,
             repetitions: 2,

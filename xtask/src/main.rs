@@ -21,6 +21,23 @@ const REQUIRED_CONTRACTS: &[&str] = &[
     "contracts/schema/bundle-v1.schema.json",
     "contracts/schema/evidence-v1.schema.json",
     "contracts/schema/diagnostic-v1.schema.json",
+    "contracts/schema/approval-v1.schema.json",
+    "contracts/schema/migration-index-v1.schema.json",
+    "contracts/schema/init-report-v1.schema.json",
+    "contracts/schema/scan-report-v1.schema.json",
+    "contracts/schema/scenario-report-v1.schema.json",
+    "contracts/schema/matrix-report-v1.schema.json",
+    "contracts/schema/audit-report-v1.schema.json",
+    "contracts/schema/analyze-report-v1.schema.json",
+    "contracts/schema/check-report-v1.schema.json",
+    "contracts/schema/verify-report-v1.schema.json",
+    "contracts/schema/observe-report-v1.schema.json",
+    "contracts/schema/doctor-report-v1.schema.json",
+    "contracts/schema/explain-report-v1.schema.json",
+    "contracts/schema/rewrite-report-v1.schema.json",
+    "contracts/schema/modernize-report-v1.schema.json",
+    "contracts/schema/harden-report-v1.schema.json",
+    "contracts/schema/migrate-report-v1.schema.json",
     "contracts/schema/protocol-v1.schema.json",
     "contracts/schema/project-v1.schema.json",
     "contracts/schema/scenario-v1.schema.json",
@@ -70,6 +87,8 @@ struct CliCase {
     stdout: Option<String>,
     #[serde(default)]
     stdout_artifact: bool,
+    #[serde(default)]
+    stdout_only: bool,
     #[serde(default)]
     stderr_only: bool,
     #[serde(default)]
@@ -149,7 +168,10 @@ fn validate_contract_tree(_root: &Path) -> Result<CliContract, Vec<String>> {
                 case.exit
             ));
         }
-        if case.stdout.is_some() && (case.stdout_artifact || case.stderr_only) {
+        if case.stdout.is_some() && (case.stdout_artifact || case.stdout_only || case.stderr_only)
+            || case.stdout_artifact && case.stdout_only
+            || case.stderr_only && (case.stdout_artifact || case.stdout_only)
+        {
             errors.push(format!(
                 "CLI case has conflicting output assertions: {:?}",
                 case.argv
@@ -238,6 +260,12 @@ fn run_conformance(root: &Path, binary: &Path) -> Result<(), Vec<String>> {
         {
             errors.push(format!(
                 "case {:?}: stdout is not a JSON artifact",
+                case.argv
+            ));
+        }
+        if case.stdout_only && (output.stdout.is_empty() || !output.stderr.is_empty()) {
+            errors.push(format!(
+                "case {:?}: expected non-empty stdout and empty stderr",
                 case.argv
             ));
         }
@@ -1259,11 +1287,10 @@ fn main() {
         }
         Some("doctor") => {
             println!("{{}}");
-            std::process::exit(6);
         }
         Some("init") => initialize(&args),
         Some("analyze") if option(&args, "--entry").as_deref() == Some("unknown.ext") => {
-            eprintln!("unknown interpreter");
+            println!("{{\"command\":\"analyze\",\"schema_version\":1}}");
             std::process::exit(4);
         }
         Some("analyze" | "scan" | "run" | "verify") => {}
@@ -1357,6 +1384,23 @@ fn main() {
     #[test]
     fn migration_oracle_contracts_are_package_gate_inputs() {
         for relative in [
+            "contracts/schema/approval-v1.schema.json",
+            "contracts/schema/migration-index-v1.schema.json",
+            "contracts/schema/init-report-v1.schema.json",
+            "contracts/schema/scan-report-v1.schema.json",
+            "contracts/schema/scenario-report-v1.schema.json",
+            "contracts/schema/matrix-report-v1.schema.json",
+            "contracts/schema/audit-report-v1.schema.json",
+            "contracts/schema/analyze-report-v1.schema.json",
+            "contracts/schema/check-report-v1.schema.json",
+            "contracts/schema/verify-report-v1.schema.json",
+            "contracts/schema/observe-report-v1.schema.json",
+            "contracts/schema/doctor-report-v1.schema.json",
+            "contracts/schema/explain-report-v1.schema.json",
+            "contracts/schema/rewrite-report-v1.schema.json",
+            "contracts/schema/modernize-report-v1.schema.json",
+            "contracts/schema/harden-report-v1.schema.json",
+            "contracts/schema/migrate-report-v1.schema.json",
             "contracts/schema/generator-protocol-v1.schema.json",
             "contracts/schema/migration-request-v1.schema.json",
             "contracts/schema/proposal-v1.schema.json",
@@ -1402,6 +1446,23 @@ fn main() {
             std::fs::read_to_string(repository_root().join("scripts/validate-json-contracts.py"))
                 .unwrap();
         for schema in [
+            "approval-v1.schema.json",
+            "migration-index-v1.schema.json",
+            "init-report-v1.schema.json",
+            "scan-report-v1.schema.json",
+            "scenario-report-v1.schema.json",
+            "matrix-report-v1.schema.json",
+            "audit-report-v1.schema.json",
+            "analyze-report-v1.schema.json",
+            "check-report-v1.schema.json",
+            "verify-report-v1.schema.json",
+            "observe-report-v1.schema.json",
+            "doctor-report-v1.schema.json",
+            "explain-report-v1.schema.json",
+            "rewrite-report-v1.schema.json",
+            "modernize-report-v1.schema.json",
+            "harden-report-v1.schema.json",
+            "migrate-report-v1.schema.json",
             "migration-request-v1.schema.json",
             "proposal-v1.schema.json",
             "migration-plan-v1.schema.json",
@@ -1623,8 +1684,14 @@ fn main() {
         assert!(ci.matches("go@1.27.0").count() >= 2);
         assert!(release.matches("go@1.27.0").count() >= 4);
         assert!(mise.contains("go = \"1.27.0\""));
+        assert!(mise.contains("node = \"26.8.1\""));
+        assert!(mise.contains("python = \"3.12.3\""));
         assert!(mise_lock.contains("[[tools.go]]"));
+        assert!(mise_lock.contains("[[tools.node]]"));
+        assert!(mise_lock.contains("[[tools.python]]"));
         assert!(mise_lock.contains("version = \"1.27.0\""));
+        assert!(mise_lock.contains("version = \"26.8.1\""));
+        assert!(mise_lock.contains("version = \"3.12.3\""));
         for platform in [
             "linux-arm64",
             "linux-x64",
@@ -1640,6 +1707,22 @@ fn main() {
             assert!(
                 mise_lock.contains(&format!("[tools.powershell.\"platforms.{platform}\"]")),
                 "mise.lock omitted the PowerShell artifact for {platform}"
+            );
+            assert!(
+                mise_lock.contains(&format!("[tools.node.\"platforms.{platform}\"]")),
+                "mise.lock omitted the Node artifact for {platform}"
+            );
+        }
+        for platform in [
+            "linux-arm64",
+            "linux-x64",
+            "macos-arm64",
+            "macos-x64",
+            "windows-x64",
+        ] {
+            assert!(
+                mise_lock.contains(&format!("[tools.python.\"platforms.{platform}\"]")),
+                "mise.lock omitted the Python artifact for {platform}"
             );
         }
         for (name, workflow, minimum) in [

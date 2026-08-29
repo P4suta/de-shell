@@ -25,6 +25,8 @@ pub(crate) struct Diagnostic {
     pub severity: Severity,
     pub code: String,
     pub message: String,
+    pub help: String,
+    pub next_actions: Vec<crate::report::Action>,
     pub context: BTreeMap<String, String>,
 }
 
@@ -35,6 +37,10 @@ impl Diagnostic {
             severity: Severity::Error,
             code: code.into(),
             message: message.into(),
+            help: "Run deshell --help for command syntax and examples.".into(),
+            next_actions: vec![crate::report::Action::Command {
+                argv: vec!["deshell".into(), "--help".into()],
+            }],
             context: BTreeMap::new(),
         }
     }
@@ -45,6 +51,8 @@ impl Diagnostic {
             severity: Severity::Warning,
             code: code.into(),
             message: message.into(),
+            help: "Review the reported condition before continuing.".into(),
+            next_actions: Vec::new(),
             context: BTreeMap::new(),
         }
     }
@@ -75,6 +83,19 @@ pub(crate) fn emit(
                 "{severity}[{}]: {}",
                 diagnostic.code, diagnostic.message
             )?;
+            writeln!(writer, "  help: {}", diagnostic.help)?;
+            for action in &diagnostic.next_actions {
+                match action {
+                    crate::report::Action::Command { argv } => writeln!(
+                        writer,
+                        "  next argv: {}",
+                        serde_json::to_string(argv).unwrap_or_else(|_| "[]".into())
+                    )?,
+                    crate::report::Action::Review { paths } => {
+                        writeln!(writer, "  review: {}", paths.join(", "))?
+                    }
+                }
+            }
             for (name, value) in &diagnostic.context {
                 writeln!(writer, "  {name}: {value}")?;
             }
@@ -99,7 +120,7 @@ mod tests {
         assert_eq!(value["schema_version"], 1);
         assert_eq!(value["severity"], "error");
         assert_eq!(value["code"], "DESHELL_USAGE");
-        assert_eq!(output, b"{\"code\":\"DESHELL_USAGE\",\"context\":{\"argument\":\"--bad\"},\"message\":\"bad option\",\"schema_version\":1,\"severity\":\"error\"}\n");
+        assert_eq!(output, b"{\"code\":\"DESHELL_USAGE\",\"context\":{\"argument\":\"--bad\"},\"help\":\"Run deshell --help for command syntax and examples.\",\"message\":\"bad option\",\"next_actions\":[{\"action\":\"command\",\"argv\":[\"deshell\",\"--help\"]}],\"schema_version\":1,\"severity\":\"error\"}\n");
     }
 
     #[test]
@@ -112,7 +133,7 @@ mod tests {
         emit(&mut output, Mode::Human, &diagnostic).unwrap();
         assert_eq!(
             String::from_utf8(output).unwrap(),
-            "error[DESHELL_INVALID_IR]: plan is invalid\n  path: .deshell/plan.json\n"
+            "error[DESHELL_INVALID_IR]: plan is invalid\n  help: Run deshell --help for command syntax and examples.\n  next argv: [\"deshell\",\"--help\"]\n  path: .deshell/plan.json\n"
         );
     }
 }

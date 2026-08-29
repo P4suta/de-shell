@@ -25,11 +25,12 @@
       "items": {
         "additionalProperties": false,
         "properties": {
+          "approval_digest": { "$ref": "#/$defs/pinnedDigest" },
           "id": { "minLength": 1, "type": "string" },
           "platform_fingerprint": { "$ref": "#/$defs/digest" },
           "runtime_fingerprint": { "$ref": "#/$defs/digest" }
         },
-        "required": ["id", "platform_fingerprint", "runtime_fingerprint"],
+        "required": ["id", "platform_fingerprint", "runtime_fingerprint", "approval_digest"],
         "type": "object"
       },
       "type": "array"
@@ -38,10 +39,11 @@
       "items": {
         "additionalProperties": false,
         "properties": {
+          "approval_digest": { "$ref": "#/$defs/pinnedDigest" },
           "digest": { "$ref": "#/$defs/digest" },
           "name": { "minLength": 1, "type": "string" }
         },
-        "required": ["name", "digest"],
+        "required": ["name", "digest", "approval_digest"],
         "type": "object"
       },
       "type": "array"
@@ -109,5 +111,6 @@
       "type": "object"
     },
     "path": { "pattern": "^(?!/)(?!\\.{1,2}(?:/|$))(?!.*//)(?!.*\\/\\.{1,2}(?:/|$))(?!.*\\/$)[^\\\\:\\u0000]+$", "type": "string" }
+    ,"pinnedDigest": { "pattern": "^sha256:[0-9a-f]{64}$", "type": "string" }
   }
 }

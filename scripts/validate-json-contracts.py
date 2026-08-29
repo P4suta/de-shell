@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import json
 import pathlib
-import platform
 import subprocess
 import tempfile
 import tomllib
@@ -32,6 +31,18 @@ def write_json(path: pathlib.Path, value: object) -> None:
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def report_command(
+    arguments: list[str], *, exits: tuple[int, ...] = (0,)
+) -> tuple[subprocess.CompletedProcess[str], dict[str, object]]:
+    completed = subprocess.run(arguments, text=True, capture_output=True, check=False)
+    if completed.returncode not in exits or completed.stderr:
+        raise RuntimeError(
+            f"report command failed ({completed.returncode}): {' '.join(arguments)}\n"
+            f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
+        )
+    return completed, json.loads(completed.stdout)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("binary", type=pathlib.Path)
@@ -52,15 +63,31 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="deshell-schema-validation-") as raw_root:
         root = pathlib.Path(raw_root)
         (root / "entry.sh").write_bytes(b"#!/bin/sh\n/usr/bin/printf schema-validation\n")
-        command([str(binary), "init", "--root", str(root), "--entry", "entry.sh"])
-
         generated = root / "generated"
         generated.mkdir()
-        inventory = command(
+        _, init_report = report_command(
+            [
+                str(binary),
+                "init",
+                "--root",
+                str(root),
+                "--entry",
+                "entry.sh",
+                "--target",
+                "rust",
+                "--format",
+                "json",
+            ]
+        )
+        write_json(generated / "init-report.json", init_report)
+        _, scan_report = report_command(
             [str(binary), "scan", "--root", str(root), "--format", "json"]
-        ).stdout
-        (generated / "inventory.json").write_text(inventory, encoding="utf-8")
-        command([str(binary), "analyze", "--root", str(root)])
+        )
+        write_json(generated / "scan-report.json", scan_report)
+        _, analyze_report = report_command(
+            [str(binary), "analyze", "--root", str(root), "--format", "json"]
+        )
+        write_json(generated / "analyze-report.json", analyze_report)
 
         plans = list((root / ".deshell" / "artifacts").glob("*/*/plan.json"))
         evidence = list((root / ".deshell" / "artifacts").glob("*/*/evidence.json"))
@@ -71,14 +98,8 @@ def main() -> int:
             generated / "project.json",
             tomllib.loads((root / ".deshell" / "project.toml").read_text(encoding="utf-8")),
         )
-        write_json(
-            generated / "scenario.json",
-            tomllib.loads(
-                (root / ".deshell" / "scenarios" / "default.toml").read_text(
-                    encoding="utf-8"
-                )
-            ),
-        )
+        scenario_path = next((root / ".deshell" / "scenarios").glob("*.toml"))
+        write_json(generated / "scenario.json", tomllib.loads(scenario_path.read_text(encoding="utf-8")))
         write_json(
             generated / "lock.json",
             tomllib.loads((root / "deshell.lock").read_text(encoding="utf-8")),
@@ -126,30 +147,74 @@ def main() -> int:
             raise RuntimeError("could not generate exactly one failure diagnostic")
         (generated / "diagnostic.json").write_text(diagnostics[0] + "\n", encoding="utf-8")
 
-        project_path = root / ".deshell" / "project.toml"
-        project_text = project_path.read_text(encoding="utf-8").replace(
-            "platform_cells = []",
-            "platform_cells = [{ id = \"host\", operating_system = \""
-            + platform.system().lower()
-            + "\", architecture = \""
-            + platform.machine().lower()
-            + "\", runtime = \"native\", approval = \"approved\" }]",
+        _, scenario_report = report_command(
+            [str(binary), "scenario", "list", "--root", str(root), "--format", "json"]
         )
-        project_path.write_text(project_text, encoding="utf-8")
-        scenario_path = root / ".deshell" / "scenarios" / "default.toml"
-        scenario_path.write_text(
-            scenario_path.read_text(encoding="utf-8").replace(
-                'approval = "draft"', 'approval = "approved"'
-            ),
-            encoding="utf-8",
+        write_json(generated / "scenario-report.json", scenario_report)
+        scenario_line = next(
+            line for line in scenario_report["details"]["output"] if "\tdraft\t" in line
         )
-        (root / "src" / "bin").mkdir(parents=True)
-        plan_output = command(
-            [str(binary), "migrate", "plan", "--root", str(root)]
-        ).stdout
+        scenario_name, _, scenario_digest, _ = scenario_line.split("\t")
+        report_command(
+            [
+                str(binary), "scenario", "approve", "--root", str(root),
+                "--name", scenario_name, "--digest", scenario_digest, "--format", "json",
+            ]
+        )
+        _, matrix_report = report_command(
+            [str(binary), "matrix", "list", "--root", str(root), "--format", "json"]
+        )
+        write_json(generated / "matrix-report.json", matrix_report)
+        matrix_line = next(
+            line for line in matrix_report["details"]["output"] if "\tdraft\t" in line
+        )
+        cell, _, matrix_digest = matrix_line.split("\t")
+        report_command(
+            [
+                str(binary), "matrix", "approve", "--root", str(root),
+                "--cell", cell, "--digest", matrix_digest, "--format", "json",
+            ]
+        )
+        _, check_report = report_command(
+            [str(binary), "check", "--root", str(root), "--format", "json"]
+        )
+        write_json(generated / "check-report.json", check_report)
+        _, verify_report = report_command(
+            [str(binary), "verify", "--root", str(root), "--format", "json"],
+            exits=(3, 6),
+        )
+        write_json(generated / "verify-report.json", verify_report)
+        _, observe_report = report_command(
+            [str(binary), "observe", "--root", str(root), "--format", "json"],
+            exits=(6,),
+        )
+        write_json(generated / "observe-report.json", observe_report)
+        _, explain_report = report_command(
+            [str(binary), "explain", "--root", str(root), "--format", "json"]
+        )
+        write_json(generated / "explain-report.json", explain_report)
+        _, rewrite_report = report_command(
+            [
+                str(binary), "rewrite", "--root", str(root), "--equivalent",
+                "--format", "json",
+            ]
+        )
+        write_json(generated / "rewrite-report.json", rewrite_report)
+        _, modernize_report = report_command(
+            [
+                str(binary), "modernize", "--root", str(root), "--profile", "secure",
+                "--format", "json",
+            ]
+        )
+        write_json(generated / "modernize-report.json", modernize_report)
+        _, plan_report = report_command(
+            [str(binary), "migrate", "plan", "--root", str(root), "--format", "json"]
+        )
+        write_json(generated / "migrate-report.json", plan_report)
+        plan_output = plan_report["details"]["output"]
         plan_digest = next(
             line.removeprefix("plan ")
-            for line in plan_output.splitlines()
+            for line in plan_output
             if line.startswith("plan ")
         )
         migration = root / ".deshell" / "migrations" / "sha256" / plan_digest
@@ -158,7 +223,7 @@ def main() -> int:
         if len(requests) != 1 or len(proposals) != 1:
             raise RuntimeError("migration did not create exactly one request/proposal pair")
         migration_evidence = generated / "migration-evidence.json"
-        command(
+        _, verify_migration_report = report_command(
             [
                 str(binary),
                 "migrate",
@@ -168,9 +233,11 @@ def main() -> int:
                 "--plan",
                 plan_digest,
                 "--cell",
-                "host",
+                cell,
                 "--output",
                 str(migration_evidence),
+                "--format",
+                "json",
             ]
         )
         command(
@@ -186,6 +253,8 @@ def main() -> int:
                 str(migration_evidence),
             ]
         )
+
+        approval_artifact = next((root / ".deshell" / "approvals" / "sha256").glob("*.json"))
         command(
             [
                 str(binary),
@@ -197,6 +266,25 @@ def main() -> int:
                 plan_digest,
             ]
         )
+        _, retired_scan = report_command(
+            [str(binary), "scan", "--root", str(root), "--format", "json"]
+        )
+        if retired_scan["details"]["counts"].get("findings") != 0:
+            raise RuntimeError("retirement did not produce a zero-finding scan")
+        _, shell_free = report_command(
+            [
+                str(binary),
+                "verify",
+                "--root",
+                str(root),
+                "--require",
+                "shell-free",
+                "--format",
+                "json",
+            ]
+        )
+        if shell_free["status"] != "ok":
+            raise RuntimeError("retirement did not satisfy the shell-free gate")
 
         (root / "risk.sh").write_text('eval "$command"\n', encoding="utf-8")
         audit = subprocess.run(
@@ -211,13 +299,25 @@ def main() -> int:
         (generated / "audit-finding.json").write_text(
             audit_lines[0] + "\n", encoding="utf-8"
         )
+        _, audit_report = report_command(
+            [str(binary), "audit", "--root", str(root), "--format", "json"],
+            exits=(4,),
+        )
+        write_json(generated / "audit-report.json", audit_report)
 
-        harden_output = command(
-            [str(binary), "harden", "plan", "--root", str(root)]
-        ).stdout
+        _, doctor_report = report_command(
+            [str(binary), "doctor", "--root", str(root), "--format", "json"]
+        )
+        write_json(generated / "doctor-report.json", doctor_report)
+
+        _, harden_report = report_command(
+            [str(binary), "harden", "plan", "--root", str(root), "--format", "json"]
+        )
+        write_json(generated / "harden-report.json", harden_report)
+        harden_output = harden_report["details"]["output"]
         harden_digest = next(
             line.removeprefix("harden plan ")
-            for line in harden_output.splitlines()
+            for line in harden_output
             if line.startswith("harden plan ")
         )
         hardening = root / ".deshell" / "hardening"
@@ -246,7 +346,23 @@ def main() -> int:
         harden_evidence = hardening / "sha256" / harden_digest / "evidence.json"
 
         instances = [
-            ("inventory-v1.schema.json", generated / "inventory.json"),
+            ("approval-v1.schema.json", approval_artifact),
+            ("migration-index-v1.schema.json", root / ".deshell" / "migrations" / "active.json"),
+            ("init-report-v1.schema.json", generated / "init-report.json"),
+            ("scan-report-v1.schema.json", generated / "scan-report.json"),
+            ("scenario-report-v1.schema.json", generated / "scenario-report.json"),
+            ("matrix-report-v1.schema.json", generated / "matrix-report.json"),
+            ("audit-report-v1.schema.json", generated / "audit-report.json"),
+            ("analyze-report-v1.schema.json", generated / "analyze-report.json"),
+            ("check-report-v1.schema.json", generated / "check-report.json"),
+            ("verify-report-v1.schema.json", generated / "verify-report.json"),
+            ("observe-report-v1.schema.json", generated / "observe-report.json"),
+            ("doctor-report-v1.schema.json", generated / "doctor-report.json"),
+            ("explain-report-v1.schema.json", generated / "explain-report.json"),
+            ("rewrite-report-v1.schema.json", generated / "rewrite-report.json"),
+            ("modernize-report-v1.schema.json", generated / "modernize-report.json"),
+            ("harden-report-v1.schema.json", generated / "harden-report.json"),
+            ("migrate-report-v1.schema.json", generated / "migrate-report.json"),
             ("manifest-v1.schema.json", root / ".deshell" / "manifest.json"),
             ("effect-ir-v1.schema.json", plans[0]),
             ("evidence-v1.schema.json", evidence[0]),

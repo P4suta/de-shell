@@ -1,4 +1,5 @@
 mod agent_process;
+mod approval;
 mod audit;
 mod canonical_json;
 mod cli;
@@ -23,6 +24,7 @@ mod properties;
 mod protocol;
 mod replay;
 mod replay_proxy;
+mod report;
 mod rewrite;
 mod runner;
 mod scanner;

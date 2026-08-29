@@ -8,7 +8,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 #[command(
     name = "deshell",
     version = env!("CARGO_PKG_VERSION"),
-    about = "Independently verify project-native replacements with a shell retirement migration oracle."
+    about = "Independently verify project-native replacements with a shell retirement migration oracle.",
+    after_help = "First retirement:\n  deshell init\n  deshell scenario list\n  deshell matrix list\n  deshell migrate plan\n  deshell migrate status\n  deshell verify --require shell-free\n\nReview commands print exact approval argv; migrate status prints the exact next argv."
 )]
 struct Cli {
     #[arg(long, global = true, value_enum, default_value = "human")]
@@ -20,11 +21,18 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Initialize canonical de-shell project files.
+    #[command(
+        after_help = "Examples:\n  deshell init\n  deshell init --target rust\n  deshell init --target go --format json\n\nAuto writes nothing when standalone shell has no unique target and returns exact retry argv."
+    )]
     Init {
         #[arg(long, default_value = ".")]
         root: PathBuf,
         #[arg(long = "entry")]
         entries: Vec<String>,
+        #[arg(long, value_enum, default_value = "auto")]
+        target: InitTargetArg,
+        #[arg(long, value_enum, default_value = "human")]
+        format: OutputFormat,
     },
     /// Inventory shell files, embedded shell, and candidates.
     Scan {
@@ -43,9 +51,20 @@ enum Command {
         persona: AuditPersona,
     },
     /// Create reviewable scenario drafts from repository call boundaries.
+    #[command(
+        after_help = "Review flow:\n  deshell scenario list\n  deshell scenario show --name NAME\n  deshell scenario approve --name NAME --digest sha256:REVIEW_DIGEST"
+    )]
     Scenario {
         #[command(subcommand)]
         command: ScenarioCommand,
+    },
+    /// Review and approve platform/runtime matrix cells.
+    #[command(
+        after_help = "Review flow:\n  deshell matrix list\n  deshell matrix approve --cell CELL --digest sha256:REVIEW_DIGEST"
+    )]
+    Matrix {
+        #[command(subcommand)]
+        command: MatrixCommand,
     },
     /// Lower an entrypoint into canonical Effect IR.
     Analyze {
@@ -53,6 +72,8 @@ enum Command {
         root: PathBuf,
         #[arg(long)]
         entry: Vec<String>,
+        #[arg(long, value_enum, default_value = "human")]
+        format: OutputFormat,
     },
     /// Preview or apply meaning-preserving shell rewrites.
     Rewrite {
@@ -64,6 +85,8 @@ enum Command {
         equivalent: bool,
         #[arg(long)]
         apply: bool,
+        #[arg(long, value_enum, default_value = "human")]
+        format: OutputFormat,
     },
     /// Propose explicitly behavior-changing improvements.
     Modernize {
@@ -73,6 +96,8 @@ enum Command {
         profile: String,
         #[arg(long)]
         apply: bool,
+        #[arg(long, value_enum, default_value = "human")]
+        format: OutputFormat,
     },
     /// Plan and verify intentional behavior changes separately from migration.
     Harden {
@@ -80,6 +105,9 @@ enum Command {
         command: HardenCommand,
     },
     /// Plan, verify, and atomically apply repository-wide shell retirement.
+    #[command(
+        after_help = "Retirement flow:\n  deshell migrate plan\n  deshell migrate status\n  deshell migrate verify --plan PLAN_DIGEST --cell CELL --output evidence.json\n  deshell migrate evidence import --plan PLAN_DIGEST evidence.json\n  deshell migrate apply --plan PLAN_DIGEST\n\nA blocker plan is saved and exits 4. Status uses only the active plan and prints exact next argv."
+    )]
     Migrate {
         #[command(subcommand)]
         command: MigrateCommand,
@@ -92,6 +120,8 @@ enum Command {
         entry: Vec<String>,
         #[arg(long, value_enum)]
         require: Option<GuaranteeRequirement>,
+        #[arg(long, value_enum, default_value = "human")]
+        format: OutputFormat,
     },
     /// Observe original and lowered behavior in a disposable provider.
     Observe {
@@ -101,13 +131,20 @@ enum Command {
         entry: Option<String>,
         #[arg(long)]
         scenario: Vec<String>,
+        #[arg(long, value_enum, default_value = "human")]
+        format: OutputFormat,
     },
     /// Diagnose locks, runtimes, and disposable-provider readiness.
+    #[command(
+        after_help = "Examples:\n  deshell doctor\n  deshell doctor --require planning\n  deshell doctor --require disposable --format json\n\nWithout --require this is an exit-0 capability report."
+    )]
     Doctor {
         #[arg(long, default_value = ".")]
         root: PathBuf,
         #[arg(long, value_enum, default_value = "human")]
         format: OutputFormat,
+        #[arg(long, value_enum)]
+        require: Option<DoctorRequirement>,
     },
     /// Run the canonical Effect IR plan.
     Run {
@@ -141,12 +178,16 @@ enum Command {
     Check {
         #[arg(long, default_value = ".")]
         root: PathBuf,
+        #[arg(long, value_enum, default_value = "human")]
+        format: OutputFormat,
     },
     /// Explain a plan or an individual guarantee.
     Explain {
         #[arg(long, default_value = ".")]
         root: PathBuf,
         node_id: Option<String>,
+        #[arg(long, value_enum, default_value = "human")]
+        format: OutputFormat,
     },
     /// Write an embedded v1 JSON Schema to stdout.
     Schema {
@@ -172,6 +213,7 @@ enum OutputFormat {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum AuditOutputFormat {
     Human,
+    Json,
     Jsonl,
     Sarif,
     Github,
@@ -184,13 +226,72 @@ enum AuditPersona {
 
 #[derive(Debug, Subcommand)]
 enum ScenarioCommand {
+    /// List scenario review digests and approval state.
+    List {
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        #[arg(long, value_enum, default_value = "human")]
+        format: OutputFormat,
+    },
+    /// Show one scenario review digest and approval state.
+    Show {
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        #[arg(long)]
+        name: String,
+        #[arg(long, value_enum, default_value = "human")]
+        format: OutputFormat,
+    },
     /// Synthesize draft scenarios; write only when --apply is supplied.
     Synthesize {
         #[arg(long, default_value = ".")]
         root: PathBuf,
         #[arg(long)]
         apply: bool,
+        #[arg(long, value_enum, default_value = "human")]
+        format: OutputFormat,
     },
+    /// Approve the exact scenario bytes shown by list/show.
+    Approve {
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        digest: String,
+        #[arg(long, value_enum, default_value = "human")]
+        format: OutputFormat,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum MatrixCommand {
+    /// List matrix review digests and approval state.
+    List {
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        #[arg(long, value_enum, default_value = "human")]
+        format: OutputFormat,
+    },
+    /// Approve the exact matrix cell shown by list.
+    Approve {
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        #[arg(long)]
+        cell: String,
+        #[arg(long)]
+        digest: String,
+        #[arg(long, value_enum, default_value = "human")]
+        format: OutputFormat,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum InitTargetArg {
+    Auto,
+    Rust,
+    Go,
+    Host,
 }
 
 #[derive(Debug, Subcommand)]
@@ -198,18 +299,24 @@ enum HardenCommand {
     Plan {
         #[arg(long, default_value = ".")]
         root: PathBuf,
+        #[arg(long, value_enum, default_value = "human")]
+        format: OutputFormat,
     },
     Verify {
         #[arg(long, default_value = ".")]
         root: PathBuf,
         #[arg(long)]
         plan: String,
+        #[arg(long, value_enum, default_value = "human")]
+        format: OutputFormat,
     },
     Apply {
         #[arg(long, default_value = ".")]
         root: PathBuf,
         #[arg(long)]
         plan: String,
+        #[arg(long, value_enum, default_value = "human")]
+        format: OutputFormat,
     },
 }
 
@@ -219,6 +326,8 @@ enum MigrateCommand {
     Plan {
         #[arg(long, default_value = ".")]
         root: PathBuf,
+        #[arg(long, value_enum, default_value = "human")]
+        format: OutputFormat,
     },
     /// Verify original, Effect IR, and replacement in one approved matrix cell.
     Verify {
@@ -230,6 +339,8 @@ enum MigrateCommand {
         cell: String,
         #[arg(long)]
         output: PathBuf,
+        #[arg(long, value_enum, default_value = "human")]
+        format: OutputFormat,
     },
     /// Import independently produced Evidence into a plan.
     Evidence {
@@ -242,6 +353,8 @@ enum MigrateCommand {
         root: PathBuf,
         #[arg(long)]
         plan: String,
+        #[arg(long, value_enum, default_value = "human")]
+        format: OutputFormat,
     },
     /// Summarize live, blocked, planned, verified, retired, and archived state.
     Status {
@@ -261,6 +374,8 @@ enum MigrateEvidenceCommand {
         plan: String,
         #[arg(required = true)]
         files: Vec<PathBuf>,
+        #[arg(long, value_enum, default_value = "human")]
+        format: OutputFormat,
     },
 }
 
@@ -268,6 +383,15 @@ enum MigrateEvidenceCommand {
 enum GuaranteeRequirement {
     Native,
     ShellFree,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum DoctorRequirement {
+    Planning,
+    Local,
+    Disposable,
+    Bundle,
+    Dagger,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -293,6 +417,37 @@ enum ExportTarget {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum SchemaName {
+    Approval,
+    #[value(name = "init-report")]
+    InitReport,
+    #[value(name = "scan-report")]
+    ScanReport,
+    #[value(name = "scenario-report")]
+    ScenarioReport,
+    #[value(name = "matrix-report")]
+    MatrixReport,
+    #[value(name = "audit-report")]
+    AuditReport,
+    #[value(name = "analyze-report")]
+    AnalyzeReport,
+    #[value(name = "check-report")]
+    CheckReport,
+    #[value(name = "verify-report")]
+    VerifyReport,
+    #[value(name = "observe-report")]
+    ObserveReport,
+    #[value(name = "doctor-report")]
+    DoctorReport,
+    #[value(name = "explain-report")]
+    ExplainReport,
+    #[value(name = "rewrite-report")]
+    RewriteReport,
+    #[value(name = "modernize-report")]
+    ModernizeReport,
+    #[value(name = "harden-report")]
+    HardenReport,
+    #[value(name = "migrate-report")]
+    MigrateReport,
     Inventory,
     Manifest,
     Bundle,
@@ -314,6 +469,8 @@ enum SchemaName {
     Proposal,
     #[value(name = "migration-plan")]
     MigrationPlan,
+    #[value(name = "migration-index")]
+    MigrationIndex,
     #[value(name = "migration-evidence")]
     MigrationEvidence,
     #[value(name = "archive-manifest")]
@@ -328,11 +485,269 @@ enum SchemaName {
     HardenEvidence,
 }
 
+#[derive(Clone, Debug)]
+struct ReportSpec {
+    command: &'static str,
+    format: OutputFormat,
+    next_actions: Vec<crate::report::Action>,
+}
+
+impl Command {
+    fn report_spec(&self) -> Option<ReportSpec> {
+        fn root_value(root: &Path) -> String {
+            root.to_string_lossy().into_owned()
+        }
+        fn action(argv: Vec<String>) -> crate::report::Action {
+            crate::report::Action::Command { argv }
+        }
+        let spec = match self {
+            Self::Init { root, format, .. } => ReportSpec {
+                command: "init",
+                format: *format,
+                next_actions: vec![
+                    action(vec![
+                        "deshell".into(),
+                        "scenario".into(),
+                        "list".into(),
+                        "--root".into(),
+                        root_value(root),
+                    ]),
+                    action(vec![
+                        "deshell".into(),
+                        "matrix".into(),
+                        "list".into(),
+                        "--root".into(),
+                        root_value(root),
+                    ]),
+                ],
+            },
+            Self::Scan { format, .. } => ReportSpec {
+                command: "scan",
+                format: *format,
+                next_actions: Vec::new(),
+            },
+            Self::Audit { format, .. } => match format {
+                AuditOutputFormat::Human => ReportSpec {
+                    command: "audit",
+                    format: OutputFormat::Human,
+                    next_actions: Vec::new(),
+                },
+                AuditOutputFormat::Json => ReportSpec {
+                    command: "audit",
+                    format: OutputFormat::Json,
+                    next_actions: Vec::new(),
+                },
+                AuditOutputFormat::Jsonl | AuditOutputFormat::Sarif | AuditOutputFormat::Github => {
+                    return None;
+                }
+            },
+            Self::Scenario { command } => {
+                let (root, format) = match command {
+                    ScenarioCommand::List { root, format }
+                    | ScenarioCommand::Show { root, format, .. }
+                    | ScenarioCommand::Synthesize { root, format, .. }
+                    | ScenarioCommand::Approve { root, format, .. } => (root, *format),
+                };
+                ReportSpec {
+                    command: "scenario",
+                    format,
+                    next_actions: vec![action(vec![
+                        "deshell".into(),
+                        "scenario".into(),
+                        "list".into(),
+                        "--root".into(),
+                        root_value(root),
+                    ])],
+                }
+            }
+            Self::Matrix { command } => {
+                let (root, format) = match command {
+                    MatrixCommand::List { root, format }
+                    | MatrixCommand::Approve { root, format, .. } => (root, *format),
+                };
+                ReportSpec {
+                    command: "matrix",
+                    format,
+                    next_actions: vec![action(vec![
+                        "deshell".into(),
+                        "matrix".into(),
+                        "list".into(),
+                        "--root".into(),
+                        root_value(root),
+                    ])],
+                }
+            }
+            Self::Analyze { root, format, .. } => ReportSpec {
+                command: "analyze",
+                format: *format,
+                next_actions: vec![action(vec![
+                    "deshell".into(),
+                    "check".into(),
+                    "--root".into(),
+                    root_value(root),
+                ])],
+            },
+            Self::Rewrite { format, .. } => ReportSpec {
+                command: "rewrite",
+                format: *format,
+                next_actions: Vec::new(),
+            },
+            Self::Modernize { format, .. } => ReportSpec {
+                command: "modernize",
+                format: *format,
+                next_actions: Vec::new(),
+            },
+            Self::Harden { command } => {
+                let format = match command {
+                    HardenCommand::Plan { format, .. }
+                    | HardenCommand::Verify { format, .. }
+                    | HardenCommand::Apply { format, .. } => *format,
+                };
+                ReportSpec {
+                    command: "harden",
+                    format,
+                    next_actions: Vec::new(),
+                }
+            }
+            Self::Migrate { command } => {
+                let (root, format) = match command {
+                    MigrateCommand::Plan { root, format }
+                    | MigrateCommand::Verify { root, format, .. }
+                    | MigrateCommand::Apply { root, format, .. }
+                    | MigrateCommand::Status { root, format } => (root, *format),
+                    MigrateCommand::Evidence { command } => match command {
+                        MigrateEvidenceCommand::Import { root, format, .. } => (root, *format),
+                    },
+                };
+                ReportSpec {
+                    command: "migrate",
+                    format,
+                    next_actions: vec![action(vec![
+                        "deshell".into(),
+                        "migrate".into(),
+                        "status".into(),
+                        "--root".into(),
+                        root_value(root),
+                    ])],
+                }
+            }
+            Self::Verify { root, format, .. } => ReportSpec {
+                command: "verify",
+                format: *format,
+                next_actions: vec![action(vec![
+                    "deshell".into(),
+                    "verify".into(),
+                    "--root".into(),
+                    root_value(root),
+                ])],
+            },
+            Self::Observe { root, format, .. } => ReportSpec {
+                command: "observe",
+                format: *format,
+                next_actions: vec![action(vec![
+                    "deshell".into(),
+                    "verify".into(),
+                    "--root".into(),
+                    root_value(root),
+                ])],
+            },
+            Self::Doctor { format, .. } => ReportSpec {
+                command: "doctor",
+                format: *format,
+                next_actions: Vec::new(),
+            },
+            Self::Check { root, format } => ReportSpec {
+                command: "check",
+                format: *format,
+                next_actions: vec![
+                    action(vec![
+                        "deshell".into(),
+                        "scenario".into(),
+                        "list".into(),
+                        "--root".into(),
+                        root_value(root),
+                    ]),
+                    action(vec![
+                        "deshell".into(),
+                        "matrix".into(),
+                        "list".into(),
+                        "--root".into(),
+                        root_value(root),
+                    ]),
+                ],
+            },
+            Self::Explain { format, .. } => ReportSpec {
+                command: "explain",
+                format: *format,
+                next_actions: Vec::new(),
+            },
+            Self::Run { .. }
+            | Self::Export { .. }
+            | Self::Schema { .. }
+            | Self::ProcessAgent
+            | Self::ObserverAgent
+            | Self::NushellAdapter
+            | Self::Generator => return None,
+        };
+        Some(spec)
+    }
+
+    fn force_human_report_source(&mut self) {
+        match self {
+            Self::Init { format, .. }
+            | Self::Scan { format, .. }
+            | Self::Analyze { format, .. }
+            | Self::Rewrite { format, .. }
+            | Self::Modernize { format, .. }
+            | Self::Verify { format, .. }
+            | Self::Observe { format, .. }
+            | Self::Doctor { format, .. }
+            | Self::Check { format, .. }
+            | Self::Explain { format, .. } => *format = OutputFormat::Human,
+            Self::Audit { format, .. } => *format = AuditOutputFormat::Human,
+            Self::Scenario { command } => match command {
+                ScenarioCommand::List { format, .. }
+                | ScenarioCommand::Show { format, .. }
+                | ScenarioCommand::Synthesize { format, .. }
+                | ScenarioCommand::Approve { format, .. } => *format = OutputFormat::Human,
+            },
+            Self::Matrix { command } => match command {
+                MatrixCommand::List { format, .. } | MatrixCommand::Approve { format, .. } => {
+                    *format = OutputFormat::Human
+                }
+            },
+            Self::Harden { command } => match command {
+                HardenCommand::Plan { format, .. }
+                | HardenCommand::Verify { format, .. }
+                | HardenCommand::Apply { format, .. } => *format = OutputFormat::Human,
+            },
+            Self::Migrate { command } => match command {
+                MigrateCommand::Plan { format, .. }
+                | MigrateCommand::Verify { format, .. }
+                | MigrateCommand::Apply { format, .. }
+                | MigrateCommand::Status { format, .. } => *format = OutputFormat::Human,
+                MigrateCommand::Evidence { command } => match command {
+                    MigrateEvidenceCommand::Import { format, .. } => *format = OutputFormat::Human,
+                },
+            },
+            Self::Run { .. }
+            | Self::Export { .. }
+            | Self::Schema { .. }
+            | Self::ProcessAgent
+            | Self::ObserverAgent
+            | Self::NushellAdapter
+            | Self::Generator => {}
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Failure {
     exit: i32,
     code: &'static str,
     message: String,
+    help: Option<String>,
+    next_actions: Vec<crate::report::Action>,
 }
 
 impl Failure {
@@ -341,6 +756,8 @@ impl Failure {
             exit: 1,
             code: "DESHELL_IO",
             message: message.into(),
+            help: None,
+            next_actions: Vec::new(),
         }
     }
     fn limit(message: impl Into<String>) -> Self {
@@ -348,6 +765,8 @@ impl Failure {
             exit: 1,
             code: "DESHELL_LIMIT_EXCEEDED",
             message: message.into(),
+            help: None,
+            next_actions: Vec::new(),
         }
     }
     fn usage(message: impl Into<String>) -> Self {
@@ -355,6 +774,8 @@ impl Failure {
             exit: 2,
             code: "DESHELL_USAGE",
             message: message.into(),
+            help: None,
+            next_actions: Vec::new(),
         }
     }
     fn invalid(message: impl Into<String>) -> Self {
@@ -362,6 +783,8 @@ impl Failure {
             exit: 3,
             code: "DESHELL_INVALID_CONTRACT",
             message: message.into(),
+            help: None,
+            next_actions: Vec::new(),
         }
     }
     fn policy(message: impl Into<String>) -> Self {
@@ -369,6 +792,8 @@ impl Failure {
             exit: 4,
             code: "DESHELL_POLICY",
             message: message.into(),
+            help: None,
+            next_actions: Vec::new(),
         }
     }
     fn shell_reintroduced(message: impl Into<String>) -> Self {
@@ -376,13 +801,8 @@ impl Failure {
             exit: 4,
             code: "DESHELL_SHELL_REINTRODUCED",
             message: message.into(),
-        }
-    }
-    fn audit_failed(message: impl Into<String>) -> Self {
-        Self {
-            exit: 4,
-            code: "DESHELL_AUDIT_FAILED",
-            message: message.into(),
+            help: None,
+            next_actions: Vec::new(),
         }
     }
     fn difference(message: impl Into<String>) -> Self {
@@ -390,6 +810,8 @@ impl Failure {
             exit: 5,
             code: "DESHELL_DIFFERENCE",
             message: message.into(),
+            help: None,
+            next_actions: Vec::new(),
         }
     }
     fn unavailable(message: impl Into<String>) -> Self {
@@ -397,6 +819,8 @@ impl Failure {
             exit: 6,
             code: "DESHELL_PROVIDER_UNAVAILABLE",
             message: message.into(),
+            help: None,
+            next_actions: Vec::new(),
         }
     }
     fn internal(message: impl Into<String>) -> Self {
@@ -404,7 +828,19 @@ impl Failure {
             exit: 70,
             code: "DESHELL_INTERNAL",
             message: message.into(),
+            help: None,
+            next_actions: Vec::new(),
         }
+    }
+
+    fn with_next_actions(
+        mut self,
+        help: impl Into<String>,
+        next_actions: Vec<crate::report::Action>,
+    ) -> Self {
+        self.help = Some(help.into());
+        self.next_actions = next_actions;
+        self
     }
 }
 
@@ -437,17 +873,303 @@ where
         }
     };
     let diagnostic_mode = cli.diagnostics;
-    match dispatch(cli.command, diagnostic_mode, stdout, stderr) {
+    let mut command = cli.command;
+    if let Some(spec) = command.report_spec() {
+        command.force_human_report_source();
+        let mut captured_stdout = Vec::new();
+        let mut captured_stderr = Vec::new();
+        let outcome = dispatch(
+            command,
+            diagnostic_mode,
+            &mut captured_stdout,
+            &mut captured_stderr,
+        );
+        let (code, completed_failure) = match outcome {
+            Ok(code) => (code, None),
+            Err(failure) if completed_report_failure(&failure) => (failure.exit, Some(failure)),
+            Err(failure) => {
+                let exit = failure.exit;
+                let diagnostic = failure_diagnostic(failure);
+                return if crate::diagnostics::emit(stderr, diagnostic_mode, &diagnostic).is_err() {
+                    70
+                } else {
+                    exit
+                };
+            }
+        };
+        let mut report = command_report(
+            &spec,
+            code,
+            completed_failure.as_ref(),
+            &captured_stdout,
+            &captured_stderr,
+        );
+        if report.next_actions.is_empty() {
+            report.next_actions = spec.next_actions;
+        }
+        let emitted = match spec.format {
+            OutputFormat::Human => report.emit_human(stdout).map_err(|error| error.to_string()),
+            OutputFormat::Json => report.emit_json(stdout),
+        };
+        if let Err(message) = emitted {
+            let diagnostic = crate::diagnostics::Diagnostic::error(
+                "DESHELL_IO",
+                format!("cannot write report: {message}"),
+            );
+            let _ = crate::diagnostics::emit(stderr, diagnostic_mode, &diagnostic);
+            return 1;
+        }
+        return code;
+    }
+    match dispatch(command, diagnostic_mode, stdout, stderr) {
         Ok(code) => code,
         Err(failure) => {
-            let diagnostic = crate::diagnostics::Diagnostic::error(failure.code, failure.message);
+            let exit = failure.exit;
+            let diagnostic = failure_diagnostic(failure);
             if crate::diagnostics::emit(stderr, diagnostic_mode, &diagnostic).is_err() {
                 70
             } else {
-                failure.exit
+                exit
             }
         }
     }
+}
+
+fn failure_diagnostic(failure: Failure) -> crate::diagnostics::Diagnostic {
+    let mut diagnostic = crate::diagnostics::Diagnostic::error(failure.code, failure.message);
+    if let Some(help) = failure.help {
+        diagnostic.help = help;
+    }
+    if !failure.next_actions.is_empty() {
+        diagnostic.next_actions = failure.next_actions;
+    }
+    diagnostic
+}
+
+fn completed_report_failure(failure: &Failure) -> bool {
+    matches!(failure.exit, 4..=6)
+        || failure.message.starts_with("migration verification failed")
+        || failure
+            .message
+            .contains("current scenarios have not been observed")
+}
+
+fn command_report(
+    spec: &ReportSpec,
+    code: i32,
+    failure: Option<&Failure>,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> crate::report::Report {
+    let stdout = String::from_utf8_lossy(stdout);
+    let stderr = String::from_utf8_lossy(stderr);
+    let not_ready = code == 0
+        && match spec.command {
+            "init" => stdout.contains("created ") || stdout.contains("initialized de-shell"),
+            "scenario" | "matrix" => stdout.contains("\tdraft\t") || stdout.contains("\tstale\t"),
+            "check" => stdout.contains("valid but not ready"),
+            _ => false,
+        };
+    let status = if not_ready {
+        crate::report::Status::NotReady
+    } else {
+        match code {
+            0 => crate::report::Status::Ok,
+            4 => crate::report::Status::Blocked,
+            5 => crate::report::Status::Different,
+            6 => crate::report::Status::Unavailable,
+            _ => crate::report::Status::Failed,
+        }
+    };
+    let summary = failure
+        .map(|failure| failure.message.clone())
+        .unwrap_or_else(|| match status {
+            crate::report::Status::Ok => format!("{} completed", spec.command),
+            crate::report::Status::NotReady => format!("{} is valid but not ready", spec.command),
+            crate::report::Status::Blocked => format!("{} completed with blockers", spec.command),
+            crate::report::Status::Different => format!("{} found a difference", spec.command),
+            crate::report::Status::Unavailable => {
+                format!("{} capability is unavailable", spec.command)
+            }
+            crate::report::Status::Failed => format!("{} failed", spec.command),
+        });
+    let mut report = crate::report::Report::new(spec.command, status, summary);
+    if let Some(failure) = failure {
+        report.details.items.push(crate::report::Item {
+            kind: Some("failure".into()),
+            name: Some(failure.code.into()),
+            message: Some(failure.message.clone()),
+            ..crate::report::Item::default()
+        });
+        report
+            .details
+            .output
+            .push(format!("{}: {}", failure.code, failure.message));
+        report.next_actions.extend(failure.next_actions.clone());
+    }
+    for line in stdout.lines() {
+        if let Some(value) = line.strip_prefix("next argv: ")
+            && let Ok(argv) = serde_json::from_str::<Vec<String>>(value)
+            && !argv.is_empty()
+        {
+            report
+                .next_actions
+                .push(crate::report::Action::Command { argv });
+            continue;
+        }
+        report.details.output.push(line.to_owned());
+        if spec.command == "scenario"
+            && let Some(path) = line.strip_prefix("# ")
+            && path.starts_with(".deshell/scenarios/")
+        {
+            report.next_actions.push(crate::report::Action::Review {
+                paths: vec![path.into()],
+            });
+        }
+        if let Some(path) = line.strip_prefix("created ") {
+            report.details.paths.push(path.to_owned());
+        } else if let Some(path) = line.strip_prefix("artifact ") {
+            report.details.paths.push(path.to_owned());
+        } else if let Some(entrypoint) = line.strip_prefix("entrypoint ") {
+            report.details.items.push(crate::report::Item {
+                kind: Some("entrypoint".into()),
+                path: Some(entrypoint.into()),
+                ..crate::report::Item::default()
+            });
+        } else if let Some(target) = line.strip_prefix("target ")
+            && let Some((target, rest)) = target.split_once(" (module root ")
+            && let Some((module_root, reason)) = rest.split_once("): ")
+        {
+            report.details.values.insert("target".into(), target.into());
+            report
+                .details
+                .values
+                .insert("module_root".into(), module_root.into());
+            report.details.values.insert("reason".into(), reason.into());
+        } else if let Some(cell) = line.strip_prefix("required cell ") {
+            report.details.items.push(crate::report::Item {
+                kind: Some("matrix_cell".into()),
+                name: Some(cell.into()),
+                ..crate::report::Item::default()
+            });
+        } else if let Some(reason) = line.strip_prefix("not-ready: ") {
+            report.details.items.push(crate::report::Item {
+                kind: Some("not_ready".into()),
+                message: Some(reason.into()),
+                ..crate::report::Item::default()
+            });
+        } else if let Some(blocker) = line.strip_prefix("blocker ") {
+            let (name, message) = blocker.split_once(' ').unwrap_or((blocker, ""));
+            report.details.items.push(crate::report::Item {
+                kind: Some("blocker".into()),
+                name: Some(name.into()),
+                message: (!message.is_empty()).then(|| message.into()),
+                ..crate::report::Item::default()
+            });
+        } else if spec.command == "scan" && line.contains('\t') {
+            let fields = line.split('\t').collect::<Vec<_>>();
+            if fields.len() >= 2 {
+                let item = match fields[0] {
+                    "error" => crate::report::Item {
+                        kind: Some("error".into()),
+                        path: Some(fields[1].into()),
+                        name: fields.get(2).map(|stage| (*stage).into()),
+                        message: fields.get(3).map(|message| (*message).into()),
+                        ..crate::report::Item::default()
+                    },
+                    "skipped" => crate::report::Item {
+                        kind: Some("skipped".into()),
+                        path: Some(fields[1].into()),
+                        message: fields.get(2).map(|reason| (*reason).into()),
+                        ..crate::report::Item::default()
+                    },
+                    kind => crate::report::Item {
+                        kind: Some(kind.into()),
+                        path: Some(fields[1].into()),
+                        name: fields.get(2).map(|interpreter| (*interpreter).into()),
+                        status: fields.get(3).map(|confidence| (*confidence).into()),
+                        message: fields
+                            .get(4)
+                            .filter(|locator| **locator != "-")
+                            .map(|locator| (*locator).into()),
+                        ..crate::report::Item::default()
+                    },
+                };
+                report.details.items.push(item);
+            }
+        } else if matches!(spec.command, "scenario" | "matrix") && line.contains('\t') {
+            let fields = line.split('\t').collect::<Vec<_>>();
+            if fields.len() >= 3 {
+                report.details.items.push(crate::report::Item {
+                    kind: Some(spec.command.into()),
+                    name: Some(fields[0].into()),
+                    status: Some(fields[1].into()),
+                    digest: Some(fields[2].into()),
+                    path: fields
+                        .get(3)
+                        .filter(|path| **path != "-")
+                        .map(|path| (*path).into()),
+                    ..crate::report::Item::default()
+                });
+            }
+        }
+        if let Some((name, value)) = line.split_once(": ")
+            && !name.is_empty()
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b' ' | b'_' | b'-'))
+        {
+            report
+                .details
+                .values
+                .insert(name.replace(' ', "_"), value.into());
+        }
+        for token in line.split_whitespace() {
+            if let Some((name, value)) = token.split_once('=')
+                && !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+            {
+                let value = value.trim_end_matches([',', ';']);
+                if let Ok(value) = value.parse::<u64>() {
+                    report.details.counts.insert(name.into(), value);
+                } else if !value.is_empty() {
+                    report.details.values.insert(name.into(), value.into());
+                }
+            }
+        }
+        if spec.command == "scan"
+            && let Some((findings, rest)) = line.split_once(" shell location(s) found; ")
+            && let Ok(findings) = findings.parse()
+        {
+            report.details.counts.insert("findings".into(), findings);
+            let fields = rest.split(';').map(str::trim).collect::<Vec<_>>();
+            for (name, suffix) in [("skipped", " skipped"), ("errors", " error(s)")] {
+                if let Some(field) = fields.iter().find(|field| field.ends_with(suffix))
+                    && let Ok(value) = field.trim_end_matches(suffix).parse()
+                {
+                    report.details.counts.insert(name.into(), value);
+                }
+            }
+        }
+        if spec.command == "audit"
+            && let Some((findings, rest)) = line.split_once(" audit finding(s); ")
+            && let Ok(findings) = findings.parse()
+        {
+            report.details.counts.insert("findings".into(), findings);
+            if let Some(failures) = rest.split_whitespace().next()
+                && let Ok(failures) = failures.parse()
+            {
+                report.details.counts.insert("threshold".into(), failures);
+            }
+        }
+    }
+    report
+        .details
+        .output
+        .extend(stderr.lines().map(|line| format!("diagnostic: {line}")));
+    report
 }
 
 fn requested_diagnostic_mode(args: &[OsString]) -> crate::diagnostics::Mode {
@@ -470,13 +1192,63 @@ fn dispatch(
     stderr: &mut dyn Write,
 ) -> Result<i32, Failure> {
     match command {
-        Command::Init { root, entries } => {
-            let result = if entries.is_empty() {
-                crate::project::init(&root)
-            } else {
-                crate::project::init_with_entries(&root, &entries)
+        Command::Init {
+            root,
+            entries,
+            target,
+            format,
+        } => {
+            let result = crate::project::init_cli(
+                &root,
+                &entries,
+                match target {
+                    InitTargetArg::Auto => crate::project::InitTarget::Auto,
+                    InitTargetArg::Rust => crate::project::InitTarget::Rust,
+                    InitTargetArg::Go => crate::project::InitTarget::Go,
+                    InitTargetArg::Host => crate::project::InitTarget::Host,
+                },
+            )
+            .map_err(|message| {
+                if message.starts_with("cannot choose a unique migration target") {
+                    let root = root.to_string_lossy().into_owned();
+                    Failure::usage(message).with_next_actions(
+                        "Select exactly one migration target after reviewing the detected project markers.",
+                        ["rust", "go", "host"]
+                            .into_iter()
+                            .map(|target| crate::report::Action::Command {
+                                argv: vec![
+                                    "deshell".into(),
+                                    "init".into(),
+                                    "--root".into(),
+                                    root.clone(),
+                                    "--target".into(),
+                                    target.into(),
+                                ],
+                            })
+                            .collect(),
+                    )
+                } else if message.contains("cannot replace")
+                    || message == "duplicate --entry value"
+                {
+                    Failure::usage(message)
+                } else {
+                    Failure::io(message)
+                }
+            })?;
+            if format == OutputFormat::Json {
+                let value = serde_json::json!({
+                    "created": result.created,
+                    "entrypoints": result.entrypoints,
+                    "module_root": result.module_root,
+                    "reason": result.reason,
+                    "target": result.target.as_str(),
+                });
+                write_io(
+                    stdout,
+                    &crate::canonical_json::pretty_bytes(&value).map_err(Failure::internal)?,
+                )?;
+                return Ok(0);
             }
-            .map_err(Failure::io)?;
             if result.created.is_empty() {
                 writeln_io(
                     stdout,
@@ -494,10 +1266,20 @@ fn dispatch(
             for entry in result.entrypoints {
                 writeln_io(stdout, format_args!("entrypoint {entry}"))?;
             }
+            writeln_io(
+                stdout,
+                format_args!(
+                    "target {} (module root {}): {}",
+                    result.target.as_str(),
+                    result.module_root,
+                    result.reason
+                ),
+            )?;
             Ok(0)
         }
         Command::Scan { root, format } => {
             let inventory = crate::project::scan(&root).map_err(Failure::io)?;
+            let exit = if inventory.errors.is_empty() { 0 } else { 1 };
             match format {
                 OutputFormat::Json => {
                     let value = serde_json::to_value(&inventory)
@@ -509,17 +1291,32 @@ fn dispatch(
                 }
                 OutputFormat::Human => {
                     for finding in &inventory.findings {
-                        let locator = finding
-                            .locator
-                            .as_ref()
-                            .map_or(String::new(), |value| format!("#{value}"));
                         writeln_io(
                             stdout,
                             format_args!(
-                                "{}\t{}{}",
+                                "{}\t{}\t{}\t{}\t{}",
                                 finding_kind(&finding.kind),
                                 finding.path,
-                                locator
+                                finding.interpreter.as_deref().unwrap_or("unknown"),
+                                interpreter_confidence(&finding.interpreter_confidence),
+                                finding.locator.as_deref().unwrap_or("-"),
+                            ),
+                        )?;
+                    }
+                    for skipped in &inventory.skipped {
+                        writeln_io(
+                            stdout,
+                            format_args!("skipped\t{}\t{}", skipped.path, skipped.reason),
+                        )?;
+                    }
+                    for error in &inventory.errors {
+                        writeln_io(
+                            stdout,
+                            format_args!(
+                                "error\t{}\t{}\t{}",
+                                error.path.as_deref().unwrap_or("<root>"),
+                                error.stage,
+                                error.message
                             ),
                         )?;
                     }
@@ -534,7 +1331,7 @@ fn dispatch(
                     )?;
                 }
             }
-            Ok(0)
+            Ok(exit)
         }
         Command::Audit {
             root,
@@ -542,11 +1339,34 @@ fn dispatch(
             persona,
         } => audit_command(&root, format, persona, stdout),
         Command::Scenario { command } => match command {
-            ScenarioCommand::Synthesize { root, apply } => {
-                scenario_synthesize_command(&root, apply, stdout)
+            ScenarioCommand::List { root, format } => {
+                scenario_review_command(&root, None, format, stdout)
             }
+            ScenarioCommand::Show { root, name, format } => {
+                scenario_review_command(&root, Some(&name), format, stdout)
+            }
+            ScenarioCommand::Synthesize {
+                root,
+                apply,
+                format,
+            } => scenario_synthesize_command(&root, apply, format, stdout),
+            ScenarioCommand::Approve {
+                root,
+                name,
+                digest,
+                format,
+            } => scenario_approve_command(&root, &name, &digest, format, stdout),
         },
-        Command::Analyze { root, entry } => {
+        Command::Matrix { command } => match command {
+            MatrixCommand::List { root, format } => matrix_review_command(&root, format, stdout),
+            MatrixCommand::Approve {
+                root,
+                cell,
+                digest,
+                format,
+            } => matrix_approve_command(&root, &cell, &digest, format, stdout),
+        },
+        Command::Analyze { root, entry, .. } => {
             for entry in selected_entries(&root, entry)? {
                 let result =
                     crate::project::analyze(&root, &entry).map_err(classify_project_error)?;
@@ -558,18 +1378,39 @@ fn dispatch(
             }
             Ok(0)
         }
-        Command::Check { root } => {
-            crate::project::check(&root).map_err(classify_project_errors)?;
-            writeln_io(
-                stdout,
-                format_args!("{}: project artifacts are valid", root.display()),
-            )?;
+        Command::Check { root, format } => {
+            let readiness =
+                crate::project::check_readiness(&root).map_err(classify_project_errors)?;
+            match format {
+                OutputFormat::Json => {
+                    let value = serde_json::to_value(&readiness)
+                        .map_err(|error| Failure::internal(error.to_string()))?;
+                    write_io(
+                        stdout,
+                        &crate::canonical_json::pretty_bytes(&value).map_err(Failure::internal)?,
+                    )?;
+                }
+                OutputFormat::Human if readiness.ready => writeln_io(
+                    stdout,
+                    format_args!("{}: project artifacts are ready", root.display()),
+                )?,
+                OutputFormat::Human => {
+                    writeln_io(
+                        stdout,
+                        format_args!("{}: project is valid but not ready", root.display()),
+                    )?;
+                    for reason in readiness.reasons {
+                        writeln_io(stdout, format_args!("not-ready: {reason}"))?;
+                    }
+                }
+            }
             Ok(0)
         }
         Command::Verify {
             root,
             entry,
             require,
+            ..
         } => {
             if require == Some(GuaranteeRequirement::ShellFree) {
                 return shell_free_command(&root, stdout);
@@ -761,9 +1602,14 @@ fn dispatch(
             root,
             entry,
             scenario,
+            ..
         } => observe_command(&root, entry, &scenario, stdout),
-        Command::Doctor { root, format } => doctor_command(&root, format, stdout),
-        Command::Explain { root, node_id } => explain(&root, node_id.as_deref(), stdout),
+        Command::Doctor {
+            root,
+            format,
+            require,
+        } => doctor_command(&root, format, require, stdout),
+        Command::Explain { root, node_id, .. } => explain(&root, node_id.as_deref(), stdout),
         Command::Schema { name } => {
             write_io(stdout, schema(name))?;
             Ok(0)
@@ -773,27 +1619,30 @@ fn dispatch(
             entry,
             equivalent,
             apply,
+            ..
         } => rewrite_command(&root, entry, equivalent, apply, stdout),
         Command::Modernize {
             root,
             profile,
             apply,
+            ..
         } => modernize_command(&root, &profile, apply, diagnostic_mode, stdout, stderr),
         Command::Harden { command } => harden_command(command, stdout),
         Command::Migrate { command } => match command {
-            MigrateCommand::Plan { root } => migrate_plan_command(&root, stdout),
+            MigrateCommand::Plan { root, .. } => migrate_plan_command(&root, stdout),
             MigrateCommand::Verify {
                 root,
                 plan,
                 cell,
                 output,
+                ..
             } => migrate_verify_command(&root, &plan, &cell, &output, stdout),
             MigrateCommand::Evidence { command } => match command {
-                MigrateEvidenceCommand::Import { root, plan, files } => {
-                    migrate_evidence_import_command(&root, &plan, &files, stdout)
-                }
+                MigrateEvidenceCommand::Import {
+                    root, plan, files, ..
+                } => migrate_evidence_import_command(&root, &plan, &files, stdout),
             },
-            MigrateCommand::Apply { root, plan } => migrate_apply_command(&root, &plan, stdout),
+            MigrateCommand::Apply { root, plan, .. } => migrate_apply_command(&root, &plan, stdout),
             MigrateCommand::Status { root, format } => {
                 migrate_status_command(&root, format, stdout)
             }
@@ -819,6 +1668,54 @@ fn dispatch(
 
 fn schema(name: SchemaName) -> &'static [u8] {
     match name {
+        SchemaName::Approval => {
+            include_bytes!("../../../contracts/schema/approval-v1.schema.json")
+        }
+        SchemaName::InitReport => {
+            include_bytes!("../../../contracts/schema/init-report-v1.schema.json")
+        }
+        SchemaName::ScanReport => {
+            include_bytes!("../../../contracts/schema/scan-report-v1.schema.json")
+        }
+        SchemaName::ScenarioReport => {
+            include_bytes!("../../../contracts/schema/scenario-report-v1.schema.json")
+        }
+        SchemaName::MatrixReport => {
+            include_bytes!("../../../contracts/schema/matrix-report-v1.schema.json")
+        }
+        SchemaName::AuditReport => {
+            include_bytes!("../../../contracts/schema/audit-report-v1.schema.json")
+        }
+        SchemaName::AnalyzeReport => {
+            include_bytes!("../../../contracts/schema/analyze-report-v1.schema.json")
+        }
+        SchemaName::CheckReport => {
+            include_bytes!("../../../contracts/schema/check-report-v1.schema.json")
+        }
+        SchemaName::VerifyReport => {
+            include_bytes!("../../../contracts/schema/verify-report-v1.schema.json")
+        }
+        SchemaName::ObserveReport => {
+            include_bytes!("../../../contracts/schema/observe-report-v1.schema.json")
+        }
+        SchemaName::DoctorReport => {
+            include_bytes!("../../../contracts/schema/doctor-report-v1.schema.json")
+        }
+        SchemaName::ExplainReport => {
+            include_bytes!("../../../contracts/schema/explain-report-v1.schema.json")
+        }
+        SchemaName::RewriteReport => {
+            include_bytes!("../../../contracts/schema/rewrite-report-v1.schema.json")
+        }
+        SchemaName::ModernizeReport => {
+            include_bytes!("../../../contracts/schema/modernize-report-v1.schema.json")
+        }
+        SchemaName::HardenReport => {
+            include_bytes!("../../../contracts/schema/harden-report-v1.schema.json")
+        }
+        SchemaName::MigrateReport => {
+            include_bytes!("../../../contracts/schema/migrate-report-v1.schema.json")
+        }
         SchemaName::Inventory => {
             include_bytes!("../../../contracts/schema/inventory-v1.schema.json")
         }
@@ -850,6 +1747,9 @@ fn schema(name: SchemaName) -> &'static [u8] {
         SchemaName::Proposal => include_bytes!("../../../contracts/schema/proposal-v1.schema.json"),
         SchemaName::MigrationPlan => {
             include_bytes!("../../../contracts/schema/migration-plan-v1.schema.json")
+        }
+        SchemaName::MigrationIndex => {
+            include_bytes!("../../../contracts/schema/migration-index-v1.schema.json")
         }
         SchemaName::MigrationEvidence => {
             include_bytes!("../../../contracts/schema/migration-evidence-v1.schema.json")
@@ -971,6 +1871,14 @@ fn finding_kind(kind: &crate::scanner::FindingKind) -> &'static str {
     }
 }
 
+fn interpreter_confidence(confidence: &crate::scanner::InterpreterConfidence) -> &'static str {
+    match confidence {
+        crate::scanner::InterpreterConfidence::High => "high",
+        crate::scanner::InterpreterConfidence::Medium => "medium",
+        crate::scanner::InterpreterConfidence::Low => "low",
+    }
+}
+
 fn shell_free_command(root: &Path, stdout: &mut dyn Write) -> Result<i32, Failure> {
     let inventory = crate::project::scan(root).map_err(Failure::io)?;
     if !inventory.errors.is_empty() || !inventory.skipped.is_empty() {
@@ -1025,6 +1933,29 @@ fn shell_free_command(root: &Path, stdout: &mut dyn Write) -> Result<i32, Failur
 fn scenario_synthesize_command(
     root: &Path,
     apply: bool,
+    format: OutputFormat,
+    stdout: &mut dyn Write,
+) -> Result<i32, Failure> {
+    if format == OutputFormat::Json {
+        let mut output = Vec::new();
+        let code = scenario_synthesize_human(root, apply, &mut output)?;
+        let value = serde_json::json!({
+            "applied": apply,
+            "output": String::from_utf8(output)
+                .map_err(|_| Failure::internal("scenario output was not UTF-8"))?,
+        });
+        write_io(
+            stdout,
+            &crate::canonical_json::pretty_bytes(&value).map_err(Failure::internal)?,
+        )?;
+        return Ok(code);
+    }
+    scenario_synthesize_human(root, apply, stdout)
+}
+
+fn scenario_synthesize_human(
+    root: &Path,
+    apply: bool,
     stdout: &mut dyn Write,
 ) -> Result<i32, Failure> {
     let config = crate::project::load_config(root).map_err(classify_project_errors)?;
@@ -1032,6 +1963,10 @@ fn scenario_synthesize_command(
         return Err(Failure::invalid(
             "scenario synthesis requires at least one configured entrypoint",
         ));
+    }
+    let mut stem_counts = std::collections::BTreeMap::new();
+    for entry in &config.entrypoints {
+        *stem_counts.entry(scenario_stem(entry)).or_insert(0_usize) += 1;
     }
     for entry in &config.entrypoints {
         let (_, path) =
@@ -1046,7 +1981,14 @@ fn scenario_synthesize_command(
             .iter()
             .find(|task| task.name == plan.entrypoint)
             .ok_or_else(|| Failure::invalid("lowered plan entrypoint task is missing"))?;
-        let name = format!("synthesized-{}", scenario_stem(entry));
+        let stem = scenario_stem(entry);
+        let suffix = if stem_counts.get(&stem).copied().unwrap_or(0) > 1 {
+            let digest = crate::digest::sha256(entry.as_bytes());
+            format!("-{}", &digest[..8])
+        } else {
+            String::new()
+        };
+        let name = format!("synthesized-{stem}{suffix}");
         let scenario = crate::config::Scenario {
             version: 1,
             name: name.clone(),
@@ -1124,6 +2066,198 @@ fn scenario_synthesize_command(
     Ok(0)
 }
 
+fn scenario_review_command(
+    root: &Path,
+    selected: Option<&str>,
+    format: OutputFormat,
+    stdout: &mut dyn Write,
+) -> Result<i32, Failure> {
+    let mut reviews = crate::approval::scenario_reviews(root).map_err(classify_project_error)?;
+    if let Some(name) = selected {
+        reviews.retain(|review| review.name == name);
+        if reviews.is_empty() {
+            return Err(Failure::invalid(format!("scenario not found: {name}")));
+        }
+        if reviews.len() != 1 {
+            return Err(Failure::invalid(format!(
+                "scenario name is ambiguous: {name}"
+            )));
+        }
+    }
+    match format {
+        OutputFormat::Json => {
+            let value = serde_json::to_value(&reviews)
+                .map_err(|error| Failure::internal(error.to_string()))?;
+            write_io(
+                stdout,
+                &crate::canonical_json::pretty_bytes(&value).map_err(Failure::internal)?,
+            )?;
+        }
+        OutputFormat::Human => {
+            for review in &reviews {
+                writeln_io(
+                    stdout,
+                    format_args!(
+                        "{}\t{}\t{}\t{}",
+                        review.name,
+                        review_status(review.status),
+                        review.digest,
+                        review.path.as_deref().unwrap_or("-")
+                    ),
+                )?;
+                if review.status != crate::approval::ReviewStatus::Approved {
+                    let argv = vec![
+                        "deshell".to_owned(),
+                        "scenario".to_owned(),
+                        "approve".to_owned(),
+                        "--root".to_owned(),
+                        root.to_string_lossy().into_owned(),
+                        "--name".to_owned(),
+                        review.name.clone(),
+                        "--digest".to_owned(),
+                        review.digest.clone(),
+                    ];
+                    writeln_io(
+                        stdout,
+                        format_args!(
+                            "next argv: {}",
+                            serde_json::to_string(&argv)
+                                .map_err(|error| Failure::internal(error.to_string()))?
+                        ),
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(0)
+}
+
+fn scenario_approve_command(
+    root: &Path,
+    name: &str,
+    digest: &str,
+    format: OutputFormat,
+    stdout: &mut dyn Write,
+) -> Result<i32, Failure> {
+    let approval = crate::approval::approve_scenario(root, name, digest).map_err(|message| {
+        if message.starts_with("review digest mismatch") {
+            Failure::policy(message)
+        } else {
+            classify_project_error(message)
+        }
+    })?;
+    match format {
+        OutputFormat::Json => {
+            let value = serde_json::to_value(&approval)
+                .map_err(|error| Failure::internal(error.to_string()))?;
+            write_io(
+                stdout,
+                &crate::canonical_json::pretty_bytes(&value).map_err(Failure::internal)?,
+            )?;
+        }
+        OutputFormat::Human => writeln_io(
+            stdout,
+            format_args!("approved scenario {name} as {}", approval.approval_digest),
+        )?,
+    }
+    Ok(0)
+}
+
+fn matrix_review_command(
+    root: &Path,
+    format: OutputFormat,
+    stdout: &mut dyn Write,
+) -> Result<i32, Failure> {
+    let reviews = crate::approval::matrix_reviews(root).map_err(classify_project_error)?;
+    match format {
+        OutputFormat::Json => {
+            let value = serde_json::to_value(&reviews)
+                .map_err(|error| Failure::internal(error.to_string()))?;
+            write_io(
+                stdout,
+                &crate::canonical_json::pretty_bytes(&value).map_err(Failure::internal)?,
+            )?;
+        }
+        OutputFormat::Human => {
+            for review in &reviews {
+                writeln_io(
+                    stdout,
+                    format_args!(
+                        "{}\t{}\t{}",
+                        review.name,
+                        review_status(review.status),
+                        review.digest
+                    ),
+                )?;
+                if review.status != crate::approval::ReviewStatus::Approved {
+                    let argv = vec![
+                        "deshell".to_owned(),
+                        "matrix".to_owned(),
+                        "approve".to_owned(),
+                        "--root".to_owned(),
+                        root.to_string_lossy().into_owned(),
+                        "--cell".to_owned(),
+                        review.name.clone(),
+                        "--digest".to_owned(),
+                        review.digest.clone(),
+                    ];
+                    writeln_io(
+                        stdout,
+                        format_args!(
+                            "next argv: {}",
+                            serde_json::to_string(&argv)
+                                .map_err(|error| Failure::internal(error.to_string()))?
+                        ),
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(0)
+}
+
+fn matrix_approve_command(
+    root: &Path,
+    cell: &str,
+    digest: &str,
+    format: OutputFormat,
+    stdout: &mut dyn Write,
+) -> Result<i32, Failure> {
+    let approval = crate::approval::approve_matrix(root, cell, digest).map_err(|message| {
+        if message.starts_with("review digest mismatch") {
+            Failure::policy(message)
+        } else {
+            classify_project_error(message)
+        }
+    })?;
+    match format {
+        OutputFormat::Json => {
+            let value = serde_json::to_value(&approval)
+                .map_err(|error| Failure::internal(error.to_string()))?;
+            write_io(
+                stdout,
+                &crate::canonical_json::pretty_bytes(&value).map_err(Failure::internal)?,
+            )?;
+        }
+        OutputFormat::Human => writeln_io(
+            stdout,
+            format_args!(
+                "approved matrix cell {cell} as {}",
+                approval.approval_digest
+            ),
+        )?,
+    }
+    Ok(0)
+}
+
+fn review_status(status: crate::approval::ReviewStatus) -> &'static str {
+    match status {
+        crate::approval::ReviewStatus::Draft => "draft",
+        crate::approval::ReviewStatus::Approved => "approved",
+        crate::approval::ReviewStatus::Stale => "stale",
+    }
+}
+
 fn scenario_stem(path: &str) -> String {
     let filename = path.rsplit('/').next().unwrap_or(path);
     let stem = filename.rsplit_once('.').map_or(filename, |(stem, _)| stem);
@@ -1195,6 +2329,20 @@ fn audit_command(
                     ),
                 )?;
             }
+        }
+        AuditOutputFormat::Json => {
+            let value = serde_json::json!({
+                "findings": findings,
+                "summary": {
+                    "acknowledged": findings.iter().filter(|finding| finding.acknowledged).count(),
+                    "findings": findings.len(),
+                    "unacknowledged": findings.iter().filter(|finding| !finding.acknowledged).count(),
+                }
+            });
+            write_io(
+                stdout,
+                &crate::canonical_json::pretty_bytes(&value).map_err(Failure::internal)?,
+            )?;
         }
         AuditOutputFormat::Jsonl => {
             for finding in &findings {
@@ -1280,14 +2428,17 @@ fn audit_command(
         .iter()
         .filter(|finding| !finding.acknowledged && finding.severity >= config.audit.fail_on)
         .count();
-    if failures == 0 {
-        Ok(0)
-    } else {
-        Err(Failure::audit_failed(format!(
-            "{failures} unacknowledged audit finding(s) met fail_on={}",
-            audit_severity(config.audit.fail_on)
-        )))
+    if format == AuditOutputFormat::Human {
+        writeln_io(
+            stdout,
+            format_args!(
+                "{} audit finding(s); {failures} met fail_on={}",
+                findings.len(),
+                audit_severity(config.audit.fail_on)
+            ),
+        )?;
     }
+    Ok(if failures == 0 { 0 } else { 4 })
 }
 
 fn audit_severity(severity: crate::config::AuditSeverity) -> &'static str {
@@ -1319,7 +2470,7 @@ fn github_escape(value: &str) -> String {
 
 fn harden_command(command: HardenCommand, stdout: &mut dyn Write) -> Result<i32, Failure> {
     match command {
-        HardenCommand::Plan { root } => {
+        HardenCommand::Plan { root, .. } => {
             let output = crate::harden::plan(&root).map_err(classify_harden_error)?;
             writeln_io(stdout, format_args!("harden plan {}", output.digest))?;
             for blocker in output.blockers {
@@ -1335,7 +2486,7 @@ fn harden_command(command: HardenCommand, stdout: &mut dyn Write) -> Result<i32,
             )?;
             Ok(0)
         }
-        HardenCommand::Verify { root, plan } => {
+        HardenCommand::Verify { root, plan, .. } => {
             let evidence = crate::harden::verify(&root, &plan).map_err(classify_harden_error)?;
             writeln_io(
                 stdout,
@@ -1353,7 +2504,7 @@ fn harden_command(command: HardenCommand, stdout: &mut dyn Write) -> Result<i32,
                 crate::harden::HardenEvidenceStatus::Failed => 5,
             })
         }
-        HardenCommand::Apply { root, plan } => {
+        HardenCommand::Apply { root, plan, .. } => {
             crate::harden::apply(&root, &plan).map_err(classify_harden_error)?;
             writeln_io(stdout, format_args!("applied harden plan {plan}"))?;
             Ok(0)
@@ -1596,6 +2747,7 @@ fn path_string(path: &Path, label: &str) -> Result<String, Failure> {
 fn doctor_command(
     root: &Path,
     format: OutputFormat,
+    require: Option<DoctorRequirement>,
     stdout: &mut dyn Write,
 ) -> Result<i32, Failure> {
     let binary = std::env::current_exe()
@@ -1670,6 +2822,16 @@ fn doctor_command(
     }
     let bundle_ready = image_pinned && runtime_asset_ready;
     let ready = binary_ok && config.is_ok() && lock.is_ok() && image_pinned && provider.is_ok();
+    let planning_ready = binary_ok && config.is_ok() && lock.is_ok();
+    let local_ready = planning_ready
+        && config
+            .as_ref()
+            .ok()
+            .is_some_and(|config| config.sandbox.allow_local);
+    let dagger_ready = lock
+        .as_ref()
+        .ok()
+        .is_some_and(|lock| crate::lab::digest_pinned(&lock.targets.dagger_image));
     match format {
         OutputFormat::Json => {
             let value = serde_json::json!({
@@ -1681,6 +2843,13 @@ fn doctor_command(
                 "lock": {"digest": lock_digest, "errors": lock_errors, "valid": lock.is_ok()},
                 "provider": {"error": provider_error, "name": provider_name},
                 "ready": ready,
+                "capabilities": {
+                    "bundle": bundle_ready,
+                    "dagger": dagger_ready,
+                    "disposable": ready,
+                    "local": local_ready,
+                    "planning": planning_ready
+                },
                 "schema_version": 1,
                 "targets": target_pins
             });
@@ -1749,9 +2918,24 @@ fn doctor_command(
                     if ready { "ready" } else { "not ready" }
                 ),
             )?;
+            writeln_io(
+                stdout,
+                format_args!(
+                    "planning={} local={} disposable={} bundle={} dagger={}",
+                    planning_ready, local_ready, ready, bundle_ready, dagger_ready
+                ),
+            )?;
         }
     }
-    Ok(if ready { 0 } else { 6 })
+    Ok(match require {
+        None => 0,
+        Some(DoctorRequirement::Planning) if !planning_ready => 3,
+        Some(DoctorRequirement::Local) if !local_ready => 4,
+        Some(DoctorRequirement::Disposable) if !ready => 6,
+        Some(DoctorRequirement::Bundle) if !bundle_ready => 6,
+        Some(DoctorRequirement::Dagger) if !dagger_ready => 6,
+        Some(_) => 0,
+    })
 }
 
 fn observe_command(
@@ -2700,6 +3884,18 @@ fn parse_profiles(value: &str) -> Result<Vec<crate::rewrite::Profile>, Failure> 
 fn migrate_plan_command(root: &Path, stdout: &mut dyn Write) -> Result<i32, Failure> {
     let output = crate::migration::create_plan(root).map_err(classify_project_error)?;
     writeln_io(stdout, format_args!("plan {}", output.digest))?;
+    writeln_io(stdout, format_args!("artifact {}", output.artifact_path))?;
+    for cell in &output.required_cells {
+        writeln_io(stdout, format_args!("required cell {cell}"))?;
+    }
+    writeln_io(
+        stdout,
+        format_args!(
+            "required_cells={} remaining_evidence={}",
+            output.required_cells.len(),
+            output.remaining_evidence
+        ),
+    )?;
     for blocker in &output.blockers {
         let location = blocker.location.as_ref().map_or_else(
             || "<repository>".to_owned(),
@@ -2716,7 +3912,30 @@ fn migrate_plan_command(root: &Path, stdout: &mut dyn Write) -> Result<i32, Fail
         )?;
     }
     write_io(stdout, output.diff.as_bytes())?;
-    Ok(0)
+    let status = crate::migration::status(root).map_err(Failure::io)?;
+    writeln_io(
+        stdout,
+        format_args!(
+            "active={} state={}",
+            status.active_plan.as_deref().unwrap_or("none"),
+            status.active_state.as_str()
+        ),
+    )?;
+    writeln_io(
+        stdout,
+        format_args!(
+            "next argv: {}",
+            serde_json::to_string(&status.next_argv)
+                .map_err(|error| Failure::internal(error.to_string()))?
+        ),
+    )?;
+    if output.blockers.is_empty() {
+        Ok(0)
+    } else {
+        // A blocker is a completed planning outcome. The immutable plan and
+        // active index are useful artifacts, so report it on stdout only.
+        Ok(4)
+    }
 }
 
 fn migrate_verify_command(
@@ -2732,6 +3951,37 @@ fn migrate_verify_command(
     writeln_io(
         stdout,
         format_args!("{} {}", status.as_str(), output.display()),
+    )?;
+    writeln_io(stdout, format_args!("artifact {}", output.display()))?;
+    writeln_io(stdout, format_args!("cell {cell}"))?;
+    let migration_status = crate::migration::status(root).map_err(Failure::io)?;
+    writeln_io(
+        stdout,
+        format_args!(
+            "active={} state={} required_cells={} remaining_evidence={}",
+            migration_status.active_plan.as_deref().unwrap_or("none"),
+            migration_status.active_state.as_str(),
+            migration_status.required_cells.len(),
+            migration_status.remaining_evidence
+        ),
+    )?;
+    let next = vec![
+        "deshell".to_owned(),
+        "migrate".to_owned(),
+        "evidence".to_owned(),
+        "import".to_owned(),
+        "--root".to_owned(),
+        root.to_string_lossy().into_owned(),
+        "--plan".to_owned(),
+        plan.to_owned(),
+        output.to_string_lossy().into_owned(),
+    ];
+    writeln_io(
+        stdout,
+        format_args!(
+            "next argv: {}",
+            serde_json::to_string(&next).map_err(|error| Failure::internal(error.to_string()))?
+        ),
     )?;
     match status {
         crate::migration::EvidenceStatus::Verified => Ok(0),
@@ -2763,12 +4013,59 @@ fn migrate_evidence_import_command(
     for digest in digests {
         writeln_io(stdout, format_args!("imported {digest}"))?;
     }
+    for file in files {
+        writeln_io(stdout, format_args!("artifact {}", file.display()))?;
+    }
+    let status = crate::migration::status(root).map_err(Failure::io)?;
+    writeln_io(
+        stdout,
+        format_args!(
+            "active={} state={} verified={} planned={} required_cells={} remaining_evidence={}",
+            status.active_plan.as_deref().unwrap_or("none"),
+            status.active_state.as_str(),
+            status.verified,
+            status.planned,
+            status.required_cells.len(),
+            status.remaining_evidence
+        ),
+    )?;
+    writeln_io(
+        stdout,
+        format_args!(
+            "next argv: {}",
+            serde_json::to_string(&status.next_argv)
+                .map_err(|error| Failure::internal(error.to_string()))?
+        ),
+    )?;
     Ok(0)
 }
 
 fn migrate_apply_command(root: &Path, plan: &str, stdout: &mut dyn Write) -> Result<i32, Failure> {
     crate::migration::apply(root, plan).map_err(Failure::policy)?;
     writeln_io(stdout, format_args!("retired migration plan {plan}"))?;
+    writeln_io(
+        stdout,
+        format_args!("artifact .deshell/archive/manifest.json"),
+    )?;
+    let status = crate::migration::status(root).map_err(Failure::io)?;
+    writeln_io(
+        stdout,
+        format_args!(
+            "active={} state={} required_cells={} remaining_evidence={}",
+            status.active_plan.as_deref().unwrap_or("none"),
+            status.active_state.as_str(),
+            status.required_cells.len(),
+            status.remaining_evidence
+        ),
+    )?;
+    writeln_io(
+        stdout,
+        format_args!(
+            "next argv: {}",
+            serde_json::to_string(&status.next_argv)
+                .map_err(|error| Failure::internal(error.to_string()))?
+        ),
+    )?;
     Ok(0)
 }
 
@@ -2800,7 +4097,43 @@ fn migrate_status_command(
                     status.archived
                 ),
             )?;
+            if let Some(active) = &status.active_plan {
+                writeln_io(
+                    stdout,
+                    format_args!("artifact .deshell/migrations/sha256/{active}/plan.json"),
+                )?;
+            }
+            writeln_io(
+                stdout,
+                format_args!(
+                    "active={} state={} stale={} history={} superseded={}",
+                    status.active_plan.as_deref().unwrap_or("none"),
+                    status.active_state.as_str(),
+                    status.stale,
+                    status.history,
+                    status.superseded
+                ),
+            )?;
+            for cell in &status.required_cells {
+                writeln_io(stdout, format_args!("required cell {cell}"))?;
+            }
+            writeln_io(
+                stdout,
+                format_args!(
+                    "required_cells={} remaining_evidence={}",
+                    status.required_cells.len(),
+                    status.remaining_evidence
+                ),
+            )?;
             writeln_io(stdout, format_args!("next: {}", status.next))?;
+            writeln_io(
+                stdout,
+                format_args!(
+                    "next argv: {}",
+                    serde_json::to_string(&status.next_argv)
+                        .map_err(|error| Failure::internal(error.to_string()))?
+                ),
+            )?;
         }
     }
     Ok(0)
@@ -3012,6 +4345,174 @@ mod tests {
         std::fs::write(path, config).unwrap();
     }
 
+    #[test]
+    fn report_formats_share_status_counts_actions_and_exit_code() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::fs::write(directory.path().join("build.sh"), "#!/bin/sh\ntrue\n").unwrap();
+        let initialized = invoke_owned(vec![
+            "deshell".into(),
+            "init".into(),
+            "--root".into(),
+            path(directory.path()),
+            "--format".into(),
+            "json".into(),
+        ]);
+        assert_eq!(initialized.0, 0);
+        assert!(initialized.2.is_empty());
+        let init: serde_json::Value = crate::strict_json::parse(&initialized.1).unwrap();
+        assert_eq!(init["schema_version"], 1);
+        assert_eq!(init["command"], "init");
+        assert_eq!(init["status"], "not_ready");
+        assert_eq!(init["details"]["values"]["target"], "rust");
+        assert_eq!(init["details"]["values"]["module_root"], "src/bin");
+        assert_eq!(init["next_actions"].as_array().unwrap().len(), 2);
+
+        let json = invoke_owned(vec![
+            "deshell".into(),
+            "scan".into(),
+            "--root".into(),
+            path(directory.path()),
+            "--format".into(),
+            "json".into(),
+        ]);
+        let human = invoke_owned(vec![
+            "deshell".into(),
+            "scan".into(),
+            "--root".into(),
+            path(directory.path()),
+            "--format".into(),
+            "human".into(),
+        ]);
+        assert_eq!(json.0, human.0);
+        assert!(json.2.is_empty() && human.2.is_empty());
+        let report: serde_json::Value = crate::strict_json::parse(&json.1).unwrap();
+        assert_eq!(report["command"], "scan");
+        assert_eq!(report["status"], "ok");
+        let counts = &report["details"]["counts"];
+        assert_eq!(counts["findings"], 1);
+        let human = String::from_utf8(human.1).unwrap();
+        assert!(human.starts_with(report["summary"].as_str().unwrap()));
+        assert!(human.contains("1 shell location(s) found; 0 skipped; 0 error(s)"));
+    }
+
+    #[test]
+    fn ambiguous_init_returns_three_exact_argv_actions_without_writes() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("build.sh"), "#!/bin/sh\ntrue\n").unwrap();
+        let root = path(directory.path());
+        let initialized = invoke_owned(vec![
+            "deshell".into(),
+            "init".into(),
+            "--root".into(),
+            root.clone(),
+            "--diagnostics=jsonl".into(),
+        ]);
+        assert_eq!(initialized.0, 2);
+        assert!(initialized.1.is_empty());
+        let diagnostic: serde_json::Value = crate::strict_json::parse(&initialized.2).unwrap();
+        assert_eq!(diagnostic["code"], "DESHELL_USAGE");
+        let actions = diagnostic["next_actions"].as_array().unwrap();
+        assert_eq!(actions.len(), 3);
+        for (action, target) in actions.iter().zip(["rust", "go", "host"]) {
+            assert_eq!(action["action"], "command");
+            assert_eq!(
+                action["argv"],
+                serde_json::json!([
+                    "deshell",
+                    "init",
+                    "--root",
+                    root.clone(),
+                    "--target",
+                    target
+                ])
+            );
+        }
+        assert!(!directory.path().join(".deshell").exists());
+        assert!(!directory.path().join("deshell.lock").exists());
+    }
+
+    #[test]
+    fn scan_read_errors_are_completed_reports_and_draft_check_is_not_ready() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        std::fs::create_dir_all(directory.path().join(".github/workflows")).unwrap();
+        std::fs::write(
+            directory.path().join(".github/workflows/broken.yml"),
+            "jobs: [unterminated\n",
+        )
+        .unwrap();
+        let scanned = invoke_owned(vec![
+            "deshell".into(),
+            "scan".into(),
+            "--root".into(),
+            path(directory.path()),
+            "--format".into(),
+            "json".into(),
+        ]);
+        assert_eq!(scanned.0, 1);
+        assert!(scanned.2.is_empty());
+        let report: serde_json::Value = crate::strict_json::parse(&scanned.1).unwrap();
+        assert_eq!(report["status"], "failed");
+        assert_eq!(report["details"]["counts"]["errors"], 1);
+
+        std::fs::remove_file(directory.path().join(".github/workflows/broken.yml")).unwrap();
+        let checked = invoke_owned(vec![
+            "deshell".into(),
+            "check".into(),
+            "--root".into(),
+            path(directory.path()),
+            "--format".into(),
+            "json".into(),
+        ]);
+        assert_eq!(checked.0, 0);
+        assert!(checked.2.is_empty());
+        let report: serde_json::Value = crate::strict_json::parse(&checked.1).unwrap();
+        assert_eq!(report["status"], "not_ready");
+        assert!(
+            report["details"]["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["kind"] == "not_ready")
+        );
+    }
+
+    #[test]
+    fn zero_audit_jsonl_is_empty_while_reports_keep_the_summary() {
+        let directory = tempfile::tempdir().unwrap();
+        let jsonl = invoke_owned(vec![
+            "deshell".into(),
+            "audit".into(),
+            "--root".into(),
+            path(directory.path()),
+            "--format".into(),
+            "jsonl".into(),
+        ]);
+        assert_eq!(jsonl.0, 0);
+        assert!(jsonl.1.is_empty() && jsonl.2.is_empty());
+        let json = invoke_owned(vec![
+            "deshell".into(),
+            "audit".into(),
+            "--root".into(),
+            path(directory.path()),
+            "--format".into(),
+            "json".into(),
+        ]);
+        assert_eq!(json.0, 0);
+        let report: serde_json::Value = crate::strict_json::parse(&json.1).unwrap();
+        assert_eq!(report["details"]["counts"]["findings"], 0);
+        assert!(
+            report["details"]["output"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|line| line
+                    .as_str()
+                    .is_some_and(|line| line.contains("0 audit finding(s)")))
+        );
+    }
+
     fn enable_bundle(root: &Path) {
         let runtime_path = root.join(".deshell/runtime/lab.asset");
         std::fs::create_dir_all(runtime_path.parent().unwrap()).unwrap();
@@ -3096,7 +4597,8 @@ mod tests {
             "shell-free".into(),
         ]);
         assert_eq!(blocked.0, 4, "{}", String::from_utf8_lossy(&blocked.2));
-        assert!(String::from_utf8_lossy(&blocked.2).contains("DESHELL_SHELL_REINTRODUCED"));
+        assert!(blocked.2.is_empty());
+        assert!(String::from_utf8_lossy(&blocked.1).contains("DESHELL_SHELL_REINTRODUCED"));
 
         std::fs::remove_file(directory.path().join("live.sh")).unwrap();
         let clean = invoke_owned(vec![
@@ -3406,6 +4908,23 @@ mod tests {
     #[test]
     fn every_named_v1_schema_is_embedded_byte_for_byte() {
         for name in [
+            "approval",
+            "migration-index",
+            "init-report",
+            "scan-report",
+            "scenario-report",
+            "matrix-report",
+            "audit-report",
+            "analyze-report",
+            "check-report",
+            "verify-report",
+            "observe-report",
+            "doctor-report",
+            "explain-report",
+            "rewrite-report",
+            "modernize-report",
+            "harden-report",
+            "migrate-report",
             "inventory",
             "manifest",
             "bundle",
@@ -3673,14 +5192,15 @@ mod tests {
         ]);
         assert_eq!(scan.0, 0, "{}", String::from_utf8_lossy(&scan.2));
         assert!(scan.2.is_empty());
-        let inventory: serde_json::Value = crate::strict_json::parse(&scan.1).unwrap();
-        assert!(inventory["errors"].as_array().unwrap().is_empty());
-        let findings = inventory["findings"].as_array().unwrap();
+        let report: serde_json::Value = crate::strict_json::parse(&scan.1).unwrap();
+        assert_eq!(report["command"], "scan");
+        assert_eq!(report["details"]["counts"]["errors"], 0);
+        let findings = report["details"]["items"].as_array().unwrap();
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0]["path"], "automation");
         assert_eq!(findings[0]["kind"], "shell_file");
-        assert_eq!(findings[0]["interpreter"], "sh");
-        assert_eq!(findings[0]["interpreter_confidence"], "high");
+        assert_eq!(findings[0]["name"], "sh");
+        assert_eq!(findings[0]["status"], "high");
     }
 
     #[test]
@@ -3707,13 +5227,18 @@ mod tests {
             "--format".into(),
             "json".into(),
         ]);
-        assert_eq!(scan.0, 0, "{}", String::from_utf8_lossy(&scan.2));
-        let inventory: serde_json::Value = crate::strict_json::parse(&scan.1).unwrap();
-        assert!(inventory["findings"].as_array().unwrap().is_empty());
-        let errors = inventory["errors"].as_array().unwrap();
+        assert_eq!(scan.0, 1, "{}", String::from_utf8_lossy(&scan.2));
+        assert!(scan.2.is_empty());
+        let report: serde_json::Value = crate::strict_json::parse(&scan.1).unwrap();
+        let errors = report["details"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| item["kind"] == "error")
+            .collect::<Vec<_>>();
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0]["path"], "automation.bash");
-        assert_eq!(errors[0]["stage"], "interpreter");
+        assert_eq!(errors[0]["name"], "interpreter");
         assert!(
             errors[0]["message"]
                 .as_str()
@@ -3738,9 +5263,10 @@ mod tests {
         ]);
         assert_eq!(scan.0, 0);
         assert!(scan.2.is_empty());
-        let inventory: serde_json::Value = crate::strict_json::parse(&scan.1).unwrap();
-        assert_eq!(inventory["schema_version"], 1);
-        assert_eq!(inventory["findings"][0]["path"], "build.sh");
+        let report: serde_json::Value = crate::strict_json::parse(&scan.1).unwrap();
+        assert_eq!(report["schema_version"], 1);
+        assert_eq!(report["command"], "scan");
+        assert_eq!(report["details"]["items"][0]["path"], "build.sh");
         crate::project::analyze(directory.path(), "build.sh").unwrap();
         let exported = invoke_owned(vec![
             "deshell".into(),
@@ -3787,12 +5313,19 @@ mod tests {
             "--format".into(),
             "json".into(),
         ]);
-        assert_eq!(doctor.0, 6);
+        assert_eq!(doctor.0, 0);
         assert!(doctor.2.is_empty());
         let report: serde_json::Value = crate::strict_json::parse(&doctor.1).unwrap();
         assert_eq!(report["schema_version"], 1);
-        assert_eq!(report["ready"], false);
-        assert_eq!(report["lab_image"]["valid"], false);
+        assert_eq!(report["command"], "doctor");
+        assert_eq!(report["status"], "ok");
+        assert!(
+            report["details"]["output"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|line| line.as_str().is_some_and(|line| line.contains("not ready")))
+        );
     }
 
     #[test]
@@ -3911,6 +5444,178 @@ mod tests {
     }
 
     #[test]
+    fn migration_plan_allows_an_official_module_root_that_apply_will_create() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        configure(
+            directory.path(),
+            "build.sh",
+            b"#!/bin/sh\n/usr/bin/printf ok\n",
+        );
+        approve_oracle_inputs(directory.path());
+        std::fs::remove_dir(directory.path().join("src/bin")).unwrap();
+        std::fs::remove_dir(directory.path().join("src")).unwrap();
+
+        let plan = crate::migration::create_plan(directory.path()).unwrap();
+        assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+        assert!(!directory.path().join("src").exists());
+        let artifact = crate::strict_json::parse(
+            &std::fs::read(directory.path().join(&plan.artifact_path)).unwrap(),
+        )
+        .unwrap();
+        let proposal_digest = artifact["sources"][0]["proposal_digest"].as_str().unwrap();
+        let proposal = crate::strict_json::parse(
+            &std::fs::read(
+                directory
+                    .path()
+                    .join(".deshell/migrations/sha256")
+                    .join(&plan.digest)
+                    .join("proposals")
+                    .join(format!("{proposal_digest}.json")),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(proposal["patches"].as_array().unwrap().iter().any(|patch| {
+            patch["path"]
+                .as_str()
+                .is_some_and(|path| path.starts_with("src/bin/"))
+        }));
+    }
+
+    #[test]
+    fn migration_status_ignores_superseded_blockers() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        configure(
+            directory.path(),
+            "build.sh",
+            b"#!/bin/sh\neval \"$DYNAMIC\"\n",
+        );
+        approve_oracle_inputs(directory.path());
+        let blocked = crate::migration::create_plan(directory.path()).unwrap();
+        assert!(!blocked.blockers.is_empty());
+
+        std::fs::write(
+            directory.path().join("build.sh"),
+            b"#!/bin/sh\n/usr/bin/printf ok\n",
+        )
+        .unwrap();
+        let ready = crate::migration::create_plan(directory.path()).unwrap();
+        assert!(ready.blockers.is_empty(), "{:?}", ready.blockers);
+        assert_ne!(blocked.digest, ready.digest);
+
+        let status = crate::migration::status(directory.path()).unwrap();
+        assert_eq!(status.active_plan.as_deref(), Some(ready.digest.as_str()));
+        assert_eq!(status.active_state, crate::migration::ActiveState::Planned);
+        assert_eq!(status.blocked, 0);
+        assert_eq!(status.planned, 1);
+        assert_eq!(status.verified, 0);
+        assert_eq!(status.history, 2);
+        assert_eq!(status.superseded, 1);
+        assert_eq!(
+            status.next_argv.get(1..3),
+            Some(["migrate".to_owned(), "verify".to_owned()].as_slice())
+        );
+    }
+
+    #[test]
+    fn every_scenario_and_matrix_draft_must_have_a_current_approval() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        configure(
+            directory.path(),
+            "build.sh",
+            b"#!/bin/sh\n/usr/bin/printf ok\n",
+        );
+        approve_oracle_inputs(directory.path());
+
+        let config_path = directory.path().join(".deshell/project.toml");
+        let config = std::fs::read_to_string(&config_path).unwrap();
+        let approved_cell = format!(
+            "platform_cells = [{{ id = \"host\", operating_system = \"{}\", architecture = \"{}\", runtime = \"native\", approval = \"approved\" }}]",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        );
+        let cells = format!(
+            "platform_cells = [{{ id = \"host\", operating_system = \"{}\", architecture = \"{}\", runtime = \"native\", approval = \"approved\" }}, {{ id = \"pending\", operating_system = \"{}\", architecture = \"{}\", runtime = \"native\", approval = \"draft\" }}]",
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        );
+        assert!(config.contains(&approved_cell));
+        std::fs::write(&config_path, config.replace(&approved_cell, &cells)).unwrap();
+
+        let default_path = directory.path().join(".deshell/scenarios/default.toml");
+        let pending = std::fs::read_to_string(default_path)
+            .unwrap()
+            .replace("name = \"default\"", "name = \"pending\"")
+            .replace("approval = \"approved\"", "approval = \"draft\"");
+        std::fs::write(
+            directory.path().join(".deshell/scenarios/pending.toml"),
+            pending,
+        )
+        .unwrap();
+
+        let readiness = crate::project::check_readiness(directory.path()).unwrap();
+        assert!(!readiness.ready);
+        assert!(
+            readiness
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("1 of 2 scenario approval(s)"))
+        );
+        assert!(
+            readiness
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("1 of 2 matrix approval(s)"))
+        );
+
+        let blocked = crate::migration::create_plan(directory.path()).unwrap();
+        assert!(blocked.blockers.iter().any(|blocker| {
+            blocker.code == "DESHELL_BLOCKER_UNAPPROVED_SCENARIO"
+                && blocker.message.contains("scenario pending")
+        }));
+        let status = crate::migration::status(directory.path()).unwrap();
+        assert_eq!(status.active_state, crate::migration::ActiveState::Blocked);
+        assert_eq!(
+            status.next_argv.get(1..3),
+            Some(["scenario".to_owned(), "approve".to_owned()].as_slice())
+        );
+
+        let review = crate::approval::scenario_reviews(directory.path())
+            .unwrap()
+            .into_iter()
+            .find(|review| review.name == "pending")
+            .unwrap();
+        crate::approval::approve_scenario(directory.path(), "pending", &review.digest).unwrap();
+        let status = crate::migration::status(directory.path()).unwrap();
+        assert_eq!(
+            status.next_argv.get(1..3),
+            Some(["matrix".to_owned(), "approve".to_owned()].as_slice())
+        );
+        let review = crate::approval::matrix_reviews(directory.path())
+            .unwrap()
+            .into_iter()
+            .find(|review| review.name == "pending")
+            .unwrap();
+        crate::approval::approve_matrix(directory.path(), "pending", &review.digest).unwrap();
+        let readiness = crate::project::check_readiness(directory.path()).unwrap();
+        assert!(
+            readiness
+                .reasons
+                .iter()
+                .all(|reason| !reason.contains("scenario") && !reason.contains("matrix")),
+            "{:?}",
+            readiness.reasons
+        );
+        let ready = crate::migration::create_plan(directory.path()).unwrap();
+        assert!(ready.blockers.is_empty(), "{:?}", ready.blockers);
+    }
+
+    #[test]
     fn migration_plan_blocks_when_approved_scenarios_omit_an_input_boundary() {
         let directory = tempfile::tempdir().unwrap();
         crate::project::init(directory.path()).unwrap();
@@ -3928,7 +5633,7 @@ mod tests {
             "--root".into(),
             path(directory.path()),
         ]);
-        assert_eq!(planned.0, 0, "{}", String::from_utf8_lossy(&planned.2));
+        assert_eq!(planned.0, 4, "{}", String::from_utf8_lossy(&planned.2));
         let output = String::from_utf8(planned.1).unwrap();
         assert!(
             output.contains("DESHELL_BLOCKER_SCENARIO_INPUT_COVERAGE"),
@@ -3982,7 +5687,7 @@ mod tests {
             "--root".into(),
             path(directory.path()),
         ]);
-        assert_eq!(planned.0, 0, "{}", String::from_utf8_lossy(&planned.2));
+        assert_eq!(planned.0, 4, "{}", String::from_utf8_lossy(&planned.2));
         let output = String::from_utf8(planned.1).unwrap();
         assert!(
             output.contains("DESHELL_BLOCKER_NETWORK_REPLAY_UNAVAILABLE"),
@@ -4277,7 +5982,7 @@ for line in sys.stdin:
             "--root".into(),
             path(directory.path()),
         ]);
-        assert_eq!(blocked.0, 0, "{}", String::from_utf8_lossy(&blocked.2));
+        assert_eq!(blocked.0, 4, "{}", String::from_utf8_lossy(&blocked.2));
         let blocked_output = String::from_utf8(blocked.1).unwrap();
         assert!(
             blocked_output.contains("DESHELL_BLOCKER_GENERATOR_NETWORK_POLICY"),
@@ -4298,7 +6003,7 @@ for line in sys.stdin:
         ]);
         assert_eq!(
             source_blocked.0,
-            0,
+            4,
             "{}",
             String::from_utf8_lossy(&source_blocked.2)
         );
@@ -4365,7 +6070,7 @@ for line in sys.stdin:
             "--root".into(),
             path(directory.path()),
         ]);
-        assert_eq!(planned.0, 0, "{}", String::from_utf8_lossy(&planned.2));
+        assert_eq!(planned.0, 4, "{}", String::from_utf8_lossy(&planned.2));
         let digest = String::from_utf8(planned.1)
             .unwrap()
             .lines()
@@ -4382,7 +6087,8 @@ for line in sys.stdin:
             digest,
         ]);
         assert_eq!(applied.0, 4);
-        assert!(String::from_utf8_lossy(&applied.2).contains("DESHELL_BLOCKER_DYNAMIC_EVAL"));
+        assert!(applied.2.is_empty());
+        assert!(String::from_utf8_lossy(&applied.1).contains("DESHELL_BLOCKER_DYNAMIC_EVAL"));
         assert_eq!(
             std::fs::read(directory.path().join("blocked.sh")).unwrap(),
             before
@@ -4409,7 +6115,7 @@ for line in sys.stdin:
             "--root".into(),
             path(directory.path()),
         ]);
-        assert_eq!(planned.0, 0, "{}", String::from_utf8_lossy(&planned.2));
+        assert_eq!(planned.0, 4, "{}", String::from_utf8_lossy(&planned.2));
         let output = String::from_utf8(planned.1).unwrap();
         assert!(output.contains("DESHELL_BLOCKER_PARSE_ERROR"), "{output}");
         assert!(output.contains("broken.sh"), "{output}");
@@ -4438,7 +6144,7 @@ for line in sys.stdin:
             "--root".into(),
             path(directory.path()),
         ]);
-        assert_eq!(planned.0, 0, "{}", String::from_utf8_lossy(&planned.2));
+        assert_eq!(planned.0, 4, "{}", String::from_utf8_lossy(&planned.2));
         let output = String::from_utf8(planned.1).unwrap();
         for path in ["broken.cmd", "broken.fish"] {
             let line = output
@@ -4472,7 +6178,7 @@ for line in sys.stdin:
             "--root".into(),
             path(directory.path()),
         ]);
-        assert_eq!(planned.0, 0, "{}", String::from_utf8_lossy(&planned.2));
+        assert_eq!(planned.0, 4, "{}", String::from_utf8_lossy(&planned.2));
         let output = String::from_utf8(planned.1).unwrap();
         for path in ["broken.nu", "broken.ps1"] {
             let line = output
@@ -4535,7 +6241,7 @@ for line in sys.stdin:
             "--root".into(),
             path(directory.path()),
         ]);
-        assert_eq!(planned.0, 0, "{}", String::from_utf8_lossy(&planned.2));
+        assert_eq!(planned.0, 4, "{}", String::from_utf8_lossy(&planned.2));
         let output = String::from_utf8(planned.1).unwrap();
         assert!(
             output.contains("DESHELL_BLOCKER_UNRESOLVED_CALL_SITE"),
@@ -5048,7 +6754,7 @@ for line in sys.stdin:
             "--root".into(),
             path(directory.path()),
         ]);
-        assert_eq!(planned.0, 0, "{}", String::from_utf8_lossy(&planned.2));
+        assert_eq!(planned.0, 4, "{}", String::from_utf8_lossy(&planned.2));
         let output = String::from_utf8(planned.1).unwrap();
         assert!(
             output.contains("DESHELL_BLOCKER_UNIMPLEMENTED_HOST_INTERFACE"),
@@ -5094,7 +6800,7 @@ for line in sys.stdin:
             "--root".into(),
             path(directory.path()),
         ]);
-        assert_eq!(planned.0, 0, "{}", String::from_utf8_lossy(&planned.2));
+        assert_eq!(planned.0, 4, "{}", String::from_utf8_lossy(&planned.2));
         let output = String::from_utf8(planned.1).unwrap();
         assert!(
             output.contains("DESHELL_BLOCKER_UNRESOLVED_CALL_SITE"),
@@ -5508,8 +7214,8 @@ for line in sys.stdin:
         ]);
         assert_eq!(status.0, 0, "{}", String::from_utf8_lossy(&status.2));
         let status: serde_json::Value = crate::strict_json::parse(&status.1).unwrap();
-        assert_eq!(status["verified"], 1);
-        assert_eq!(status["retired"], 0);
+        assert_eq!(status["details"]["counts"]["verified"], 1);
+        assert_eq!(status["details"]["counts"]["retired"], 0);
 
         let applied = invoke_owned(vec![
             "deshell".into(),
@@ -5569,7 +7275,8 @@ for line in sys.stdin:
             "shell-free".into(),
         ]);
         assert_eq!(tampered.0, 4);
-        assert!(String::from_utf8_lossy(&tampered.2).contains("ARCHIVE_TAMPERED"));
+        assert!(tampered.2.is_empty());
+        assert!(String::from_utf8_lossy(&tampered.1).contains("ARCHIVE_TAMPERED"));
     }
 
     #[cfg(unix)]
@@ -5770,8 +7477,9 @@ for line in sys.stdin:
             digest,
         ]);
         assert_eq!(applied.0, 4, "{}", String::from_utf8_lossy(&applied.2));
+        assert!(applied.2.is_empty());
         assert!(
-            String::from_utf8_lossy(&applied.2).contains("DESHELL_BLOCKER_STALE_VALIDATION_POLICY")
+            String::from_utf8_lossy(&applied.1).contains("DESHELL_BLOCKER_STALE_VALIDATION_POLICY")
         );
         assert!(directory.path().join("build.sh").is_file());
     }
@@ -5821,8 +7529,9 @@ for line in sys.stdin:
             planned.digest,
         ]);
         assert_eq!(applied.0, 4, "{}", String::from_utf8_lossy(&applied.2));
+        assert!(applied.2.is_empty());
         assert!(
-            String::from_utf8_lossy(&applied.2).contains("DESHELL_BLOCKER_STALE_VALIDATION_LIMITS")
+            String::from_utf8_lossy(&applied.1).contains("DESHELL_BLOCKER_STALE_VALIDATION_LIMITS")
         );
         assert!(directory.path().join("limits.sh").is_file());
     }
@@ -5908,7 +7617,8 @@ for line in sys.stdin:
             path(&conflicting_path),
         ]);
         assert_eq!(imported.0, 4, "{}", String::from_utf8_lossy(&imported.2));
-        assert!(String::from_utf8_lossy(&imported.2).contains("DESHELL_BLOCKER_EVIDENCE_CONFLICT"));
+        assert!(imported.2.is_empty());
+        assert!(String::from_utf8_lossy(&imported.1).contains("DESHELL_BLOCKER_EVIDENCE_CONFLICT"));
         assert!(directory.path().join("build.sh").is_file());
     }
 
@@ -6880,8 +8590,9 @@ for line in sys.stdin:
             "secure".into(),
         ]);
         assert_eq!(preview.0, 0);
-        assert!(preview.1.starts_with(b"--- a/build.sh\n+++ b/build.sh\n"));
-        assert!(String::from_utf8_lossy(&preview.2).contains("DESHELL_MODERNIZE_FINDING"));
+        assert!(String::from_utf8_lossy(&preview.1).contains("--- a/build.sh\n+++ b/build.sh\n"));
+        assert!(String::from_utf8_lossy(&preview.1).contains("DESHELL_MODERNIZE_FINDING"));
+        assert!(preview.2.is_empty());
         assert_eq!(
             std::fs::read(directory.path().join("build.sh")).unwrap(),
             b"#!/bin/sh\necho hello\n"
@@ -6896,10 +8607,9 @@ for line in sys.stdin:
             "secure".into(),
         ]);
         assert_eq!(jsonl.0, 0);
-        assert!(jsonl.1.starts_with(b"--- a/build.sh\n+++ b/build.sh\n"));
-        let diagnostic: serde_json::Value = crate::strict_json::parse(&jsonl.2).unwrap();
-        assert_eq!(diagnostic["severity"], "warning");
-        assert_eq!(diagnostic["code"], "DESHELL_MODERNIZE_FINDING");
+        assert!(String::from_utf8_lossy(&jsonl.1).contains("--- a/build.sh\n+++ b/build.sh\n"));
+        assert!(String::from_utf8_lossy(&jsonl.1).contains("DESHELL_MODERNIZE_FINDING"));
+        assert!(jsonl.2.is_empty());
         let applied = invoke_owned(vec![
             "deshell".into(),
             "modernize".into(),
@@ -6993,8 +8703,9 @@ for line in sys.stdin:
             digest.clone(),
         ]);
         assert_eq!(unapproved.0, 4);
+        assert!(unapproved.2.is_empty());
         assert!(
-            String::from_utf8_lossy(&unapproved.2).contains("DESHELL_HARDEN_APPROVAL_REQUIRED")
+            String::from_utf8_lossy(&unapproved.1).contains("DESHELL_HARDEN_APPROVAL_REQUIRED")
         );
 
         let approval_path = directory
@@ -7115,8 +8826,8 @@ for line in sys.stdin:
             path(directory.path()),
         ]);
         assert_eq!(verified.0, 5);
-        assert!(verified.1.starts_with(b"native="));
-        assert!(!verified.2.is_empty());
+        assert!(String::from_utf8_lossy(&verified.1).contains("native="));
+        assert!(verified.2.is_empty());
     }
 
     #[test]

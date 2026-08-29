@@ -111,6 +111,23 @@ mod tests {
             "contracts/project-v1.md",
             "contracts/cli/cases.json",
             "contracts/schema/diagnostic-v1.schema.json",
+            "contracts/schema/approval-v1.schema.json",
+            "contracts/schema/migration-index-v1.schema.json",
+            "contracts/schema/init-report-v1.schema.json",
+            "contracts/schema/scan-report-v1.schema.json",
+            "contracts/schema/scenario-report-v1.schema.json",
+            "contracts/schema/matrix-report-v1.schema.json",
+            "contracts/schema/audit-report-v1.schema.json",
+            "contracts/schema/analyze-report-v1.schema.json",
+            "contracts/schema/check-report-v1.schema.json",
+            "contracts/schema/verify-report-v1.schema.json",
+            "contracts/schema/observe-report-v1.schema.json",
+            "contracts/schema/doctor-report-v1.schema.json",
+            "contracts/schema/explain-report-v1.schema.json",
+            "contracts/schema/rewrite-report-v1.schema.json",
+            "contracts/schema/modernize-report-v1.schema.json",
+            "contracts/schema/harden-report-v1.schema.json",
+            "contracts/schema/migrate-report-v1.schema.json",
             "contracts/schema/inventory-v1.schema.json",
             "contracts/schema/manifest-v1.schema.json",
             "contracts/schema/bundle-v1.schema.json",
@@ -219,11 +236,16 @@ mod tests {
         let plan = json("contracts/schema/migration-plan-v1.schema.json");
         assert_eq!(
             plan["properties"]["required_scenarios"]["items"]["required"],
-            serde_json::json!(["name", "digest"])
+            serde_json::json!(["name", "digest", "approval_digest"])
         );
         assert_eq!(
             plan["properties"]["required_cells"]["items"]["required"],
-            serde_json::json!(["id", "platform_fingerprint", "runtime_fingerprint"])
+            serde_json::json!([
+                "id",
+                "platform_fingerprint",
+                "runtime_fingerprint",
+                "approval_digest"
+            ])
         );
         assert_eq!(
             plan["properties"]["validation_commands"]["items"]["required"],

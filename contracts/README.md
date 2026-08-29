@@ -12,8 +12,21 @@ indentation, and one trailing LF. JSON-RPC objects ignore unknown fields for
 forward compatibility. Every embedded Schema is self-contained so a caller can
 validate artifacts offline using only the bytes returned by `deshell schema`.
 
-`scan --format json` emits the versioned Inventory v1 document described by
-`schema/inventory-v1.schema.json`; scan omissions and failures are explicit.
+Every reporting command has a strict family-specific `*-report-v1` schema.
+Human and JSON output are renderings of the same report value, including typed
+exact-argv or path-review next actions. Inventory v1 remains the scanner's
+bound command-specific data model; scan omissions and failures are explicit.
+Audit JSONL is a Finding-only stream, while human and JSON reports include the
+zero-finding summary. `run`, raw exports, and `schema` are byte interfaces and
+do not use report envelopes.
+
+Scenario and matrix review decisions are immutable Approval v1 artifacts. The
+artifact binds the reviewed subject digest and is stored by its own digest;
+editing the subject makes it stale. `.deshell/migrations/active.json` is the
+strict, atomically replaced Migration Index v1 and names the only plan used for
+current status and next-action calculation. Older plan artifacts are history,
+not current blockers.
+
 Bundle exports contain a `bundle-manifest.json` conforming to
 `schema/bundle-v1.schema.json` and bind every embedded file by size and SHA-256.
 They retain every active manifest entry, identify the selected entrypoint, and
