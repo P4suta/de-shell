@@ -24,7 +24,7 @@ jobs:
           persist-credentials: false
 
       - name: Install pinned Rust toolchain
-        uses: jdx/mise-action@3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518 # v4.2.5
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
           version: 2026.8.6
           cache: true
@@ -38,7 +38,7 @@ jobs:
         run: rustup component add llvm-tools-preview
 
       - name: Install checksum-verified coverage tool
-        uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad # v2.85.10
+        uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2.87.0
         with:
           tool: cargo-llvm-cov@0.8.7
           fallback: none
@@ -64,7 +64,7 @@ jobs:
           persist-credentials: false
 
       - name: Install the pinned dynamic-analysis toolchain
-        uses: jdx/mise-action@3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518 # v4.2.5
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
           version: 2026.8.6
           cache: true
@@ -174,7 +174,7 @@ jobs:
           persist-credentials: false
 
       - name: Install migration toolchains
-        uses: jdx/mise-action@3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518 # v4.2.5
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
           version: 2026.8.6
           cache: true
@@ -234,7 +234,7 @@ jobs:
           persist-credentials: false
 
       - name: Install mise toolchain
-        uses: jdx/mise-action@3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518 # v4.2.5
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
           version: 2026.8.6
           cache: true
@@ -342,14 +342,14 @@ jobs:
           persist-credentials: false
 
       - name: Install mise toolchain
-        uses: jdx/mise-action@3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518 # v4.2.5
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
           version: 2026.8.6
           cache: true
           install_args: rust@1.98.0
 
       - name: Install checksum-verified SBOM generator
-        uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad # v2.85.10
+        uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2.87.0
         with:
           tool: syft@1.51.0
           fallback: none
