@@ -337,10 +337,19 @@ to `harden`.
 The two that stopped being frontend blockers moved to the generation side, and
 those are open:
 
-- [ ] `DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: structured host generator does
-  not support action.yml`. The shell lowers; what has no target is the host
-  rewrite — a GitHub composite action's `run:` block has to become a step that
-  invokes the generated program, and the generator has no shape for that.
+- [ ] A composite action's `run:` block. The shell lowers; what has no target
+  is the host rewrite. The workflow rewrite writes the generated program into
+  the repository the workflow lives in and points at it with a local path,
+  which works because it is the same repository. An action is consumed by
+  other repositories, so a file beside it does not travel with it — whatever
+  GitHub resolves such a path against. The replacement belongs in whatever the
+  action already ships its executable through: OComment's downloads a signed
+  release archive, so the program belongs in the archive and the call site
+  stays a `run:`. That is a generator shape this repository does not have.
+
+  Recorded as a boundary rather than as something unmeasured, because the
+  OComment session pointed out that "not established here" invites somebody to
+  establish it and turn the rewrite on.
 - [ ] `DESHELL_BLOCKER_DUPLICATE_TARGET: multiple sources generate action.yml`.
   Two blocks in one file both want to generate into it. The plan has no way to
   say "two programs, one call site each", and refusing is the safe half of an

@@ -2549,15 +2549,25 @@ fn generate_structured_host(
         return generate_github_action_host(root, finding, plan);
     }
     // A composite action is a `run:` step like a workflow's, and the rewrite
-    // that replaces one is not the same. A workflow step becomes `uses:
-    // ./.github/actions/...`, a path GitHub resolves against the repository the
-    // workflow lives in. Inside a composite action that is published and used
-    // by another repository, what such a path resolves against is a fact about
-    // GitHub that this tool has no way to measure, and a replacement that
-    // resolves somewhere else is a broken action rather than a delegated one.
+    // that replaces one is not the same. A workflow step becomes
+    // `uses: ./.github/actions/...`, which puts the generated program in the
+    // repository the workflow lives in — the same repository, so the path is
+    // there when the step runs.
+    //
+    // An action is consumed by other repositories. Generating a file beside it
+    // and pointing at that file with a local path crosses the boundary the
+    // action is distributed across, and it does so whatever GitHub resolves
+    // such a path against: the program has to reach the consumer, and a path
+    // is not a distribution. The right target is whatever the action already
+    // uses to ship its own executable — a release archive, a container, a
+    // pinned remote action — and this generator has no shape for one.
+    //
+    // Stated this way rather than as "not measured", which the OComment
+    // session pointed out would invite somebody to measure it and turn the
+    // rewrite on.
     if lower == "action.yml" || lower == "action.yaml" {
         return Err(format!(
-            "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: {} is a composite action, and how a local path inside one resolves for a consuming repository is not established here; the rewrite is refused rather than guessed",
+            "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: {} is an action other repositories consume, and a generated file beside it does not travel with it; the replacement belongs in whatever the action already ships its executable through",
             finding.path
         ));
     }
