@@ -3618,7 +3618,37 @@ fn generate_rust(plan: &crate::ir::Plan) -> Result<Vec<u8>, String> {
         ""
     };
     let argument_binding = if arguments {
-        "    let deshell_args: Vec<String> = std::env::args().skip(1).collect();\n"
+        "    let deshell_args: &[String] = &std::env::args().skip(1).collect::<Vec<_>>();\n"
+    } else {
+        ""
+    };
+    // `$1` and `${NAME}` are the same question about a different store, so
+    // `set -u` is answered for both in one place.
+    let argument_helper = if arguments {
+        if task.nounset {
+            concat!(
+                "/// Read a positional argument the script requires to be there.\n",
+                "///\n",
+                "/// The retired script ran under `set -u`, where reading one that\n",
+                "/// was not passed ends the script rather than producing an empty\n",
+                "/// string.\n",
+                "fn deshell_argument(arguments: &[String], index: usize) -> String {\n",
+                "    match arguments.get(index) {\n",
+                "        Some(value) => value.clone(),\n",
+                "        None => {\n",
+                "            eprintln!(\"${}: unbound variable\", index + 1);\n",
+                "            std::process::exit(1)\n",
+                "        }\n",
+                "    }\n",
+                "}\n\n"
+            )
+        } else {
+            concat!(
+                "fn deshell_argument(arguments: &[String], index: usize) -> String {\n",
+                "    arguments.get(index).cloned().unwrap_or_default()\n",
+                "}\n\n"
+            )
+        }
     } else {
         ""
     };
@@ -3645,7 +3675,33 @@ fn generate_rust(plan: &crate::ir::Plan) -> Result<Vec<u8>, String> {
             matches!(part, crate::ir::TextPart::DefaultValue { .. })
         })
     });
-    let lookup_helper = if uses_plain_expansion {
+    // `set -u` says an unset name and an empty one are different. A lookup that
+    // answers an empty string for both is a program with the option silently
+    // off, which is what `unwrap_or_default` did — the `Option` was already
+    // there and the answer was being thrown away.
+    let lookup_helper = if uses_plain_expansion && task.nounset {
+        concat!(
+            "fn deshell_lookup_opt(\n",
+            "    name: &str,\n",
+            "    locals: &std::collections::BTreeMap<String, String>,\n",
+            ") -> Option<String> {\n",
+            "    locals.get(name).cloned().or_else(|| std::env::var(name).ok())\n",
+            "}\n\n",
+            "/// Read a name the script requires to be set.\n",
+            "///\n",
+            "/// The retired script ran under `set -u`, where reading an unset\n",
+            "/// name ends the script rather than producing an empty string.\n",
+            "fn deshell_lookup(name: &str, locals: &std::collections::BTreeMap<String, String>) -> String {\n",
+            "    match deshell_lookup_opt(name, locals) {\n",
+            "        Some(value) => value,\n",
+            "        None => {\n",
+            "            eprintln!(\"{name}: unbound variable\");\n",
+            "            std::process::exit(1)\n",
+            "        }\n",
+            "    }\n",
+            "}\n\n"
+        )
+    } else if uses_plain_expansion {
         concat!(
             "fn deshell_lookup_opt(\n",
             "    name: &str,\n",
@@ -3678,6 +3734,7 @@ fn generate_rust(plan: &crate::ir::Plan) -> Result<Vec<u8>, String> {
             "//! refers back to the tool that wrote it.\n\n",
             "{import}",
             "{pipeline_helper}",
+            "{argument_helper}",
             "{lookup_helper}",
             "{functions}",
             "/// The retired script's own statements.\n",
@@ -3696,6 +3753,7 @@ fn generate_rust(plan: &crate::ir::Plan) -> Result<Vec<u8>, String> {
         ),
         import = import,
         pipeline_helper = pipeline_helper,
+        argument_helper = argument_helper,
         lookup_helper = lookup_helper,
         functions = functions,
         argument_binding = argument_binding,
@@ -5023,12 +5081,7 @@ fn rust_expression(expression: &crate::ir::TextExpression) -> Result<String, Str
                 .ok()
                 .and_then(|position| position.checked_sub(1))
                 .ok_or_else(|| format!("generator cannot bind named argument {name}"))?;
-            let lookup = if index == 0 {
-                "deshell_args.first()".to_owned()
-            } else {
-                format!("deshell_args.get({index})")
-            };
-            return Ok(format!("{lookup}.map_or(\"\", String::as_str).to_owned()"));
+            return Ok(format!("deshell_argument(deshell_args, {index})"));
         }
         _ => {}
     }
@@ -5082,13 +5135,8 @@ fn rust_expression(expression: &crate::ir::TextExpression) -> Result<String, Str
                     .ok()
                     .and_then(|index| index.checked_sub(1))
                     .ok_or_else(|| format!("generator cannot bind named argument {name}"))?;
-                let lookup = if index == 0 {
-                    "deshell_args.first()".to_owned()
-                } else {
-                    format!("deshell_args.get({index})")
-                };
                 output.push_str(&format!(
-                    " deshell_value.push_str({lookup}.map_or(\"\", String::as_str));"
+                    " deshell_value.push_str(&deshell_argument(deshell_args, {index}));"
                 ));
             }
         }
@@ -5179,7 +5227,23 @@ fn generate_go(plan: &crate::ir::Plan) -> Result<Vec<u8>, String> {
         ""
     };
     let uses_arguments = rust_node_uses_arguments(&task.body);
-    let argument_helper = if uses_arguments {
+    // `set -u` says an unset name and an empty one are different, so a helper
+    // that answers an empty string for both is a program with the option
+    // silently off.
+    let argument_helper = if uses_arguments && task.nounset {
+        concat!(
+            "// deshellArgument reads a positional argument the script requires\n",
+            "// to be there. The retired script ran under `set -u`, where reading\n",
+            "// one that was not passed ends the script rather than producing an\n",
+            "// empty string.\n",
+            "func deshellArgument(arguments []string, index int) string {\n",
+            "\tif len(arguments) > index {\n\t\treturn arguments[index]\n\t}\n",
+            "\tfmt.Fprintf(os.Stderr, \"$%d: unbound variable\\n\", index+1)\n",
+            "\tos.Exit(1)\n",
+            "\treturn \"\"\n",
+            "}\n\n"
+        )
+    } else if uses_arguments {
         concat!(
             "func deshellArgument(arguments []string, index int) string {\n",
             "\tif len(arguments) > index {\n\t\treturn arguments[index]\n\t}\n",
@@ -5211,7 +5275,25 @@ fn generate_go(plan: &crate::ir::Plan) -> Result<Vec<u8>, String> {
         .tasks
         .iter()
         .any(|task| rust_node_sets_variables(&task.body));
-    let lookup_helper = if go_uses_plain || go_uses_defaults {
+    let lookup_helper = if (go_uses_plain || go_uses_defaults) && task.nounset {
+        concat!(
+            "func deshellLookup(locals map[string]string, name string) (string, bool) {\n",
+            "\tif value, ok := locals[name]; ok {\n\t\treturn value, true\n\t}\n",
+            "\treturn os.LookupEnv(name)\n",
+            "}\n\n",
+            "// deshellValue reads a name the script requires to be set. The\n",
+            "// retired script ran under `set -u`, where reading an unset name\n",
+            "// ends the script rather than producing an empty string.\n",
+            "func deshellValue(locals map[string]string, name string) string {\n",
+            "\tvalue, ok := deshellLookup(locals, name)\n",
+            "\tif !ok {\n",
+            "\t\tfmt.Fprintf(os.Stderr, \"%s: unbound variable\\n\", name)\n",
+            "\t\tos.Exit(1)\n",
+            "\t}\n",
+            "\treturn value\n",
+            "}\n\n"
+        )
+    } else if go_uses_plain || go_uses_defaults {
         concat!(
             "func deshellLookup(locals map[string]string, name string) (string, bool) {\n",
             "\tif value, ok := locals[name]; ok {\n\t\treturn value, true\n\t}\n",
@@ -10046,7 +10128,9 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
         let go = String::from_utf8(generate_go(&plan).unwrap()).unwrap();
         for expected in [
             "VALUE",
-            "deshell_args.first()",
+            // Every positional read goes through one helper, so `set -u` is
+            // answered in one place rather than at each site.
+            "deshell_argument(deshell_args, 0)",
             ".env(\"LOCAL\"",
             ".current_dir",
             "deshell_run_pipeline",
@@ -10570,6 +10654,173 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
                 "appended\nappended\n",
                 "{program} wrote other bytes"
             );
+        }
+    }
+
+    /// `set -u` reaches the generated programs.
+    ///
+    /// Reported by the OComment session, reading a generated file: the script
+    /// ran under `set -euo pipefail`, `-e` was carried and `-u` was not.
+    /// `deshell_lookup` ended in `unwrap_or_default()`, which answers an empty
+    /// string for a name that is unset — and `set -u` is the rule that says
+    /// those two are different. The `Option` was already there; the answer was
+    /// being thrown away.
+    ///
+    /// This is the same distinction that was wrong in the other direction when
+    /// the two projects started: the frontend refused every unset name whether
+    /// or not the script asked it to.
+    #[test]
+    fn set_u_reaches_the_generated_programs() {
+        let script = concat!(
+            "set -u\n",
+            "/bin/echo \"${DESHELL_ABSENT}\"\n",
+            "/bin/echo reached\n"
+        );
+        let plan = crate::frontend::lower(
+            "unset.sh",
+            format!("#!/bin/bash\n{script}").as_bytes(),
+            crate::config::UnknownInterpreter::TraceOnly,
+        )
+        .unwrap();
+        assert!(plan.tasks[0].nounset, "the plan records the option");
+
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("unset.sh"), script).unwrap();
+        std::fs::write(
+            directory.path().join("unset.rs"),
+            generate_rust(&plan).unwrap(),
+        )
+        .unwrap();
+        let built = std::process::Command::new("rustc")
+            .args([
+                "unset.rs",
+                "--edition=2024",
+                "-D",
+                "warnings",
+                "-o",
+                "unset-rust",
+            ])
+            .current_dir(directory.path())
+            .output()
+            .unwrap();
+        assert!(
+            built.status.success(),
+            "rustc rejected generated source:\n{}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        std::fs::write(
+            directory.path().join("unset.go"),
+            generate_go(&plan).unwrap(),
+        )
+        .unwrap();
+        let built = std::process::Command::new("go")
+            .args(["build", "-o", "unset-go", "unset.go"])
+            .current_dir(directory.path())
+            .output()
+            .unwrap();
+        assert!(
+            built.status.success(),
+            "go build rejected generated source:\n{}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+
+        // Unset: the shell stops before `echo reached`, and so does the program.
+        let shell = std::process::Command::new("bash")
+            .arg("unset.sh")
+            .env_remove("DESHELL_ABSENT")
+            .current_dir(directory.path())
+            .output()
+            .unwrap();
+        assert_eq!(shell.stdout, b"");
+        assert_eq!(shell.status.code(), Some(1));
+        for program in ["./unset-rust", "./unset-go"] {
+            let ran = std::process::Command::new(program)
+                .env_remove("DESHELL_ABSENT")
+                .current_dir(directory.path())
+                .output()
+                .unwrap();
+            assert_eq!(
+                ran.stdout, shell.stdout,
+                "{program} ran past the unset name"
+            );
+            assert_eq!(ran.status.code(), shell.status.code(), "{program}");
+            assert!(
+                String::from_utf8_lossy(&ran.stderr).contains("DESHELL_ABSENT"),
+                "{program}: the message names the variable: {}",
+                String::from_utf8_lossy(&ran.stderr)
+            );
+        }
+
+        // Set but empty: `set -u` says that is a value, and both carry on.
+        for empty in ["", "value"] {
+            let shell = std::process::Command::new("bash")
+                .arg("unset.sh")
+                .env("DESHELL_ABSENT", empty)
+                .current_dir(directory.path())
+                .output()
+                .unwrap();
+            let ran = std::process::Command::new("./unset-rust")
+                .env("DESHELL_ABSENT", empty)
+                .current_dir(directory.path())
+                .output()
+                .unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&ran.stdout),
+                String::from_utf8_lossy(&shell.stdout),
+                "{empty:?}"
+            );
+            assert_eq!(ran.status.code(), shell.status.code(), "{empty:?}");
+        }
+
+        // A positional the call did not pass is the same rule.
+        let script = concat!("set -u\n", "/bin/echo \"$1\"\n", "/bin/echo reached\n");
+        let plan = crate::frontend::lower(
+            "arg.sh",
+            format!("#!/bin/bash\n{script}").as_bytes(),
+            crate::config::UnknownInterpreter::TraceOnly,
+        )
+        .unwrap();
+        std::fs::write(directory.path().join("arg.sh"), script).unwrap();
+        std::fs::write(
+            directory.path().join("arg.rs"),
+            generate_rust(&plan).unwrap(),
+        )
+        .unwrap();
+        let built = std::process::Command::new("rustc")
+            .args([
+                "arg.rs",
+                "--edition=2024",
+                "-D",
+                "warnings",
+                "-o",
+                "arg-rust",
+            ])
+            .current_dir(directory.path())
+            .output()
+            .unwrap();
+        assert!(
+            built.status.success(),
+            "rustc rejected generated source:\n{}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        for arguments in [vec![], vec!["given"]] {
+            let shell = std::process::Command::new("bash")
+                .arg("arg.sh")
+                .args(&arguments)
+                .current_dir(directory.path())
+                .output()
+                .unwrap();
+            let ran = std::process::Command::new("./arg-rust")
+                .args(&arguments)
+                .current_dir(directory.path())
+                .output()
+                .unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&ran.stdout),
+                String::from_utf8_lossy(&shell.stdout),
+                "{arguments:?}"
+            );
+            assert_eq!(ran.status.code(), shell.status.code(), "{arguments:?}");
         }
     }
 

@@ -1,21 +1,93 @@
 {
-  "schema_version": 1,
-  "contract": "bash-set-semantics-v1",
-  "purpose": "Pin what `set -e`, `set -u` and `set -o pipefail` actually do, per interpreter build, so a model of them can be checked against a measurement rather than against a reading of the specification.",
-  "note": "`expected` was measured on GNU bash 3.2.57(1)-release (arm64-apple-darwin), the build Apple ships. A differing result on another build is not a failure of this corpus: it is the list of places where the option model has to carry the interpreter version.",
-  "cases": [
-    {"name": "untested-failure-stops", "script": "set -e; false; echo reached", "expected": 1},
-    {"name": "or-guard-does-not-stop", "script": "set -e; false || true; echo reached", "expected": 0},
-    {"name": "if-condition-does-not-stop", "script": "set -e; if false; then :; fi; echo reached", "expected": 0},
-    {"name": "bang-operand-does-not-stop", "script": "set -e; ! false; echo reached", "expected": 0},
-    {"name": "pipeline-head-does-not-stop", "script": "set -e; false | true; echo reached", "expected": 0},
-    {"name": "pipefail-makes-the-head-count", "script": "set -eo pipefail; false | true; echo reached", "expected": 1},
-    {"name": "capturing-status-does-not-stop", "script": "set -e; s=0; false || s=$?; echo reached", "expected": 0},
-    {"name": "call-site-suppresses-inside-a-function", "script": "set -e; f(){ false; echo in-f; }; f || true", "expected": 0},
-    {"name": "assignment-from-substitution-stops", "script": "set -e; x=$(false); echo reached", "expected": 1},
-    {"name": "substitution-as-an-argument-does-not-stop", "script": "set -e; echo $(false) ok", "expected": 0},
-    {"name": "nounset-exits-127-not-1", "script": "set -u; echo ${undefined}", "expected": 127},
-    {"name": "nounset-default-is-not-unset", "script": "set -u; echo ${undefined:-ok}", "expected": 0},
-    {"name": "pipefail-turns-no-match-into-failure", "script": "set -eo pipefail; echo x | grep -q nomatch", "expected": 1}
-  ]
+ "schema_version": 1,
+ "contract": "bash-set-semantics-v1",
+ "purpose": "Pin what `set -e`, `set -u` and `set -o pipefail` actually do, per interpreter build, so a model of them can be checked against a measurement rather than against a reading of the specification.",
+ "note": "`expected` was measured on GNU bash 3.2.57(1)-release (arm64-apple-darwin), the build Apple ships. A differing result on another build is not a failure of this corpus: it is the list of places where the option model has to carry the interpreter version. The `nounset` cases are the ones a generated program has to carry: `set -u` says an unset name and an empty one are different, and a lookup that answers an empty string for both is a program with the option silently off. The two `nounset` failures are recorded as 127 rather than 1 because this corpus runs each case through `bash -c`, and a shell that ends on an unset name reports differently there than it does reading a file \u2014 which is itself a fact about the option rather than about the harness.",
+ "cases": [
+  {
+   "name": "untested-failure-stops",
+   "script": "set -e; false; echo reached",
+   "expected": 1
+  },
+  {
+   "name": "or-guard-does-not-stop",
+   "script": "set -e; false || true; echo reached",
+   "expected": 0
+  },
+  {
+   "name": "if-condition-does-not-stop",
+   "script": "set -e; if false; then :; fi; echo reached",
+   "expected": 0
+  },
+  {
+   "name": "bang-operand-does-not-stop",
+   "script": "set -e; ! false; echo reached",
+   "expected": 0
+  },
+  {
+   "name": "pipeline-head-does-not-stop",
+   "script": "set -e; false | true; echo reached",
+   "expected": 0
+  },
+  {
+   "name": "pipefail-makes-the-head-count",
+   "script": "set -eo pipefail; false | true; echo reached",
+   "expected": 1
+  },
+  {
+   "name": "capturing-status-does-not-stop",
+   "script": "set -e; s=0; false || s=$?; echo reached",
+   "expected": 0
+  },
+  {
+   "name": "call-site-suppresses-inside-a-function",
+   "script": "set -e; f(){ false; echo in-f; }; f || true",
+   "expected": 0
+  },
+  {
+   "name": "assignment-from-substitution-stops",
+   "script": "set -e; x=$(false); echo reached",
+   "expected": 1
+  },
+  {
+   "name": "substitution-as-an-argument-does-not-stop",
+   "script": "set -e; echo $(false) ok",
+   "expected": 0
+  },
+  {
+   "name": "nounset-exits-127-not-1",
+   "script": "set -u; echo ${undefined}",
+   "expected": 127
+  },
+  {
+   "name": "nounset-default-is-not-unset",
+   "script": "set -u; echo ${undefined:-ok}",
+   "expected": 0
+  },
+  {
+   "name": "pipefail-turns-no-match-into-failure",
+   "script": "set -eo pipefail; echo x | grep -q nomatch",
+   "expected": 1
+  },
+  {
+   "name": "nounset-stops-on-a-variable",
+   "script": "set -u; echo \"${DESHELL_ABSENT_NAME}\"; echo reached",
+   "expected": 127
+  },
+  {
+   "name": "nounset-stops-on-a-positional",
+   "script": "set -u; echo \"$1\"; echo reached",
+   "expected": 127
+  },
+  {
+   "name": "nounset-allows-an-empty-value",
+   "script": "set -u; DESHELL_EMPTY=''; echo \"${DESHELL_EMPTY}\"; echo reached",
+   "expected": 0
+  },
+  {
+   "name": "nounset-allows-a-default",
+   "script": "set -u; echo \"${DESHELL_ABSENT_NAME:-fallback}\"; echo reached",
+   "expected": 0
+  }
+ ]
 }
