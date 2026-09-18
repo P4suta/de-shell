@@ -144,6 +144,74 @@
     "stdout": "a\tb\n",
     "exit": 0
    }
+  },
+  {
+   "name": "ansi-c-newline-and-tab",
+   "script": "printf '%s' $'a\\nb\\tc'",
+   "note": "ANSI-C quoting is a word-expansion form, so what it produces is decided before anything reads the word.",
+   "bash": {
+    "stdout": "a\nb\tc",
+    "exit": 0
+   },
+   "zsh": {
+    "stdout": "a\nb\tc",
+    "exit": 0
+   },
+   "dash": {
+    "stdout": "$a\\nb\\tc",
+    "exit": 0
+   }
+  },
+  {
+   "name": "ansi-c-escaped-backslash",
+   "script": "printf '%s' $'a\\\\b'",
+   "note": "ANSI-C quoting is a word-expansion form, so what it produces is decided before anything reads the word.",
+   "bash": {
+    "stdout": "a\\b",
+    "exit": 0
+   },
+   "zsh": {
+    "stdout": "a\\b",
+    "exit": 0
+   },
+   "dash": {
+    "stdout": "$a\\\\b",
+    "exit": 0
+   }
+  },
+  {
+   "name": "ansi-c-unknown-escape",
+   "script": "printf '%s' $'a\\qb'",
+   "note": "ANSI-C quoting is a word-expansion form, so what it produces is decided before anything reads the word.",
+   "bash": {
+    "stdout": "a\\qb",
+    "exit": 0
+   },
+   "zsh": {
+    "stdout": "aqb",
+    "exit": 0
+   },
+   "dash": {
+    "stdout": "$a\\qb",
+    "exit": 0
+   }
+  },
+  {
+   "name": "ansi-c-single-quote",
+   "script": "printf '%s' $'a\\'b'",
+   "note": "ANSI-C quoting is a word-expansion form, so what it produces is decided before anything reads the word.",
+   "bash": {
+    "stdout": "a'b",
+    "exit": 0
+   },
+   "zsh": {
+    "stdout": "a'b",
+    "exit": 0
+   },
+   "dash": {
+    "stdout": "",
+    "exit": 2
+   }
   }
  ]
 }

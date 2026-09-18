@@ -10727,12 +10727,6 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
         ))
         .expect("corpus is readable");
         let corpus: serde_json::Value = serde_json::from_str(&raw).expect("corpus is JSON");
-        let shells: Vec<&str> = corpus["shells"]
-            .as_array()
-            .expect("corpus lists shells")
-            .iter()
-            .map(|value| value.as_str().expect("shell is a string"))
-            .collect();
 
         let mut checks = String::new();
         let mut expected = Vec::new();
@@ -10749,10 +10743,8 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
                 case["word_base64"].as_str().expect("case has a word"),
             ))
             .expect("word is UTF-8");
-            let answers: std::collections::BTreeSet<&str> = shells
-                .iter()
-                .map(|shell| case[*shell].as_str().expect("case records this shell"))
-                .collect();
+            // Bash, because that is the interpreter the patterns are read for.
+            let answer = case["bash"].as_str().expect("case records bash");
             let models: Option<Vec<crate::ir::PatternExpression>> = pattern
                 .split('|')
                 .map(crate::frontend::case_pattern_for_tests)
@@ -10764,8 +10756,6 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
                 .collect();
             let Ok(tests) = tests else { continue };
 
-            let answer = answers.iter().next().copied().expect("one answer");
-            assert_eq!(answers.len(), 1, "{id}: the shells disagree");
             expected.push((id.to_owned(), answer == "MATCH"));
             checks.push_str(&format!(
                 // `let _ = &subject` because a pattern that matches anything

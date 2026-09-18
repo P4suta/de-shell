@@ -1609,7 +1609,7 @@ fn case_arm(text: &str) -> Option<(Vec<&str>, &str)> {
 ///   pattern has a metacharacter in it, and that is not knowable here.
 /// - A backslash at the end, which is a line continuation rather than a quote.
 /// - `(`, which opens an extglob list that three of the four shells refuse.
-fn case_pattern(pattern: &str) -> Option<crate::ir::PatternExpression> {
+fn case_pattern(pattern: &str, interpreter: &Interpreter) -> Option<crate::ir::PatternExpression> {
     let mut pieces: Vec<crate::ir::PatternPiece> = Vec::new();
     let mut literal = String::new();
     let flush = |literal: &mut String, pieces: &mut Vec<crate::ir::PatternPiece>| {
@@ -1656,6 +1656,32 @@ fn case_pattern(pattern: &str) -> Option<crate::ir::PatternExpression> {
             // dash refuse outright and zsh reads as a literal that matches
             // nothing. It is also where the arm splitter would cut: an arm
             // written `@(a|b))` has its first `)` inside the pattern.
+            // `$'\n'` is a spelling, not a pattern feature: the word expander
+            // turns it into a newline and what reaches the matcher is an
+            // ordinary character. Measured, and bash-only — zsh drops the
+            // backslash of an unknown escape where bash keeps it, and dash has
+            // no such form at all and reads the whole thing literally, which is
+            // how a line-break guard written this way accepts every input under
+            // `sh` on Ubuntu.
+            '$' if matches!(interpreter, Interpreter::Bash) && rest.peek() == Some(&'\'') => {
+                rest.next();
+                loop {
+                    match rest.next()? {
+                        '\'' => break,
+                        '\\' => match rest.next()? {
+                            'n' => literal.push('\n'),
+                            't' => literal.push('\t'),
+                            'r' => literal.push('\r'),
+                            '\\' => literal.push('\\'),
+                            '\'' => literal.push('\''),
+                            // bash keeps the backslash and zsh drops it, so the
+                            // sequence has no single meaning to lower.
+                            _ => return None,
+                        },
+                        quoted => literal.push(quoted),
+                    }
+                }
+            }
             '[' | '$' | '`' | '(' | ')' => return None,
             other => literal.push(other),
         }
@@ -1703,7 +1729,7 @@ pub(crate) fn decode_base64(encoded: &str) -> Vec<u8> {
 /// expressions against the same corpus this reads.
 #[cfg(test)]
 pub(crate) fn case_pattern_for_tests(pattern: &str) -> Option<crate::ir::PatternExpression> {
-    case_pattern(pattern)
+    case_pattern(pattern, &Interpreter::Bash)
 }
 
 /// Group the statements between `in` and `esac` into arms.
@@ -2154,7 +2180,7 @@ fn lower_statements(parts: LowerStatementsArgs<'_>) -> Result<Vec<Node>, String>
                                 default = Some(Box::new(node.clone()));
                                 continue;
                             }
-                            let Some(pattern) = case_pattern(pattern) else {
+                            let Some(pattern) = case_pattern(pattern, interpreter) else {
                                 modelled = false;
                                 break;
                             };
@@ -5637,12 +5663,6 @@ mod tests {
         ))
         .expect("corpus is readable");
         let corpus: serde_json::Value = serde_json::from_str(&raw).expect("corpus is JSON");
-        let shells: Vec<&str> = corpus["shells"]
-            .as_array()
-            .expect("corpus lists shells")
-            .iter()
-            .map(|value| value.as_str().expect("shell is a string"))
-            .collect();
         let cases = corpus["cases"].as_array().expect("corpus has cases");
         assert!(!cases.is_empty());
 
@@ -5668,30 +5688,25 @@ mod tests {
                 case["word_base64"].as_str().expect("case has a word"),
             );
             let word = String::from_utf8(word).expect("word is UTF-8");
-            let answers: std::collections::BTreeSet<&str> = shells
-                .iter()
-                .map(|shell| case[*shell].as_str().expect("case records this shell"))
-                .collect();
+            // Checked against bash, because that is the interpreter the
+            // patterns are read for: `$'\n'` is a bash form, and the shells
+            // part over it. A pattern this refuses needs no agreement to hold.
+            let expected = case["bash"].as_str().expect("case records bash");
 
             // An alternation is several patterns in the source and several cases
             // in the IR, so each side is read on its own.
             let alternatives: Vec<&str> = pattern.split('|').collect();
-            let models: Option<Vec<crate::ir::PatternExpression>> =
-                alternatives.iter().map(|one| case_pattern(one)).collect();
+            let models: Option<Vec<crate::ir::PatternExpression>> = alternatives
+                .iter()
+                .map(|one| case_pattern(one, &Interpreter::Bash))
+                .collect();
             let Some(models) = models else {
                 refused += 1;
                 continue;
             };
             lowered += 1;
 
-            // Only a verdict every shell shares is one to be checked against.
-            assert_eq!(
-                answers.len(),
-                1,
-                "{id} lowers but the shells disagree: {answers:?}"
-            );
-            let expected = answers.iter().next().copied().expect("one answer");
-            assert_ne!(expected, "ERROR", "{id} lowers but every shell refuses it");
+            assert_ne!(expected, "ERROR", "{id} lowers but bash refuses it");
             let matched = models.iter().any(|model| {
                 let pieces: Vec<crate::ir::MatchPiece<'_>> = model
                     .pieces
@@ -5864,6 +5879,59 @@ mod tests {
                 Operation::WriteStdout { .. } | Operation::Exec { .. }
             ),
             "{node:#?}"
+        );
+    }
+
+    /// `$'\n'` in a pattern is a spelling, and it is bash's.
+    ///
+    /// The word expander turns it into a newline, after which the pattern is an
+    /// ordinary `*<LF>*` — so there is no ANSI-C pattern support to write. The
+    /// form is bash's: zsh drops the backslash of an unknown escape where bash
+    /// keeps it, and dash has no such form at all and reads the whole thing
+    /// literally, which is how a line-break guard written this way accepts every
+    /// input under `sh` on Ubuntu.
+    #[test]
+    fn ansi_c_quoting_in_a_pattern_is_expanded_for_bash_and_delegated_elsewhere() {
+        let node = body(
+            "build.sh",
+            b"#!/bin/bash\ncase \"$1\" in\n  *$'\\n'*) /bin/echo bad ;;\nesac\n",
+        );
+        let Operation::Match { cases, .. } = &node.operation else {
+            panic!("expected a match: {node:#?}")
+        };
+        assert_eq!(
+            cases[0].pattern.pieces,
+            [
+                crate::ir::PatternPiece::AnyRun,
+                crate::ir::PatternPiece::Literal {
+                    value: crate::ir::TextExpression::literal("\n")
+                },
+                crate::ir::PatternPiece::AnyRun,
+            ]
+        );
+
+        // `sh` is not one program — measured, this machine's is neither the
+        // bash on `PATH` nor dash — so the form has no single meaning there.
+        for shebang in ["#!/bin/sh", "#!/bin/zsh"] {
+            let node = body(
+                "build.sh",
+                format!("{shebang}\ncase \"$1\" in\n  *$'\\n'*) /bin/echo bad ;;\nesac\n")
+                    .as_bytes(),
+            );
+            assert!(
+                matches!(node.operation, Operation::InterpreterCall { .. }),
+                "{shebang} must delegate: {node:#?}"
+            );
+        }
+
+        // An escape bash and zsh read differently is refused for both.
+        let node = body(
+            "build.sh",
+            b"#!/bin/bash\ncase \"$1\" in\n  *$'\\q'*) /bin/echo bad ;;\nesac\n",
+        );
+        assert!(
+            matches!(node.operation, Operation::InterpreterCall { .. }),
+            "an unknown escape must delegate: {node:#?}"
         );
     }
 
