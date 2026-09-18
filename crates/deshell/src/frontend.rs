@@ -2932,7 +2932,40 @@ fn lower_posix_simple(parts: LowerPosixSimpleArgs<'_>) -> Result<Node, String> {
             span_for_range(path, source, range.start, range.end)?,
         ));
     }
-    let (command, redirections) = split_redirections(&source[range.start..range.end])?;
+    let (command, raw_redirections) = split_redirections(&source[range.start..range.end])?;
+    let mut redirections = Vec::new();
+    for raw in raw_redirections {
+        // The target is expanded the same way an argument is. A word that
+        // expands to more than one field is a different redirection in the
+        // shell — an ambiguous one, which bash refuses — so it is delegated.
+        let path = |target: &str,
+                    inputs: &mut BTreeSet<String>,
+                    environment: &mut BTreeSet<String>|
+         -> Result<crate::ir::TextExpression, String> {
+            let mut words = tokenize_posix(target, inputs, environment, locals)?;
+            if words.len() != 1 {
+                return Err(
+                    "redirection target is not one word and requires pinned interpreter delegation"
+                        .into(),
+                );
+            }
+            Ok(words.remove(0))
+        };
+        redirections.push(match raw {
+            RawRedirection::Duplicate { fd, target_fd } => {
+                crate::ir::Redirection::Duplicate { fd, target_fd }
+            }
+            RawRedirection::Read { fd, target } => crate::ir::Redirection::Read {
+                fd,
+                path: path(&target, inputs, environment)?,
+            },
+            RawRedirection::Write { fd, target, append } => crate::ir::Redirection::Write {
+                fd,
+                path: path(&target, inputs, environment)?,
+                append,
+            },
+        });
+    }
     let words = tokenize_posix(&command, inputs, environment, locals)?;
     if words.is_empty() {
         return Err("empty shell command".into());
@@ -4623,7 +4656,29 @@ fn tokenize_nushell_external(
 /// `N>&M`. A heredoc (`<<`), `<>`, `>|` or a descriptor wider than one digit
 /// leaves the whole statement to delegation, because getting those wrong changes
 /// where a script's output goes.
-fn split_redirections(source: &str) -> Result<(String, Vec<crate::ir::Redirection>), String> {
+/// A redirection whose target has not been expanded yet.
+///
+/// Splitting runs before the tokenizer, because finding the operators means
+/// knowing where the quotes are. The target is a word like any other and is
+/// expanded where the rest of the command is — which is what lets `>>"${OUT}"`
+/// lower, the form a workflow uses to append to `$GITHUB_OUTPUT`.
+enum RawRedirection {
+    Read {
+        fd: u32,
+        target: String,
+    },
+    Write {
+        fd: u32,
+        target: String,
+        append: bool,
+    },
+    Duplicate {
+        fd: u32,
+        target_fd: u32,
+    },
+}
+
+fn split_redirections(source: &str) -> Result<(String, Vec<RawRedirection>), String> {
     let bytes = source.as_bytes();
     // Bytes rather than chars: `byte as char` would map each byte of a multi-byte
     // scalar to its own Latin-1 character and corrupt the text.
@@ -4691,7 +4746,7 @@ fn split_redirections(source: &str) -> Result<(String, Vec<crate::ir::Redirectio
                 .get(cursor + 1)
                 .filter(|byte| byte.is_ascii_digit())
                 .ok_or("descriptor duplication requires pinned interpreter delegation")?;
-            redirections.push(crate::ir::Redirection::Duplicate {
+            redirections.push(RawRedirection::Duplicate {
                 fd,
                 target_fd: u32::from(target - b'0'),
             });
@@ -4719,14 +4774,11 @@ fn split_redirections(source: &str) -> Result<(String, Vec<crate::ir::Redirectio
         if start == cursor {
             return Err("redirection target is missing".into());
         }
-        let target = &source[start..cursor];
-        let unquoted = strip_matching_quotes(target)
-            .ok_or("redirection target requires pinned interpreter delegation")?;
-        let path = crate::ir::TextExpression::literal(unquoted);
+        let target = source[start..cursor].to_owned();
         redirections.push(if operator == b'<' {
-            crate::ir::Redirection::Read { fd, path }
+            RawRedirection::Read { fd, target }
         } else {
-            crate::ir::Redirection::Write { fd, path, append }
+            RawRedirection::Write { fd, target, append }
         });
         index = cursor;
     }
@@ -4736,26 +4788,6 @@ fn split_redirections(source: &str) -> Result<(String, Vec<crate::ir::Redirectio
     let command =
         String::from_utf8(command).map_err(|_| "command is not valid UTF-8".to_owned())?;
     Ok((command, redirections))
-}
-
-/// A redirection target this frontend can represent: a bare or wholly quoted
-/// word with no expansion in it. Anything else is delegated rather than guessed.
-fn strip_matching_quotes(value: &str) -> Option<String> {
-    let bytes = value.as_bytes();
-    let inner = match (bytes.first(), bytes.last()) {
-        (Some(b'"'), Some(b'"')) | (Some(b'\''), Some(b'\'')) if bytes.len() >= 2 => {
-            &value[1..value.len() - 1]
-        }
-        _ => value,
-    };
-    if inner.is_empty()
-        || inner
-            .bytes()
-            .any(|byte| matches!(byte, b'$' | b'`' | b'*' | b'?' | b'"' | b'\''))
-    {
-        return None;
-    }
-    Some(inner.to_owned())
 }
 
 fn tokenize_posix(

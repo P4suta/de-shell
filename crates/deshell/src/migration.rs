@@ -3545,7 +3545,15 @@ fn generate_rust(plan: &crate::ir::Plan) -> Result<Vec<u8>, String> {
     let arguments = rust_node_uses_arguments(&task.body);
     let mut body = String::new();
     emit_rust_node(&task.body, &mut body, 2)?;
-    let import = if pipeline {
+    // `Stdio` is named by a pipeline and by a redirection, which are the two
+    // places a command's descriptors are set to something other than the
+    // parent's.
+    let import = if pipeline
+        || plan
+            .tasks
+            .iter()
+            .any(|task| rust_node_redirects(&task.body))
+    {
         "use std::process::{Command, Stdio};\n\n"
     } else if plan
         .tasks
@@ -3844,6 +3852,99 @@ fn emit_rust_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> 
                 None => output.push_str(&format!("{indent}        0")),
             }
             output.push_str(&format!("\n{indent}    }}\n{indent}}}"));
+        }
+        // Only a redirect around a single command is emitted. The shell can
+        // redirect a whole compound statement, and reproducing that means
+        // holding the descriptors open across everything inside — so the
+        // general case is refused rather than narrowed silently.
+        crate::ir::Operation::Redirect { redirections, body } => {
+            let crate::ir::Operation::Exec {
+                argv,
+                environment,
+                working_directory,
+            } = &body.operation
+            else {
+                return Err(
+                    "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: redirect supports only a simple command"
+                        .into(),
+                );
+            };
+            output.push_str(&format!("{indent}{{\n"));
+            emit_rust_command(EmitRustCommandArgs {
+                argv,
+                environment,
+                working_directory: working_directory.as_ref(),
+                variable: "deshell_command",
+                output,
+                depth: depth + 1,
+                force_mutable: true,
+            })?;
+            let mut closers = 0_usize;
+            for redirection in redirections {
+                let (fd, path, append) = match redirection {
+                    crate::ir::Redirection::Write { fd, path, append } => (fd, path, *append),
+                    crate::ir::Redirection::Read { .. }
+                    | crate::ir::Redirection::Duplicate { .. }
+                    | crate::ir::Redirection::Close { .. } => {
+                        return Err(
+                            "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: only an output redirection is emitted"
+                                .into(),
+                        );
+                    }
+                };
+                let sink = match fd {
+                    1 => "stdout",
+                    2 => "stderr",
+                    _ => {
+                        return Err(
+                            "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: only fd 1 and 2 are redirected"
+                                .into(),
+                        );
+                    }
+                };
+                // A file that will not open is the shell's exit 1, and the
+                // block is an expression, so the status is carried rather than
+                // returned: `return` here would leave `main`.
+                output.push_str(&format!(
+                    concat!(
+                        "{indent}    let deshell_opened = std::fs::OpenOptions::new()\n",
+                        "{indent}        .write(true)\n",
+                        "{indent}        .create(true)\n",
+                        "{indent}        .append({append})\n",
+                        "{indent}        .truncate({truncate})\n",
+                        "{indent}        .open({path});\n",
+                        "{indent}    match deshell_opened {{\n",
+                        "{indent}        Err(error) => {{\n",
+                        "{indent}            eprintln!(\"{{error}}\");\n",
+                        "{indent}            1\n",
+                        "{indent}        }}\n",
+                        "{indent}        Ok(deshell_file) => {{\n",
+                        "{indent}            deshell_command.{sink}(Stdio::from(deshell_file));\n"
+                    ),
+                    indent = indent,
+                    append = append,
+                    truncate = !append,
+                    path = rust_expression_borrowed(path)?,
+                    sink = sink,
+                ));
+                closers += 1;
+            }
+            output.push_str(&format!(
+                concat!(
+                    "{indent}            match deshell_command.status() {{\n",
+                    "{indent}                Ok(status) => status.code().unwrap_or(128),\n",
+                    "{indent}                Err(error) => {{\n",
+                    "{indent}                    eprintln!(\"{{error}}\");\n",
+                    "{indent}                    127\n",
+                    "{indent}                }}\n",
+                    "{indent}            }}\n"
+                ),
+                indent = indent
+            ));
+            for _ in 0..closers {
+                output.push_str(&format!("{indent}        }}\n{indent}    }}\n"));
+            }
+            output.push_str(&format!("{indent}}}"));
         }
         // A shell function is a function: the definition and its call sites
         // stay a definition and calls, because that is where "these are the
@@ -4400,6 +4501,16 @@ fn go_pattern_packages(node: &crate::ir::Node) -> (bool, bool) {
     (strings, utf8)
 }
 
+/// Whether any command under this node has a descriptor redirected.
+fn rust_node_redirects(node: &crate::ir::Node) -> bool {
+    if matches!(node.operation, crate::ir::Operation::Redirect { .. }) {
+        return true;
+    }
+    let mut found = false;
+    visit_node(node, |child| found |= rust_node_redirects(child));
+    found
+}
+
 /// Whether every path through this node ends the task.
 ///
 /// A statement after one cannot run, and emitting it anyway produces code the
@@ -4638,7 +4749,6 @@ fn node_has_expression_part(
             | crate::ir::TestPredicate::Contains { value, .. } => value.parts.iter().any(wanted),
         },
         crate::ir::Operation::Not { body }
-        | crate::ir::Operation::Redirect { body, .. }
         | crate::ir::Operation::Foreach { body, .. }
         | crate::ir::Operation::Scope { body, .. }
         | crate::ir::Operation::CaptureStdout { body, .. }
@@ -4709,6 +4819,18 @@ fn node_has_expression_part(
         // "$1"` reads the caller's arguments even though the callee's body does
         // not. Answering `false` here left the generated `main` naming a
         // binding it had decided not to emit.
+        // Destructured without `..`: a redirection's target is an expression,
+        // and `>>"${OUT}"` produced a program that named `deshell_vars` without
+        // declaring it.
+        crate::ir::Operation::Redirect { redirections, body } => {
+            redirections.iter().any(|redirection| match redirection {
+                crate::ir::Redirection::Read { path, .. }
+                | crate::ir::Redirection::Write { path, .. } => expression(path),
+                crate::ir::Redirection::Duplicate { .. } | crate::ir::Redirection::Close { .. } => {
+                    false
+                }
+            }) || node_has_expression_part(body, wanted)
+        }
         crate::ir::Operation::TaskCall {
             task: _,
             arguments,
@@ -5248,6 +5370,77 @@ fn emit_go_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> Re
             output.push_str(&format!(
                 "{indent}deshellLast = {task}([]string{{{}}})\n",
                 values.join(", ")
+            ));
+        }
+        // Only a redirect around a single command: redirecting a compound
+        // statement means holding the descriptors open across everything
+        // inside, which is refused rather than narrowed silently.
+        crate::ir::Operation::Redirect { redirections, body } => {
+            let crate::ir::Operation::Exec {
+                argv,
+                environment,
+                working_directory,
+            } = &body.operation
+            else {
+                return Err(
+                    "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: redirect supports only a simple command"
+                        .into(),
+                );
+            };
+            output.push_str(&format!("{indent}{{\n"));
+            emit_go_command(EmitGoCommandArgs {
+                argv,
+                environment,
+                working_directory: working_directory.as_ref(),
+                variable: "deshellCommand",
+                output,
+                depth: depth + 1,
+            })?;
+            for redirection in redirections {
+                let (fd, path, append) = match redirection {
+                    crate::ir::Redirection::Write { fd, path, append } => (fd, path, *append),
+                    crate::ir::Redirection::Read { .. }
+                    | crate::ir::Redirection::Duplicate { .. }
+                    | crate::ir::Redirection::Close { .. } => {
+                        return Err(
+                            "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: only an output redirection is emitted"
+                                .into(),
+                        );
+                    }
+                };
+                let sink = match fd {
+                    1 => "Stdout",
+                    2 => "Stderr",
+                    _ => {
+                        return Err(
+                            "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: only fd 1 and 2 are redirected"
+                                .into(),
+                        );
+                    }
+                };
+                output.push_str(&format!(
+                    concat!(
+                        "{indent}\tdeshellFile, deshellErr := os.OpenFile(\n",
+                        "{indent}\t\t{path},\n",
+                        "{indent}\t\tos.O_WRONLY|os.O_CREATE|{mode},\n",
+                        "{indent}\t\t0o644,\n",
+                        "{indent}\t)\n",
+                        "{indent}\tif deshellErr != nil {{\n",
+                        "{indent}\t\tfmt.Fprintln(os.Stderr, deshellErr)\n",
+                        "{indent}\t\tdeshellLast = 1\n",
+                        "{indent}\t}} else {{\n",
+                        "{indent}\t\tdefer deshellFile.Close()\n",
+                        "{indent}\t\tdeshellCommand.{sink} = deshellFile\n",
+                        "{indent}\t}}\n"
+                    ),
+                    indent = indent,
+                    path = go_expression(path)?,
+                    mode = if append { "os.O_APPEND" } else { "os.O_TRUNC" },
+                    sink = sink,
+                ));
+            }
+            output.push_str(&format!(
+                "{indent}\tdeshellLast = deshellExitCode(deshellCommand.Run())\n{indent}}}\n"
             ));
         }
         // `echo` returns 1 when the write fails, so the status is the write's.
@@ -10001,6 +10194,98 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
             "go vet rejected generated source:\n{}",
             String::from_utf8_lossy(&vet.stderr)
         );
+    }
+
+    /// A redirection target is expanded, and the generated programs write where
+    /// the shell writes.
+    ///
+    /// `>>"${GITHUB_OUTPUT}"` is how a workflow appends to a file whose path
+    /// arrives in the environment. The target used to have to be a literal, so
+    /// the most common redirection in CI was the one that delegated.
+    #[test]
+    fn a_redirection_target_is_expanded_like_any_other_word() {
+        let script = "/bin/echo appended >>\"${DESHELL_TEST_OUT}\"\n";
+        let plan = crate::frontend::lower(
+            "write.sh",
+            format!("#!/bin/bash\n{script}").as_bytes(),
+            crate::config::UnknownInterpreter::TraceOnly,
+        )
+        .unwrap();
+        let crate::ir::Operation::Redirect { redirections, .. } = &plan.tasks[0].body.operation
+        else {
+            panic!("expected a redirect: {plan:#?}")
+        };
+        let [crate::ir::Redirection::Write { fd, path, append }] = redirections.as_slice() else {
+            panic!("expected one write: {redirections:#?}")
+        };
+        assert_eq!(*fd, 1);
+        assert!(*append);
+        assert_eq!(
+            path.parts,
+            [crate::ir::TextPart::Variable {
+                name: "DESHELL_TEST_OUT".into()
+            }]
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("write.sh"), script).unwrap();
+        std::fs::write(
+            directory.path().join("write.rs"),
+            generate_rust(&plan).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("write.go"),
+            generate_go(&plan).unwrap(),
+        )
+        .unwrap();
+        let built = std::process::Command::new("rustc")
+            .arg("write.rs")
+            .args(["--edition=2024", "-D", "warnings", "-o", "write-rust"])
+            .current_dir(directory.path())
+            .output()
+            .unwrap();
+        assert!(
+            built.status.success(),
+            "rustc rejected generated source:\n{}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        let built = std::process::Command::new("go")
+            .args(["build", "-o", "write-go", "write.go"])
+            .current_dir(directory.path())
+            .output()
+            .unwrap();
+        assert!(
+            built.status.success(),
+            "go build rejected generated source:\n{}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+
+        for (program, arguments) in [
+            ("bash", vec!["write.sh"]),
+            ("./write-rust", vec![]),
+            ("./write-go", vec![]),
+        ] {
+            let target = directory
+                .path()
+                .join(format!("{}.out", program.replace(['.', '/'], "")));
+            // Appended twice: the second run has to add to the first, which is
+            // what separates `>>` from `>`.
+            for _ in 0..2 {
+                let status = std::process::Command::new(program)
+                    .args(&arguments)
+                    .env("DESHELL_TEST_OUT", &target)
+                    .current_dir(directory.path())
+                    .status()
+                    .unwrap();
+                assert!(status.success(), "{program}");
+            }
+            assert_eq!(
+                std::fs::read_to_string(&target).unwrap(),
+                "appended\nappended\n",
+                "{program} wrote other bytes"
+            );
+        }
     }
 
     /// A shell function arrives as a function, and behaves like one.
