@@ -856,13 +856,137 @@ fn source_span_for_bytes(path: &str, source: &[u8]) -> SourceSpan {
     }
 }
 
-fn native_node(operation: Operation, basis: &str, span: SourceSpan) -> Node {
+/// Declare the vocabulary of native claims once.
+///
+/// The enum, the list of every variant and the two tables are generated from
+/// the same rows, so they cannot drift: a variant added without a suffix does
+/// not compile, and one added without being in the list is impossible because
+/// there is no separate list to forget. A hand-written `ALL` had already lost
+/// two variants by the time it was first read.
+macro_rules! semantic_models {
+    ($($variant:ident => $suffix:literal, $evidence:expr;)*) => {
+        /// The claim a native node makes about how it behaves.
+        ///
+        /// A name rather than a string. `Guarantee::Native` carries a
+        /// `semantic_model`, and the validator asked only that it not be empty
+        /// — so a claim could name anything, including a model that does not
+        /// exist and a measurement nobody took. This enum is the whole
+        /// vocabulary, so a node cannot be built with a claim outside it.
+        ///
+        /// `contracts/semantic-models-v1.json` records the same list along with
+        /// the recording each claim rests on, and a test compares the two. A
+        /// model with evidence is one whose behaviour was measured across the
+        /// shells; a model without is one whose meaning is the IR operation's
+        /// own definition — a sequence runs its statements in order — and there
+        /// is nothing to measure.
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum SemanticModel {
+            $($variant,)*
+        }
+
+        impl SemanticModel {
+            /// Every model, so a gate can walk the vocabulary itself.
+            ///
+            /// The gate is the test that compares this with the contract, so
+            /// this is built for the test alone rather than carried into the
+            /// binary unused.
+            #[cfg(test)]
+            const ALL: &'static [Self] = &[$(Self::$variant,)*];
+
+            fn suffix(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $suffix,)*
+                }
+            }
+
+            /// The recording this claim rests on, if it rests on a measurement.
+            #[cfg(test)]
+            fn evidence(self) -> Option<&'static str> {
+                match self {
+                    $(Self::$variant => $evidence,)*
+                }
+            }
+        }
+    };
+}
+
+semantic_models! {
+    AndIf => "and-if-v1", None;
+    ExplicitCommand => "explicit-command-v1", None;
+    ExplicitRedirection => "explicit-redirection-v1", None;
+    ImmutableAssignment => "immutable-assignment-v1", None;
+    LastExitCondition => "last-exit-condition-v1", None;
+    StaticCondition => "static-condition-v1", None;
+    StaticDoubleBracket => "static-double-bracket-v1", None;
+    StaticEcho => "static-echo-v1", Some("contracts/golden/echo-builtin-semantics-v1.json");
+    StaticEmptyArm => "static-empty-arm-v1", None;
+    StaticExit => "static-exit-v1", Some("contracts/golden/exit-builtin-semantics-v1.json");
+    StaticExternalCommand => "static-external-command-v1", None;
+    StaticMainSequence => "static-main-sequence-v1", None;
+    StaticMatch => "static-match-v1", None;
+    StaticNegation => "static-negation-v1", None;
+    StaticPipeline => "static-pipeline-v1", None;
+    StaticPrintf => "static-printf-v1", Some("contracts/golden/printf-builtin-semantics-v1.json");
+    StaticSequence => "static-sequence-v1", None;
+    StaticSequenceWithStatus => "static-sequence-with-status-v1", None;
+    StaticTest => "static-test-v1", Some("contracts/golden/test-builtin-semantics-v1.json");
+    StaticWhile => "static-while-v1", None;
+}
+
+/// A word a claim is written under that is not the interpreter's own name.
+///
+/// Two of these predate the vocabulary: `posix` where [`Interpreter::Sh`] is
+/// called `sh`, and `nushell` where [`Interpreter::Nushell`] is called `nu`.
+/// The spellings are quoted by recorded evidence and by approvals keyed on its
+/// digest, so correcting them would invalidate what has been approved rather
+/// than fix anything. Naming them here keeps them from being typed by hand.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ModelPrefix {
+    Posix,
+    Nushell,
+}
+
+impl ModelPrefix {
+    fn word(self) -> &'static str {
+        match self {
+            Self::Posix => "posix",
+            Self::Nushell => "nushell",
+        }
+    }
+}
+
+/// A `semantic_model`, which can only be built from the vocabulary.
+///
+/// A newtype rather than a `String` parameter: `native_node` took a `&str`, so
+/// any caller could invent a claim, and the validator only asked that it not be
+/// empty.
+struct NativeBasis(String);
+
+impl SemanticModel {
+    /// The `semantic_model` an interpreter writes for this claim.
+    fn named(self, interpreter: &Interpreter) -> NativeBasis {
+        NativeBasis(format!("{}-{}", interpreter.name(), self.suffix()))
+    }
+
+    /// The same, under a word that is not the interpreter's own name.
+    fn under(self, prefix: ModelPrefix) -> NativeBasis {
+        NativeBasis(format!("{}-{}", prefix.word(), self.suffix()))
+    }
+}
+
+/// A node that claims to behave the way the shell did, and says on what basis.
+///
+/// The basis is a [`SemanticModel`] rather than a string: a `&str` parameter
+/// let a caller name a model that does not exist, and the validator only asked
+/// that the name not be empty.
+fn native_node(operation: Operation, basis: NativeBasis, span: SourceSpan) -> Node {
+    // Destructured rather than read through a field: the newtype exists so that
+    // the only way to reach this string is through the vocabulary.
+    let NativeBasis(semantic_model) = basis;
     Node {
         id: String::new(),
         operation,
-        guarantee: Guarantee::Native {
-            semantic_model: basis.to_owned(),
-        },
+        guarantee: Guarantee::Native { semantic_model },
         source: Some(span),
     }
 }
@@ -1632,7 +1756,7 @@ fn lower_posix(path: &str, source: &str, interpreter: &Interpreter) -> Result<Lo
                         condition: Box::new(condition),
                         body: Box::new(loop_body),
                     },
-                    &format!("{}-static-while-v1", interpreter.name()),
+                    SemanticModel::StaticWhile.named(interpreter),
                     span,
                 ));
                 index = done_at + 1;
@@ -1688,7 +1812,7 @@ fn lower_posix(path: &str, source: &str, interpreter: &Interpreter) -> Result<Lo
                             Ok(Some(node)) => node,
                             Ok(None) => native_node(
                                 Operation::NoOp,
-                                &format!("{}-static-empty-arm-v1", interpreter.name()),
+                                SemanticModel::StaticEmptyArm.named(interpreter),
                                 span_for_range(path, source, range.start, range.end)?,
                             ),
                             Err(_) => {
@@ -1721,7 +1845,7 @@ fn lower_posix(path: &str, source: &str, interpreter: &Interpreter) -> Result<Lo
                         cases,
                         default,
                     },
-                    &format!("{}-static-match-v1", interpreter.name()),
+                    SemanticModel::StaticMatch.named(interpreter),
                     span,
                 ));
                 index = esac_at + 1;
@@ -1771,7 +1895,7 @@ fn lower_posix(path: &str, source: &str, interpreter: &Interpreter) -> Result<Lo
                         if_true: Box::new(if_true),
                         if_false: if_false.map(Box::new),
                     },
-                    &format!("{}-static-condition-v1", interpreter.name()),
+                    SemanticModel::StaticCondition.named(interpreter),
                     span,
                 ));
                 index = fi_at + 1;
@@ -1829,7 +1953,7 @@ fn lower_posix(path: &str, source: &str, interpreter: &Interpreter) -> Result<Lo
                     crate::ir::SequenceFailure::Continue
                 },
             },
-            &format!("{}-static-sequence-v1", interpreter.name()),
+            SemanticModel::StaticSequence.named(interpreter),
             cover_spans(first, last),
         )
     };
@@ -2027,7 +2151,7 @@ fn lower_statement_list(parts: LowerStatementListArgs<'_>) -> Result<Option<Node
                 crate::ir::SequenceFailure::Continue
             },
         },
-        &format!("{}-static-sequence-v1", interpreter.name()),
+        SemanticModel::StaticSequence.named(interpreter),
         span,
     )))
 }
@@ -2111,7 +2235,7 @@ fn lower_posix_control(parts: LowerPosixControlArgs<'_>) -> Result<Node, String>
                     crate::ir::PipelineStatus::Last
                 },
             },
-            "posix-static-pipeline-v1",
+            SemanticModel::StaticPipeline.under(ModelPrefix::Posix),
             span,
         )),
         "&&" => {
@@ -2124,7 +2248,7 @@ fn lower_posix_control(parts: LowerPosixControlArgs<'_>) -> Result<Node, String>
                         if_true: Box::new(next),
                         if_false: None,
                     },
-                    "posix-and-if-v1",
+                    SemanticModel::AndIf.under(ModelPrefix::Posix),
                     span.clone(),
                 );
             }
@@ -2312,7 +2436,7 @@ fn lower_posix_simple(parts: LowerPosixSimpleArgs<'_>) -> Result<Node, String> {
         locals.insert(name.to_owned());
         return Ok(native_node(
             operation,
-            "posix-immutable-assignment-v1",
+            SemanticModel::ImmutableAssignment.under(ModelPrefix::Posix),
             span_for_range(path, source, range.start, range.end)?,
         ));
     }
@@ -2341,7 +2465,7 @@ fn lower_posix_simple(parts: LowerPosixSimpleArgs<'_>) -> Result<Node, String> {
             Operation::Not {
                 body: Box::new(inner),
             },
-            &format!("{}-static-negation-v1", interpreter.name()),
+            SemanticModel::StaticNegation.named(interpreter),
             span_for_range(path, source, range.start, range.end)?,
         ));
     }
@@ -2371,7 +2495,7 @@ fn lower_posix_simple(parts: LowerPosixSimpleArgs<'_>) -> Result<Node, String> {
         })?;
         return Ok(native_node(
             Operation::Test { predicate },
-            &format!("{}-static-double-bracket-v1", interpreter.name()),
+            SemanticModel::StaticDoubleBracket.named(interpreter),
             span_for_range(path, source, range.start, range.end)?,
         ));
     }
@@ -2393,7 +2517,7 @@ fn lower_posix_simple(parts: LowerPosixSimpleArgs<'_>) -> Result<Node, String> {
             .ok_or("unmodelled test operator requires pinned interpreter delegation")?;
         return Ok(native_node(
             Operation::Test { predicate },
-            &format!("{}-static-test-v1", interpreter.name()),
+            SemanticModel::StaticTest.named(interpreter),
             span_for_range(path, source, range.start, range.end)?,
         ));
     }
@@ -2412,7 +2536,7 @@ fn lower_posix_simple(parts: LowerPosixSimpleArgs<'_>) -> Result<Node, String> {
             .ok_or("unmodelled test operator requires pinned interpreter delegation")?;
         return Ok(native_node(
             Operation::Test { predicate },
-            &format!("{}-static-test-v1", interpreter.name()),
+            SemanticModel::StaticTest.named(interpreter),
             span_for_range(path, source, range.start, range.end)?,
         ));
     }
@@ -2434,7 +2558,7 @@ fn lower_posix_simple(parts: LowerPosixSimpleArgs<'_>) -> Result<Node, String> {
                 Operation::WriteStdout {
                     contents: crate::ir::TextExpression { parts },
                 },
-                &format!("{}-static-echo-v1", interpreter.name()),
+                SemanticModel::StaticEcho.named(interpreter),
                 span_for_range(path, source, range.start, range.end)?,
             ));
         }
@@ -2459,7 +2583,7 @@ fn lower_posix_simple(parts: LowerPosixSimpleArgs<'_>) -> Result<Node, String> {
                 Operation::Exit {
                     status: crate::ir::TextExpression::literal(literal.trim()),
                 },
-                &format!("{}-static-exit-v1", interpreter.name()),
+                SemanticModel::StaticExit.named(interpreter),
                 span_for_range(path, source, range.start, range.end)?,
             ));
         }
@@ -2475,7 +2599,7 @@ fn lower_posix_simple(parts: LowerPosixSimpleArgs<'_>) -> Result<Node, String> {
             Operation::WriteStdout {
                 contents: crate::ir::TextExpression { parts },
             },
-            &format!("{}-static-printf-v1", interpreter.name()),
+            SemanticModel::StaticPrintf.named(interpreter),
             span_for_range(path, source, range.start, range.end)?,
         ));
     }
@@ -2526,7 +2650,7 @@ fn lower_posix_simple(parts: LowerPosixSimpleArgs<'_>) -> Result<Node, String> {
             environment: command_environment,
             working_directory: None,
         },
-        &format!("{}-explicit-command-v1", interpreter.name()),
+        SemanticModel::ExplicitCommand.named(interpreter),
         span.clone(),
     );
     if redirections.is_empty() {
@@ -2537,7 +2661,7 @@ fn lower_posix_simple(parts: LowerPosixSimpleArgs<'_>) -> Result<Node, String> {
             redirections,
             body: Box::new(exec),
         },
-        &format!("{}-explicit-redirection-v1", interpreter.name()),
+        SemanticModel::ExplicitRedirection.named(interpreter),
         span,
     ))
 }
@@ -2926,7 +3050,7 @@ fn lower_fish(path: &str, source: &str) -> Result<Lowered, String> {
                 nodes,
                 on_failure: crate::ir::SequenceFailure::Continue,
             },
-            "fish-static-sequence-v1",
+            SemanticModel::StaticSequence.named(&Interpreter::Fish),
             cover_spans(first, last),
         )
     };
@@ -3011,7 +3135,7 @@ fn lower_fish_control(parts: LowerFishControlArgs<'_>) -> Result<Node, String> {
                 if_true: Box::new(next),
                 if_false: None,
             },
-            "fish-and-if-v1",
+            SemanticModel::AndIf.named(&Interpreter::Fish),
             span.clone(),
         );
     }
@@ -3056,7 +3180,7 @@ fn lower_fish_simple(parts: LowerFishSimpleArgs<'_>) -> Result<Node, String> {
             environment: Vec::new(),
             working_directory: None,
         },
-        "fish-static-external-command-v1",
+        SemanticModel::StaticExternalCommand.named(&Interpreter::Fish),
         span_for_range(path, source, range.start, range.end)?,
     ))
 }
@@ -3250,7 +3374,7 @@ fn lower_cmd(path: &str, source: &str) -> Result<Lowered, String> {
                 nodes,
                 on_failure: crate::ir::SequenceFailure::Continue,
             },
-            "cmd-static-sequence-v1",
+            SemanticModel::StaticSequence.named(&Interpreter::Cmd),
             cover_spans(first, last),
         )
     };
@@ -3332,7 +3456,7 @@ fn lower_cmd_control(parts: LowerCmdControlArgs<'_>) -> Result<Node, String> {
                 if_true: Box::new(next),
                 if_false: None,
             },
-            "cmd-and-if-v1",
+            SemanticModel::AndIf.named(&Interpreter::Cmd),
             span.clone(),
         );
     }
@@ -3410,7 +3534,7 @@ fn lower_cmd_simple(parts: LowerCmdSimpleArgs<'_>) -> Result<Node, String> {
             environment: Vec::new(),
             working_directory: None,
         },
-        "cmd-static-external-command-v1",
+        SemanticModel::StaticExternalCommand.named(&Interpreter::Cmd),
         span_for_range(path, source, range.start, range.end)?,
     ))
 }
@@ -3551,7 +3675,7 @@ fn lower_powershell(path: &str, source: &str) -> Result<Lowered, String> {
                 nodes,
                 on_failure: crate::ir::SequenceFailure::Continue,
             },
-            "powershell-static-sequence-with-status-v1",
+            SemanticModel::StaticSequenceWithStatus.named(&Interpreter::Powershell),
             cover_spans(first, last),
         )
     };
@@ -3633,7 +3757,7 @@ fn lower_powershell_control(parts: LowerPowershellControlArgs<'_>) -> Result<Nod
                 if_true: Box::new(next),
                 if_false: None,
             },
-            "powershell-and-if-v1",
+            SemanticModel::AndIf.named(&Interpreter::Powershell),
             span.clone(),
         );
     }
@@ -3716,7 +3840,7 @@ fn lower_powershell_simple(parts: LowerPowershellSimpleArgs<'_>) -> Result<Node,
             environment: Vec::new(),
             working_directory: None,
         },
-        "powershell-static-external-command-v1",
+        SemanticModel::StaticExternalCommand.named(&Interpreter::Powershell),
         span_for_range(path, source, range.start, range.end)?,
     ))
 }
@@ -3876,7 +4000,7 @@ fn lower_nushell(path: &str, source: &str, interpreter: &Interpreter) -> Result<
             if_true: Box::new(if_true),
             if_false: Some(Box::new(if_false)),
         },
-        "nushell-last-exit-condition-v1",
+        SemanticModel::LastExitCondition.under(ModelPrefix::Nushell),
         span_for_range(path, source, lines[2].0.start, lines[7].0.end)?,
     );
     let span = cover_spans(
@@ -3890,7 +4014,7 @@ fn lower_nushell(path: &str, source: &str, interpreter: &Interpreter) -> Result<
                 nodes: vec![first, condition],
                 on_failure: crate::ir::SequenceFailure::Continue,
             },
-            "nushell-static-main-sequence-v1",
+            SemanticModel::StaticMainSequence.under(ModelPrefix::Nushell),
             span,
         ),
         inputs: BTreeSet::from(["1".into()]),
@@ -3967,7 +4091,7 @@ fn lower_nushell_external(parts: LowerNushellExternalArgs<'_>) -> Result<Node, S
             environment: Vec::new(),
             working_directory: None,
         },
-        "nushell-static-external-command-v1",
+        SemanticModel::StaticExternalCommand.under(ModelPrefix::Nushell),
         span_for_range(path, source, range.start, range.end)?,
     ))
 }
@@ -4603,7 +4727,7 @@ fn lower_literal_family(
                 environment: vec![],
                 working_directory: None,
             },
-            &format!("{}-static-external-command-v1", interpreter.name()),
+            SemanticModel::StaticExternalCommand.named(interpreter),
             span_for_range(path, source, range.start, range.end)?,
         ));
     }
@@ -4623,7 +4747,7 @@ fn lower_literal_family(
                 nodes,
                 on_failure: crate::ir::SequenceFailure::Continue,
             },
-            &format!("{}-static-sequence-v1", interpreter.name()),
+            SemanticModel::StaticSequence.named(interpreter),
             cover_spans(first, last),
         )
     };
@@ -4921,6 +5045,63 @@ mod tests {
             names.len(),
             "the builtin table repeats a name"
         );
+    }
+
+    /// The vocabulary of native claims, and the evidence behind each one.
+    ///
+    /// `Guarantee::Native` carries a string and the validator asked only that
+    /// it not be empty, so a node could claim a model that does not exist. The
+    /// frontend builds the string from [`SemanticModel`] now; this checks that
+    /// the enum and `contracts/semantic-models-v1.json` say the same thing, and
+    /// that every recording a model cites is a file that is actually there.
+    #[test]
+    fn every_native_claim_names_a_model_that_exists_and_evidence_that_does() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let raw = std::fs::read_to_string(root.join("contracts/semantic-models-v1.json"))
+            .expect("contract is readable");
+        let contract: serde_json::Value = serde_json::from_str(&raw).expect("contract is JSON");
+        let models = contract["models"]
+            .as_object()
+            .expect("contract lists models");
+
+        for model in SemanticModel::ALL {
+            let recorded = models
+                .get(model.suffix())
+                .unwrap_or_else(|| panic!("{} is not in the contract", model.suffix()));
+            assert_eq!(
+                recorded["evidence"].as_str(),
+                model.evidence(),
+                "{} cites different evidence than the contract",
+                model.suffix()
+            );
+            // A model that cites a recording has to cite one that is there. A
+            // path that has moved is how a claim keeps its wording and loses
+            // what made it true.
+            if let Some(evidence) = model.evidence() {
+                assert!(
+                    root.join(evidence).is_file(),
+                    "{} cites {evidence}, which is not a file",
+                    model.suffix()
+                );
+            }
+        }
+        for name in models.keys() {
+            assert!(
+                SemanticModel::ALL
+                    .iter()
+                    .any(|model| model.suffix() == name),
+                "{name} is in the contract and not in the vocabulary"
+            );
+        }
+
+        // The vocabulary is what the lowering actually writes, not a list beside
+        // it: a model no node ever builds would pass everything above.
+        let node = body("build.sh", b"#!/bin/bash\nprintf '%s' a\n");
+        let Guarantee::Native { semantic_model } = &node.guarantee else {
+            panic!("expected a native guarantee: {node:#?}")
+        };
+        let NativeBasis(expected) = SemanticModel::StaticPrintf.named(&Interpreter::Bash);
+        assert_eq!(semantic_model, &expected);
     }
 
     /// The `echo` lowering writes the bytes bash writes, checked against a

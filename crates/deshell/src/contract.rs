@@ -156,6 +156,7 @@ mod tests {
             "contracts/golden/shell-builtin-inventory-v1.json",
             "contracts/golden/posix-sh-divergence-v1.json",
             "contracts/golden/printf-builtin-semantics-v1.json",
+            "contracts/semantic-models-v1.json",
         ] {
             assert!(root().join(relative).is_file(), "missing {relative}");
         }
