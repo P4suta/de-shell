@@ -286,6 +286,37 @@ blocker DESHELL_BLOCKER_UNIMPLEMENTED_SEMANTIC action.yml@3963..6698:
   contained no `set` at all, which is why none of this surfaced until the tool
   was pointed at a repository that was not its own.
 
+## What one real `action.yml` still needs
+
+Five `run:` blocks, 22 KiB, measured after each change rather than once.
+
+| blocks the frontend delegates | |
+| --- | --- |
+| before this round | 5 |
+| after | 3 |
+
+The three that remain are not gaps. Each builds a `GITHUB_OUTPUT` delimiter
+from `${RANDOM}` and `$$`, which are a new number and a process id — there is
+no native expression for "the same random number", and de-shell delegating
+them is the tool being right rather than behind. A native replacement would
+pick a delimiter a different way, which is a change to the script and belongs
+to `harden`.
+
+The two that stopped being frontend blockers moved to the generation side, and
+those are open:
+
+- [ ] `DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: structured host generator does
+  not support action.yml`. The shell lowers; what has no target is the host
+  rewrite — a GitHub composite action's `run:` block has to become a step that
+  invokes the generated program, and the generator has no shape for that.
+- [ ] `DESHELL_BLOCKER_DUPLICATE_TARGET: multiple sources generate action.yml`.
+  Two blocks in one file both want to generate into it. The plan has no way to
+  say "two programs, one call site each", and refusing is the safe half of an
+  answer.
+
+Both are about where generated code goes, not about what the shell means. That
+is a better place for this file to be stuck than where it was.
+
 ## A coverage number that improved when the tool got a fact wrong
 
 Measured on OComment's `action.yml`, one file, five `run:` blocks, against
