@@ -81,6 +81,17 @@ Nushell), with both official Rust and Go generators where applicable.
   schema fuzzing, Miri, ASan/UBSan, and validator/policy mutation thresholds.
 - [ ] Record scan, simple-run, and release-size baselines on the release runner
   and require review for regressions greater than 20 percent.
+
+  `cargo xtask performance` runs and reports. On this machine — macOS,
+  aarch64, a release build — scan over 4096 files is 58 ms median and 61 ms at
+  p95, a simple run is 3.3 ms median and 3.6 ms at p95, and the binary is 7.8
+  MiB. These are not the baseline: the baseline is the release runner's, and
+  what is recorded here is that the harness produces one.
+
+  It did not until now. The fixture ran `/bin/true`, which macOS does not have,
+  so the measured run had failed to start; and `deshell init` refuses to choose
+  a target for a directory holding one script and nothing else, which the
+  benchmark had not said.
 - [ ] Install and smoke all six archives, including `--version`, every embedded
   schema, and all three internal-agent handshakes.
 - [ ] Verify the CycloneDX SBOM, SHA-256 checksums, Sigstore bundle, and

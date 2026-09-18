@@ -1467,12 +1467,19 @@ fn prepare_simple_run_project(binary: &Path, root: &Path) -> Result<(), String> 
     std::fs::create_dir_all(root)
         .map_err(|error| format!("cannot create {}: {error}", root.display()))?;
     let entry = "benchmark.sh";
+    // An absolute path, because the frontend refuses one resolved through
+    // `PATH` — and one that is there, which `/bin/true` is not on macOS. The
+    // benchmark measured a run that could not start until this was checked.
     let source = if cfg!(windows) {
-        b"cmd.exe /d /c exit 0\n".as_slice()
+        "cmd.exe /d /c exit 0\n".to_owned()
     } else {
-        b"/bin/true\n".as_slice()
+        let program = ["/usr/bin/true", "/bin/true"]
+            .into_iter()
+            .find(|candidate| std::path::Path::new(candidate).is_file())
+            .ok_or("no `true` to benchmark a simple run with")?;
+        format!("{program}\n")
     };
-    std::fs::write(root.join(entry), source)
+    std::fs::write(root.join(entry), source.as_bytes())
         .map_err(|error| format!("cannot write simple-run entrypoint: {error}"))?;
     command_success(
         binary,
@@ -1482,6 +1489,12 @@ fn prepare_simple_run_project(binary: &Path, root: &Path) -> Result<(), String> 
             root.to_string_lossy().into_owned(),
             "--entry".to_owned(),
             entry.to_owned(),
+            // A directory holding one shell script and nothing else has no
+            // unique target — `deshell init` refuses to choose between rust, go
+            // and host, which is right, and a benchmark has to say which it is
+            // measuring rather than depend on that refusal not happening.
+            "--target".to_owned(),
+            "rust".to_owned(),
         ],
         "simple-run init",
     )?;
