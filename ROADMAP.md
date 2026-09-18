@@ -125,10 +125,26 @@ blocker DESHELL_BLOCKER_UNIMPLEMENTED_SEMANTIC action.yml@3963..6698:
     while `"$VALUE"` lowers natively. The exception table `-u` needs — `${x:-}`,
     `${x+}`, `${x-}`, `${x:?}` — is exactly the syntax that is missing, so the
     option cannot be modelled over an IR that cannot say what it excepts.
-  - [ ] Then `-u` itself. Unlike `-e` it is not a property of the sequence: it
-    changes what an expansion does, so it belongs to the text expression or the
-    task rather than to the statement list. The measured exit status is 127, not
-    1.
+  - [x] Represent it. `TextPart::DefaultValue` carries `${name:-fallback}` and
+    `${name-fallback}` as separate forms, since `:-` substitutes an empty value
+    as well as an unset one.
+  - [ ] Then `-u` itself — and the direction is the opposite of what it looks
+    like. `TextExpression::evaluate` already fails on an undefined variable, so
+    de-shell's default *is* `set -u` and the plain shell behaviour is the one it
+    cannot express:
+
+    ```
+    bash -c 'echo "[${UNDEFINED}]"'           → []   exit 0
+    bash -c 'set -u; echo "[${UNDEFINED}]"'   → unbound variable, exit 127
+    de-shell, either way                      → error
+    ```
+
+    Being stricter than the source is safer than being looser, but it is still a
+    difference, and a tool that reports observed differences should not be one of
+    them. The work is to make the default substitute an empty string and let
+    `set -u` select the current behaviour, which needs the flag on the task
+    rather than on the statement list — unlike `-e`, this changes what an
+    expansion does rather than when a sequence stops.
 - [ ] `-e` needs one new IR value, not a call-graph analysis. Which commands
   `set -e` stops on is already the shape of the tree: the left of `&&`/`||`, an
   `if` condition and the operand of `!` each lower into their own node, so the
