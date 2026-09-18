@@ -90,6 +90,48 @@ Nushell), with both official Rust and Go generators where applicable.
   retaining binary name `deshell`.
 - [ ] Obtain the release-environment owner approval and publish `v0.1.0`.
 
+## Blocking the claim that de-shell retires real shell — found by dogfooding
+
+Running `deshell scan` and `migrate plan` against OComment's `action.yml`
+retired nothing: all five `run:` steps came back as whole-file delegation, each
+for the same reason.
+
+```
+blocker DESHELL_BLOCKER_UNIMPLEMENTED_SEMANTIC action.yml@3963..6698:
+  shell builtin set requires pinned interpreter delegation
+```
+
+- [ ] Split `set` by option instead of refusing the builtin by name. Every shell
+  builtin is delegated today, `set` among them, and `set -euo pipefail` opens
+  approximately every CI step that exists. The same corpus with `set` removed
+  lowers 48% of its bytes natively, so this is a granularity problem rather than
+  a capability one. Start with `-o pipefail`: it decides a pipeline's exit
+  status, which is local and static. `-f` (field splitting) and `-x` (tracing)
+  stay delegated.
+- [ ] Do not treat `-e` as the easy one. Measured against bash 3.2.57, `set -e`
+  stops on a command that is *not tested*, where tested means the left of
+  `&&`/`||`, the condition of `if`/`while`/`until`, the operand of `!`, and every
+  element of a pipeline but the last. It is also a property of the call site
+  rather than of the code: a function body whose `false` aborts when called
+  directly runs to completion when called as `f || true`. Lowering it to `?` per
+  statement is observably wrong, and `set +e` … `set -e` pairs are how callers
+  express "a non-zero exit is not a failure here".
+- [ ] Pin the bash version in `deshell.lock` the way `nu` already is. macOS ships
+  3.2 and Linux runners ship 5.x; the CI matrix spans both. A tool that claims
+  equivalence has to say which interpreter it is equivalent to, and the `set -e`
+  rules above were only measured on 3.2.
+- [ ] Separate "no decision" from `delegated`. A node delegated because `set` is
+  unmodelled is a decision: the source was read and isolation was chosen. A node
+  delegated because the parser timed out is the absence of one, and it is
+  retryable where the first is not. Both currently surface as `delegated` with a
+  blocker, so a plan cannot be read to tell them apart.
+- [ ] Model `case`, redirection, and `2>/dev/null`. These blocked three of six
+  steps in a corpus with no `set` in it, and unlike the above they are missing
+  implementation rather than unsettled semantics.
+- [ ] Carry the thirteen `set` semantics cases into the golden corpus. The corpus
+  contained no `set` at all, which is why none of this surfaced until the tool
+  was pointed at a repository that was not its own.
+
 ## After 0.1.0
 
 - Keep the unpublished OCaml reference aligned for deterministic IR, analysis,
