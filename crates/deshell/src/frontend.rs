@@ -1295,6 +1295,41 @@ fn if_arms(source: &str, statements: &[Range], start: usize) -> Option<(usize, u
     None
 }
 
+/// The statement index of the `esac` that closes a `case`, if this models it.
+///
+/// Returns `None` for a nested `case`, so the statement is delegated rather than
+/// lowered from a guess.
+fn case_end(source: &str, statements: &[Range], start: usize) -> Option<usize> {
+    for index in start + 1..statements.len() {
+        let text = source[statements[index].start..statements[index].end].trim();
+        if text == "esac" {
+            return Some(index);
+        }
+        if text.starts_with("case ") {
+            return None;
+        }
+    }
+    None
+}
+
+/// Split `PATTERN) BODY` into its two halves.
+///
+/// Only a single literal pattern is modelled. An alternation (`a|b`), a pattern
+/// carrying an expansion, or a missing `)` yields `None`, because matching the
+/// wrong arm runs the wrong command.
+fn case_arm(text: &str) -> Option<(&str, &str)> {
+    let (pattern, body) = text.split_once(')')?;
+    let pattern = pattern.trim().trim_start_matches('(').trim();
+    if pattern.is_empty()
+        || pattern
+            .bytes()
+            .any(|byte| matches!(byte, b'|' | b'$' | b'`' | b'"' | b'\'' | b'[' | b'?'))
+    {
+        return None;
+    }
+    Some((pattern, body.trim().trim_end_matches(";;").trim()))
+}
+
 fn lower_posix(path: &str, source: &str, interpreter: &Interpreter) -> Result<Lowered, String> {
     let statements = shell_statements(source)?;
     let mut inputs = BTreeSet::new();
@@ -1312,6 +1347,84 @@ fn lower_posix(path: &str, source: &str, interpreter: &Interpreter) -> Result<Lo
         let trimmed = text.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
+        }
+        // `case WORD in PATTERN) BODY ;; esac`, rejoined the same way as `if`.
+        // `*` becomes the default arm; a pattern this does not model leaves the
+        // whole statement delegated.
+        if let Some(word) = trimmed
+            .strip_prefix("case ")
+            .and_then(|rest| rest.strip_suffix(" in"))
+            && let Some(esac_at) = case_end(source, &statements, index - 1)
+        {
+            let start_of_word = range.start
+                + source[range.start..range.end]
+                    .find(word)
+                    .ok_or("case word is not inside its range")?;
+            let words = tokenize_posix(
+                &source[start_of_word..start_of_word + word.len()],
+                &mut inputs,
+                &mut environment,
+                &locals,
+            );
+            let mut cases = Vec::new();
+            let mut default = None;
+            let mut modelled = words.as_ref().is_ok_and(|words| words.len() == 1);
+            for statement in &statements[index..esac_at] {
+                let text = source[statement.start..statement.end].trim();
+                if text.is_empty() {
+                    continue;
+                }
+                let Some((pattern, arm)) = case_arm(text) else {
+                    modelled = false;
+                    break;
+                };
+                let offset = statement.start
+                    + source[statement.start..statement.end]
+                        .find(arm)
+                        .unwrap_or_default();
+                let Ok(node) = lower_posix_control(LowerPosixControlArgs {
+                    path,
+                    source,
+                    range: Range {
+                        start: offset,
+                        end: offset + arm.len(),
+                    },
+                    interpreter,
+                    inputs: &mut inputs,
+                    environment: &mut environment,
+                    locals: &mut locals,
+                    pipefail: options.pipefail,
+                }) else {
+                    modelled = false;
+                    break;
+                };
+                if pattern == "*" {
+                    default = Some(Box::new(node));
+                } else {
+                    cases.push(crate::ir::MatchCase {
+                        pattern: crate::ir::TextExpression::literal(pattern),
+                        body: node,
+                    });
+                }
+            }
+            if modelled
+                && let Ok(mut words) = words
+                && (!cases.is_empty() || default.is_some())
+            {
+                let span = span_for_range(path, source, range.start, statements[esac_at].end)?;
+                nodes.push(native_node(
+                    Operation::Match {
+                        value: words.remove(0),
+                        cases,
+                        default,
+                    },
+                    &format!("{}-static-match-v1", interpreter.name()),
+                    span,
+                ));
+                index = esac_at + 1;
+                continue;
+            }
+            return Err("shell compound syntax requires pinned interpreter delegation".into());
         }
         // `if COND; then BODY; fi` arrives as several statements because the
         // splitter breaks on `;` and newlines. Rejoining them here keeps the
@@ -4012,6 +4125,40 @@ mod tests {
                 fallback: String::new(),
                 empty_is_unset: true,
             }]
+        );
+    }
+
+    #[test]
+    fn a_case_statement_lowers_to_a_match() {
+        // `Operation::Match` and `MatchCase` have been in the IR from the start.
+        // `case` was refused as compound syntax, so a target-triple dispatch — the
+        // shape every cross-platform CI step uses — was delegated whole.
+        let node = body(
+            "build.sh",
+            b"case \"$1\" in\n  a) /bin/echo first ;;\n  *) /bin/echo other ;;\nesac\n",
+        );
+        let Operation::Match {
+            value,
+            cases,
+            default,
+        } = &node.operation
+        else {
+            panic!("expected match: {node:#?}")
+        };
+        assert_eq!(value.parts, [TextPart::Argument { name: "1".into() }]);
+        assert_eq!(cases.len(), 1, "{cases:#?}");
+        assert_eq!(cases[0].pattern, crate::ir::TextExpression::literal("a"));
+        assert!(matches!(cases[0].body.operation, Operation::Exec { .. }));
+        assert!(default.is_some(), "`*` is the default arm");
+
+        // A pattern this does not model keeps the whole statement delegated.
+        let node = body(
+            "build.sh",
+            b"case \"$1\" in\n  a|b) /bin/echo alt ;;\nesac\n",
+        );
+        assert!(
+            matches!(node.operation, Operation::InterpreterCall { .. }),
+            "an alternation pattern must delegate: {node:#?}"
         );
     }
 
