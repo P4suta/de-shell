@@ -322,6 +322,10 @@ fn rebind_source_path(plan: &mut Plan, from: &str, to: &str) -> Result<(), Strin
             *path = to.into();
         }
         match &mut node.operation {
+            Operation::While { condition, body } => {
+                visit(condition, from, to);
+                visit(body, from, to);
+            }
             Operation::Not { body } => visit(body, from, to),
             Operation::Pipeline { nodes, .. }
             | Operation::Sequence { nodes, .. }
@@ -752,6 +756,10 @@ pub(crate) fn bind_interpreter_pins(
 
 fn bind_node_pin(node: &mut Node, pins: &crate::config::InterpreterPins) -> Result<(), String> {
     match &mut node.operation {
+        Operation::While { condition, body } => {
+            bind_node_pin(condition, pins)?;
+            bind_node_pin(body, pins)?;
+        }
         Operation::Not { body } => bind_node_pin(body, pins)?,
         Operation::InterpreterCall {
             interpreter,
@@ -1269,6 +1277,29 @@ fn set_statement(statement: &str, current: ShellOptions) -> Option<ShellOptions>
     if saw_one { Some(options) } else { None }
 }
 
+/// Where a `while` ends, and where its `do` divides it.
+///
+/// Returns `None` for a nested loop or a missing `do`, so the statement is
+/// delegated rather than lowered from a guess. `until` is not recognised here:
+/// rewriting it as a negated `while` would be a rewrite, not a lowering.
+fn while_arms(source: &str, statements: &[Range], start: usize) -> Option<(usize, usize)> {
+    let word = |index: usize| source[statements[index].start..statements[index].end].trim();
+    let mut do_at = None;
+    for index in start + 1..statements.len() {
+        let text = word(index);
+        if text == "done" {
+            return do_at.map(|at| (index, at));
+        }
+        if text.starts_with("while ") || text.starts_with("until ") || text.starts_with("for ") {
+            return None;
+        }
+        if text.starts_with("do") && do_at.is_none() {
+            do_at = Some(index);
+        }
+    }
+    None
+}
+
 /// Where an `if` ends, given the statement that opens it.
 ///
 /// Returns the index of the `fi` statement and the indices of the `then` and
@@ -1361,6 +1392,78 @@ fn lower_posix(path: &str, source: &str, interpreter: &Interpreter) -> Result<Lo
         let trimmed = text.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
+        }
+        // `while COND; do BODY; done`, rejoined the same way as `if`.
+        if trimmed.starts_with("while ")
+            && let Some((done_at, do_at)) = while_arms(source, &statements, index - 1)
+        {
+            let mut arm = |from: usize, to: usize, strip: &str| -> Result<Node, String> {
+                let mut pieces = Vec::new();
+                for statement in &statements[from..to] {
+                    let raw = source[statement.start..statement.end].trim();
+                    let text = raw.strip_prefix(strip).unwrap_or(raw).trim();
+                    if text.is_empty() {
+                        continue;
+                    }
+                    let offset = statement.start
+                        + source[statement.start..statement.end]
+                            .find(text)
+                            .ok_or("loop statement is not inside its range")?;
+                    pieces.push(lower_posix_control(LowerPosixControlArgs {
+                        path,
+                        source,
+                        range: Range {
+                            start: offset,
+                            end: offset + text.len(),
+                        },
+                        interpreter,
+                        inputs: &mut inputs,
+                        environment: &mut environment,
+                        locals: &mut locals,
+                        pipefail: options.pipefail,
+                    })?);
+                }
+                if pieces.len() == 1 {
+                    return Ok(pieces.remove(0));
+                }
+                let first = pieces
+                    .first()
+                    .and_then(|node| node.source.clone())
+                    .ok_or("loop arm is empty")?;
+                let last = pieces
+                    .last()
+                    .and_then(|node| node.source.clone())
+                    .ok_or("loop arm span is missing")?;
+                Ok(native_node(
+                    Operation::Sequence {
+                        nodes: pieces,
+                        on_failure: if options.errexit {
+                            crate::ir::SequenceFailure::Stop
+                        } else {
+                            crate::ir::SequenceFailure::Continue
+                        },
+                    },
+                    &format!("{}-static-sequence-v1", interpreter.name()),
+                    cover_spans(first, last),
+                ))
+            };
+            let condition = arm(index - 1, do_at, "while ");
+            let loop_body = arm(do_at, done_at, "do");
+            if let (Ok(condition), Ok(loop_body)) = (condition, loop_body) {
+                let span =
+                    span_for_range(path, source, statements[index - 1].start, statements[done_at].end)?;
+                nodes.push(native_node(
+                    Operation::While {
+                        condition: Box::new(condition),
+                        body: Box::new(loop_body),
+                    },
+                    &format!("{}-static-while-v1", interpreter.name()),
+                    span,
+                ));
+                index = done_at + 1;
+                continue;
+            }
+            return Err("shell compound syntax requires pinned interpreter delegation".into());
         }
         // `case WORD in PATTERN) BODY ;; esac`, rejoined the same way as `if`.
         // `*` becomes the default arm; a pattern this does not model leaves the
@@ -4249,6 +4352,33 @@ mod tests {
                 fallback: String::new(),
                 empty_is_unset: true,
             }]
+        );
+    }
+
+    #[test]
+    fn a_while_loop_lowers_to_a_loop() {
+        // `while COND; do BODY; done`. The statement splitter breaks on `;` and
+        // newlines, so this arrives as several statements and is rejoined the same
+        // way `if` and `case` are.
+        let node = body(
+            "build.sh",
+            b"while [ -n \"$VALUE\" ]; do /bin/echo tick; done\n",
+        );
+        let Operation::While { condition, body: inner } = &node.operation else {
+            panic!("expected while: {node:#?}")
+        };
+        assert!(matches!(condition.operation, Operation::Test { .. }));
+        assert!(matches!(inner.operation, Operation::Exec { .. }));
+
+        // `until` inverts the condition, and is not modelled: rewriting it as a
+        // negated `while` would be a rewrite rather than a lowering.
+        let node = body(
+            "build.sh",
+            b"until [ -n \"$VALUE\" ]; do /bin/echo tick; done\n",
+        );
+        assert!(
+            matches!(node.operation, Operation::InterpreterCall { .. }),
+            "until is not modelled: {node:#?}"
         );
     }
 

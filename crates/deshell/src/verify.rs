@@ -222,6 +222,10 @@ fn collect_identity<'a>(node: &'a Node, output: &mut Vec<(&'a str, &'a str, &'a 
 
 fn visit_children<'a>(node: &'a Node, mut visit: impl FnMut(&'a Node)) {
     match &node.operation {
+        Operation::While { condition, body } => {
+            visit(condition);
+            visit(body);
+        }
         Operation::Pipeline { nodes, .. }
         | Operation::Sequence { nodes, .. }
         | Operation::Parallel { nodes } => {

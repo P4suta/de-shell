@@ -3590,6 +3590,18 @@ fn emit_rust_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> 
                 indent = indent
             ));
         }
+        crate::ir::Operation::While { condition, body } => {
+            output.push_str(&format!("{indent}{{\n"));
+            output.push_str(&format!("{indent}    let mut deshell_last = 0;\n"));
+            output.push_str(&format!("{indent}    loop {{\n"));
+            output.push_str(&format!("{indent}        if (\n"));
+            emit_rust_node(condition, output, depth + 3)?;
+            output.push_str(&format!("\n{indent}        ) != 0 {{ break; }}\n"));
+            output.push_str(&format!("{indent}        deshell_last =\n"));
+            emit_rust_node(body, output, depth + 3)?;
+            output.push_str(&format!(";\n{indent}    }}\n"));
+            output.push_str(&format!("{indent}    deshell_last\n{indent}}}"));
+        }
         crate::ir::Operation::Not { body } => {
             // `!` inverts to a boolean, so a body exiting 2 yields 0 just as one
             // exiting 1 does.
@@ -3728,11 +3740,41 @@ fn rust_node_starts_a_process(node: &crate::ir::Node) -> bool {
         }
         crate::ir::Operation::Redirect { body, .. }
         | crate::ir::Operation::Foreach { body, .. }
-        | crate::ir::Operation::Scope { body, .. } => rust_node_starts_a_process(body),
-        crate::ir::Operation::TryFinally { body, finalizer } => {
-            rust_node_starts_a_process(body) || rust_node_starts_a_process(finalizer)
+        | crate::ir::Operation::Scope { body, .. }
+        | crate::ir::Operation::Not { body }
+        | crate::ir::Operation::CaptureStdout { body, .. }
+        | crate::ir::Operation::Spawn { body, .. } => rust_node_starts_a_process(body),
+        crate::ir::Operation::While {
+            condition: first,
+            body: second,
         }
-        _ => false,
+        | crate::ir::Operation::TryFinally {
+            body: first,
+            finalizer: second,
+        } => rust_node_starts_a_process(first) || rust_node_starts_a_process(second),
+        // Listed rather than left to a wildcard: a `_` arm here answered "no" for
+        // `While`, and the generated program then named `Command` without
+        // importing it. A new operation must be classified, not defaulted.
+        crate::ir::Operation::Test { .. }
+        | crate::ir::Operation::ExpandWords { .. }
+        | crate::ir::Operation::SetVariable { .. }
+        | crate::ir::Operation::SetEnvironment { .. }
+        | crate::ir::Operation::SetWorkingDirectory { .. }
+        | crate::ir::Operation::FileRead { .. }
+        | crate::ir::Operation::FileWrite { .. }
+        | crate::ir::Operation::FileRemove { .. }
+        | crate::ir::Operation::FileMetadata { .. }
+        | crate::ir::Operation::FileSetMetadata { .. }
+        | crate::ir::Operation::NetworkRequest { .. }
+        | crate::ir::Operation::ClockRead { .. }
+        | crate::ir::Operation::RandomBytes { .. }
+        | crate::ir::Operation::Wait { .. }
+        | crate::ir::Operation::OpaqueCapsule { .. }
+        | crate::ir::Operation::SendSignal { .. } => false,
+        // A task call runs whatever that task runs, which this walk does not
+        // follow; assuming it starts a process keeps the import present rather
+        // than producing code that names `Command` without it.
+        crate::ir::Operation::TaskCall { .. } => true,
     }
 }
 
@@ -3783,11 +3825,63 @@ fn node_has_expression_part(
             if_true,
             if_false,
         } => {
-            rust_node_uses_arguments(predicate)
-                || rust_node_uses_arguments(if_true)
-                || if_false.as_deref().is_some_and(rust_node_uses_arguments)
+            node_has_expression_part(predicate, wanted)
+                || node_has_expression_part(if_true, wanted)
+                || if_false
+                    .as_ref()
+                    .is_some_and(|child| node_has_expression_part(child, wanted))
         }
-        _ => false,
+        crate::ir::Operation::While { condition, body } => {
+            node_has_expression_part(condition, wanted) || node_has_expression_part(body, wanted)
+        }
+        crate::ir::Operation::Test { predicate } => match predicate {
+            crate::ir::TestPredicate::NonEmpty { value }
+            | crate::ir::TestPredicate::Empty { value } => value.parts.iter().any(wanted),
+            crate::ir::TestPredicate::StringEqual { left, right }
+            | crate::ir::TestPredicate::StringNotEqual { left, right } => {
+                left.parts.iter().any(wanted) || right.parts.iter().any(wanted)
+            }
+        },
+        crate::ir::Operation::Not { body }
+        | crate::ir::Operation::Redirect { body, .. }
+        | crate::ir::Operation::Foreach { body, .. }
+        | crate::ir::Operation::Scope { body, .. }
+        | crate::ir::Operation::CaptureStdout { body, .. }
+        | crate::ir::Operation::Spawn { body, .. } => node_has_expression_part(body, wanted),
+        crate::ir::Operation::Match { cases, default, .. } => {
+            cases
+                .iter()
+                .any(|case| node_has_expression_part(&case.body, wanted))
+                || default
+                    .as_ref()
+                    .is_some_and(|child| node_has_expression_part(child, wanted))
+        }
+        crate::ir::Operation::TryFinally { body, finalizer } => {
+            node_has_expression_part(body, wanted) || node_has_expression_part(finalizer, wanted)
+        }
+        crate::ir::Operation::Parallel { nodes } => nodes
+            .iter()
+            .any(|child| node_has_expression_part(child, wanted)),
+        // Listed rather than defaulted: a `_` arm here answered "no" for `While`,
+        // and the generated program then referred to `deshell_args` without
+        // binding it.
+        crate::ir::Operation::ExpandWords { .. }
+        | crate::ir::Operation::SetVariable { .. }
+        | crate::ir::Operation::SetEnvironment { .. }
+        | crate::ir::Operation::SetWorkingDirectory { .. }
+        | crate::ir::Operation::FileRead { .. }
+        | crate::ir::Operation::FileWrite { .. }
+        | crate::ir::Operation::FileRemove { .. }
+        | crate::ir::Operation::FileMetadata { .. }
+        | crate::ir::Operation::FileSetMetadata { .. }
+        | crate::ir::Operation::NetworkRequest { .. }
+        | crate::ir::Operation::ClockRead { .. }
+        | crate::ir::Operation::RandomBytes { .. }
+        | crate::ir::Operation::Wait { .. }
+        | crate::ir::Operation::SendSignal { .. }
+        | crate::ir::Operation::TaskCall { .. }
+        | crate::ir::Operation::InterpreterCall { .. }
+        | crate::ir::Operation::OpaqueCapsule { .. } => false,
     }
 }
 
@@ -4038,6 +4132,15 @@ fn emit_go_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> Re
                 ),
                 indent = indent
             ));
+        }
+        crate::ir::Operation::While { condition, body } => {
+            output.push_str(&format!("{indent}for {{\n"));
+            emit_go_node(condition, output, depth + 1)?;
+            output.push_str(&format!(
+                "{indent}\tif deshellLast != 0 {{\n{indent}\t\tdeshellLast = 0\n{indent}\t\tbreak\n{indent}\t}}\n"
+            ));
+            emit_go_node(body, output, depth + 1)?;
+            output.push_str(&format!("{indent}}}\n"));
         }
         crate::ir::Operation::Not { body } => {
             emit_go_node(body, output, depth)?;

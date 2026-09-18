@@ -262,7 +262,8 @@ fn collect_nodes(node: &crate::ir::Node, output: &mut Vec<NodeEvidence>) {
         | crate::ir::Operation::Redirect { body, .. }
         | crate::ir::Operation::CaptureStdout { body, .. }
         | crate::ir::Operation::Spawn { body, .. } => collect_nodes(body, output),
-        crate::ir::Operation::TryFinally { body, finalizer } => {
+        crate::ir::Operation::While { condition: body, body: finalizer }
+        | crate::ir::Operation::TryFinally { body, finalizer } => {
             collect_nodes(body, output);
             collect_nodes(finalizer, output);
         }

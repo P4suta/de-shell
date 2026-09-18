@@ -260,7 +260,7 @@ blocker DESHELL_BLOCKER_UNIMPLEMENTED_SEMANTIC action.yml@3963..6698:
   case "$2" in                                     — implemented
   if [ -n "${INPUT_BINARY_PATH}" ]; then           — implemented (`[` operators)
   if ! "${binary}" --version >"${version_file}"    — implemented (`!`)
-  while [ "$2" = "${delimiter}" ]; do              — `while` is unimplemented
+  while [ "$2" = "${delimiter}" ]; do              — implemented
   if [ ... ] && [[ "${ACTION_REF}" == v* ]]        — `[[` is a bash extension
   expected="$(awk ...)"                            — command substitution
   ```

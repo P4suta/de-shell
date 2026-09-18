@@ -355,6 +355,17 @@ pub(crate) enum Operation {
     Test {
         predicate: TestPredicate,
     },
+    /// `while COND; do BODY; done`.
+    ///
+    /// The loop's exit status is the body's last run, or 0 if the condition was
+    /// false on the first test — which is what the shell reports. Termination is
+    /// not proven here: a loop that never ends is bounded by the run's timeout the
+    /// same way the original script is, and no claim is made that the two stop at
+    /// the same moment.
+    While {
+        condition: Box<Node>,
+        body: Box<Node>,
+    },
     /// `! COMMAND`: the body's exit status inverted to 0 or 1.
     ///
     /// The inversion is to a boolean, not an arithmetic negation: a body that
@@ -475,6 +486,7 @@ impl Operation {
             Self::Sequence { .. } => "sequence",
             Self::Test { .. } => "test",
             Self::Not { .. } => "not",
+            Self::While { .. } => "while",
             Self::Parallel { .. } => "parallel",
             Self::Condition { .. } => "condition",
             Self::Match { .. } => "match",
@@ -801,7 +813,8 @@ fn visit_children_mut<E>(
         | Operation::Redirect { body, .. }
         | Operation::CaptureStdout { body, .. }
         | Operation::Spawn { body, .. } => visit(body)?,
-        Operation::TryFinally { body, finalizer } => {
+        Operation::While { condition: body, body: finalizer }
+        | Operation::TryFinally { body, finalizer } => {
             visit(body)?;
             visit(finalizer)?;
         }
@@ -1045,8 +1058,8 @@ fn validate_node(parts: ValidateNodeArgs<'_>) {
         }
     };
     match &node.operation {
-        // The body is validated by the walk over children; nothing here is its own.
-        Operation::Not { .. } => {}
+        // Children are validated by the walk over them; nothing here is its own.
+        Operation::Not { .. } | Operation::While { .. } => {}
         Operation::Test { predicate } => match predicate {
             TestPredicate::NonEmpty { value } | TestPredicate::Empty { value } => {
                 expression(value, errors);
@@ -1521,6 +1534,9 @@ fn validate_node(parts: ValidateNodeArgs<'_>) {
 fn contains_state_mutation(node: &Node) -> bool {
     match &node.operation {
         Operation::Not { body } => contains_state_mutation(body),
+        Operation::While { condition, body } => {
+            contains_state_mutation(condition) || contains_state_mutation(body)
+        }
         Operation::ExpandWords { .. }
         | Operation::SetVariable { .. }
         | Operation::SetEnvironment { .. }

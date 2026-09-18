@@ -345,6 +345,43 @@ impl Executor<'_> {
             stack,
         } = parts;
         match &node.operation {
+            // The loop's status is the body's last run, or 0 if the condition was
+            // false the first time. Termination is not proven: an endless loop is
+            // bounded by the run's timeout the way the original script is, and no
+            // claim is made that the two stop at the same moment.
+            Operation::While { condition, body } => {
+                let mut aggregate = RunResult::empty();
+                let mut next = context;
+                let mut input = stdin;
+                loop {
+                    let (test, after_test) = self.run_node(RunNodeArgs {
+                        node: condition,
+                        context: next,
+                        stdin: Vec::new(),
+                        stack,
+                    })?;
+                    let passed = test.exit_code == 0;
+                    // The condition's own status is not the loop's: a `while` that
+                    // never enters its body reports 0, not the failing test.
+                    let carried = aggregate.exit_code;
+                    aggregate = combine(aggregate, test);
+                    aggregate.exit_code = carried;
+                    next = after_test;
+                    if !passed {
+                        break;
+                    }
+                    let (result, after_body) = self.run_node(RunNodeArgs {
+                        node: body,
+                        context: next,
+                        stdin: input,
+                        stack,
+                    })?;
+                    input = Vec::new();
+                    aggregate = combine(aggregate, result);
+                    next = after_body;
+                }
+                Ok((aggregate, next))
+            }
             // `! cmd` inverts the status to a boolean: a body that exits 2 makes
             // this exit 0, the same as one that exits 1. Output passes through.
             Operation::Not { body } => {
