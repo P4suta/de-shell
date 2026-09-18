@@ -3693,7 +3693,7 @@ fn node_has_expression_part(
     node: &crate::ir::Node,
     wanted: &dyn Fn(&crate::ir::TextPart) -> bool,
 ) -> bool {
-    let expression = |value: &crate::ir::TextExpression| value.parts.iter().any(|p| wanted(p));
+    let expression = |value: &crate::ir::TextExpression| value.parts.iter().any(wanted);
     match &node.operation {
         crate::ir::Operation::Exec {
             argv,
