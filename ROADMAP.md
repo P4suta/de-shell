@@ -204,7 +204,28 @@ blocker DESHELL_BLOCKER_UNIMPLEMENTED_SEMANTIC action.yml@3963..6698:
   It did not move OComment's composite action, whose five blockers are unchanged
   at three `dynamic expansion or control syntax` and two `shell compound syntax`.
   Redirection was not what those five were waiting on.
-- [ ] Model `case`, `if` and the remaining expansions. These blocked three of six
+- [x] `if COND; then BODY; fi`, with an optional `else`. The statement splitter
+  breaks on `;` and newlines, so a branch arrives as several statements and had
+  to be rejoined; a nested `if`, an `elif` or a missing arm falls through to
+  delegation rather than being lowered from a guess.
+- [ ] What OComment's composite action still needs, which is more than one
+  feature. Its branches are not the shape that was just implemented:
+
+  ```
+  case "$2" in                                     — `case` is unimplemented
+  while [ "$2" = "${delimiter}" ]; do              — `while` is unimplemented
+  if [ -n "${INPUT_BINARY_PATH}" ]; then           — `[` is a shell builtin
+  if ! "${binary}" --version >"${version_file}"    — `!` is delegated
+  if [ ... ] && [[ "${ACTION_REF}" == v* ]]        — `[[` is a bash extension
+  expected="$(awk ...)"                            — command substitution
+  ```
+
+  `[` is the one to weigh first: it is a builtin, so it is refused by name, and
+  nearly every shell conditional goes through it. Treating it as `/bin/test`
+  would make these branches lower, but a builtin `[` and the external one are not
+  the same program, and the difference is exactly the kind this tool exists to
+  report. Modelling its operators (`-n`, `-z`, `-f`, `-e`, `=`, `-ne`) is the
+  honest version and is a table, not a parser. These blocked three of six
   steps in a corpus with no `set` in it, and unlike the above they are missing
   implementation rather than unsettled semantics.
 - [ ] Carry the thirteen `set` semantics cases into the golden corpus. The corpus

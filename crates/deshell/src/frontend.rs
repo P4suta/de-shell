@@ -1265,6 +1265,36 @@ fn set_statement(statement: &str, current: ShellOptions) -> Option<ShellOptions>
     if saw_one { Some(options) } else { None }
 }
 
+/// Where an `if` ends, given the statement that opens it.
+///
+/// Returns the index of the `fi` statement and the indices of the `then` and
+/// optional `else` that divide it. A nested `if`, an `elif`, or a missing arm
+/// yields `None` so the statement is delegated rather than lowered from a guess.
+fn if_arms(source: &str, statements: &[Range], start: usize) -> Option<(usize, usize, Option<usize>)> {
+    let word = |index: usize| source[statements[index].start..statements[index].end].trim();
+    let mut then_at = None;
+    let mut else_at = None;
+    for index in start + 1..statements.len() {
+        let text = word(index);
+        if text == "fi" {
+            return then_at.map(|then| (index, then, else_at));
+        }
+        if text.starts_with("if ") || text.starts_with("elif ") || text == "elif" {
+            // A nested branch needs a stack this does not keep.
+            return None;
+        }
+        if text.starts_with("then") && then_at.is_none() {
+            then_at = Some(index);
+            continue;
+        }
+        if text.starts_with("else") && else_at.is_none() {
+            then_at?;
+            else_at = Some(index);
+        }
+    }
+    None
+}
+
 fn lower_posix(path: &str, source: &str, interpreter: &Interpreter) -> Result<Lowered, String> {
     let statements = shell_statements(source)?;
     let mut inputs = BTreeSet::new();
@@ -1274,11 +1304,99 @@ fn lower_posix(path: &str, source: &str, interpreter: &Interpreter) -> Result<Lo
     // Shell options apply from where they are set onwards, so this travels with
     // the statement cursor rather than being read once for the file.
     let mut options = ShellOptions::default();
-    for range in statements {
+    let mut index = 0;
+    while index < statements.len() {
+        let range = statements[index];
+        index += 1;
         let text = &source[range.start..range.end];
         let trimmed = text.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
+        }
+        // `if COND; then BODY; fi` arrives as several statements because the
+        // splitter breaks on `;` and newlines. Rejoining them here keeps the
+        // branch in the native subset; anything this cannot rejoin — a nested
+        // `if`, an `elif`, a missing arm — falls through and is delegated.
+        if trimmed.starts_with("if ")
+            && let Some((fi_at, then_at, else_at)) = if_arms(source, &statements, index - 1)
+        {
+            let mut branch = |from: usize, to: usize, strip: &str| -> Result<Node, String> {
+                let mut pieces = Vec::new();
+                for statement in &statements[from..to] {
+                    let raw = source[statement.start..statement.end].trim();
+                    let body = raw.strip_prefix(strip).unwrap_or(raw).trim();
+                    if body.is_empty() {
+                        continue;
+                    }
+                    let offset = statement.start
+                        + source[statement.start..statement.end]
+                            .find(body)
+                            .ok_or("branch statement is not inside its range")?;
+                    pieces.push(lower_posix_control(LowerPosixControlArgs {
+                        path,
+                        source,
+                        range: Range {
+                            start: offset,
+                            end: offset + body.len(),
+                        },
+                        interpreter,
+                        inputs: &mut inputs,
+                        environment: &mut environment,
+                        locals: &mut locals,
+                        pipefail: options.pipefail,
+                    })?);
+                }
+                let first = pieces.first().ok_or("branch is empty")?;
+                if pieces.len() == 1 {
+                    return Ok(pieces.remove(0));
+                }
+                let span = cover_spans(
+                    first.source.clone().ok_or("branch span is missing")?,
+                    pieces
+                        .last()
+                        .and_then(|node| node.source.clone())
+                        .ok_or("branch span is missing")?,
+                );
+                Ok(native_node(
+                    Operation::Sequence {
+                        nodes: pieces,
+                        on_failure: if options.errexit {
+                            crate::ir::SequenceFailure::Stop
+                        } else {
+                            crate::ir::SequenceFailure::Continue
+                        },
+                    },
+                    &format!("{}-static-sequence-v1", interpreter.name()),
+                    span,
+                ))
+            };
+            let predicate = branch(index - 1, then_at, "if ");
+            let true_end = else_at.unwrap_or(fi_at);
+            let if_true = branch(then_at, true_end, "then");
+            let if_false = match else_at {
+                Some(at) => branch(at, fi_at, "else").map(Some),
+                None => Ok(None),
+            };
+            if let (Ok(predicate), Ok(if_true), Ok(if_false)) = (predicate, if_true, if_false) {
+                let span = span_for_range(
+                    path,
+                    source,
+                    statements[index - 1].start,
+                    statements[fi_at].end,
+                )?;
+                nodes.push(native_node(
+                    Operation::Condition {
+                        predicate: Box::new(predicate),
+                        if_true: Box::new(if_true),
+                        if_false: if_false.map(Box::new),
+                    },
+                    &format!("{}-static-condition-v1", interpreter.name()),
+                    span,
+                ));
+                index = fi_at + 1;
+                continue;
+            }
+            return Err("shell compound syntax requires pinned interpreter delegation".into());
         }
         if let Some(updated) = set_statement(trimmed, options) {
             // A `set` is a change of lowering state, not an operation: it emits no
@@ -3894,6 +4012,51 @@ mod tests {
                 fallback: String::new(),
                 empty_is_unset: true,
             }]
+        );
+    }
+
+    #[test]
+    fn an_if_statement_lowers_to_a_condition() {
+        // `Operation::Condition` has been in the IR from the start. `if` was
+        // refused as compound syntax, so every CI step that branches — which is
+        // most of them — was delegated whole.
+        let node = body(
+            "build.sh",
+            b"if /bin/test x = x; then /bin/echo yes; fi\n",
+        );
+        let Operation::Condition {
+            predicate,
+            if_true,
+            if_false,
+        } = &node.operation
+        else {
+            panic!("expected condition: {node:#?}")
+        };
+        assert!(matches!(predicate.operation, Operation::Exec { .. }));
+        assert!(matches!(if_true.operation, Operation::Exec { .. }));
+        assert!(if_false.is_none());
+
+        // With an `else` arm.
+        let node = body(
+            "build.sh",
+            b"if /bin/test x = x; then /bin/echo yes; else /bin/echo no; fi\n",
+        );
+        let Operation::Condition { if_false, .. } = &node.operation else {
+            panic!("expected condition")
+        };
+        assert!(
+            if_false.is_some(),
+            "the else arm must survive: {node:#?}"
+        );
+
+        // A form this does not model stays delegated rather than being guessed at.
+        let node = body(
+            "build.sh",
+            b"if /bin/test x = x; then /bin/echo a; elif /bin/test y = y; then /bin/echo b; fi\n",
+        );
+        assert!(
+            matches!(node.operation, Operation::InterpreterCall { .. }),
+            "elif is not modelled and must delegate: {node:#?}"
         );
     }
 
