@@ -286,6 +286,38 @@ blocker DESHELL_BLOCKER_UNIMPLEMENTED_SEMANTIC action.yml@3963..6698:
   contained no `set` at all, which is why none of this surfaced until the tool
   was pointed at a repository that was not its own.
 
+## `==` against an enum is outside the exhaustiveness check
+
+From the OComment session, on finding two of nine call sites left behind when a
+variant was added:
+
+> `match` は守ってくれるが `==` は守ってくれない。同じ型でも書き方で安全性が変わる。
+
+`cargo xtask enum-equality` finds every `==` or `!=` against a variant of an
+enum this repository declares, outside tests and comments, and reports the ones
+whose type has more than two variants. With two, `!= A` is `== B` and there is
+nowhere for a third answer to hide; with three there is, and the compiler stops
+helping exactly where the question gets harder.
+
+Twenty-six today:
+
+| type | sites |
+| --- | --- |
+| `FindingKind` | 10 |
+| `EvidenceStatus` | 5 |
+| `ReviewStatus` | 4 |
+| `OutputFormat` | 2 |
+| six others | 1 each |
+
+`MigrationTarget` was the first fixed, and the shape is the remedy for all of
+them: not rewriting the comparison but asking the question once, in a method
+whose body is a `match`, so a variant added later does not compile until
+somebody answers for it.
+
+- [ ] Drive the twenty-six to zero, then wire the gate into `mise run lint` so
+  it fails rather than reports. It reports today because a gate that fails on
+  twenty-six pre-existing sites is a gate somebody suppresses.
+
 ## What one real `action.yml` still needs
 
 Five `run:` blocks, 22 KiB, measured after each change rather than once.

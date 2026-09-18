@@ -664,8 +664,7 @@ pub(crate) fn create_plan(root: &Path) -> Result<PlanOutput, String> {
                     end_byte: reference.span.end_byte,
                 })
                 .collect::<Vec<_>>();
-            if kind == SourceKind::EmbeddedShell
-                && selection.target != crate::config::MigrationTarget::Host
+            if kind == SourceKind::EmbeddedShell && !selection.target.rewrites_the_source_in_place()
             {
                 blockers.push(Blocker {
                     code: "DESHELL_BLOCKER_UNSUPPORTED_HOST_REWRITE".into(),
@@ -1092,7 +1091,7 @@ fn build_request_and_proposal(
         // — so two of them describe the same file twice rather than a file
         // twice rewritten. Saying which of the two it is, is the difference
         // between "this cannot be done" and "this is what has to change".
-        if selection.target == crate::config::MigrationTarget::Host {
+        if selection.target.rewrites_the_source_in_place() {
             return Err(format!(
                 "DESHELL_BLOCKER_DUPLICATE_TARGET: {target} holds more than one shell block, and a host rewrite replaces the whole file; the blocks have to be rewritten together rather than one at a time"
             ));

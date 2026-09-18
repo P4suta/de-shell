@@ -40,6 +40,23 @@ pub(crate) enum MigrationTarget {
     Agent,
 }
 
+impl MigrationTarget {
+    /// Whether this target rewrites the source file in place rather than
+    /// writing a program beside it.
+    ///
+    /// A method rather than `== MigrationTarget::Host` at each site: `==` is
+    /// outside the exhaustiveness check a `match` gets, so a target added later
+    /// compiles everywhere and answers "no" everywhere. Asking here means the
+    /// question is answered once, and a new target does not compile until it
+    /// is.
+    pub(crate) fn rewrites_the_source_in_place(self) -> bool {
+        match self {
+            Self::Host => true,
+            Self::Rust | Self::Go | Self::Agent => false,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ExternalGenerator {

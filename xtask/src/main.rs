@@ -842,6 +842,166 @@ fn run_shell_variables(root: &Path) -> Result<(), Vec<String>> {
     Err(errors)
 }
 
+/// Refuse `==` against an enum that has more than two variants.
+///
+/// A `match` is checked for exhaustiveness and `==` is not, so a variant added
+/// later compiles at every comparison and answers "no" at every one of them.
+/// With two variants the two forms say the same thing, because `!= A` is `== B`
+/// and there is nowhere for a third answer to hide. With three there is, and
+/// the compiler stops helping exactly when the question gets harder.
+///
+/// The remedy is not to rewrite the comparison but to ask the question once, in
+/// a method whose body is a `match` — which is what `MigrationTarget` does.
+fn run_enum_equality(root: &Path) -> Result<(), Vec<String>> {
+    let mut variants: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut comparisons: Vec<(String, String, usize)> = Vec::new();
+    for entry in walk_rust_sources(root)? {
+        let text = std::fs::read_to_string(&entry)
+            .map_err(|error| vec![format!("cannot read {}: {error}", entry.display())])?;
+        let mut current: Option<(String, usize)> = None;
+        // A comparison inside a test module is a test comparing a value against
+        // an expected variant. A new variant makes such a test weaker, not
+        // wrong: the behaviour it guards is in the code above, which is what
+        // this gate is about.
+        let tests_begin = text
+            .find("\n#[cfg(test)]\n")
+            .map_or(usize::MAX, |index| text[..index].lines().count());
+        for (number, line) in text.lines().enumerate() {
+            if number >= tests_begin {
+                break;
+            }
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed
+                .strip_prefix("pub(crate) enum ")
+                .or_else(|| trimmed.strip_prefix("enum "))
+                && let Some(name) = rest.split_whitespace().next()
+                && trimmed.ends_with('{')
+            {
+                current = Some((name.trim_end_matches('{').trim().to_owned(), 0));
+                continue;
+            }
+            if let Some((name, count)) = current.as_mut() {
+                if trimmed == "}" {
+                    variants.insert(name.clone(), *count);
+                    current = None;
+                    continue;
+                }
+                // A variant line is an identifier that starts a line, with or
+                // without a payload. Anything else is a field or an attribute.
+                let head = trimmed.trim_end_matches(&[',', '{'][..]).trim();
+                if !head.is_empty()
+                    && head
+                        .chars()
+                        .next()
+                        .is_some_and(|character| character.is_ascii_uppercase())
+                    && head
+                        .chars()
+                        .all(|character| character.is_ascii_alphanumeric() || character == '_')
+                {
+                    *count += 1;
+                }
+            }
+            // A comment mentioning `==` is talking about the rule, not
+            // branching on one; an assertion compares a value against an
+            // expected variant, which is what a test is for and where a third
+            // answer cannot hide — the assertion fails either way.
+            if trimmed.starts_with("//")
+                || trimmed.starts_with("///")
+                || trimmed.contains("assert_eq!")
+                || trimmed.contains("assert_ne!")
+            {
+                continue;
+            }
+            for marker in ["== ", "!= "] {
+                let Some(position) = line.find(marker) else {
+                    continue;
+                };
+                let rest = line[position + marker.len()..].trim();
+                let Some(path) = rest
+                    .split(|character: char| {
+                        !character.is_ascii_alphanumeric() && character != '_' && character != ':'
+                    })
+                    .next()
+                else {
+                    continue;
+                };
+                let segments: Vec<&str> = path.split("::").collect();
+                if segments.len() < 2 {
+                    continue;
+                }
+                let type_name = segments[segments.len() - 2];
+                let variant = segments[segments.len() - 1];
+                if !type_name
+                    .chars()
+                    .next()
+                    .is_some_and(|character| character.is_ascii_uppercase())
+                    || !variant
+                        .chars()
+                        .next()
+                        .is_some_and(|character| character.is_ascii_uppercase())
+                {
+                    continue;
+                }
+                comparisons.push((
+                    type_name.to_owned(),
+                    format!("{}:{}", entry.display(), number + 1),
+                    0,
+                ));
+            }
+        }
+    }
+    let mut errors = Vec::new();
+    let mut checked = 0_usize;
+    for (type_name, where_, _) in &comparisons {
+        let Some(count) = variants.get(type_name) else {
+            // A type declared elsewhere — `std`, a dependency — is not this
+            // repository's to answer for.
+            continue;
+        };
+        checked += 1;
+        if *count > 2 {
+            errors.push(format!(
+                "{where_}: `==` against {type_name}, which has {count} variants; ask the question in a method whose body is a `match`"
+            ));
+        }
+    }
+    // Reported rather than failed, for now: twenty-six sites predate the rule,
+    // and a gate that fails on all of them is a gate somebody suppresses. The
+    // count is in ROADMAP.md with the work to drive it to zero.
+    println!(
+        "{} of {checked} enum comparison(s) are against a type with more than two variants",
+        errors.len()
+    );
+    for error in &errors {
+        println!("  {error}");
+    }
+    Ok(())
+}
+
+/// Every `.rs` file this repository owns.
+fn walk_rust_sources(root: &Path) -> Result<Vec<std::path::PathBuf>, Vec<String>> {
+    let mut sources = Vec::new();
+    for directory in ["crates", "xtask"] {
+        let mut stack = vec![root.join(directory)];
+        while let Some(path) = stack.pop() {
+            let entries = std::fs::read_dir(&path)
+                .map_err(|error| vec![format!("cannot read {}: {error}", path.display())])?;
+            for entry in entries {
+                let entry =
+                    entry.map_err(|error| vec![format!("cannot read an entry: {error}")])?;
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|extension| extension == "rs") {
+                    sources.push(path);
+                }
+            }
+        }
+    }
+    sources.sort();
+    Ok(sources)
+}
+
 fn run_test_semantics(root: &Path) -> Result<(), Vec<String>> {
     let path = root.join("contracts/golden/test-builtin-semantics-v1.json");
     let raw = std::fs::read_to_string(&path)
@@ -1922,6 +2082,7 @@ fn dispatch(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Vec<Str
         Some("printf-semantics") => run_printf_semantics(root),
         Some("case-patterns") => run_case_patterns(root),
         Some("shell-variables") => run_shell_variables(root),
+        Some("enum-equality") => run_enum_equality(root),
         Some("validate-contracts") => validate_contract_tree(root).map(|_| ()),
         Some("performance") => {
             let binary = arguments
