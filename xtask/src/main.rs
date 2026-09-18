@@ -175,6 +175,78 @@ fn run_bash_semantics(root: &Path) -> Result<(), Vec<String>> {
     Ok(())
 }
 
+/// Measure the modelled `test` operators against the shell builtin and the
+/// external utility, and report every case where either disagrees with the
+/// recording or with the other.
+///
+/// The builtin is what de-shell models, since `[` never reaches the PATH lookup.
+/// The external utility is measured alongside it because an operator where the
+/// two disagree is a difference this tool exists to report rather than model
+/// away — and because a table checked only against its author's reading of the
+/// specification is not checked at all.
+fn run_test_semantics(root: &Path) -> Result<(), Vec<String>> {
+    let path = root.join("contracts/golden/test-builtin-semantics-v1.json");
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|error| vec![format!("cannot read {}: {error}", path.display())])?;
+    let corpus: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|error| vec![format!("malformed corpus: {error}")])?;
+    let cases = corpus["cases"]
+        .as_array()
+        .ok_or_else(|| vec!["corpus has no cases array".to_owned()])?;
+    if cases.is_empty() {
+        return Err(vec!["corpus is empty".to_owned()]);
+    }
+    let mut differences = 0_usize;
+    for case in cases {
+        let name = case["name"]
+            .as_str()
+            .ok_or_else(|| vec!["case has no name".to_owned()])?;
+        let expected = case["expected"]
+            .as_i64()
+            .ok_or_else(|| vec!["case has no expected".to_owned()])?;
+        let operands = case["operands"]
+            .as_array()
+            .ok_or_else(|| vec!["case has no operands".to_owned()])?
+            .iter()
+            .map(|value| value.as_str().unwrap_or_default().to_owned())
+            .collect::<Vec<_>>();
+        let quoted = operands
+            .iter()
+            .map(|operand| format!("'{}'", operand.replace('\'', "'\\''")))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let builtin = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!("[ {quoted} ]"))
+            .status()
+            .map_err(|error| vec![format!("cannot run bash for {name}: {error}")])?;
+        let external = std::process::Command::new("test")
+            .args(&operands)
+            .status()
+            .map_err(|error| vec![format!("cannot run test for {name}: {error}")])?;
+        let builtin_code = i64::from(builtin.code().unwrap_or(-1));
+        let external_code = i64::from(external.code().unwrap_or(-1));
+        if builtin_code == expected && external_code == expected {
+            continue;
+        }
+        differences += 1;
+        println!(
+            "differs  {name}: expected {expected}, builtin {builtin_code}, external {external_code}"
+        );
+    }
+    if differences == 0 {
+        println!(
+            "{} operator case(s) agree between the builtin, the external utility and the recording",
+            cases.len()
+        );
+        return Ok(());
+    }
+    Err(vec![format!(
+        "{differences} of {} operator case(s) disagree; the table does not describe what runs",
+        cases.len()
+    )])
+}
+
 fn validate_contract_tree(_root: &Path) -> Result<CliContract, Vec<String>> {
     let root = _root;
     let mut errors = Vec::new();
@@ -1184,6 +1256,7 @@ fn dispatch(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Vec<Str
             run_conformance(root, &binary)
         }
         Some("bash-semantics") => run_bash_semantics(root),
+        Some("test-semantics") => run_test_semantics(root),
         Some("validate-contracts") => validate_contract_tree(root).map(|_| ()),
         Some("performance") => {
             let binary = arguments

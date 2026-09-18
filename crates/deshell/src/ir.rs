@@ -215,8 +215,41 @@ impl SourceBytes {
     }
 }
 
+/// A POSIX `test` predicate, as written with `test` or `[`.
+///
+/// Only the string operators are modelled. The file predicates (`-e`, `-f`,
+/// `-d`) are not, because the runner has no way to ask about a path: the
+/// `FileMetadata` operation reports that the capability is unavailable, and
+/// answering from the host would be the wrong filesystem for a disposable run.
+/// Every other operator — `-nt`, `-ef`, the arithmetic comparisons, `!`, `-a`,
+/// `-o` — is likewise left to delegation rather than approximated by a
+/// neighbouring one, which would answer a different question.
+///
+/// `[` is a shell builtin, not the external `test` utility, and lowering it to
+/// an `Exec` of `/bin/test` would be a rewrite rather than a lowering: the two
+/// are separate programs that agree on exit status and differ in everything
+/// else, including whether a process is created at all.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, rename_all = "snake_case", tag = "kind")]
+pub(crate) enum TestPredicate {
+    /// `-n STRING`: the string has non-zero length.
+    NonEmpty { value: TextExpression },
+    /// `-z STRING`: the string has zero length.
+    Empty { value: TextExpression },
+    /// `STRING = STRING`.
+    StringEqual {
+        left: TextExpression,
+        right: TextExpression,
+    },
+    /// `STRING != STRING`.
+    StringNotEqual {
+        left: TextExpression,
+        right: TextExpression,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
 pub(crate) struct MatchCase {
     pub pattern: TextExpression,
     pub body: Node,
@@ -317,6 +350,10 @@ pub(crate) enum Operation {
         predicate: Box<Node>,
         if_true: Box<Node>,
         if_false: Option<Box<Node>>,
+    },
+    /// A `test` / `[` predicate. Succeeds with exit status 0, fails with 1.
+    Test {
+        predicate: TestPredicate,
     },
     Match {
         value: TextExpression,
@@ -429,6 +466,7 @@ impl Operation {
             Self::Redirect { .. } => "redirect",
             Self::Pipeline { .. } => "pipeline",
             Self::Sequence { .. } => "sequence",
+            Self::Test { .. } => "test",
             Self::Parallel { .. } => "parallel",
             Self::Condition { .. } => "condition",
             Self::Match { .. } => "match",
@@ -766,6 +804,7 @@ fn visit_children_mut<E>(
         | Operation::SetWorkingDirectory { .. }
         | Operation::Wait { .. }
         | Operation::SendSignal { .. }
+        | Operation::Test { .. }
         | Operation::FileRead { .. }
         | Operation::FileWrite { .. }
         | Operation::FileRemove { .. }
@@ -997,6 +1036,16 @@ fn validate_node(parts: ValidateNodeArgs<'_>) {
         }
     };
     match &node.operation {
+        Operation::Test { predicate } => match predicate {
+            TestPredicate::NonEmpty { value } | TestPredicate::Empty { value } => {
+                expression(value, errors);
+            }
+            TestPredicate::StringEqual { left, right }
+            | TestPredicate::StringNotEqual { left, right } => {
+                expression(left, errors);
+                expression(right, errors);
+            }
+        },
         Operation::Exec {
             argv,
             environment,
@@ -1495,6 +1544,7 @@ fn contains_state_mutation(node: &Node) -> bool {
         }
         Operation::Exec { .. }
         | Operation::TaskCall { .. }
+        | Operation::Test { .. }
         | Operation::FileRead { .. }
         | Operation::FileWrite { .. }
         | Operation::FileRemove { .. }

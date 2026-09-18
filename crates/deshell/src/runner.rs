@@ -345,6 +345,32 @@ impl Executor<'_> {
             stack,
         } = parts;
         match &node.operation {
+            // `test` succeeds with 0 and fails with 1, and produces no output.
+            Operation::Test { predicate } => {
+                let truth = match predicate {
+                    crate::ir::TestPredicate::NonEmpty { value } => {
+                        !evaluate(value, &context)?.is_empty()
+                    }
+                    crate::ir::TestPredicate::Empty { value } => {
+                        evaluate(value, &context)?.is_empty()
+                    }
+                    crate::ir::TestPredicate::StringEqual { left, right } => {
+                        evaluate(left, &context)? == evaluate(right, &context)?
+                    }
+                    crate::ir::TestPredicate::StringNotEqual { left, right } => {
+                        evaluate(left, &context)? != evaluate(right, &context)?
+                    }
+                };
+                Ok((
+                    RunResult {
+                        exit_code: i32::from(!truth),
+                        stdout: vec![],
+                        stderr: vec![],
+                        trace: vec![],
+                    },
+                    context,
+                ))
+            }
             Operation::Exec {
                 argv,
                 environment,

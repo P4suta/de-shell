@@ -265,6 +265,7 @@ fn visit_children<'a>(node: &'a Node, mut visit: impl FnMut(&'a Node)) {
         | Operation::SetWorkingDirectory { .. }
         | Operation::Wait { .. }
         | Operation::SendSignal { .. }
+        | Operation::Test { .. }
         | Operation::FileRead { .. }
         | Operation::FileWrite { .. }
         | Operation::FileRemove { .. }

@@ -365,7 +365,8 @@ fn rebind_source_path(plan: &mut Plan, from: &str, to: &str) -> Result<(), Strin
             | Operation::SetWorkingDirectory { .. }
             | Operation::Wait { .. }
             | Operation::SendSignal { .. }
-            | Operation::FileRead { .. }
+            | Operation::Test { .. }
+        | Operation::FileRead { .. }
             | Operation::FileWrite { .. }
             | Operation::FileRemove { .. }
             | Operation::FileMetadata { .. }
@@ -812,6 +813,7 @@ fn bind_node_pin(node: &mut Node, pins: &crate::config::InterpreterPins) -> Resu
         | Operation::SetWorkingDirectory { .. }
         | Operation::Wait { .. }
         | Operation::SendSignal { .. }
+        | Operation::Test { .. }
         | Operation::FileRead { .. }
         | Operation::FileWrite { .. }
         | Operation::FileRemove { .. }
@@ -1940,6 +1942,32 @@ fn lower_posix_simple(parts: LowerPosixSimpleArgs<'_>) -> Result<Node, String> {
         ));
     }
 
+    // `[ ... ]` has to be recognised before tokenizing, because `[` and `]` are in
+    // the glob character set the tokenizer refuses. The brackets are the builtin's
+    // syntax here, not a pattern.
+    let statement = source[range.start..range.end].trim();
+    if let Some(inner) = statement
+        .strip_prefix("[ ")
+        .and_then(|rest| rest.strip_suffix(" ]"))
+    {
+        let offset = range.start
+            + source[range.start..range.end]
+                .find(inner)
+                .ok_or("test operands are not inside their range")?;
+        let operands = tokenize_posix(
+            &source[offset..offset + inner.len()],
+            inputs,
+            environment,
+            locals,
+        )?;
+        let predicate = test_predicate(&operands)
+            .ok_or("unmodelled test operator requires pinned interpreter delegation")?;
+        return Ok(native_node(
+            Operation::Test { predicate },
+            &format!("{}-static-test-v1", interpreter.name()),
+            span_for_range(path, source, range.start, range.end)?,
+        ));
+    }
     let (command, redirections) = split_redirections(&source[range.start..range.end])?;
     let words = tokenize_posix(&command, inputs, environment, locals)?;
     if words.is_empty() {
@@ -1947,6 +1975,18 @@ fn lower_posix_simple(parts: LowerPosixSimpleArgs<'_>) -> Result<Node, String> {
     }
     let executable = literal_expression(&words[0])
         .ok_or("dynamic executable requires pinned interpreter delegation")?;
+    if executable == "test" {
+        // `test` is a builtin, so it never reaches the shell's PATH lookup.
+        // Modelling its operators is what keeps a conditional native; lowering it
+        // to an `Exec` of `/bin/test` would substitute a different program.
+        let predicate = test_predicate(&words[1..])
+            .ok_or("unmodelled test operator requires pinned interpreter delegation")?;
+        return Ok(native_node(
+            Operation::Test { predicate },
+            &format!("{}-static-test-v1", interpreter.name()),
+            span_for_range(path, source, range.start, range.end)?,
+        ));
+    }
     if shell_builtin(&executable) {
         return Err(format!(
             "shell builtin {executable} requires pinned interpreter delegation"
@@ -1994,6 +2034,38 @@ fn lower_posix_simple(parts: LowerPosixSimpleArgs<'_>) -> Result<Node, String> {
         &format!("{}-explicit-redirection-v1", interpreter.name()),
         span,
     ))
+}
+
+/// Map a `test` operand list onto a modelled predicate.
+///
+/// Returns `None` for anything not in the table, including the file predicates,
+/// negation, and the `-a`/`-o` connectives. An operator answered by a
+/// neighbouring one would answer a different question, so the statement is
+/// delegated instead.
+fn test_predicate(operands: &[TextExpression]) -> Option<crate::ir::TestPredicate> {
+    match operands {
+        [flag, value] => match literal_expression(flag)?.as_str() {
+            "-n" => Some(crate::ir::TestPredicate::NonEmpty {
+                value: value.clone(),
+            }),
+            "-z" => Some(crate::ir::TestPredicate::Empty {
+                value: value.clone(),
+            }),
+            _ => None,
+        },
+        [left, operator, right] => match literal_expression(operator)?.as_str() {
+            "=" => Some(crate::ir::TestPredicate::StringEqual {
+                left: left.clone(),
+                right: right.clone(),
+            }),
+            "!=" => Some(crate::ir::TestPredicate::StringNotEqual {
+                left: left.clone(),
+                right: right.clone(),
+            }),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn shell_builtin(executable: &str) -> bool {
@@ -4144,6 +4216,53 @@ mod tests {
                 fallback: String::new(),
                 empty_is_unset: true,
             }]
+        );
+    }
+
+    #[test]
+    fn a_test_builtin_lowers_to_a_modelled_predicate() {
+        // `[` is a shell builtin and was refused by name, which stopped nearly
+        // every shell conditional: the branch shape is implemented, but its
+        // condition is written with `[` almost every time.
+        //
+        // Lowering it to `/bin/test` instead would be a rewrite, not a lowering —
+        // the builtin and the external utility are not the same program — so the
+        // operators are modelled directly.
+        let node = body("build.sh", b"[ -n \"$VALUE\" ]\n");
+        let Operation::Test { predicate } = &node.operation else {
+            panic!("expected test: {node:#?}")
+        };
+        assert_eq!(
+            predicate,
+            &crate::ir::TestPredicate::NonEmpty {
+                value: crate::ir::TextExpression {
+                    parts: vec![TextPart::Variable {
+                        name: "VALUE".into()
+                    }]
+                }
+            }
+        );
+
+        let node = body("build.sh", b"[ \"$A\" = \"b\" ]\n");
+        let Operation::Test { predicate } = &node.operation else {
+            panic!("expected test")
+        };
+        assert!(matches!(
+            predicate,
+            crate::ir::TestPredicate::StringEqual { .. }
+        ));
+
+        // `-f` is not modelled: the runner cannot ask about a path, so answering
+        // would mean answering about the wrong filesystem.
+        let node = body("build.sh", b"[ -f \"$PATHNAME\" ]\n");
+        assert!(matches!(node.operation, Operation::InterpreterCall { .. }));
+
+        // An operator this does not model keeps the statement delegated rather
+        // than being approximated by a neighbouring one.
+        let node = body("build.sh", b"[ \"$A\" -nt \"$B\" ]\n");
+        assert!(
+            matches!(node.operation, Operation::InterpreterCall { .. }),
+            "an unmodelled operator must delegate: {node:#?}"
         );
     }
 
