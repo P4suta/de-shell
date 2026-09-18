@@ -272,8 +272,10 @@ blocker DESHELL_BLOCKER_UNIMPLEMENTED_SEMANTIC action.yml@3963..6698:
   The map and its lookup helper are emitted together: one without the other is a
   program that does not compile.
 
-  The Go generator still refuses both, so a script that assigns to a name is
-  Rust-only for now.
+  The Go generator does the same: `deshellVars` holds the locals, `deshellLookup`
+  consults them before the environment, and `strings` is imported only when a
+  capture needs it, since Go rejects an unused import outright. Verified by
+  generating, running `go vet`, building, and comparing output with the shell.
 
   `[` was the one that gated the most and is done: its string operators are
   modelled, measured against the builtin and the external utility, and recorded

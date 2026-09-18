@@ -3817,6 +3817,65 @@ fn emit_rust_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> 
     Ok(())
 }
 
+/// Whether the tree contains a `CaptureStdout`.
+///
+/// Reuses the shape `rust_node_sets_variables` walks, narrowed to the one
+/// operation whose generated Go needs an extra import.
+fn node_captures_stdout(node: &crate::ir::Node) -> bool {
+    if matches!(node.operation, crate::ir::Operation::CaptureStdout { .. }) {
+        return true;
+    }
+    match &node.operation {
+        crate::ir::Operation::Sequence { nodes, .. }
+        | crate::ir::Operation::Pipeline { nodes, .. }
+        | crate::ir::Operation::Parallel { nodes } => nodes.iter().any(node_captures_stdout),
+        crate::ir::Operation::Condition {
+            predicate,
+            if_true,
+            if_false,
+        } => {
+            node_captures_stdout(predicate)
+                || node_captures_stdout(if_true)
+                || if_false.as_deref().is_some_and(node_captures_stdout)
+        }
+        crate::ir::Operation::While { condition, body } => {
+            node_captures_stdout(condition) || node_captures_stdout(body)
+        }
+        crate::ir::Operation::TryFinally { body, finalizer } => {
+            node_captures_stdout(body) || node_captures_stdout(finalizer)
+        }
+        crate::ir::Operation::Match { cases, default, .. } => {
+            cases.iter().any(|case| node_captures_stdout(&case.body))
+                || default.as_deref().is_some_and(node_captures_stdout)
+        }
+        crate::ir::Operation::Not { body }
+        | crate::ir::Operation::Redirect { body, .. }
+        | crate::ir::Operation::Foreach { body, .. }
+        | crate::ir::Operation::Scope { body, .. }
+        | crate::ir::Operation::CaptureStdout { body, .. }
+        | crate::ir::Operation::Spawn { body, .. } => node_captures_stdout(body),
+        crate::ir::Operation::Exec { .. }
+        | crate::ir::Operation::Test { .. }
+        | crate::ir::Operation::ExpandWords { .. }
+        | crate::ir::Operation::SetVariable { .. }
+        | crate::ir::Operation::SetEnvironment { .. }
+        | crate::ir::Operation::SetWorkingDirectory { .. }
+        | crate::ir::Operation::FileRead { .. }
+        | crate::ir::Operation::FileWrite { .. }
+        | crate::ir::Operation::FileRemove { .. }
+        | crate::ir::Operation::FileMetadata { .. }
+        | crate::ir::Operation::FileSetMetadata { .. }
+        | crate::ir::Operation::NetworkRequest { .. }
+        | crate::ir::Operation::ClockRead { .. }
+        | crate::ir::Operation::RandomBytes { .. }
+        | crate::ir::Operation::Wait { .. }
+        | crate::ir::Operation::SendSignal { .. }
+        | crate::ir::Operation::TaskCall { .. }
+        | crate::ir::Operation::InterpreterCall { .. }
+        | crate::ir::Operation::OpaqueCapsule { .. } => false,
+    }
+}
+
 /// Whether the tree assigns to a shell-local name.
 fn rust_node_sets_variables(node: &crate::ir::Node) -> bool {
     if matches!(
@@ -4246,27 +4305,61 @@ fn generate_go(plan: &crate::ir::Plan) -> Result<Vec<u8>, String> {
     } else {
         ""
     };
-    // `os.Getenv` returns "" for both unset and empty, which is the distinction
-    // `${x-d}` turns on, so the two forms need separate helpers.
-    let default_helper = if go_node_uses_defaults(&task.body) {
+    // A shell-local name is not an environment variable, so the generated program
+    // keeps its own map and consults it first — the order the shell resolves in.
+    // `os.Getenv` cannot tell unset from empty, which is the distinction `${x-d}`
+    // turns on, so the two default forms stay separate.
+    let go_uses_plain = node_has_expression_part(&task.body, &|part| {
+        matches!(part, crate::ir::TextPart::Variable { .. })
+    });
+    let go_uses_defaults = go_node_uses_defaults(&task.body);
+    let go_sets_variables = rust_node_sets_variables(&task.body);
+    let lookup_helper = if go_uses_plain || go_uses_defaults {
         concat!(
-            "func deshellDefaultEmpty(name string, fallback string) string {\n",
-            "\tif value := os.Getenv(name); value != \"\" {\n\t\treturn value\n\t}\n",
+            "func deshellLookup(locals map[string]string, name string) (string, bool) {\n",
+            "\tif value, ok := locals[name]; ok {\n\t\treturn value, true\n\t}\n",
+            "\treturn os.LookupEnv(name)\n",
+            "}\n\n",
+            "func deshellValue(locals map[string]string, name string) string {\n",
+            "\tvalue, _ := deshellLookup(locals, name)\n",
+            "\treturn value\n",
+            "}\n\n"
+        )
+    } else {
+        ""
+    };
+    let default_helper = if go_uses_defaults {
+        concat!(
+            "func deshellDefaultEmpty(locals map[string]string, name string, fallback string) string {\n",
+            "\tif value, _ := deshellLookup(locals, name); value != \"\" {\n\t\treturn value\n\t}\n",
             "\treturn fallback\n",
             "}\n\n",
-            "func deshellDefaultUnset(name string, fallback string) string {\n",
-            "\tif value, ok := os.LookupEnv(name); ok {\n\t\treturn value\n\t}\n",
+            "func deshellDefaultUnset(locals map[string]string, name string, fallback string) string {\n",
+            "\tif value, ok := deshellLookup(locals, name); ok {\n\t\treturn value\n\t}\n",
             "\treturn fallback\n",
             "}\n\n"
         )
     } else {
         ""
     };
+    let variable_binding = if go_uses_plain || go_uses_defaults || go_sets_variables {
+        "\tdeshellVars := map[string]string{}\n"
+    } else {
+        ""
+    };
+    // Go rejects an unused import outright, so `strings` appears only when a
+    // capture is emitted — which is the only thing that trims.
+    let go_captures = node_captures_stdout(&task.body);
+    let imports = if go_captures {
+        "import (\n\t\"fmt\"\n\t\"os\"\n\t\"os/exec\"\n\t\"strings\"\n)\n\n"
+    } else {
+        "import (\n\t\"fmt\"\n\t\"os\"\n\t\"os/exec\"\n)\n\n"
+    };
     let source = format!(
         concat!(
             "// Code generated by de-shell. This file has no de-shell runtime dependency.\n",
             "package main\n\n",
-            "import (\n\t\"fmt\"\n\t\"os\"\n\t\"os/exec\"\n)\n\n",
+            "{imports}",
             "func deshellExitCode(err error) int {{\n",
             "\tif err == nil {{\n\t\treturn 0\n\t}}\n",
             "\tif exit, ok := err.(*exec.ExitError); ok {{\n\t\treturn exit.ExitCode()\n\t}}\n",
@@ -4274,18 +4367,22 @@ fn generate_go(plan: &crate::ir::Plan) -> Result<Vec<u8>, String> {
             "\treturn 127\n",
             "}}\n\n",
             "{pipeline_helper}",
-            "{argument_helper}{default_helper}",
+            "{argument_helper}{lookup_helper}{default_helper}",
             "func main() {{\n",
             "{argument_binding}",
+            "{variable_binding}",
             "\tdeshellLast := 0\n",
             "{body}",
             "\tos.Exit(deshellLast)\n",
             "}}\n"
         ),
+        imports = imports,
         pipeline_helper = pipeline_helper,
         argument_helper = argument_helper,
+        lookup_helper = lookup_helper,
         default_helper = default_helper,
         argument_binding = argument_binding,
+        variable_binding = variable_binding,
         body = body,
     );
     Ok(source.into_bytes())
@@ -4422,6 +4519,48 @@ fn emit_go_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> Re
             }
             output.push_str(&format!("{indent}}}\n"));
         }
+        crate::ir::Operation::SetVariable { name, value, .. } => {
+            output.push_str(&format!(
+                "{indent}deshellVars[{}] = {}\n{indent}deshellLast = 0\n",
+                go_string(name)?,
+                go_expression(value)?
+            ));
+        }
+        crate::ir::Operation::CaptureStdout { name, body, .. } => {
+            let crate::ir::Operation::Exec {
+                argv,
+                environment,
+                working_directory,
+            } = &body.operation
+            else {
+                return Err(
+                    "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: capture supports only a simple command"
+                        .into(),
+                );
+            };
+            output.push_str(&format!("{indent}{{\n"));
+            emit_go_command(EmitGoCommandArgs {
+                argv,
+                environment,
+                working_directory: working_directory.as_ref(),
+                variable: "deshellCommand",
+                output,
+                depth: depth + 1,
+            })?;
+            // The shell strips trailing newlines from a substitution and nothing
+            // else, so `TrimRight(.., "\n")` is right where `TrimSpace` is not.
+            output.push_str(&format!(
+                concat!(
+                    "{indent}\tdeshellCommand.Stderr = os.Stderr\n",
+                    "{indent}\tdeshellOut, deshellErr := deshellCommand.Output()\n",
+                    "{indent}\tdeshellLast = deshellExitCode(deshellErr)\n",
+                    "{indent}\tdeshellVars[{name}] = strings.TrimRight(string(deshellOut), \"\\n\")\n",
+                    "{indent}}}\n"
+                ),
+                indent = indent,
+                name = go_string(name)?
+            ));
+        }
         other => {
             return Err(format!(
                 "generator cannot preserve {} semantics yet",
@@ -4510,7 +4649,7 @@ fn go_expression(expression: &crate::ir::TextExpression) -> Result<String, Strin
         parts.push(match part {
             crate::ir::TextPart::Literal { value } => go_string(value)?,
             crate::ir::TextPart::Variable { name } => {
-                format!("os.Getenv({})", go_string(name)?)
+                format!("deshellValue(deshellVars, {})", go_string(name)?)
             }
             crate::ir::TextPart::DefaultValue {
                 name,
@@ -4520,13 +4659,13 @@ fn go_expression(expression: &crate::ir::TextExpression) -> Result<String, Strin
                 // `os.Getenv` cannot tell unset from empty, so `-` needs LookupEnv.
                 if *empty_is_unset {
                     format!(
-                        "deshellDefaultEmpty({}, {})",
+                        "deshellDefaultEmpty(deshellVars, {}, {})",
                         go_string(name)?,
                         go_string(fallback)?
                     )
                 } else {
                     format!(
-                        "deshellDefaultUnset({}, {})",
+                        "deshellDefaultUnset(deshellVars, {}, {})",
                         go_string(name)?,
                         go_string(fallback)?
                     )
@@ -8694,7 +8833,9 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
             );
         }
         for expected in [
-            "os.Getenv(\"VALUE\")",
+            // Locals shadow the environment, so an expansion goes through the
+            // lookup rather than straight to `os.Getenv`.
+            "deshellValue(deshellVars, \"VALUE\")",
             "deshellArgument(deshellArgs, 0)",
             ".Env = append",
             ".Dir =",
