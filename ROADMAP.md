@@ -118,11 +118,17 @@ blocker DESHELL_BLOCKER_UNIMPLEMENTED_SEMANTIC action.yml@3963..6698:
   change what the script does.
 - [ ] Model `-u`, which is what OComment's `action.yml` still waits on — all five
   of its `run:` blocks open with `set -euo pipefail`, so the work above moves
-  nothing there yet. The exceptions are a finite table (`${x:-}`, `${x+}`, `${x-}`,
-  `${x:?}`, `$@`/`$*` with no arguments) and the measured exit status is 127
-  rather than 1. Unlike `-e`, this one is not a property of the sequence: it
-  changes what an expansion does, so it needs a home in the text expression or
-  the task rather than in the statement list.
+  nothing there yet. This is two steps rather than one, and the first is not
+  about `-u` at all:
+  - [ ] Represent a default expansion. `TextPart` is `Literal | Variable |
+    Argument`, so `${VALUE:-fallback}` has nowhere to go and is delegated today
+    while `"$VALUE"` lowers natively. The exception table `-u` needs — `${x:-}`,
+    `${x+}`, `${x-}`, `${x:?}` — is exactly the syntax that is missing, so the
+    option cannot be modelled over an IR that cannot say what it excepts.
+  - [ ] Then `-u` itself. Unlike `-e` it is not a property of the sequence: it
+    changes what an expansion does, so it belongs to the text expression or the
+    task rather than to the statement list. The measured exit status is 127, not
+    1.
 - [ ] `-e` needs one new IR value, not a call-graph analysis. Which commands
   `set -e` stops on is already the shape of the tree: the left of `&&`/`||`, an
   `if` condition and the operand of `!` each lower into their own node, so the
