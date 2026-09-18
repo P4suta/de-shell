@@ -898,12 +898,12 @@ where
             }
         };
         let mut report = command_report(CommandReportArgs {
-                spec: &spec,
-                code,
-                failure: completed_failure.as_ref(),
-                stdout: &captured_stdout,
-                stderr: &captured_stderr,
-            });
+            spec: &spec,
+            code,
+            failure: completed_failure.as_ref(),
+            stdout: &captured_stdout,
+            stderr: &captured_stderr,
+        });
         if report.next_actions.is_empty() {
             report.next_actions = spec.next_actions;
         }
@@ -1388,12 +1388,12 @@ fn dispatch(
                 digest,
                 format,
             } => scenario_approve_command(ScenarioApproveCommandArgs {
-                    root: &root,
-                    name: &name,
-                    digest: &digest,
-                    format,
-                    stdout,
-                }),
+                root: &root,
+                name: &name,
+                digest: &digest,
+                format,
+                stdout,
+            }),
         },
         Command::Matrix { command } => match command {
             MatrixCommand::List { root, format } => matrix_review_command(&root, format, stdout),
@@ -1403,12 +1403,12 @@ fn dispatch(
                 digest,
                 format,
             } => matrix_approve_command(MatrixApproveCommandArgs {
-                    root: &root,
-                    cell: &cell,
-                    digest: &digest,
-                    format,
-                    stdout,
-                }),
+                root: &root,
+                cell: &cell,
+                digest: &digest,
+                format,
+                stdout,
+            }),
         },
         Command::Analyze { root, entry, .. } => {
             for entry in selected_entries(&root, entry)? {
@@ -1665,25 +1665,25 @@ fn dispatch(
             apply,
             ..
         } => rewrite_command(RewriteCommandArgs {
-                root: &root,
-                entry,
-                equivalent,
-                apply,
-                stdout,
-            }),
+            root: &root,
+            entry,
+            equivalent,
+            apply,
+            stdout,
+        }),
         Command::Modernize {
             root,
             profile,
             apply,
             ..
         } => modernize_command(ModernizeCommandArgs {
-                root: &root,
-                profile: &profile,
-                apply,
-                diagnostic_mode,
-                stdout,
-                stderr,
-            }),
+            root: &root,
+            profile: &profile,
+            apply,
+            diagnostic_mode,
+            stdout,
+            stderr,
+        }),
         Command::Harden { command } => harden_command(command, stdout),
         Command::Migrate { command } => match command {
             MigrateCommand::Plan { root, .. } => migrate_plan_command(&root, stdout),
@@ -1694,12 +1694,12 @@ fn dispatch(
                 output,
                 ..
             } => migrate_verify_command(MigrateVerifyCommandArgs {
-                    root: &root,
-                    plan: &plan,
-                    cell: &cell,
-                    output: &output,
-                    stdout,
-                }),
+                root: &root,
+                plan: &plan,
+                cell: &cell,
+                output: &output,
+                stdout,
+            }),
             MigrateCommand::Evidence { command } => match command {
                 MigrateEvidenceCommand::Import {
                     root, plan, files, ..
@@ -2665,13 +2665,13 @@ fn run_plan(
         selected_entry_from_config(&project.config, options.entrypoint.map(str::to_owned))?;
     if options.backend == BackendKind::Disposable {
         return run_disposable(RunDisposableArgs {
-                root: options.root,
-                entrypoint: &entrypoint,
-                node_id: options.node_id,
-                arguments: options.arguments,
-                stdout,
-                stderr,
-            });
+            root: options.root,
+            entrypoint: &entrypoint,
+            node_id: options.node_id,
+            arguments: options.arguments,
+            stdout,
+            stderr,
+        });
     }
     let validated = project
         .entry(&entrypoint)
@@ -3186,25 +3186,25 @@ fn observe_command(
         let original_workspace = crate::workspace::private_snapshot(base).map_err(Failure::io)?;
         let actual_workspace = crate::workspace::private_snapshot(base).map_err(Failure::io)?;
         let original = lab_scenario_request(LabScenarioRequestArgs {
-                workspace: original_workspace.path(),
-                target: crate::lab::Target::Original {
+            workspace: original_workspace.path(),
+            target: crate::lab::Target::Original {
                 interpreter: interpreter.clone(),
                 script: entry.clone(),
             },
-                scenario: &scenario,
-                config,
-                image: &lock.lab.image,
-            })?;
+            scenario: &scenario,
+            config,
+            image: &lock.lab.image,
+        })?;
         let actual = lab_scenario_request(LabScenarioRequestArgs {
-                workspace: actual_workspace.path(),
-                target: crate::lab::Target::Plan {
+            workspace: actual_workspace.path(),
+            target: crate::lab::Target::Plan {
                 entrypoint: entry.clone(),
                 node_id: None,
             },
-                scenario: &scenario,
-                config,
-                image: &lock.lab.image,
-            })?;
+            scenario: &scenario,
+            config,
+            image: &lock.lab.image,
+        })?;
         let expected = match crate::lab::execute(provider, &original) {
             Ok(result) => result,
             Err(error) => {
@@ -3264,12 +3264,12 @@ fn observe_command(
         };
         let comparison = crate::verify::compare(&expected, &actual).map_err(Failure::internal)?;
         let status = crate::verify::record_comparison(crate::verify::RecordComparisonArgs {
-                evidence: &mut evidence,
-                scenario: &scenario.name,
-                provider: provider_name,
-                key,
-                comparison: &comparison,
-            })
+            evidence: &mut evidence,
+            scenario: &scenario.name,
+            provider: provider_name,
+            key,
+            comparison: &comparison,
+        })
         .map_err(Failure::invalid)?;
         writeln_io(
             stdout,
@@ -4552,7 +4552,10 @@ fn writeln_io(writer: &mut dyn Write, arguments: std::fmt::Arguments<'_>) -> Res
 // writers against one path, and assert on what the transactional layer does with
 // the result. Constructing those situations is precisely what the production ban
 // exists to prevent, so the ban is lifted here and nowhere else.
-#[expect(clippy::disallowed_methods, reason = "tests construct the races and corrupt trees the production ban prevents")]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "tests construct the races and corrupt trees the production ban prevents"
+)]
 mod tests {
     use super::*;
     use crate::config::ProjectConfig;

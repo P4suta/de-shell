@@ -1,4 +1,10 @@
-#![cfg_attr(not(test), expect(dead_code, reason = "reachable only from the test-only differential harness; kept compiled in release so the two paths cannot drift"))]
+#![cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "reachable only from the test-only differential harness; kept compiled in release so the two paths cannot drift"
+    )
+)]
 
 use crate::config::Scenario;
 use crate::evidence::Evidence;
@@ -49,13 +55,10 @@ pub(crate) struct Evaluation<'a> {
     pub(crate) evidence: &'a mut Evidence,
 }
 
-
 pub(crate) fn evaluate(parts: Evaluation<'_>) -> Result<Outcome, String> {
-
     // Destructured without `..`: see `Evaluation`.
 
     let Evaluation {
-
         observer,
 
         backend,
@@ -69,7 +72,6 @@ pub(crate) fn evaluate(parts: Evaluation<'_>) -> Result<Outcome, String> {
         runtime_lock_digest,
 
         evidence,
-
     } = parts;
     if observer.name().trim().is_empty() {
         return Err("observer provider name must not be empty".into());
@@ -162,12 +164,12 @@ pub(crate) fn evaluate(parts: Evaluation<'_>) -> Result<Outcome, String> {
     };
     let comparison = crate::verify::compare(&expected, &actual)?;
     let status = crate::verify::record_comparison(crate::verify::RecordComparisonArgs {
-            evidence,
-            scenario: &scenario.name,
-            provider: observer.name(),
-            key,
-            comparison: &comparison,
-        })?;
+        evidence,
+        scenario: &scenario.name,
+        provider: observer.name(),
+        key,
+        comparison: &comparison,
+    })?;
     Ok(match status {
         crate::evidence::ObservationStatus::Nondeterministic => Outcome::Nondeterministic,
         _ if comparison.equivalent => Outcome::Verified,
@@ -306,14 +308,14 @@ mod tests {
         let expected = result(0, b"");
         let mut evidence = Evidence::from_plan(&plan, "build.sh", b"emit").unwrap();
         let outcome = evaluate(Evaluation {
-                observer: &MockObserver(Ok(expected.clone())),
-                backend: &MockBackend(expected),
-                policy: Policy::default(),
-                plan: &plan,
-                scenario: &scenario(),
-                runtime_lock_digest: &runtime_digest(),
-                evidence: &mut evidence,
-            })
+            observer: &MockObserver(Ok(expected.clone())),
+            backend: &MockBackend(expected),
+            policy: Policy::default(),
+            plan: &plan,
+            scenario: &scenario(),
+            runtime_lock_digest: &runtime_digest(),
+            evidence: &mut evidence,
+        })
         .unwrap();
         assert_eq!(outcome, Outcome::Verified);
         assert_eq!(evidence.observations[0].status, ObservationStatus::Verified);
@@ -325,14 +327,14 @@ mod tests {
         let plan = plan();
         let mut evidence = Evidence::from_plan(&plan, "build.sh", b"emit").unwrap();
         let outcome = evaluate(Evaluation {
-                observer: &MockObserver(Ok(result(0, &[0xff]))),
-                backend: &MockBackend(result(7, &[0xfe])),
-                policy: Policy::default(),
-                plan: &plan,
-                scenario: &scenario(),
-                runtime_lock_digest: &runtime_digest(),
-                evidence: &mut evidence,
-            })
+            observer: &MockObserver(Ok(result(0, &[0xff]))),
+            backend: &MockBackend(result(7, &[0xfe])),
+            policy: Policy::default(),
+            plan: &plan,
+            scenario: &scenario(),
+            runtime_lock_digest: &runtime_digest(),
+            evidence: &mut evidence,
+        })
         .unwrap();
         assert_eq!(outcome, Outcome::Different);
         assert_eq!(
@@ -370,14 +372,14 @@ mod tests {
             }));
             assert_eq!(
                 evaluate(Evaluation {
-                        observer: &observer,
-                        backend: &MockBackend(result(0, b"")),
-                        policy: Policy::default(),
-                        plan: &plan,
-                        scenario: &scenario(),
-                        runtime_lock_digest: &runtime_digest(),
-                        evidence: &mut evidence,
-                    })
+                    observer: &observer,
+                    backend: &MockBackend(result(0, b"")),
+                    policy: Policy::default(),
+                    plan: &plan,
+                    scenario: &scenario(),
+                    runtime_lock_digest: &runtime_digest(),
+                    evidence: &mut evidence,
+                })
                 .unwrap(),
                 outcome
             );
@@ -394,14 +396,14 @@ mod tests {
         scenario.expect.stdout = Some(crate::config::BinaryData::from("expected"));
         let mut evidence = Evidence::from_plan(&plan, "build.sh", b"emit").unwrap();
         let outcome = evaluate(Evaluation {
-                observer: &MockObserver(Ok(result(0, b"actual"))),
-                backend: &MockBackend(result(0, b"actual")),
-                policy: Policy::default(),
-                plan: &plan,
-                scenario: &scenario,
-                runtime_lock_digest: &runtime_digest(),
-                evidence: &mut evidence,
-            })
+            observer: &MockObserver(Ok(result(0, b"actual"))),
+            backend: &MockBackend(result(0, b"actual")),
+            policy: Policy::default(),
+            plan: &plan,
+            scenario: &scenario,
+            runtime_lock_digest: &runtime_digest(),
+            evidence: &mut evidence,
+        })
         .unwrap();
         assert_eq!(outcome, Outcome::Failed);
         assert_eq!(evidence.observations[0].status, ObservationStatus::Failed);

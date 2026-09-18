@@ -13,7 +13,10 @@ mod exporter;
 mod frontend;
 mod harden;
 mod ir;
-#[expect(dead_code, reason = "constructed by contract paths that are exercised only under specific platforms or feature gates")]
+#[expect(
+    dead_code,
+    reason = "constructed by contract paths that are exercised only under specific platforms or feature gates"
+)]
 mod lab;
 mod local_backend;
 mod migration;

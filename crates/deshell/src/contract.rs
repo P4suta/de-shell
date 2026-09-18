@@ -149,6 +149,9 @@ mod tests {
             "contracts/schema/harden-evidence-v1.schema.json",
             "contracts/golden/frontend-v1.json",
             "contracts/golden/transform-export-v1.json",
+            "contracts/golden/bash-set-semantics-v1.json",
+            "contracts/golden/test-builtin-semantics-v1.json",
+            "contracts/golden/echo-builtin-semantics-v1.json",
         ] {
             assert!(root().join(relative).is_file(), "missing {relative}");
         }

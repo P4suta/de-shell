@@ -980,7 +980,10 @@ fn generator_selection<'a>(
         )
 }
 
-#[expect(clippy::too_many_arguments, reason = "the arguments are a contract record; grouping them into a struct would hide which fields the caller must supply")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the arguments are a contract record; grouping them into a struct would hide which fields the caller must supply"
+)]
 fn build_request_and_proposal(
     root: &Path,
     config: &crate::config::ProjectConfig,
@@ -1045,14 +1048,14 @@ fn build_request_and_proposal(
         );
         let expected_digest = current_target_digest(root, &target)?;
         let proposal = invoke_external_generator(InvokeExternalGeneratorArgs {
-                root,
-                config,
-                registration,
-                request: &request,
-                target_path: &target,
-                expected_digest,
-                task,
-            })
+            root,
+            config,
+            registration,
+            request: &request,
+            target_path: &target,
+            expected_digest,
+            task,
+        })
         .map_err(external_generator_blocker)?;
         for patch in &proposal.patches {
             if targets.contains(&patch.path) {
@@ -1133,14 +1136,14 @@ fn build_request_and_proposal(
         0o644,
     )?];
     let call_site_patches = official_call_site_patches(OfficialCallSitePatchesArgs {
-            root,
-            config,
-            call_sites: &request.call_sites,
-            retiring_source: &finding.path,
-            selection,
-            stem: &stem,
-            generated_target: &target,
-        })
+        root,
+        config,
+        call_sites: &request.call_sites,
+        retiring_source: &finding.path,
+        selection,
+        stem: &stem,
+        generated_target: &target,
+    })
     .unwrap_or_default();
     for patch in call_site_patches {
         if !targets.insert(patch.path.clone()) {
@@ -1212,7 +1215,9 @@ struct OfficialCallSitePatchesArgs<'a> {
     generated_target: &'a str,
 }
 
-fn official_call_site_patches(parts: OfficialCallSitePatchesArgs<'_>) -> Result<Vec<GeneratorPatch>, String> {
+fn official_call_site_patches(
+    parts: OfficialCallSitePatchesArgs<'_>,
+) -> Result<Vec<GeneratorPatch>, String> {
     // Destructured without `..`: see `OfficialCallSitePatchesArgs`.
     let OfficialCallSitePatchesArgs {
         root,
@@ -1295,12 +1300,12 @@ fn official_call_site_patches(parts: OfficialCallSitePatchesArgs<'_>) -> Result<
         for location in locations {
             if is_github_workflow_path(&path) {
                 let rewritten = rewrite_github_run_call_site(RewriteGithubRunCallSiteArgs {
-                        path: &path,
-                        contents: &contents,
-                        location,
-                        retiring_source,
-                        replacement_argv: &replacement_argv,
-                    })?;
+                    path: &path,
+                    contents: &contents,
+                    location,
+                    retiring_source,
+                    replacement_argv: &replacement_argv,
+                })?;
                 contents = rewritten.0;
                 additional_files.extend(rewritten.1);
                 continue;
@@ -1388,7 +1393,9 @@ struct RewriteGithubRunCallSiteArgs<'a> {
     replacement_argv: &'a [String],
 }
 
-fn rewrite_github_run_call_site(parts: RewriteGithubRunCallSiteArgs<'_>) -> Result<(Vec<u8>, Vec<HostFile>), String> {
+fn rewrite_github_run_call_site(
+    parts: RewriteGithubRunCallSiteArgs<'_>,
+) -> Result<(Vec<u8>, Vec<HostFile>), String> {
     // Destructured without `..`: see `RewriteGithubRunCallSiteArgs`.
     let RewriteGithubRunCallSiteArgs {
         path,
@@ -1940,13 +1947,13 @@ fn invoke_external_generator(parts: InvokeExternalGeneratorArgs<'_>) -> Result<P
         "params": {"protocol_version": 1}
     });
     let handshake_result = execute_external_rpc(ExecuteExternalRpcArgs {
-            root: isolated.path(),
-            executable: &copied,
-            request: &handshake_request,
-            id: &serde_json::json!("handshake"),
-            project_limits: config.limits,
-            frame_limit: crate::protocol::MAX_MESSAGE_BYTES,
-        });
+        root: isolated.path(),
+        executable: &copied,
+        request: &handshake_request,
+        id: &serde_json::json!("handshake"),
+        project_limits: config.limits,
+        frame_limit: crate::protocol::MAX_MESSAGE_BYTES,
+    });
     ensure_isolated_tree_unchanged(isolated.path(), &baseline)?;
     ensure_guarded_project_tree_unchanged(root, &project_baseline)?;
     let handshake_value = handshake_result?;
@@ -1971,26 +1978,26 @@ fn invoke_external_generator(parts: InvokeExternalGeneratorArgs<'_>) -> Result<P
         }
     });
     let proposal_result = execute_external_rpc(ExecuteExternalRpcArgs {
-            root: isolated.path(),
-            executable: &copied,
-            request: &propose_request,
-            id: &serde_json::json!("proposal"),
-            project_limits: config.limits,
-            frame_limit: handshake.max_frame_bytes as usize,
-        });
+        root: isolated.path(),
+        executable: &copied,
+        request: &propose_request,
+        id: &serde_json::json!("proposal"),
+        project_limits: config.limits,
+        frame_limit: handshake.max_frame_bytes as usize,
+    });
     ensure_isolated_tree_unchanged(isolated.path(), &baseline)?;
     ensure_guarded_project_tree_unchanged(root, &project_baseline)?;
     let result = proposal_result?;
     let proposal: Proposal = serde_json::from_value(result)
         .map_err(|error| format!("external generator returned an invalid Proposal v1: {error}"))?;
     validate_external_proposal(ValidateExternalProposalArgs {
-            root,
-            registration,
-            request,
-            task,
-            validation: &validation,
-            proposal: &proposal,
-        })?;
+        root,
+        registration,
+        request,
+        task,
+        validation: &validation,
+        proposal: &proposal,
+    })?;
     Ok(proposal)
 }
 
@@ -2597,14 +2604,13 @@ fn generate_github_action_host(
     let action_id = &finding.content_digest[..12];
     let action_directory = format!(".github/actions/deshell-{action_id}");
     let uses = format!("uses: ./{action_directory}");
-    let (bytes, _workflow_span) =
-        replace_structured_host_span(ReplaceStructuredHostSpanArgs {
-                host: &host,
-                finding,
-                start: key_start,
-                end,
-                replacement: uses.as_bytes(),
-            });
+    let (bytes, _workflow_span) = replace_structured_host_span(ReplaceStructuredHostSpanArgs {
+        host: &host,
+        finding,
+        start: key_start,
+        end,
+        replacement: uses.as_bytes(),
+    });
     let program = serde_json::to_string(&argv[0]).map_err(|error| error.to_string())?;
     let arguments = serde_json::to_string(&argv[1..]).map_err(|error| error.to_string())?;
     let javascript = format!(
@@ -2687,14 +2693,13 @@ fn generate_javascript_host(
     let program = serde_json::to_string(&argv[0]).map_err(|error| error.to_string())?;
     let arguments = serde_json::to_string(&argv[1..]).map_err(|error| error.to_string())?;
     let replacement = format!("child_process.execFileSync({program},{arguments}, {options})");
-    let (bytes, generated_span) =
-        replace_structured_host_span(ReplaceStructuredHostSpanArgs {
-                host: &host,
-                finding,
-                start,
-                end,
-                replacement: replacement.as_bytes(),
-            });
+    let (bytes, generated_span) = replace_structured_host_span(ReplaceStructuredHostSpanArgs {
+        host: &host,
+        finding,
+        start,
+        end,
+        replacement: replacement.as_bytes(),
+    });
     Ok(HostGeneration {
         bytes,
         build_argv: vec!["node".into(), "--check".into(), finding.path.clone()],
@@ -2763,14 +2768,13 @@ fn generate_python_host(
             "False"
         }
     );
-    let (bytes, generated_span) =
-        replace_structured_host_span(ReplaceStructuredHostSpanArgs {
-                host: &host,
-                finding,
-                start,
-                end,
-                replacement: replacement.as_bytes(),
-            });
+    let (bytes, generated_span) = replace_structured_host_span(ReplaceStructuredHostSpanArgs {
+        host: &host,
+        finding,
+        start,
+        end,
+        replacement: replacement.as_bytes(),
+    });
     Ok(HostGeneration {
         bytes,
         build_argv: vec![
@@ -3208,11 +3212,40 @@ fn visit_node(node: &crate::ir::Node, mut visit: impl FnMut(&crate::ir::Node)) {
         | crate::ir::Operation::Scope { body, .. }
         | crate::ir::Operation::CaptureStdout { body, .. }
         | crate::ir::Operation::Spawn { body, .. } => visit(body),
+        crate::ir::Operation::While { condition, body } => {
+            visit(condition);
+            visit(body);
+        }
         crate::ir::Operation::TryFinally { body, finalizer } => {
             visit(body);
             visit(finalizer);
         }
-        _ => {}
+        // Listed rather than matched with `_`: a new operation that carries a
+        // node has to be added here, and a wildcard would instead walk past its
+        // children in silence. `While` reached this walk only after the
+        // wildcard was removed, and until then every node inside a loop was
+        // invisible to every caller.
+        crate::ir::Operation::Exec { .. }
+        | crate::ir::Operation::ExpandWords { .. }
+        | crate::ir::Operation::NoOp
+        | crate::ir::Operation::WriteStdout { .. }
+        | crate::ir::Operation::Test { .. }
+        | crate::ir::Operation::SetVariable { .. }
+        | crate::ir::Operation::SetEnvironment { .. }
+        | crate::ir::Operation::SetWorkingDirectory { .. }
+        | crate::ir::Operation::Wait { .. }
+        | crate::ir::Operation::SendSignal { .. }
+        | crate::ir::Operation::FileRead { .. }
+        | crate::ir::Operation::FileWrite { .. }
+        | crate::ir::Operation::FileRemove { .. }
+        | crate::ir::Operation::FileMetadata { .. }
+        | crate::ir::Operation::FileSetMetadata { .. }
+        | crate::ir::Operation::NetworkRequest { .. }
+        | crate::ir::Operation::ClockRead { .. }
+        | crate::ir::Operation::RandomBytes { .. }
+        | crate::ir::Operation::TaskCall { .. }
+        | crate::ir::Operation::InterpreterCall { .. }
+        | crate::ir::Operation::OpaqueCapsule { .. } => {}
     }
 }
 
@@ -3631,14 +3664,14 @@ fn emit_rust_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> 
         } => {
             output.push_str(&format!("{indent}{{\n"));
             emit_rust_command(EmitRustCommandArgs {
-                    argv,
-                    environment,
-                    working_directory: working_directory.as_ref(),
-                    variable: "deshell_command",
-                    force_mutable: true,
-                    output,
-                    depth: depth + 1,
-                })?;
+                argv,
+                environment,
+                working_directory: working_directory.as_ref(),
+                variable: "deshell_command",
+                force_mutable: true,
+                output,
+                depth: depth + 1,
+            })?;
             output.push_str(&format!(
                 concat!(
                     "{indent}    match deshell_command.status() {{\n",
@@ -3697,6 +3730,59 @@ fn emit_rust_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> 
             };
             output.push_str(&format!("{indent}i32::from(!({condition}))"));
         }
+        // Running nothing succeeds, which is what the shell reports for an arm
+        // whose body is empty.
+        crate::ir::Operation::NoOp => output.push_str(&format!("{indent}0")),
+        // `Operation::Match` compares for equality — the frontend refuses a
+        // glob pattern precisely so that it does — so the arms become a chain
+        // of comparisons rather than a `match`, whose patterns must be literals
+        // Rust can see at compile time. A `case` with no matching arm and no
+        // `*` runs nothing and succeeds, which is the trailing `0`.
+        crate::ir::Operation::Match {
+            value,
+            cases,
+            default,
+        } => {
+            output.push_str(&format!(
+                "{indent}{{\n{indent}    let deshell_subject = {};\n",
+                rust_expression(value)?
+            ));
+            for case in cases {
+                output.push_str(&format!(
+                    "{indent}    if deshell_subject == {} {{\n",
+                    rust_expression(&case.pattern)?
+                ));
+                emit_rust_node(&case.body, output, depth + 2)?;
+                output.push_str(&format!("\n{indent}    }} else "));
+            }
+            output.push_str(&format!("{indent}    {{\n"));
+            match default {
+                Some(default) => emit_rust_node(default, output, depth + 2)?,
+                None => output.push_str(&format!("{indent}        0")),
+            }
+            output.push_str(&format!("\n{indent}    }}\n{indent}}}"));
+        }
+        // `echo` returns 1 when the write fails, so the status is the write's.
+        // The `use` is local to the block: the import list is decided before the
+        // body is walked, and an unconditional `std::io::Write` would be unused
+        // in every plan that prints nothing.
+        crate::ir::Operation::WriteStdout { contents } => {
+            output.push_str(&format!(
+                concat!(
+                    "{indent}{{\n",
+                    "{indent}    use std::io::Write as _;\n",
+                    "{indent}    let deshell_bytes = {contents};\n",
+                    "{indent}    i32::from(\n",
+                    "{indent}        std::io::stdout()\n",
+                    "{indent}            .write_all(deshell_bytes.as_bytes())\n",
+                    "{indent}            .is_err(),\n",
+                    "{indent}    )\n",
+                    "{indent}}}"
+                ),
+                indent = indent,
+                contents = rust_expression(contents)?
+            ));
+        }
         crate::ir::Operation::Sequence { nodes, .. } => {
             let Some((last, preceding)) = nodes.split_last() else {
                 return Err("generator received an empty sequence".into());
@@ -3725,14 +3811,14 @@ fn emit_rust_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> 
                     return Err("generator pipeline supports only Exec stages".into());
                 };
                 emit_rust_command(EmitRustCommandArgs {
-                        argv,
-                        environment,
-                        working_directory: working_directory.as_ref(),
-                        variable: "deshell_stage",
-                        force_mutable: false,
-                        output,
-                        depth: depth + 1,
-                    })?;
+                    argv,
+                    environment,
+                    working_directory: working_directory.as_ref(),
+                    variable: "deshell_stage",
+                    force_mutable: false,
+                    output,
+                    depth: depth + 1,
+                })?;
                 output.push_str(&format!(
                     "{indent}    deshell_commands.push(deshell_stage);\n"
                 ));
@@ -3847,6 +3933,7 @@ fn node_captures_stdout(node: &crate::ir::Node) -> bool {
         return true;
     }
     match &node.operation {
+        crate::ir::Operation::NoOp | crate::ir::Operation::WriteStdout { .. } => false,
         crate::ir::Operation::Sequence { nodes, .. }
         | crate::ir::Operation::Pipeline { nodes, .. }
         | crate::ir::Operation::Parallel { nodes } => nodes.iter().any(node_captures_stdout),
@@ -3906,11 +3993,10 @@ fn rust_node_sets_variables(node: &crate::ir::Node) -> bool {
         return true;
     }
     match &node.operation {
+        crate::ir::Operation::NoOp | crate::ir::Operation::WriteStdout { .. } => false,
         crate::ir::Operation::Sequence { nodes, .. }
         | crate::ir::Operation::Pipeline { nodes, .. }
-        | crate::ir::Operation::Parallel { nodes } => {
-            nodes.iter().any(rust_node_sets_variables)
-        }
+        | crate::ir::Operation::Parallel { nodes } => nodes.iter().any(rust_node_sets_variables),
         crate::ir::Operation::Condition {
             predicate,
             if_true,
@@ -3927,7 +4013,9 @@ fn rust_node_sets_variables(node: &crate::ir::Node) -> bool {
             rust_node_sets_variables(body) || rust_node_sets_variables(finalizer)
         }
         crate::ir::Operation::Match { cases, default, .. } => {
-            cases.iter().any(|case| rust_node_sets_variables(&case.body))
+            cases
+                .iter()
+                .any(|case| rust_node_sets_variables(&case.body))
                 || default.as_deref().is_some_and(rust_node_sets_variables)
         }
         crate::ir::Operation::Not { body }
@@ -3965,6 +4053,7 @@ fn rust_node_sets_variables(node: &crate::ir::Node) -> bool {
 /// so emitting the import unconditionally made such a plan ungeneratable.
 fn rust_node_starts_a_process(node: &crate::ir::Node) -> bool {
     match &node.operation {
+        crate::ir::Operation::NoOp | crate::ir::Operation::WriteStdout { .. } => false,
         crate::ir::Operation::Exec { .. }
         | crate::ir::Operation::Pipeline { .. }
         | crate::ir::Operation::InterpreterCall { .. } => true,
@@ -4030,21 +4119,19 @@ fn rust_node_starts_a_process(node: &crate::ir::Node) -> bool {
     }
 }
 
+/// Whether the generated program will call the pipeline helper.
+///
+/// Written over the shared walk rather than over a hand-listed few operations:
+/// the hand-listed version knew about `Sequence` and `Condition` only, so a
+/// pipeline inside a loop or a `case` arm emitted a call to a helper the
+/// generator had decided not to define.
 fn rust_node_uses_pipeline(node: &crate::ir::Node) -> bool {
-    match &node.operation {
-        crate::ir::Operation::Pipeline { .. } => true,
-        crate::ir::Operation::Sequence { nodes, .. } => nodes.iter().any(rust_node_uses_pipeline),
-        crate::ir::Operation::Condition {
-            predicate,
-            if_true,
-            if_false,
-        } => {
-            rust_node_uses_pipeline(predicate)
-                || rust_node_uses_pipeline(if_true)
-                || if_false.as_deref().is_some_and(rust_node_uses_pipeline)
-        }
-        _ => false,
+    if matches!(node.operation, crate::ir::Operation::Pipeline { .. }) {
+        return true;
     }
+    let mut found = false;
+    visit_node(node, |child| found |= rust_node_uses_pipeline(child));
+    found
 }
 
 fn rust_node_uses_arguments(node: &crate::ir::Node) -> bool {
@@ -4060,6 +4147,8 @@ fn node_has_expression_part(
 ) -> bool {
     let expression = |value: &crate::ir::TextExpression| value.parts.iter().any(wanted);
     match &node.operation {
+        crate::ir::Operation::NoOp => false,
+        crate::ir::Operation::WriteStdout { contents } => expression(contents),
         crate::ir::Operation::Exec {
             argv,
             environment,
@@ -4069,9 +4158,10 @@ fn node_has_expression_part(
                 || environment.iter().any(|value| expression(&value.value))
                 || working_directory.as_ref().is_some_and(expression)
         }
-        crate::ir::Operation::Sequence { nodes, .. } | crate::ir::Operation::Pipeline { nodes, .. } => {
-            nodes.iter().any(|child| node_has_expression_part(child, wanted))
-        }
+        crate::ir::Operation::Sequence { nodes, .. }
+        | crate::ir::Operation::Pipeline { nodes, .. } => nodes
+            .iter()
+            .any(|child| node_has_expression_part(child, wanted)),
         crate::ir::Operation::Condition {
             predicate,
             if_true,
@@ -4422,13 +4512,13 @@ fn emit_go_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> Re
         } => {
             output.push_str(&format!("{indent}{{\n"));
             emit_go_command(EmitGoCommandArgs {
-                    argv,
-                    environment,
-                    working_directory: working_directory.as_ref(),
-                    variable: "deshellCommand",
-                    output,
-                    depth: depth + 1,
-                })?;
+                argv,
+                environment,
+                working_directory: working_directory.as_ref(),
+                variable: "deshellCommand",
+                output,
+                depth: depth + 1,
+            })?;
             output.push_str(&format!(
                 "{indent}\tdeshellCommand.Stdin, deshellCommand.Stdout, deshellCommand.Stderr = os.Stdin, os.Stdout, os.Stderr\n"
             ));
@@ -4506,6 +4596,51 @@ fn emit_go_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> Re
                 condition = condition
             ));
         }
+        // Running nothing succeeds, which is what the shell reports for an arm
+        // whose body is empty.
+        crate::ir::Operation::NoOp => {
+            output.push_str(&format!("{indent}deshellLast = 0\n"));
+        }
+        // `switch` on a string compares for equality, which is what
+        // `Operation::Match` means; the frontend refuses a glob pattern so that
+        // it does. A `case` with no matching arm and no `*` runs nothing and
+        // succeeds, which is the `default` clause.
+        crate::ir::Operation::Match {
+            value,
+            cases,
+            default,
+        } => {
+            output.push_str(&format!("{indent}switch {} {{\n", go_expression(value)?));
+            for case in cases {
+                output.push_str(&format!(
+                    "{indent}case {}:\n",
+                    go_expression(&case.pattern)?
+                ));
+                emit_go_node(&case.body, output, depth + 1)?;
+            }
+            output.push_str(&format!("{indent}default:\n"));
+            match default {
+                Some(default) => emit_go_node(default, output, depth + 1)?,
+                None => output.push_str(&format!("{indent}\tdeshellLast = 0\n")),
+            }
+            output.push_str(&format!("{indent}}}\n"));
+        }
+        // `echo` returns 1 when the write fails, so the status is the write's.
+        crate::ir::Operation::WriteStdout { contents } => {
+            output.push_str(&format!(
+                concat!(
+                    "{indent}{{\n",
+                    "{indent}\tdeshellLast = 0\n",
+                    "{indent}\tif _, deshellWriteErr := os.Stdout.WriteString({contents}); ",
+                    "deshellWriteErr != nil {{\n",
+                    "{indent}\t\tdeshellLast = 1\n",
+                    "{indent}\t}}\n",
+                    "{indent}}}\n"
+                ),
+                indent = indent,
+                contents = go_expression(contents)?
+            ));
+        }
         crate::ir::Operation::Sequence { nodes, .. } => {
             for child in nodes {
                 emit_go_node(child, output, depth)?;
@@ -4528,13 +4663,13 @@ fn emit_go_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> Re
                 };
                 let variable = format!("deshellStage{index}");
                 emit_go_command(EmitGoCommandArgs {
-                        argv,
-                        environment,
-                        working_directory: working_directory.as_ref(),
-                        variable: &variable,
-                        output,
-                        depth: depth + 1,
-                    })?;
+                    argv,
+                    environment,
+                    working_directory: working_directory.as_ref(),
+                    variable: &variable,
+                    output,
+                    depth: depth + 1,
+                })?;
                 output.push_str(&format!(
                     "{indent}\tdeshellCommands = append(deshellCommands, {variable})\n"
                 ));
@@ -5333,8 +5468,7 @@ fn ensure_child_directory(parent: &Path, name: &str) -> Result<PathBuf, String> 
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             match crate::patch::ensure_directory(&target) {
                 Ok(
-                    crate::patch::DirectoryState::Created
-                    | crate::patch::DirectoryState::Existing,
+                    crate::patch::DirectoryState::Created | crate::patch::DirectoryState::Existing,
                 ) => {}
                 Err(crate::patch::DirectoryError::Occupied) => {
                     return Err(format!(
@@ -5851,13 +5985,13 @@ fn observe_replacement(
     let build_environment = verification_build_environment(workspace.path(), &proposal.build_argv);
     let build_limits = verification_build_limits(&proposal.build_argv, scenario.limits);
     let build = execute_exact(ExecuteExactArgs {
-            root: workspace.path(),
-            argv: &proposal.build_argv,
-            environment: &build_environment,
-            cwd: None,
-            stdin: &[],
-            limits: build_limits,
-        })?;
+        root: workspace.path(),
+        argv: &proposal.build_argv,
+        environment: &build_environment,
+        cwd: None,
+        stdin: &[],
+        limits: build_limits,
+    })?;
     if build.exit_code != 0 || build.timed_out || build.limit_exceeded.is_some() {
         return Err(format!(
             "replacement build failed with exit {}: {}",
@@ -5871,13 +6005,13 @@ fn observe_replacement(
     let mut argv = proposal.run_argv.clone();
     argv.extend(scenario.argv.clone());
     let outcome = execute_exact(ExecuteExactArgs {
-            root: workspace.path(),
-            argv: &argv,
-            environment: &environment,
-            cwd: scenario.cwd.clone(),
-            stdin: &scenario_stdin(scenario)?,
-            limits: scenario.limits,
-        })?;
+        root: workspace.path(),
+        argv: &argv,
+        environment: &environment,
+        cwd: scenario.cwd.clone(),
+        stdin: &scenario_stdin(scenario)?,
+        limits: scenario.limits,
+    })?;
     let network = finish_replay_proxy(proxy)?;
     observation_from_outcome(workspace.path(), &before, outcome, network)
 }
@@ -5963,7 +6097,10 @@ fn observe_ir(
     ))
 }
 
-#[expect(clippy::too_many_arguments, reason = "the arguments are a contract record; grouping them into a struct would hide which fields the caller must supply")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the arguments are a contract record; grouping them into a struct would hide which fields the caller must supply"
+)]
 fn execute_ir_node(
     root: &Path,
     node: &crate::ir::Node,
@@ -5990,7 +6127,9 @@ fn execute_ir_node(
             for value in environment {
                 process_environment.insert(
                     value.name.clone(),
-                    value.value.evaluate(variables, arguments, crate::ir::UnsetPolicy::Empty)?,
+                    value
+                        .value
+                        .evaluate(variables, arguments, crate::ir::UnsetPolicy::Empty)?,
                 );
             }
             let working_directory = working_directory
@@ -6045,14 +6184,14 @@ fn execute_ir_node(
             for (index, child) in nodes.iter().enumerate() {
                 visited.insert(child.id.clone());
                 requests.push(ir_exec_request(IrExecRequestArgs {
-                        _root: root,
-                        node: child,
-                        variables,
-                        arguments,
-                        stdin: if index == 0 { stdin } else { &[] },
-                        default_cwd,
-                        limits,
-                    })?);
+                    _root: root,
+                    node: child,
+                    variables,
+                    arguments,
+                    stdin: if index == 0 { stdin } else { &[] },
+                    default_cwd,
+                    limits,
+                })?);
             }
             let outcomes = crate::agent_process::execute_pipeline(root, requests)?;
             let selected = match status {
@@ -6173,7 +6312,9 @@ fn ir_exec_request(parts: IrExecRequestArgs<'_>) -> Result<crate::agent_process:
     for value in environment {
         process_environment.insert(
             value.name.clone(),
-            value.value.evaluate(variables, arguments, crate::ir::UnsetPolicy::Empty)?,
+            value
+                .value
+                .evaluate(variables, arguments, crate::ir::UnsetPolicy::Empty)?,
         );
     }
     let working_directory = working_directory
@@ -6484,13 +6625,13 @@ fn verify_validation_commands(
     let mut output = Vec::new();
     for command in &plan.validation_commands {
         let outcome = execute_exact(ExecuteExactArgs {
-                root: workspace.path(),
-                argv: &command.argv,
-                environment: &validation_environment,
-                cwd: None,
-                stdin: &[],
-                limits: plan.validation_limits,
-            })?;
+            root: workspace.path(),
+            argv: &command.argv,
+            environment: &validation_environment,
+            cwd: None,
+            stdin: &[],
+            limits: plan.validation_limits,
+        })?;
         output.push(ValidationEvidence {
             name: command.name.clone(),
             argv: command.argv.clone(),
@@ -8095,7 +8236,10 @@ fn archive_executable(_metadata: &std::fs::Metadata) -> bool {
 // writers against one path, and assert on what the transactional layer does with
 // the result. Constructing those situations is precisely what the production ban
 // exists to prevent, so the ban is lifted here and nowhere else.
-#[expect(clippy::disallowed_methods, reason = "tests construct the races and corrupt trees the production ban prevents")]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "tests construct the races and corrupt trees the production ban prevents"
+)]
 mod tests {
     use super::*;
 
@@ -8362,13 +8506,13 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
         std::fs::set_permissions(&generator, std::fs::Permissions::from_mode(0o500)).unwrap();
 
         let error = execute_external_rpc(ExecuteExternalRpcArgs {
-                root: directory.path(),
-                executable: &generator,
-                request: &serde_json::json!({"id": "proposal", "jsonrpc": "2.0", "method": "test"}),
-                id: &serde_json::json!("proposal"),
-                project_limits: crate::config::ResourceLimits::DEFAULT,
-                frame_limit: 1024,
-            })
+            root: directory.path(),
+            executable: &generator,
+            request: &serde_json::json!({"id": "proposal", "jsonrpc": "2.0", "method": "test"}),
+            id: &serde_json::json!("proposal"),
+            project_limits: crate::config::ResourceLimits::DEFAULT,
+            frame_limit: 1024,
+        })
         .unwrap_err();
         assert!(error.contains("negotiated frame limit"), "{error}");
     }
@@ -9113,6 +9257,83 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
                 String::from_utf8_lossy(&output.stderr)
             );
         }
+    }
+
+    /// A pipeline inside a loop or a `case` arm must still get its helper.
+    ///
+    /// The walk that decides whether to define `deshell_run_pipeline` listed
+    /// `Sequence` and `Condition` by hand and fell through on everything else,
+    /// so this plan generated a call to a function the generator had chosen not
+    /// to emit — code its own `-D warnings` gate rejects. The plan also carries
+    /// an empty `case` arm and an `echo`, which are the other two operations
+    /// that reach the generators without starting a process.
+    #[test]
+    fn a_pipeline_nested_in_a_loop_or_a_case_arm_still_defines_its_helper() {
+        let pipeline = || {
+            node(crate::ir::Operation::Pipeline {
+                nodes: vec![
+                    exec(vec![crate::ir::TextExpression::literal("/bin/first")]),
+                    exec(vec![crate::ir::TextExpression::literal("/bin/second")]),
+                ],
+                status: crate::ir::PipelineStatus::Pipefail,
+            })
+        };
+        let loop_node = node(crate::ir::Operation::While {
+            condition: Box::new(node(crate::ir::Operation::Test {
+                predicate: crate::ir::TestPredicate::Empty {
+                    value: crate::ir::TextExpression::literal(""),
+                },
+            })),
+            body: Box::new(pipeline()),
+        });
+        let match_node = node(crate::ir::Operation::Match {
+            value: crate::ir::TextExpression::literal("a"),
+            cases: vec![
+                crate::ir::MatchCase {
+                    pattern: crate::ir::TextExpression::literal("a"),
+                    body: pipeline(),
+                },
+                crate::ir::MatchCase {
+                    pattern: crate::ir::TextExpression::literal("b"),
+                    body: node(crate::ir::Operation::NoOp),
+                },
+            ],
+            default: Some(Box::new(node(crate::ir::Operation::WriteStdout {
+                contents: crate::ir::TextExpression::literal("::error::unknown\n"),
+            }))),
+        });
+        let plan = plan_with_body(node(crate::ir::Operation::Sequence {
+            nodes: vec![loop_node, match_node],
+            on_failure: crate::ir::SequenceFailure::Stop,
+        }));
+
+        let directory = tempfile::tempdir().unwrap();
+        let rust = directory.path().join("nested.rs");
+        let go = directory.path().join("nested.go");
+        std::fs::write(&rust, generate_rust(&plan).unwrap()).unwrap();
+        std::fs::write(&go, generate_go(&plan).unwrap()).unwrap();
+
+        let rustc = std::process::Command::new("rustc")
+            .arg(&rust)
+            .args(["--edition=2024", "-D", "warnings", "-o"])
+            .arg(directory.path().join("nested-rust"))
+            .output()
+            .unwrap();
+        assert!(
+            rustc.status.success(),
+            "rustc rejected generated source:\n{}",
+            String::from_utf8_lossy(&rustc.stderr)
+        );
+        let vet = std::process::Command::new("go")
+            .args(["vet", "nested.go"])
+            .current_dir(directory.path())
+            .output()
+            .unwrap();
+        assert!(
+            vet.status.success(),
+            "go vet rejected generated source:\n{}",
+            String::from_utf8_lossy(&vet.stderr)
+        );
     }
 
     #[test]

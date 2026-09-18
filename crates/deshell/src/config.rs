@@ -413,12 +413,12 @@ fn validate_migration_config(config: &ProjectConfig, errors: &mut Vec<String>) {
         }
     }
     validate_generator_selection(ValidateGeneratorSelectionArgs {
-            label: "migration",
-            generator: &config.migration.generator,
-            target: config.migration.target,
-            external: &config.migration.external_generators,
-            errors,
-        });
+        label: "migration",
+        generator: &config.migration.generator,
+        target: config.migration.target,
+        external: &config.migration.external_generators,
+        errors,
+    });
     let mut overrides = std::collections::BTreeSet::new();
     for location in &config.location_overrides {
         validate_contract_path("location override", &location.path, errors);
@@ -442,12 +442,12 @@ fn validate_migration_config(config: &ProjectConfig, errors: &mut Vec<String>) {
             ));
         }
         validate_generator_selection(ValidateGeneratorSelectionArgs {
-                label: "location override",
-                generator: &location.generator,
-                target: location.target,
-                external: &config.migration.external_generators,
-                errors,
-            });
+            label: "location override",
+            generator: &location.generator,
+            target: location.target,
+            external: &config.migration.external_generators,
+            errors,
+        });
         if !overrides.insert((
             location.path.as_str(),
             location.start_byte,
@@ -1720,12 +1720,12 @@ mod tests {
         ] {
             let mut errors = Vec::new();
             validate_generator_selection(ValidateGeneratorSelectionArgs {
-                    label: "test",
-                    generator,
-                    target,
-                    external: &[],
-                    errors: &mut errors,
-                });
+                label: "test",
+                generator,
+                target,
+                external: &[],
+                errors: &mut errors,
+            });
             assert!(errors.join("; ").contains(expected));
         }
     }

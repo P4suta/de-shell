@@ -14,9 +14,15 @@ pub(crate) struct TextExpression {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "snake_case", tag = "kind")]
 pub(crate) enum TextPart {
-    Literal { value: String },
-    Variable { name: String },
-    Argument { name: String },
+    Literal {
+        value: String,
+    },
+    Variable {
+        name: String,
+    },
+    Argument {
+        name: String,
+    },
     /// `${name:-fallback}` and `${name-fallback}`.
     ///
     /// The fallback is a literal. An expansion nested inside it is delegated
@@ -366,6 +372,24 @@ pub(crate) enum Operation {
     Parallel {
         nodes: Vec<Node>,
     },
+    /// Write bytes to the task's standard output.
+    ///
+    /// `echo` is a shell builtin, so lowering it to an `Exec` of `/bin/echo`
+    /// would substitute a different program. The three builtins do not agree:
+    /// measured on macOS, `/bin/sh` and `zsh` interpret backslash escapes while
+    /// `/bin/bash` does not, and `/bin/sh` prints `-n` instead of consuming it.
+    /// `contracts/golden/echo-builtin-semantics-v1.json` records the measurement
+    /// and the frontend lowers only the domain where all of them agree.
+    WriteStdout {
+        contents: TextExpression,
+    },
+    /// Runs nothing and succeeds.
+    ///
+    /// Distinct from an empty [`Operation::Sequence`], which the validator
+    /// rejects: a sequence that lost its nodes is a lowering defect, while doing
+    /// nothing is what `case a) ;; esac` and `if ...; then :; fi` actually mean.
+    /// Keeping them apart is what lets the validator reject the first.
+    NoOp,
     Condition {
         predicate: Box<Node>,
         if_true: Box<Node>,
@@ -504,6 +528,8 @@ impl Operation {
             Self::Redirect { .. } => "redirect",
             Self::Pipeline { .. } => "pipeline",
             Self::Sequence { .. } => "sequence",
+            Self::NoOp => "no_op",
+            Self::WriteStdout { .. } => "write_stdout",
             Self::Test { .. } => "test",
             Self::Not { .. } => "not",
             Self::While { .. } => "while",
@@ -675,12 +701,12 @@ impl Plan {
         let mut preorder = 0_u64;
         for task in &self.tasks {
             validate_task(ValidateTaskArgs {
-                    task,
-                    task_table: &task_table,
-                    seen_ids: &mut seen_ids,
-                    preorder: &mut preorder,
-                    errors: &mut errors,
-                });
+                task,
+                task_table: &task_table,
+                seen_ids: &mut seen_ids,
+                preorder: &mut preorder,
+                errors: &mut errors,
+            });
         }
 
         if errors.is_empty() {
@@ -784,12 +810,12 @@ fn assign_node_id(node: &mut Node, preorder: &mut u64) -> Result<(), String> {
         None => ("", 0, 0),
     };
     node.id = node_id(NodeIdArgs {
-            normalized_path: path,
-            start_byte: start,
-            end_byte: end,
-            operation: node.operation.name(),
-            preorder: *preorder,
-        })?;
+        normalized_path: path,
+        start_byte: start,
+        end_byte: end,
+        operation: node.operation.name(),
+        preorder: *preorder,
+    })?;
     *preorder = preorder
         .checked_add(1)
         .ok_or_else(|| "node preorder overflow".to_owned())?;
@@ -801,6 +827,7 @@ fn visit_children_mut<E>(
     mut visit: impl FnMut(&mut Node) -> Result<(), E>,
 ) -> Result<(), E> {
     match operation {
+        Operation::NoOp | Operation::WriteStdout { .. } => {}
         Operation::Pipeline { nodes, .. }
         | Operation::Sequence { nodes, .. }
         | Operation::Parallel { nodes } => {
@@ -833,7 +860,10 @@ fn visit_children_mut<E>(
         | Operation::Redirect { body, .. }
         | Operation::CaptureStdout { body, .. }
         | Operation::Spawn { body, .. } => visit(body)?,
-        Operation::While { condition: body, body: finalizer }
+        Operation::While {
+            condition: body,
+            body: finalizer,
+        }
         | Operation::TryFinally { body, finalizer } => {
             visit(body)?;
             visit(finalizer)?;
@@ -968,13 +998,13 @@ fn validate_task(parts: ValidateTaskArgs<'_>) {
         }
     }
     validate_node(ValidateNodeArgs {
-            node: &task.body,
-            inputs: &input_names,
-            task_table,
-            seen_ids: &mut *seen_ids,
-            preorder: &mut *preorder,
-            errors: &mut *errors,
-        });
+        node: &task.body,
+        inputs: &input_names,
+        task_table,
+        seen_ids: &mut *seen_ids,
+        preorder: &mut *preorder,
+        errors: &mut *errors,
+    });
 }
 
 /// The inputs of [`validate_node`].
@@ -1029,12 +1059,12 @@ fn validate_node(parts: ValidateNodeArgs<'_>) {
         None => ("", 0, 0),
     };
     match node_id(NodeIdArgs {
-            normalized_path: path,
-            start_byte: start,
-            end_byte: end,
-            operation: node.operation.name(),
-            preorder: *preorder,
-        }) {
+        normalized_path: path,
+        start_byte: start,
+        end_byte: end,
+        operation: node.operation.name(),
+        preorder: *preorder,
+    }) {
         Ok(expected) if node.id != expected => errors.push(format!(
             "node id {} is not deterministic; expected {expected}",
             node.id
@@ -1079,7 +1109,8 @@ fn validate_node(parts: ValidateNodeArgs<'_>) {
     };
     match &node.operation {
         // Children are validated by the walk over them; nothing here is its own.
-        Operation::Not { .. } | Operation::While { .. } => {}
+        Operation::NoOp | Operation::Not { .. } | Operation::While { .. } => {}
+        Operation::WriteStdout { contents } => expression(contents, errors),
         Operation::Test { predicate } => match predicate {
             TestPredicate::NonEmpty { value } | TestPredicate::Empty { value } => {
                 expression(value, errors);
@@ -1160,13 +1191,13 @@ fn validate_node(parts: ValidateNodeArgs<'_>) {
                 }
             }
             validate_node(ValidateNodeArgs {
-                    node: body,
-                    inputs,
-                    task_table,
-                    seen_ids: &mut *seen_ids,
-                    preorder: &mut *preorder,
-                    errors: &mut *errors,
-                });
+                node: body,
+                inputs,
+                task_table,
+                seen_ids: &mut *seen_ids,
+                preorder: &mut *preorder,
+                errors: &mut *errors,
+            });
         }
         Operation::Pipeline { nodes, .. } | Operation::Parallel { nodes } => {
             if nodes.is_empty() {
@@ -1183,13 +1214,13 @@ fn validate_node(parts: ValidateNodeArgs<'_>) {
             }
             for child in nodes {
                 validate_node(ValidateNodeArgs {
-                        node: child,
-                        inputs,
-                        task_table,
-                        seen_ids: &mut *seen_ids,
-                        preorder: &mut *preorder,
-                        errors: &mut *errors,
-                    });
+                    node: child,
+                    inputs,
+                    task_table,
+                    seen_ids: &mut *seen_ids,
+                    preorder: &mut *preorder,
+                    errors: &mut *errors,
+                });
             }
         }
         Operation::Sequence { nodes, .. } => {
@@ -1198,13 +1229,13 @@ fn validate_node(parts: ValidateNodeArgs<'_>) {
             }
             for child in nodes {
                 validate_node(ValidateNodeArgs {
-                        node: child,
-                        inputs,
-                        task_table,
-                        seen_ids: &mut *seen_ids,
-                        preorder: &mut *preorder,
-                        errors: &mut *errors,
-                    });
+                    node: child,
+                    inputs,
+                    task_table,
+                    seen_ids: &mut *seen_ids,
+                    preorder: &mut *preorder,
+                    errors: &mut *errors,
+                });
             }
         }
         Operation::Condition {
@@ -1213,30 +1244,30 @@ fn validate_node(parts: ValidateNodeArgs<'_>) {
             if_false,
         } => {
             validate_node(ValidateNodeArgs {
-                    node: predicate,
-                    inputs,
-                    task_table,
-                    seen_ids: &mut *seen_ids,
-                    preorder: &mut *preorder,
-                    errors: &mut *errors,
-                });
+                node: predicate,
+                inputs,
+                task_table,
+                seen_ids: &mut *seen_ids,
+                preorder: &mut *preorder,
+                errors: &mut *errors,
+            });
             validate_node(ValidateNodeArgs {
-                    node: if_true,
-                    inputs,
-                    task_table,
-                    seen_ids: &mut *seen_ids,
-                    preorder: &mut *preorder,
-                    errors: &mut *errors,
-                });
+                node: if_true,
+                inputs,
+                task_table,
+                seen_ids: &mut *seen_ids,
+                preorder: &mut *preorder,
+                errors: &mut *errors,
+            });
             if let Some(child) = if_false {
                 validate_node(ValidateNodeArgs {
-                        node: child,
-                        inputs,
-                        task_table,
-                        seen_ids: &mut *seen_ids,
-                        preorder: &mut *preorder,
-                        errors: &mut *errors,
-                    });
+                    node: child,
+                    inputs,
+                    task_table,
+                    seen_ids: &mut *seen_ids,
+                    preorder: &mut *preorder,
+                    errors: &mut *errors,
+                });
             }
         }
         Operation::Match {
@@ -1254,23 +1285,23 @@ fn validate_node(parts: ValidateNodeArgs<'_>) {
                     errors.push("duplicate literal match case".into());
                 }
                 validate_node(ValidateNodeArgs {
-                        node: &case.body,
-                        inputs,
-                        task_table,
-                        seen_ids: &mut *seen_ids,
-                        preorder: &mut *preorder,
-                        errors: &mut *errors,
-                    });
+                    node: &case.body,
+                    inputs,
+                    task_table,
+                    seen_ids: &mut *seen_ids,
+                    preorder: &mut *preorder,
+                    errors: &mut *errors,
+                });
             }
             if let Some(child) = default {
                 validate_node(ValidateNodeArgs {
-                        node: child,
-                        inputs,
-                        task_table,
-                        seen_ids: &mut *seen_ids,
-                        preorder: &mut *preorder,
-                        errors: &mut *errors,
-                    });
+                    node: child,
+                    inputs,
+                    task_table,
+                    seen_ids: &mut *seen_ids,
+                    preorder: &mut *preorder,
+                    errors: &mut *errors,
+                });
             }
         }
         Operation::Foreach {
@@ -1285,13 +1316,13 @@ fn validate_node(parts: ValidateNodeArgs<'_>) {
                 expression(item, errors);
             }
             validate_node(ValidateNodeArgs {
-                    node: body,
-                    inputs,
-                    task_table,
-                    seen_ids: &mut *seen_ids,
-                    preorder: &mut *preorder,
-                    errors: &mut *errors,
-                });
+                node: body,
+                inputs,
+                task_table,
+                seen_ids: &mut *seen_ids,
+                preorder: &mut *preorder,
+                errors: &mut *errors,
+            });
         }
         Operation::Scope {
             variables,
@@ -1331,34 +1362,34 @@ fn validate_node(parts: ValidateNodeArgs<'_>) {
                 expression(directory, errors);
             }
             validate_node(ValidateNodeArgs {
-                    node: body,
-                    inputs,
-                    task_table,
-                    seen_ids: &mut *seen_ids,
-                    preorder: &mut *preorder,
-                    errors: &mut *errors,
-                });
+                node: body,
+                inputs,
+                task_table,
+                seen_ids: &mut *seen_ids,
+                preorder: &mut *preorder,
+                errors: &mut *errors,
+            });
         }
         Operation::TryFinally { body, finalizer } => {
             if contains_state_mutation(body) || contains_state_mutation(finalizer) {
                 errors.push("try/finally state mutation is undefined across failure paths".into());
             }
             validate_node(ValidateNodeArgs {
-                    node: body,
-                    inputs,
-                    task_table,
-                    seen_ids: &mut *seen_ids,
-                    preorder: &mut *preorder,
-                    errors: &mut *errors,
-                });
+                node: body,
+                inputs,
+                task_table,
+                seen_ids: &mut *seen_ids,
+                preorder: &mut *preorder,
+                errors: &mut *errors,
+            });
             validate_node(ValidateNodeArgs {
-                    node: finalizer,
-                    inputs,
-                    task_table,
-                    seen_ids: &mut *seen_ids,
-                    preorder: &mut *preorder,
-                    errors: &mut *errors,
-                });
+                node: finalizer,
+                inputs,
+                task_table,
+                seen_ids: &mut *seen_ids,
+                preorder: &mut *preorder,
+                errors: &mut *errors,
+            });
         }
         Operation::TaskCall { task, arguments } => {
             require_nonempty("task call target", task, errors);
@@ -1418,13 +1449,13 @@ fn validate_node(parts: ValidateNodeArgs<'_>) {
                 errors.push("stdout capture value_type must be text".into());
             }
             validate_node(ValidateNodeArgs {
-                    node: body,
-                    inputs,
-                    task_table,
-                    seen_ids: &mut *seen_ids,
-                    preorder: &mut *preorder,
-                    errors: &mut *errors,
-                });
+                node: body,
+                inputs,
+                task_table,
+                seen_ids: &mut *seen_ids,
+                preorder: &mut *preorder,
+                errors: &mut *errors,
+            });
         }
         Operation::Spawn { handle, body } => {
             if !valid_identifier(handle) {
@@ -1434,13 +1465,13 @@ fn validate_node(parts: ValidateNodeArgs<'_>) {
                 errors.push("spawned state mutation is undefined".into());
             }
             validate_node(ValidateNodeArgs {
-                    node: body,
-                    inputs,
-                    task_table,
-                    seen_ids: &mut *seen_ids,
-                    preorder: &mut *preorder,
-                    errors: &mut *errors,
-                });
+                node: body,
+                inputs,
+                task_table,
+                seen_ids: &mut *seen_ids,
+                preorder: &mut *preorder,
+                errors: &mut *errors,
+            });
         }
         Operation::Wait { handle } => {
             if !valid_identifier(handle) {
@@ -1556,6 +1587,8 @@ fn validate_node(parts: ValidateNodeArgs<'_>) {
 
 fn contains_state_mutation(node: &Node) -> bool {
     match &node.operation {
+        Operation::NoOp => false,
+        Operation::WriteStdout { .. } => true,
         Operation::Not { body } => contains_state_mutation(body),
         Operation::While { condition, body } => {
             contains_state_mutation(condition) || contains_state_mutation(body)
@@ -1844,7 +1877,9 @@ mod tests {
         ]);
         let arguments = BTreeMap::from([("name".into(), "-${SECOND}".into())]);
         assert_eq!(
-            expression.evaluate(&variables, &arguments, UnsetPolicy::Empty).unwrap(),
+            expression
+                .evaluate(&variables, &arguments, UnsetPolicy::Empty)
+                .unwrap(),
             "$SECOND-${SECOND}"
         );
     }
@@ -1853,21 +1888,25 @@ mod tests {
     fn deterministic_node_id_has_a_fixed_vector() {
         assert_eq!(
             node_id(NodeIdArgs {
-                    normalized_path: "scripts/build.sh",
-                    start_byte: 12,
-                    end_byte: 34,
-                    operation: "exec",
-                    preorder: 5,
-                }).unwrap(),
+                normalized_path: "scripts/build.sh",
+                start_byte: 12,
+                end_byte: 34,
+                operation: "exec",
+                preorder: 5,
+            })
+            .unwrap(),
             "680482a635998b2ac7bb4bd0782fb5a8"
         );
-        assert!(node_id(NodeIdArgs {
+        assert!(
+            node_id(NodeIdArgs {
                 normalized_path: "scripts/../escape.sh",
                 start_byte: 0,
                 end_byte: 1,
                 operation: "exec",
                 preorder: 0,
-            }).is_err());
+            })
+            .is_err()
+        );
     }
 
     #[test]
@@ -2128,12 +2167,13 @@ mod tests {
             ("build.sh", 0, 1, "Exec", "operation name"),
         ] {
             let error = node_id(NodeIdArgs {
-                    normalized_path: path,
-                    start_byte: start,
-                    end_byte: end,
-                    operation,
-                    preorder: 0,
-                }).unwrap_err();
+                normalized_path: path,
+                start_byte: start,
+                end_byte: end,
+                operation,
+                preorder: 0,
+            })
+            .unwrap_err();
             assert!(error.contains(expected), "unexpected {error:?}");
         }
 

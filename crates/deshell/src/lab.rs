@@ -965,7 +965,14 @@ mod tests {
                 .unwrap_err()
                 .contains("rootless")
         );
-        assert!(validate_provider(Platform::Macos, &probe(&["podman"], &[], false), Provider::Podman).is_ok());
+        assert!(
+            validate_provider(
+                Platform::Macos,
+                &probe(&["podman"], &[], false),
+                Provider::Podman
+            )
+            .is_ok()
+        );
     }
 
     #[test]

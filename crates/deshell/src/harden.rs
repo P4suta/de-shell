@@ -730,8 +730,7 @@ fn ensure_child(parent: &Path, child: &str) -> Result<PathBuf, String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             match crate::patch::ensure_directory(&path) {
                 Ok(
-                    crate::patch::DirectoryState::Created
-                    | crate::patch::DirectoryState::Existing,
+                    crate::patch::DirectoryState::Created | crate::patch::DirectoryState::Existing,
                 ) => {}
                 Err(crate::patch::DirectoryError::Occupied) => {
                     return Err(format!(
@@ -843,7 +842,10 @@ fn simple_diff(path: &str, before: &str, after: &str) -> String {
 // writers against one path, and assert on what the transactional layer does with
 // the result. Constructing those situations is precisely what the production ban
 // exists to prevent, so the ban is lifted here and nowhere else.
-#[expect(clippy::disallowed_methods, reason = "tests construct the races and corrupt trees the production ban prevents")]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "tests construct the races and corrupt trees the production ban prevents"
+)]
 mod tests {
     use super::*;
 

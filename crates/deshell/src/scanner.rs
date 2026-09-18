@@ -221,14 +221,14 @@ pub(crate) fn scan_with_interpreters(
             configured.interpreter.name(),
         ) {
             Ok(interpreter) => inventory.findings.push(finding(FindingParts {
-                    path: &configured.path,
-                    kind: FindingKind::ShellFile,
-                    interpreter: Some(interpreter.name().into()),
-                    interpreter_confidence: InterpreterConfidence::High,
-                    locator: None,
-                    span: ByteSpan::whole(&source),
-                    source,
-                })),
+                path: &configured.path,
+                kind: FindingKind::ShellFile,
+                interpreter: Some(interpreter.name().into()),
+                interpreter_confidence: InterpreterConfidence::High,
+                locator: None,
+                span: ByteSpan::whole(&source),
+                source,
+            })),
             Err(message) => {
                 push_interpreter_error(&mut inventory.errors, &configured.path, message)
             }
@@ -693,14 +693,14 @@ fn findings_for_file(relative: &str, absolute: &Path) -> FileScan {
     if let Some(detected) = detected {
         let interpreter = detected.name().to_owned();
         return FileScan::findings(vec![finding(FindingParts {
-                path: relative,
-                kind: FindingKind::ShellFile,
-                interpreter: Some(interpreter),
-                interpreter_confidence: InterpreterConfidence::High,
-                locator: None,
-                span: ByteSpan::whole(&source),
-                source,
-            })]);
+            path: relative,
+            kind: FindingKind::ShellFile,
+            interpreter: Some(interpreter),
+            interpreter_confidence: InterpreterConfidence::High,
+            locator: None,
+            span: ByteSpan::whole(&source),
+            source,
+        })]);
     }
     if !path_is_relevant && !potential_structured_host {
         return FileScan::default();
@@ -1022,14 +1022,14 @@ fn package_findings(path: &str, source: &str) -> Result<Vec<Finding>, String> {
                 .filter(|script| !script.is_empty())
                 .map(|script| {
                     finding(FindingParts {
-                            path,
-                            kind: FindingKind::EmbeddedShell,
-                            interpreter: Some("package-shell".into()),
-                            interpreter_confidence: InterpreterConfidence::Medium,
-                            locator: Some(format!("scripts.{name}")),
-                            span: span_of(source, script),
-                            source: script.as_bytes().to_vec(),
-                        })
+                        path,
+                        kind: FindingKind::EmbeddedShell,
+                        interpreter: Some("package-shell".into()),
+                        interpreter_confidence: InterpreterConfidence::Medium,
+                        locator: Some(format!("scripts.{name}")),
+                        span: span_of(source, script),
+                        source: script.as_bytes().to_vec(),
+                    })
                 })
         })
         .collect())
@@ -1046,17 +1046,17 @@ fn makefile_findings(path: &str, source: &str) -> Vec<Finding> {
                 .map(|command| {
                     let start = offsets[index] + 1;
                     finding(FindingParts {
-                            path,
-                            kind: FindingKind::EmbeddedShell,
-                            interpreter: Some("sh".into()),
-                            interpreter_confidence: InterpreterConfidence::High,
-                            locator: Some(format!("recipe:{}", index + 1)),
-                            span: ByteSpan {
+                        path,
+                        kind: FindingKind::EmbeddedShell,
+                        interpreter: Some("sh".into()),
+                        interpreter_confidence: InterpreterConfidence::High,
+                        locator: Some(format!("recipe:{}", index + 1)),
+                        span: ByteSpan {
                             start_byte: start as u64,
                             end_byte: (start + command.len()) as u64,
                         },
-                            source: command.as_bytes().to_vec(),
-                        })
+                        source: command.as_bytes().to_vec(),
+                    })
                 })
         })
         .collect()
@@ -1093,17 +1093,17 @@ fn dockerfile_findings(path: &str, source: &str) -> Result<Vec<Finding>, String>
                 }
             } else {
                 findings.push(finding(FindingParts {
-                        path,
-                        kind: FindingKind::EmbeddedShell,
-                        interpreter: Some("sh".into()),
-                        interpreter_confidence: InterpreterConfidence::High,
-                        locator: Some(format!("RUN:{line}")),
-                        span: ByteSpan {
+                    path,
+                    kind: FindingKind::EmbeddedShell,
+                    interpreter: Some("sh".into()),
+                    interpreter_confidence: InterpreterConfidence::High,
+                    locator: Some(format!("RUN:{line}")),
+                    span: ByteSpan {
                         start_byte: offsets[first_index] as u64,
                         end_byte: (offsets[index] + lines[index].len()) as u64,
                     },
-                        source: command.into_bytes(),
-                    }));
+                    source: command.into_bytes(),
+                }));
             }
         }
         index += 1;
@@ -1184,20 +1184,20 @@ fn yaml_findings(path: &str, source: &str, lower: &str) -> Result<Vec<Finding>, 
             let command = yaml_scalar(&block, &style);
             if !command.trim().is_empty() {
                 findings.push(finding(FindingParts {
-                        path,
-                        kind: if known {
+                    path,
+                    kind: if known {
                         FindingKind::EmbeddedShell
                     } else {
                         FindingKind::Candidate
                     },
-                        interpreter: Some(interpreter.into()),
-                        interpreter_confidence: if known {
+                    interpreter: Some(interpreter.into()),
+                    interpreter_confidence: if known {
                         InterpreterConfidence::High
                     } else {
                         InterpreterConfidence::Low
                     },
-                        locator: Some(format!("{key}:{line}")),
-                        span: ByteSpan {
+                    locator: Some(format!("{key}:{line}")),
+                    span: ByteSpan {
                         start_byte: offsets[line - 1] as u64,
                         end_byte: if index < offsets.len() {
                             offsets[index].saturating_sub(1) as u64
@@ -1205,29 +1205,29 @@ fn yaml_findings(path: &str, source: &str, lower: &str) -> Result<Vec<Finding>, 
                             source.len() as u64
                         },
                     },
-                        source: command.into_bytes(),
-                    }));
+                    source: command.into_bytes(),
+                }));
             }
             continue;
         }
         if !value.is_empty() && (known || looks_like_shell(&value)) {
             findings.push(finding(FindingParts {
-                    path,
-                    kind: if known {
+                path,
+                kind: if known {
                     FindingKind::EmbeddedShell
                 } else {
                     FindingKind::Candidate
                 },
-                    interpreter: Some((*interpreter).into()),
-                    interpreter_confidence: if known {
+                interpreter: Some((*interpreter).into()),
+                interpreter_confidence: if known {
                     InterpreterConfidence::High
                 } else {
                     InterpreterConfidence::Low
                 },
-                    locator: Some(format!("{key}:{line}")),
-                    span: span_of(source, &value),
-                    source: value.into_bytes(),
-                }));
+                locator: Some(format!("{key}:{line}")),
+                span: span_of(source, &value),
+                source: value.into_bytes(),
+            }));
         }
         index += 1;
     }
@@ -1423,13 +1423,13 @@ fn json_candidate_findings(path: &str, source: &str) -> Result<Vec<Finding>, Str
         .map_err(|error| format!("malformed JSON: {error}"))?;
     let mut output = Vec::new();
     collect_json_candidates(CollectJsonCandidatesArgs {
-            path,
-            source,
-            locator: "$",
-            executable: false,
-            value: &value,
-            output: &mut output,
-        });
+        path,
+        source,
+        locator: "$",
+        executable: false,
+        value: &value,
+        output: &mut output,
+    });
     Ok(output)
 }
 
@@ -1557,37 +1557,37 @@ fn collect_json_candidates(parts: CollectJsonCandidatesArgs<'_>) {
         serde_json::Value::Object(fields) => {
             for (name, value) in fields {
                 collect_json_candidates(CollectJsonCandidatesArgs {
-                        path,
-                        source,
-                        locator: &format!("{locator}.{name}"),
-                        executable: executable || executable_field(name),
-                        value,
-                        output,
-                    });
+                    path,
+                    source,
+                    locator: &format!("{locator}.{name}"),
+                    executable: executable || executable_field(name),
+                    value,
+                    output,
+                });
             }
         }
         serde_json::Value::Array(values) => {
             for (index, value) in values.iter().enumerate() {
                 collect_json_candidates(CollectJsonCandidatesArgs {
-                        path,
-                        source,
-                        locator: &format!("{locator}[{index}]"),
-                        executable,
-                        value,
-                        output,
-                    });
+                    path,
+                    source,
+                    locator: &format!("{locator}[{index}]"),
+                    executable,
+                    value,
+                    output,
+                });
             }
         }
         serde_json::Value::String(command) if executable && looks_like_shell(command) => output
             .push(finding(FindingParts {
-                    path,
-                    kind: FindingKind::Candidate,
-                    interpreter: None,
-                    interpreter_confidence: InterpreterConfidence::Low,
-                    locator: Some(locator.into()),
-                    span: span_of(source, command),
-                    source: command.as_bytes().to_vec(),
-                })),
+                path,
+                kind: FindingKind::Candidate,
+                interpreter: None,
+                interpreter_confidence: InterpreterConfidence::Low,
+                locator: Some(locator.into()),
+                span: span_of(source, command),
+                source: command.as_bytes().to_vec(),
+            })),
         _ => {}
     }
 }
@@ -1597,13 +1597,13 @@ fn toml_candidate_findings(path: &str, source: &str) -> Result<Vec<Finding>, Str
         .map_err(|error| format!("malformed TOML: {error}"))?;
     let mut output = Vec::new();
     collect_toml_candidates(CollectTomlCandidatesArgs {
-            path,
-            source,
-            locator: "$",
-            executable: false,
-            value: &value,
-            output: &mut output,
-        });
+        path,
+        source,
+        locator: "$",
+        executable: false,
+        value: &value,
+        output: &mut output,
+    });
     Ok(output)
 }
 
@@ -1636,37 +1636,37 @@ fn collect_toml_candidates(parts: CollectTomlCandidatesArgs<'_>) {
         toml::Value::Table(fields) => {
             for (name, value) in fields {
                 collect_toml_candidates(CollectTomlCandidatesArgs {
-                        path,
-                        source,
-                        locator: &format!("{locator}.{name}"),
-                        executable: executable || executable_field(name),
-                        value,
-                        output,
-                    });
+                    path,
+                    source,
+                    locator: &format!("{locator}.{name}"),
+                    executable: executable || executable_field(name),
+                    value,
+                    output,
+                });
             }
         }
         toml::Value::Array(values) => {
             for (index, value) in values.iter().enumerate() {
                 collect_toml_candidates(CollectTomlCandidatesArgs {
-                        path,
-                        source,
-                        locator: &format!("{locator}[{index}]"),
-                        executable,
-                        value,
-                        output,
-                    });
+                    path,
+                    source,
+                    locator: &format!("{locator}[{index}]"),
+                    executable,
+                    value,
+                    output,
+                });
             }
         }
         toml::Value::String(command) if executable && looks_like_shell(command) => {
             output.push(finding(FindingParts {
-                    path,
-                    kind: FindingKind::Candidate,
-                    interpreter: None,
-                    interpreter_confidence: InterpreterConfidence::Low,
-                    locator: Some(locator.into()),
-                    span: span_of(source, command),
-                    source: command.as_bytes().to_vec(),
-                }));
+                path,
+                kind: FindingKind::Candidate,
+                interpreter: None,
+                interpreter_confidence: InterpreterConfidence::Low,
+                locator: Some(locator.into()),
+                span: span_of(source, command),
+                source: command.as_bytes().to_vec(),
+            }));
         }
         _ => {}
     }
@@ -1677,34 +1677,34 @@ fn host_findings(path: &str, source: &str, lower: &str) -> Vec<Finding> {
     let mut output = Vec::new();
     if lower.ends_with(".py") {
         append_host_findings(AppendHostFindingsArgs {
-                output: &mut output,
-                path,
-                source,
-                line_offsets: &offsets,
-                regex: &PYTHON_OS_SYSTEM,
-                interpreter: "sh",
-            });
+            output: &mut output,
+            path,
+            source,
+            line_offsets: &offsets,
+            regex: &PYTHON_OS_SYSTEM,
+            interpreter: "sh",
+        });
         append_process_reference_findings(AppendProcessReferenceFindingsArgs {
-                output: &mut output,
-                path,
-                source,
-                line_offsets: &offsets,
-                start_regex: &PYTHON_SUBPROCESS_START,
-                syntax: ProcessSyntax::Python,
-            });
+            output: &mut output,
+            path,
+            source,
+            line_offsets: &offsets,
+            start_regex: &PYTHON_SUBPROCESS_START,
+            syntax: ProcessSyntax::Python,
+        });
     } else if [".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx"]
         .iter()
         .any(|extension| lower.ends_with(extension))
     {
         append_javascript_shell_findings(&mut output, path, source, &offsets);
         append_process_reference_findings(AppendProcessReferenceFindingsArgs {
-                output: &mut output,
-                path,
-                source,
-                line_offsets: &offsets,
-                start_regex: &JAVASCRIPT_PROCESS_START,
-                syntax: ProcessSyntax::Javascript,
-            });
+            output: &mut output,
+            path,
+            source,
+            line_offsets: &offsets,
+            start_regex: &JAVASCRIPT_PROCESS_START,
+            syntax: ProcessSyntax::Javascript,
+        });
     }
     output
 }
@@ -1741,17 +1741,17 @@ fn append_javascript_shell_findings(
         let line = line_index + 1;
         let column = source[line_start..start.start()].chars().count();
         output.push(finding(FindingParts {
-                path,
-                kind,
-                interpreter: Some("sh".into()),
-                interpreter_confidence: confidence,
-                locator: Some(format!("line:{line}:column:{column}")),
-                span: ByteSpan {
+            path,
+            kind,
+            interpreter: Some("sh".into()),
+            interpreter_confidence: confidence,
+            locator: Some(format!("line:{line}:column:{column}")),
+            span: ByteSpan {
                 start_byte: start.start() as u64,
                 end_byte: end as u64,
             },
-                source: command.into_bytes(),
-            }));
+            source: command.into_bytes(),
+        }));
     }
 }
 
@@ -1828,21 +1828,21 @@ fn append_process_reference_findings(parts: AppendProcessReferenceFindingsArgs<'
         let line = line_index + 1;
         let column = source[line_start..start.start()].chars().count();
         output.push(finding(FindingParts {
-                path,
-                kind,
-                interpreter: Some("sh".into()),
-                interpreter_confidence: if quoted_command {
+            path,
+            kind,
+            interpreter: Some("sh".into()),
+            interpreter_confidence: if quoted_command {
                 InterpreterConfidence::High
             } else {
                 InterpreterConfidence::Low
             },
-                locator: Some(format!("line:{line}:column:{column}")),
-                span: ByteSpan {
+            locator: Some(format!("line:{line}:column:{column}")),
+            span: ByteSpan {
                 start_byte: start.start() as u64,
                 end_byte: end as u64,
             },
-                source: command.into_bytes(),
-            }));
+            source: command.into_bytes(),
+        }));
     }
 }
 
@@ -1982,17 +1982,17 @@ fn append_host_findings(parts: AppendHostFindingsArgs<'_>) {
         let line = line_index + 1;
         let column = source[line_start..whole.start()].chars().count();
         output.push(finding(FindingParts {
-                path,
-                kind,
-                interpreter: Some(interpreter.into()),
-                interpreter_confidence: confidence,
-                locator: Some(format!("line:{line}:column:{column}")),
-                span: ByteSpan {
+            path,
+            kind,
+            interpreter: Some(interpreter.into()),
+            interpreter_confidence: confidence,
+            locator: Some(format!("line:{line}:column:{column}")),
+            span: ByteSpan {
                 start_byte: whole.start() as u64,
                 end_byte: whole.end() as u64,
             },
-                source: command.into_bytes(),
-            }));
+            source: command.into_bytes(),
+        }));
     }
 }
 
@@ -2086,7 +2086,10 @@ fn kind_order(kind: &FindingKind) -> u8 {
 // writers against one path, and assert on what the transactional layer does with
 // the result. Constructing those situations is precisely what the production ban
 // exists to prevent, so the ban is lifted here and nowhere else.
-#[expect(clippy::disallowed_methods, reason = "tests construct the races and corrupt trees the production ban prevents")]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "tests construct the races and corrupt trees the production ban prevents"
+)]
 mod tests {
     use super::*;
     use std::fs;

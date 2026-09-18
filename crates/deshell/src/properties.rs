@@ -77,7 +77,9 @@ fn generated_expressions_never_reparse_expanded_dollar_text() {
         let variables = BTreeMap::from([(variable_name, variable_value.clone())]);
         let arguments = BTreeMap::from([(argument_name, argument_value.clone())]);
         assert_eq!(
-            expression.evaluate(&variables, &arguments, crate::ir::UnsetPolicy::Empty).unwrap(),
+            expression
+                .evaluate(&variables, &arguments, crate::ir::UnsetPolicy::Empty)
+                .unwrap(),
             literal + &variable_value + &argument_value
         );
     }
@@ -91,26 +93,29 @@ fn generated_node_ids_are_stable_and_domain_separated() {
         let start = generator.next() % 10_000;
         let end = start + generator.next() % 1_000;
         let first = crate::ir::node_id(crate::ir::NodeIdArgs {
-                normalized_path: &path,
-                start_byte: start,
-                end_byte: end,
-                operation: "exec",
-                preorder,
-            }).unwrap();
+            normalized_path: &path,
+            start_byte: start,
+            end_byte: end,
+            operation: "exec",
+            preorder,
+        })
+        .unwrap();
         let second = crate::ir::node_id(crate::ir::NodeIdArgs {
-                normalized_path: &path,
-                start_byte: start,
-                end_byte: end,
-                operation: "exec",
-                preorder,
-            }).unwrap();
+            normalized_path: &path,
+            start_byte: start,
+            end_byte: end,
+            operation: "exec",
+            preorder,
+        })
+        .unwrap();
         let other_operation = crate::ir::node_id(crate::ir::NodeIdArgs {
-                normalized_path: &path,
-                start_byte: start,
-                end_byte: end,
-                operation: "file_read",
-                preorder,
-            }).unwrap();
+            normalized_path: &path,
+            start_byte: start,
+            end_byte: end,
+            operation: "file_read",
+            preorder,
+        })
+        .unwrap();
         assert_eq!(first, second);
         assert_ne!(first, other_operation);
         assert_eq!(first.len(), 32);

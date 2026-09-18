@@ -115,12 +115,21 @@ run = [
   "cargo llvm-cov --locked --workspace --all-targets --summary-only --fail-under-lines 90 -- --test-threads=1",
 ]
 
+[tasks."test:builtin-semantics"]
+description = "Measure the `test` and `echo` builtins against their recordings"
+run = [
+  "cargo run --locked -p xtask -- test-semantics",
+  "cargo run --locked -p xtask -- echo-semantics",
+]
+
 [tasks.test]
 description = "Run the complete test suite"
 run = [
   "cargo test --locked --workspace -- --test-threads=1",
   "cargo build --locked -p deshell",
   "cargo run --locked -p xtask -- conformance target/debug/deshell",
+  "cargo run --locked -p xtask -- test-semantics",
+  "cargo run --locked -p xtask -- echo-semantics",
 ]
 
 [tasks.performance]

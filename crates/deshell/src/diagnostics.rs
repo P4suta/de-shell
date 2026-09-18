@@ -11,7 +11,10 @@ pub(crate) enum Mode {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
-#[expect(dead_code, reason = "constructed by contract paths that are exercised only under specific platforms or feature gates")]
+#[expect(
+    dead_code,
+    reason = "constructed by contract paths that are exercised only under specific platforms or feature gates"
+)]
 pub(crate) enum Severity {
     Error,
     Warning,

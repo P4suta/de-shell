@@ -145,9 +145,15 @@ fn run_bash_semantics(root: &Path) -> Result<(), Vec<String>> {
 
     let mut differences = 0_usize;
     for case in cases {
-        let name = case["name"].as_str().ok_or_else(|| vec!["case has no name".to_owned()])?;
-        let script = case["script"].as_str().ok_or_else(|| vec!["case has no script".to_owned()])?;
-        let expected = case["expected"].as_i64().ok_or_else(|| vec!["case has no expected".to_owned()])?;
+        let name = case["name"]
+            .as_str()
+            .ok_or_else(|| vec!["case has no name".to_owned()])?;
+        let script = case["script"]
+            .as_str()
+            .ok_or_else(|| vec!["case has no script".to_owned()])?;
+        let expected = case["expected"]
+            .as_i64()
+            .ok_or_else(|| vec!["case has no expected".to_owned()])?;
         let status = std::process::Command::new("bash")
             .arg("-c")
             .arg(script)
@@ -165,7 +171,10 @@ fn run_bash_semantics(root: &Path) -> Result<(), Vec<String>> {
     }
 
     if differences == 0 {
-        println!("{} case(s) agree with the recorded measurement", cases.len());
+        println!(
+            "{} case(s) agree with the recorded measurement",
+            cases.len()
+        );
     } else {
         println!(
             "{differences} of {} case(s) differ on this interpreter; each one is a place where an option model has to name the version",
@@ -184,12 +193,103 @@ fn run_bash_semantics(root: &Path) -> Result<(), Vec<String>> {
 /// two disagree is a difference this tool exists to report rather than model
 /// away — and because a table checked only against its author's reading of the
 /// specification is not checked at all.
+/// Check each shell's `echo` builtin against the recording, and check the
+/// frontend's native rule against bash.
+///
+/// The shells disagree, so the recording has a column per shell rather than one
+/// expected value. A case marked `modelled` is one the frontend lowers, and the
+/// only rule it implements is "the arguments joined by a single space and a
+/// newline" — so bash's measured output has to be exactly that, or the lowering
+/// writes different bytes than the shell it replaced.
+fn run_echo_semantics(root: &Path) -> Result<(), Vec<String>> {
+    let path = root.join("contracts/golden/echo-builtin-semantics-v1.json");
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|error| vec![format!("cannot read {}: {error}", path.display())])?;
+    let corpus: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|error| vec![format!("malformed corpus: {error}")])?;
+    let cases = corpus["cases"]
+        .as_array()
+        .ok_or_else(|| vec!["corpus has no cases array".to_owned()])?;
+    if cases.is_empty() {
+        return Err(vec!["corpus is empty".to_owned()]);
+    }
+    let mut errors = Vec::new();
+    let mut checked = 0_usize;
+    for case in cases {
+        let name = case["name"].as_str().unwrap_or("<unnamed>");
+        let arguments = case["arguments"]
+            .as_array()
+            .ok_or_else(|| vec![format!("{name} has no arguments array")])?
+            .iter()
+            .map(|value| value.as_str().unwrap_or_default().to_owned())
+            .collect::<Vec<_>>();
+        let quoted = arguments
+            .iter()
+            .map(|argument| format!("'{}'", argument.replace('\'', "'\\''")))
+            .collect::<Vec<_>>()
+            .join(" ");
+        // Bash is the only shell the frontend models, so its absence is fatal
+        // rather than a column to skip.
+        for shell in ["bash", "sh", "zsh"] {
+            let Some(recorded) = case[shell].as_str() else {
+                errors.push(format!("{name} has no {shell} column"));
+                continue;
+            };
+            let output = std::process::Command::new(shell)
+                .arg("-c")
+                .arg(format!("echo {quoted}"))
+                .output();
+            let output = match output {
+                Ok(output) => output,
+                Err(error) if shell != "bash" => {
+                    println!("skipped  {name}/{shell}: {error}");
+                    continue;
+                }
+                Err(error) => {
+                    errors.push(format!("cannot run {shell} for {name}: {error}"));
+                    continue;
+                }
+            };
+            let actual = String::from_utf8_lossy(&output.stdout).into_owned();
+            checked += 1;
+            if actual != recorded {
+                errors.push(format!(
+                    "{name}/{shell}: recorded {recorded:?}, observed {actual:?}"
+                ));
+            }
+        }
+        let modelled = case["modelled"].as_bool();
+        let Some(modelled) = modelled else {
+            errors.push(format!("{name} does not say whether it is modelled"));
+            continue;
+        };
+        if !modelled {
+            continue;
+        }
+        let rule = format!("{}\n", arguments.join(" "));
+        let recorded = case["bash"].as_str().unwrap_or_default();
+        if recorded != rule {
+            errors.push(format!(
+                "{name} is modelled, but bash writes {recorded:?} where the rule gives {rule:?}"
+            ));
+        }
+    }
+    if errors.is_empty() {
+        println!(
+            "{} echo case(s) match the recording across {checked} shell observation(s)",
+            cases.len()
+        );
+        return Ok(());
+    }
+    Err(errors)
+}
+
 fn run_test_semantics(root: &Path) -> Result<(), Vec<String>> {
     let path = root.join("contracts/golden/test-builtin-semantics-v1.json");
     let raw = std::fs::read_to_string(&path)
         .map_err(|error| vec![format!("cannot read {}: {error}", path.display())])?;
-    let corpus: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|error| vec![format!("malformed corpus: {error}")])?;
+    let corpus: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|error| vec![format!("malformed corpus: {error}")])?;
     let cases = corpus["cases"]
         .as_array()
         .ok_or_else(|| vec!["corpus has no cases array".to_owned()])?;
@@ -1257,6 +1357,7 @@ fn dispatch(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Vec<Str
         }
         Some("bash-semantics") => run_bash_semantics(root),
         Some("test-semantics") => run_test_semantics(root),
+        Some("echo-semantics") => run_echo_semantics(root),
         Some("validate-contracts") => validate_contract_tree(root).map(|_| ()),
         Some("performance") => {
             let binary = arguments

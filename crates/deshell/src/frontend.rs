@@ -212,12 +212,12 @@ pub(crate) fn lower(
                 residual_node(&normalized, source, interpreter.name(), reason)
             } else {
                 delegated_node(DelegatedNodeArgs {
-                        path: &normalized,
-                        source,
-                        interpreter: interpreter.name(),
-                        reason,
-                        capabilities: analysis.capabilities.clone(),
-                    })
+                    path: &normalized,
+                    source,
+                    interpreter: interpreter.name(),
+                    reason,
+                    capabilities: analysis.capabilities.clone(),
+                })
             };
             (
                 body,
@@ -322,6 +322,7 @@ fn rebind_source_path(plan: &mut Plan, from: &str, to: &str) -> Result<(), Strin
             *path = to.into();
         }
         match &mut node.operation {
+            Operation::NoOp | Operation::WriteStdout { .. } => {}
             Operation::While { condition, body } => {
                 visit(condition, from, to);
                 visit(body, from, to);
@@ -371,7 +372,7 @@ fn rebind_source_path(plan: &mut Plan, from: &str, to: &str) -> Result<(), Strin
             | Operation::Wait { .. }
             | Operation::SendSignal { .. }
             | Operation::Test { .. }
-        | Operation::FileRead { .. }
+            | Operation::FileRead { .. }
             | Operation::FileWrite { .. }
             | Operation::FileRemove { .. }
             | Operation::FileMetadata { .. }
@@ -596,12 +597,12 @@ fn conservative_source_analysis(
             if byte == b'$' {
                 let locals = BTreeSet::new();
                 if let Ok((_, end)) = parse_expansion(ParseExpansionArgs {
-                        source: text,
-                        start: index,
-                        inputs: &mut analysis.inputs,
-                        environment: &mut analysis.environment,
-                        locals: &locals,
-                    }) {
+                    source: text,
+                    start: index,
+                    inputs: &mut analysis.inputs,
+                    environment: &mut analysis.environment,
+                    locals: &locals,
+                }) {
                     index = end;
                     continue;
                 }
@@ -756,6 +757,7 @@ pub(crate) fn bind_interpreter_pins(
 
 fn bind_node_pin(node: &mut Node, pins: &crate::config::InterpreterPins) -> Result<(), String> {
     match &mut node.operation {
+        Operation::NoOp | Operation::WriteStdout { .. } => {}
         Operation::While { condition, body } => {
             bind_node_pin(condition, pins)?;
             bind_node_pin(body, pins)?;
@@ -1305,7 +1307,11 @@ fn while_arms(source: &str, statements: &[Range], start: usize) -> Option<(usize
 /// Returns the index of the `fi` statement and the indices of the `then` and
 /// optional `else` that divide it. A nested `if`, an `elif`, or a missing arm
 /// yields `None` so the statement is delegated rather than lowered from a guess.
-fn if_arms(source: &str, statements: &[Range], start: usize) -> Option<(usize, usize, Option<usize>)> {
+fn if_arms(
+    source: &str,
+    statements: &[Range],
+    start: usize,
+) -> Option<(usize, usize, Option<usize>)> {
     let word = |index: usize| source[statements[index].start..statements[index].end].trim();
     let mut then_at = None;
     let mut else_at = None;
@@ -1347,22 +1353,124 @@ fn case_end(source: &str, statements: &[Range], start: usize) -> Option<usize> {
     None
 }
 
-/// Split `PATTERN) BODY` into its two halves.
+/// Split `PATTERN) BODY` into its patterns and its body.
 ///
-/// Only a single literal pattern is modelled. An alternation (`a|b`), a pattern
-/// carrying an expansion, or a missing `)` yields `None`, because matching the
-/// wrong arm runs the wrong command.
-fn case_arm(text: &str) -> Option<(&str, &str)> {
-    let (pattern, body) = text.split_once(')')?;
-    let pattern = pattern.trim().trim_start_matches('(').trim();
-    if pattern.is_empty()
-        || pattern
-            .bytes()
-            .any(|byte| matches!(byte, b'|' | b'$' | b'`' | b'"' | b'\'' | b'[' | b'?'))
-    {
+/// An alternation (`a|b`) becomes several patterns sharing one body, which is
+/// what the shell does with it. A pattern carrying an expansion or a glob, or a
+/// missing `)`, yields `None`: matching the wrong arm runs the wrong command.
+fn case_arm(text: &str) -> Option<(Vec<&str>, &str)> {
+    let (patterns, body) = text.split_once(')')?;
+    let patterns = patterns.trim().trim_start_matches('(').trim();
+    if patterns.is_empty() {
         return None;
     }
-    Some((pattern, body.trim().trim_end_matches(";;").trim()))
+    let patterns: Vec<&str> = patterns.split('|').map(str::trim).collect();
+    if patterns.iter().any(|pattern| {
+        pattern.is_empty()
+            || pattern
+                .bytes()
+                .any(|byte| matches!(byte, b'$' | b'`' | b'"' | b'\'' | b'[' | b'?' | b'*'))
+                && *pattern != "*"
+    }) {
+        return None;
+    }
+    Some((patterns, body.trim()))
+}
+
+/// Group the statements between `in` and `esac` into arms.
+///
+/// An arm is `PATTERN) BODY` ended by `;;`, and `BODY` can span any number of
+/// statements. The returned range covers the whole body; `None` is an arm that
+/// runs nothing. The last arm may omit its `;;`, which POSIX permits.
+///
+/// Returns `None` when a statement cannot belong to an arm — a body before any
+/// pattern, a `;&` or `;;&` fallthrough this does not model — so the `case` is
+/// delegated rather than lowered from a guess.
+fn case_arms<'a>(
+    source: &'a str,
+    statements: &[Range],
+) -> Option<Vec<(Vec<&'a str>, Option<Range>)>> {
+    let mut arms: Vec<(Vec<&'a str>, Option<Range>)> = Vec::new();
+    let mut open: Option<(Vec<&'a str>, Option<Range>)> = None;
+    for statement in statements {
+        let text = source[statement.start..statement.end].trim();
+        if text.is_empty() {
+            continue;
+        }
+        if text == ";;" {
+            arms.push(open.take()?);
+            continue;
+        }
+        match &mut open {
+            // A `;&` or `;;&` arrives here as its own statement and has no `)`,
+            // so `case_arm` rejects it and the fallthrough is delegated.
+            None => {
+                let (patterns, first) = case_arm(text)?;
+                let body = (!first.is_empty()).then(|| {
+                    let start = statement.start
+                        + source[statement.start..statement.end]
+                            .find(first)
+                            .unwrap_or_default();
+                    Range {
+                        start,
+                        end: start + first.len(),
+                    }
+                });
+                open = Some((patterns, body));
+            }
+            Some((_, body)) => match body {
+                Some(body) => body.end = statement.end,
+                None => {
+                    *body = Some(Range {
+                        start: statement.start,
+                        end: statement.end,
+                    });
+                }
+            },
+        }
+    }
+    // POSIX lets the final arm omit its `;;`; `esac` ends it.
+    if let Some(arm) = open.take() {
+        arms.push(arm);
+    }
+    Some(arms)
+}
+
+/// The bytes bash's `echo` writes for these arguments, if that is provable.
+///
+/// `None` means the first argument could begin with `-`, so bash might read it
+/// as `-n`, `-e` or `-E` instead of printing it. Everything after the first
+/// argument is printed verbatim whatever it holds, because bash stops looking
+/// for options at the first one that is not one.
+fn echo_contents(arguments: &[crate::ir::TextExpression]) -> Option<Vec<TextPart>> {
+    if let Some(first) = arguments.first() {
+        match first.parts.first() {
+            Some(TextPart::Literal { value }) if !value.starts_with('-') => {}
+            // An empty first argument prints an empty field, which is not an
+            // option; anything else is unknown until the expansion happens.
+            Some(TextPart::Literal { value }) if value.is_empty() => {}
+            _ => return None,
+        }
+    }
+    let mut parts: Vec<TextPart> = Vec::new();
+    // The canonical form has no two adjacent literals, and joining arguments
+    // creates them: `echo a b` is `"a"`, `" "`, `"b"`, `"\n"` before merging.
+    let mut push = |part: TextPart| match (parts.last_mut(), &part) {
+        (Some(TextPart::Literal { value }), TextPart::Literal { value: next }) => {
+            value.push_str(next);
+        }
+        _ => parts.push(part),
+    };
+    for (index, argument) in arguments.iter().enumerate() {
+        if index > 0 {
+            push(TextPart::Literal { value: " ".into() });
+        }
+        for part in &argument.parts {
+            push(part.clone());
+        }
+    }
+    push(TextPart::Literal { value: "\n".into() });
+    Some(parts)
 }
 
 fn lower_posix(path: &str, source: &str, interpreter: &Interpreter) -> Result<Lowered, String> {
@@ -1450,8 +1558,12 @@ fn lower_posix(path: &str, source: &str, interpreter: &Interpreter) -> Result<Lo
             let condition = arm(index - 1, do_at, "while ");
             let loop_body = arm(do_at, done_at, "do");
             if let (Ok(condition), Ok(loop_body)) = (condition, loop_body) {
-                let span =
-                    span_for_range(path, source, statements[index - 1].start, statements[done_at].end)?;
+                let span = span_for_range(
+                    path,
+                    source,
+                    statements[index - 1].start,
+                    statements[done_at].end,
+                )?;
                 nodes.push(native_node(
                     Operation::While {
                         condition: Box::new(condition),
@@ -1486,43 +1598,53 @@ fn lower_posix(path: &str, source: &str, interpreter: &Interpreter) -> Result<Lo
             let mut cases = Vec::new();
             let mut default = None;
             let mut modelled = words.as_ref().is_ok_and(|words| words.len() == 1);
-            for statement in &statements[index..esac_at] {
-                let text = source[statement.start..statement.end].trim();
-                if text.is_empty() {
-                    continue;
+            // Grouping the arms is separate from lowering them: an arm's body
+            // can be any number of statements, and the boundary is the `;;`
+            // rather than the end of a line. Doing it in one pass made every
+            // arm exactly one statement long, so an arm written across lines
+            // delegated the whole `case`.
+            match case_arms(source, &statements[index..esac_at]) {
+                Some(arms) => {
+                    for (patterns, body) in arms {
+                        // `a|b) ;;` is a real arm that does nothing, and it is
+                        // how a script says "these values are fine". Running
+                        // nothing is the behaviour, not a gap in the model.
+                        let node = match body {
+                            None => native_node(
+                                Operation::NoOp,
+                                &format!("{}-static-empty-arm-v1", interpreter.name()),
+                                span_for_range(path, source, range.start, range.end)?,
+                            ),
+                            Some(body) => {
+                                let Ok(node) = lower_posix_control(LowerPosixControlArgs {
+                                    path,
+                                    source,
+                                    range: body,
+                                    interpreter,
+                                    inputs: &mut inputs,
+                                    environment: &mut environment,
+                                    locals: &mut locals,
+                                    pipefail: options.pipefail,
+                                }) else {
+                                    modelled = false;
+                                    break;
+                                };
+                                node
+                            }
+                        };
+                        for pattern in patterns {
+                            if pattern == "*" {
+                                default = Some(Box::new(node.clone()));
+                            } else {
+                                cases.push(crate::ir::MatchCase {
+                                    pattern: crate::ir::TextExpression::literal(pattern),
+                                    body: node.clone(),
+                                });
+                            }
+                        }
+                    }
                 }
-                let Some((pattern, arm)) = case_arm(text) else {
-                    modelled = false;
-                    break;
-                };
-                let offset = statement.start
-                    + source[statement.start..statement.end]
-                        .find(arm)
-                        .unwrap_or_default();
-                let Ok(node) = lower_posix_control(LowerPosixControlArgs {
-                    path,
-                    source,
-                    range: Range {
-                        start: offset,
-                        end: offset + arm.len(),
-                    },
-                    interpreter,
-                    inputs: &mut inputs,
-                    environment: &mut environment,
-                    locals: &mut locals,
-                    pipefail: options.pipefail,
-                }) else {
-                    modelled = false;
-                    break;
-                };
-                if pattern == "*" {
-                    default = Some(Box::new(node));
-                } else {
-                    cases.push(crate::ir::MatchCase {
-                        pattern: crate::ir::TextExpression::literal(pattern),
-                        body: node,
-                    });
-                }
+                None => modelled = false,
             }
             if modelled
                 && let Ok(mut words) = words
@@ -1638,15 +1760,15 @@ fn lower_posix(path: &str, source: &str, interpreter: &Interpreter) -> Result<Lo
             continue;
         }
         let node = lower_posix_control(LowerPosixControlArgs {
-                path,
-                source,
-                range,
-                interpreter,
-                inputs: &mut inputs,
-                environment: &mut environment,
-                locals: &mut locals,
-                pipefail: options.pipefail,
-            })?;
+            path,
+            source,
+            range,
+            interpreter,
+            inputs: &mut inputs,
+            environment: &mut environment,
+            locals: &mut locals,
+            pipefail: options.pipefail,
+        })?;
         nodes.push(node);
     }
     if nodes.is_empty() {
@@ -1729,6 +1851,28 @@ fn shell_statements(source: &str) -> Result<Vec<Range>, String> {
             if range.start < range.end {
                 output.push(range);
             }
+            // `;;`, `;;&` and `;&` end a `case` arm. Splitting on `;` alone drops
+            // them, and with them the only record of where an arm's body ends —
+            // an arm written across several lines became several statements with
+            // no boundary between them. Each is emitted as a statement of its own
+            // so the `case` lowering can read it; no other shell construct
+            // contains them.
+            let terminator = if byte != b';' {
+                0
+            } else if bytes[index..].starts_with(b";;&") {
+                3
+            } else if bytes[index..].starts_with(b";;") || bytes[index..].starts_with(b";&") {
+                2
+            } else {
+                0
+            };
+            if terminator > 0 {
+                output.push(Range {
+                    start: index,
+                    end: index + terminator,
+                });
+                index += terminator - 1;
+            }
             start = index + 1;
             token_started = false;
         } else {
@@ -1792,14 +1936,14 @@ fn lower_posix_control(parts: LowerPosixControlArgs<'_>) -> Result<Node, String>
     let controls = top_level_controls(source, range)?;
     if controls.is_empty() {
         return lower_posix_simple(LowerPosixSimpleArgs {
-                path,
-                source,
-                range,
-                interpreter,
-                inputs,
-                environment,
-                locals,
-            });
+            path,
+            source,
+            range,
+            interpreter,
+            inputs,
+            environment,
+            locals,
+        });
     }
     let kind = controls[0].1;
     if controls.iter().any(|(_, current)| *current != kind) {
@@ -1824,14 +1968,14 @@ fn lower_posix_control(parts: LowerPosixControlArgs<'_>) -> Result<Node, String>
     let mut nodes = Vec::new();
     for piece in pieces {
         nodes.push(lower_posix_simple(LowerPosixSimpleArgs {
-                path,
-                source,
-                range: piece,
-                interpreter,
-                inputs,
-                environment,
-                locals,
-            })?);
+            path,
+            source,
+            range: piece,
+            interpreter,
+            inputs,
+            environment,
+            locals,
+        })?);
     }
     let span = span_for_range(path, source, range.start, range.end)?;
     match kind {
@@ -2015,14 +2159,14 @@ fn lower_posix_simple(parts: LowerPosixSimpleArgs<'_>) -> Result<Node, String> {
             let inner_start = range.start + raw.find("$(").unwrap() + 2;
             let inner_end = range.end - 1;
             let body = lower_posix_simple(LowerPosixSimpleArgs {
-                    path,
-                    source,
-                    range: trim_range(source, inner_start, inner_end),
-                    interpreter,
-                    inputs,
-                    environment,
-                    locals,
-                })?;
+                path,
+                source,
+                range: trim_range(source, inner_start, inner_end),
+                interpreter,
+                inputs,
+                environment,
+                locals,
+            })?;
             Operation::CaptureStdout {
                 name: name.to_owned(),
                 value_type: PrimitiveType::Text,
@@ -2030,12 +2174,12 @@ fn lower_posix_simple(parts: LowerPosixSimpleArgs<'_>) -> Result<Node, String> {
             }
         } else {
             let expression = parse_posix_word(ParsePosixWordArgs {
-                    source: rhs,
-                    allow_unquoted_expansion: true,
-                    inputs,
-                    environment,
-                    locals,
-                })?;
+                source: rhs,
+                allow_unquoted_expansion: true,
+                inputs,
+                environment,
+                locals,
+            })?;
             Operation::SetVariable {
                 name: name.to_owned(),
                 value_type: infer_value_type(&expression),
@@ -2149,6 +2293,30 @@ fn lower_posix_simple(parts: LowerPosixSimpleArgs<'_>) -> Result<Node, String> {
             span_for_range(path, source, range.start, range.end)?,
         ));
     }
+    if executable == "echo" && matches!(interpreter, Interpreter::Bash) {
+        // `echo` is a builtin, and the three builtins do not agree. Measured on
+        // macOS: `/bin/sh` and `zsh` interpret backslash escapes in every
+        // argument, `/bin/bash` interprets none; `/bin/sh` prints `-n` rather
+        // than consuming it, and `zsh` prints nothing for a lone `-`.
+        // `contracts/golden/echo-builtin-semantics-v1.json` records this.
+        //
+        // Bash's own rule is narrow enough to prove: options are read only from
+        // the first argument, and without `-e` no argument is rescanned. So a
+        // first argument that cannot begin with `-` makes the whole call
+        // equivalent to writing the arguments joined by a space and a newline.
+        // A first argument whose leading byte is not known statically — `echo
+        // "$1"` — is refused, because `$1` may be `-n` at run time.
+        if let Some(parts) = echo_contents(&words[1..]) {
+            return Ok(native_node(
+                Operation::WriteStdout {
+                    contents: crate::ir::TextExpression { parts },
+                },
+                &format!("{}-static-echo-v1", interpreter.name()),
+                span_for_range(path, source, range.start, range.end)?,
+            ));
+        }
+        return Err("echo argument requires pinned interpreter delegation".into());
+    }
     if shell_builtin(&executable) {
         return Err(format!(
             "shell builtin {executable} requires pinned interpreter delegation"
@@ -2215,7 +2383,9 @@ struct DoubleBracketArgs<'a> {
 /// modelled — `p*`, `*s`, `*i*` — and a pattern with `?`, a bracket class or an
 /// interior `*` leaves the statement delegated. The remaining operators are the
 /// ones `[` has, read the same way.
-fn double_bracket_predicate(parts: DoubleBracketArgs<'_>) -> Result<crate::ir::TestPredicate, String> {
+fn double_bracket_predicate(
+    parts: DoubleBracketArgs<'_>,
+) -> Result<crate::ir::TestPredicate, String> {
     // Destructured without `..`: see `DoubleBracketArgs`.
     let DoubleBracketArgs {
         path,
@@ -2273,10 +2443,7 @@ fn double_bracket_predicate(parts: DoubleBracketArgs<'_>) -> Result<crate::ir::T
 }
 
 /// A glob with exactly one anchor, as one of the three modelled predicates.
-fn anchored_pattern(
-    value: &TextExpression,
-    pattern: &str,
-) -> Option<crate::ir::TestPredicate> {
+fn anchored_pattern(value: &TextExpression, pattern: &str) -> Option<crate::ir::TestPredicate> {
     let body = pattern.strip_prefix('*');
     let leading = body.is_some();
     let body = body.unwrap_or(pattern);
@@ -2478,12 +2645,12 @@ fn lower_fish(path: &str, source: &str) -> Result<Lowered, String> {
             continue;
         }
         nodes.push(lower_fish_control(LowerFishControlArgs {
-                path,
-                source,
-                range,
-                inputs: &mut inputs,
-                environment: &mut environment,
-            })?);
+            path,
+            source,
+            range,
+            inputs: &mut inputs,
+            environment: &mut environment,
+        })?);
     }
     if nodes.is_empty() {
         return Err("fish script contains no static external invocation".into());
@@ -2536,12 +2703,12 @@ fn lower_fish_control(parts: LowerFishControlArgs<'_>) -> Result<Node, String> {
     let controls = top_level_controls(source, range)?;
     if controls.is_empty() {
         return lower_fish_simple(LowerFishSimpleArgs {
-                path,
-                source,
-                range,
-                inputs,
-                environment,
-            });
+            path,
+            source,
+            range,
+            inputs,
+            environment,
+        });
     }
     if controls.iter().any(|(_, operator)| *operator != "&&") {
         return Err("fish control syntax is outside the static && subset".into());
@@ -2564,13 +2731,15 @@ fn lower_fish_control(parts: LowerFishControlArgs<'_>) -> Result<Node, String> {
     let span = span_for_range(path, source, range.start, range.end)?;
     let mut nodes = pieces
         .into_iter()
-        .map(|piece| lower_fish_simple(LowerFishSimpleArgs {
+        .map(|piece| {
+            lower_fish_simple(LowerFishSimpleArgs {
                 path,
                 source,
                 range: piece,
                 inputs,
                 environment,
-            }))
+            })
+        })
         .collect::<Result<Vec<_>, _>>()?
         .into_iter();
     let mut result = nodes.next().expect("fish && pieces are non-empty");
@@ -2795,12 +2964,12 @@ fn lower_cmd(path: &str, source: &str) -> Result<Lowered, String> {
             return Err("cmd command echo must be suppressed".into());
         }
         nodes.push(lower_cmd_control(LowerCmdControlArgs {
-                path,
-                source,
-                range,
-                inputs: &mut inputs,
-                environment: &mut environment,
-            })?);
+            path,
+            source,
+            range,
+            inputs: &mut inputs,
+            environment: &mut environment,
+        })?);
     }
     if nodes.is_empty() {
         return Err("cmd script contains no static external invocation".into());
@@ -2858,12 +3027,12 @@ fn lower_cmd_control(parts: LowerCmdControlArgs<'_>) -> Result<Node, String> {
     let controls = cmd_and_controls(source, range)?;
     if controls.is_empty() {
         return lower_cmd_simple(LowerCmdSimpleArgs {
-                path,
-                source,
-                range,
-                inputs,
-                environment,
-            });
+            path,
+            source,
+            range,
+            inputs,
+            environment,
+        });
     }
     let mut pieces = Vec::new();
     let mut cursor = range.start;
@@ -2883,13 +3052,15 @@ fn lower_cmd_control(parts: LowerCmdControlArgs<'_>) -> Result<Node, String> {
     let span = span_for_range(path, source, range.start, range.end)?;
     let mut nodes = pieces
         .into_iter()
-        .map(|piece| lower_cmd_simple(LowerCmdSimpleArgs {
+        .map(|piece| {
+            lower_cmd_simple(LowerCmdSimpleArgs {
                 path,
                 source,
                 range: piece,
                 inputs,
                 environment,
-            }))
+            })
+        })
         .collect::<Result<Vec<_>, _>>()?
         .into_iter();
     let mut result = nodes.next().expect("cmd && pieces are non-empty");
@@ -3098,12 +3269,12 @@ fn lower_powershell(path: &str, source: &str) -> Result<Lowered, String> {
             continue;
         }
         nodes.push(lower_powershell_control(LowerPowershellControlArgs {
-                path,
-                source,
-                range,
-                inputs: &mut inputs,
-                environment: &mut environment,
-            })?);
+            path,
+            source,
+            range,
+            inputs: &mut inputs,
+            environment: &mut environment,
+        })?);
     }
     if nodes.is_empty() {
         return Err("PowerShell script contains no static external invocation".into());
@@ -3157,12 +3328,12 @@ fn lower_powershell_control(parts: LowerPowershellControlArgs<'_>) -> Result<Nod
     let controls = powershell_and_controls(source, range)?;
     if controls.is_empty() {
         return lower_powershell_simple(LowerPowershellSimpleArgs {
-                path,
-                source,
-                range,
-                inputs,
-                environment,
-            });
+            path,
+            source,
+            range,
+            inputs,
+            environment,
+        });
     }
     let mut pieces = Vec::new();
     let mut cursor = range.start;
@@ -3182,13 +3353,15 @@ fn lower_powershell_control(parts: LowerPowershellControlArgs<'_>) -> Result<Nod
     let span = span_for_range(path, source, range.start, range.end)?;
     let mut nodes = pieces
         .into_iter()
-        .map(|piece| lower_powershell_simple(LowerPowershellSimpleArgs {
+        .map(|piece| {
+            lower_powershell_simple(LowerPowershellSimpleArgs {
                 path,
                 source,
                 range: piece,
                 inputs,
                 environment,
-            }))
+            })
+        })
         .collect::<Result<Vec<_>, _>>()?
         .into_iter();
     let mut result = nodes.next().expect("PowerShell && pieces are non-empty");
@@ -3409,33 +3582,33 @@ fn lower_nushell(path: &str, source: &str, interpreter: &Interpreter) -> Result<
 
     let mut environment = BTreeSet::new();
     let first = lower_nushell_external(LowerNushellExternalArgs {
-            path,
-            source,
-            range: lines[1].0,
-            parameter,
-            environment: &mut environment,
-        })?;
+        path,
+        source,
+        range: lines[1].0,
+        parameter,
+        environment: &mut environment,
+    })?;
     let predicate = lower_nushell_external(LowerNushellExternalArgs {
-            path,
-            source,
-            range: lines[2].0,
-            parameter,
-            environment: &mut environment,
-        })?;
+        path,
+        source,
+        range: lines[2].0,
+        parameter,
+        environment: &mut environment,
+    })?;
     let if_true = lower_nushell_external(LowerNushellExternalArgs {
-            path,
-            source,
-            range: lines[4].0,
-            parameter,
-            environment: &mut environment,
-        })?;
+        path,
+        source,
+        range: lines[4].0,
+        parameter,
+        environment: &mut environment,
+    })?;
     let if_false = lower_nushell_external(LowerNushellExternalArgs {
-            path,
-            source,
-            range: lines[6].0,
-            parameter,
-            environment: &mut environment,
-        })?;
+        path,
+        source,
+        range: lines[6].0,
+        parameter,
+        environment: &mut environment,
+    })?;
     let condition = native_node(
         Operation::Condition {
             predicate: Box::new(predicate),
@@ -3660,8 +3833,12 @@ fn split_redirections(source: &str) -> Result<(String, Vec<crate::ir::Redirectio
         // A descriptor is only a descriptor when a redirection operator follows it
         // immediately; `echo 2 > file` redirects stdout and prints "2".
         let (fd, operator_at) = if byte.is_ascii_digit()
-            && bytes.get(index + 1).is_some_and(|next| matches!(next, b'>' | b'<'))
-            && !command.last().is_some_and(|last| !last.is_ascii_whitespace())
+            && bytes
+                .get(index + 1)
+                .is_some_and(|next| matches!(next, b'>' | b'<'))
+            && !command
+                .last()
+                .is_some_and(|last| !last.is_ascii_whitespace())
         {
             (u32::from(byte - b'0'), index + 1)
         } else if matches!(byte, b'>' | b'<') {
@@ -3730,7 +3907,8 @@ fn split_redirections(source: &str) -> Result<(String, Vec<crate::ir::Redirectio
     if quote.is_some() {
         return Err("unterminated quote".into());
     }
-    let command = String::from_utf8(command).map_err(|_| "command is not valid UTF-8".to_owned())?;
+    let command =
+        String::from_utf8(command).map_err(|_| "command is not valid UTF-8".to_owned())?;
     Ok((command, redirections))
 }
 
@@ -3744,7 +3922,11 @@ fn strip_matching_quotes(value: &str) -> Option<String> {
         }
         _ => value,
     };
-    if inner.is_empty() || inner.bytes().any(|byte| matches!(byte, b'$' | b'`' | b'*' | b'?' | b'"' | b'\'')) {
+    if inner.is_empty()
+        || inner
+            .bytes()
+            .any(|byte| matches!(byte, b'$' | b'`' | b'*' | b'?' | b'"' | b'\''))
+    {
         return None;
     }
     Some(inner.to_owned())
@@ -3791,12 +3973,12 @@ fn tokenize_posix(
                 if byte == b'$' {
                     flush_literal(&mut parts, &mut literal);
                     let (part, next) = parse_expansion(ParseExpansionArgs {
-                            source,
-                            start: index,
-                            inputs,
-                            environment,
-                            locals,
-                        })?;
+                        source,
+                        start: index,
+                        inputs,
+                        environment,
+                        locals,
+                    })?;
                     parts.push(part);
                     index = next;
                     token_started = true;
@@ -3930,12 +4112,12 @@ fn parse_posix_word(parts: ParsePosixWordArgs<'_>) -> Result<TextExpression, Str
     } = parts;
     if allow_unquoted_expansion && source.starts_with('$') && !source.starts_with("$(") {
         let (part, end) = parse_expansion(ParseExpansionArgs {
-                source,
-                start: 0,
-                inputs,
-                environment,
-                locals,
-            })?;
+            source,
+            start: 0,
+            inputs,
+            environment,
+            locals,
+        })?;
         if end == source.len() {
             return Ok(TextExpression { parts: vec![part] });
         }
@@ -3989,10 +4171,7 @@ fn parse_expansion(parts: ParseExpansionArgs<'_>) -> Result<(TextPart, usize), S
             .or_else(|| inner.split_once('-').map(|(n, f)| ((n, false), f)))
         {
             let ((name, empty_is_unset), fallback) = (name, fallback);
-            if valid_identifier(name)
-                && !fallback.contains('$')
-                && !fallback.contains('`')
-            {
+            if valid_identifier(name) && !fallback.contains('$') && !fallback.contains('`') {
                 if !locals.contains(name) {
                     environment.insert(name.to_owned());
                 }
@@ -4375,6 +4554,85 @@ mod tests {
             .body
     }
 
+    /// The `echo` lowering writes the bytes bash writes, checked against a
+    /// measurement of bash rather than against a reading of its manual.
+    ///
+    /// `contracts/golden/echo-builtin-semantics-v1.json` is measured by
+    /// `cargo xtask echo-semantics`; this reads the same file, so widening the
+    /// lowering without widening the recording fails here, and widening the
+    /// recording without re-measuring fails there.
+    #[test]
+    fn the_echo_lowering_writes_what_bash_writes() {
+        let raw = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/contracts/golden/echo-builtin-semantics-v1.json"
+        ))
+        .expect("corpus is readable");
+        let corpus: serde_json::Value = serde_json::from_str(&raw).expect("corpus is JSON");
+        let cases = corpus["cases"].as_array().expect("corpus has cases");
+        assert!(!cases.is_empty());
+        for case in cases {
+            let name = case["name"].as_str().expect("case has a name");
+            let arguments: Vec<String> = case["arguments"]
+                .as_array()
+                .expect("case has arguments")
+                .iter()
+                .map(|value| value.as_str().expect("argument is a string").to_owned())
+                .collect();
+            let modelled = case["modelled"].as_bool().expect("case says modelled");
+            let quoted = arguments
+                .iter()
+                .map(|argument| format!("'{}'", argument.replace('\'', "'\\''")))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let node = body(
+                "build.sh",
+                format!("#!/bin/bash\necho {quoted}\n").as_bytes(),
+            );
+            let Operation::WriteStdout { contents } = &node.operation else {
+                assert!(!modelled, "{name} is modelled but delegated: {node:#?}");
+                continue;
+            };
+            assert!(modelled, "{name} is not modelled but lowered: {node:#?}");
+            let written: String = contents
+                .parts
+                .iter()
+                .map(|part| match part {
+                    TextPart::Literal { value } => value.clone(),
+                    other => panic!("{name} has a non-literal part: {other:#?}"),
+                })
+                .collect();
+            assert_eq!(
+                written,
+                case["bash"].as_str().expect("case records bash"),
+                "{name} writes different bytes than bash"
+            );
+        }
+    }
+
+    /// `echo` is modelled for bash only, because the builtins disagree.
+    ///
+    /// The same corpus records `/bin/sh` interpreting `\t` and printing `-n`
+    /// where bash does neither, so lowering a `sh` script's `echo` with bash's
+    /// rule would substitute different bytes.
+    #[test]
+    fn echo_is_delegated_for_the_shells_whose_builtin_differs() {
+        for shebang in ["#!/bin/sh", "#!/bin/zsh"] {
+            let node = body("build.sh", format!("{shebang}\necho hello\n").as_bytes());
+            assert!(
+                matches!(node.operation, Operation::InterpreterCall { .. }),
+                "{shebang} must delegate echo: {node:#?}"
+            );
+        }
+        // A first argument that is not known until the expansion happens may be
+        // `-n`, which bash would consume instead of printing.
+        let node = body("build.sh", b"#!/bin/bash\necho \"$1\"\n");
+        assert!(
+            matches!(node.operation, Operation::InterpreterCall { .. }),
+            "a dynamic first argument must delegate: {node:#?}"
+        );
+    }
+
     #[test]
     fn detects_extension_and_portable_shebangs() {
         assert_eq!(detect("build.ps1", b""), Interpreter::Powershell);
@@ -4526,7 +4784,10 @@ mod tests {
         // `NAME=$(COMMAND)` is the form `Operation::CaptureStdout` represents: a
         // name, and the command whose stdout becomes its value.
         let node = body("build.sh", b"value=$(/bin/echo hello)\n");
-        let Operation::CaptureStdout { name, body: inner, .. } = &node.operation else {
+        let Operation::CaptureStdout {
+            name, body: inner, ..
+        } = &node.operation
+        else {
             panic!("expected capture: {node:#?}")
         };
         assert_eq!(name, "value");
@@ -4551,7 +4812,11 @@ mod tests {
             "build.sh",
             b"while [ -n \"$VALUE\" ]; do /bin/echo tick; done\n",
         );
-        let Operation::While { condition, body: inner } = &node.operation else {
+        let Operation::While {
+            condition,
+            body: inner,
+        } = &node.operation
+        else {
             panic!("expected while: {node:#?}")
         };
         assert!(matches!(condition.operation, Operation::Test { .. }));
@@ -4707,14 +4972,49 @@ mod tests {
         assert!(matches!(cases[0].body.operation, Operation::Exec { .. }));
         assert!(default.is_some(), "`*` is the default arm");
 
-        // A pattern this does not model keeps the whole statement delegated.
+        // `a|b)` is one arm in the source and two cases in the IR: the shell
+        // runs the same body for either value, and `Operation::Match` has no
+        // alternation of its own to carry the `|` across.
         let node = body(
             "build.sh",
             b"case \"$1\" in\n  a|b) /bin/echo alt ;;\nesac\n",
         );
+        let Operation::Match { cases, .. } = &node.operation else {
+            panic!("expected match: {node:#?}")
+        };
+        assert_eq!(cases.len(), 2, "{cases:#?}");
+        assert_eq!(cases[0].pattern, crate::ir::TextExpression::literal("a"));
+        assert_eq!(cases[1].pattern, crate::ir::TextExpression::literal("b"));
+        assert_eq!(cases[0].body.operation, cases[1].body.operation);
+
+        // `0|1) ;;` — an arm whose body is empty. It is how a script says "these
+        // exit codes are fine"; running nothing is the behaviour, not a gap in
+        // the model.
+        let node = body(
+            "build.sh",
+            b"case \"$1\" in\n  0|1) ;;\n  *) /bin/echo bad ;;\nesac\n",
+        );
+        let Operation::Match { cases, default, .. } = &node.operation else {
+            panic!("expected match: {node:#?}")
+        };
+        assert_eq!(cases.len(), 2, "{cases:#?}");
+        for case in cases {
+            assert!(
+                matches!(case.body.operation, Operation::NoOp),
+                "an empty arm runs nothing: {case:#?}"
+            );
+        }
+        assert!(default.is_some());
+
+        // A glob inside a pattern still delegates: matching is not equality, and
+        // `TextExpression::literal` compares for equality.
+        let node = body(
+            "build.sh",
+            b"case \"$1\" in\n  a*) /bin/echo glob ;;\nesac\n",
+        );
         assert!(
             matches!(node.operation, Operation::InterpreterCall { .. }),
-            "an alternation pattern must delegate: {node:#?}"
+            "a glob pattern must delegate: {node:#?}"
         );
     }
 
@@ -4723,10 +5023,7 @@ mod tests {
         // `Operation::Condition` has been in the IR from the start. `if` was
         // refused as compound syntax, so every CI step that branches — which is
         // most of them — was delegated whole.
-        let node = body(
-            "build.sh",
-            b"if /bin/test x = x; then /bin/echo yes; fi\n",
-        );
+        let node = body("build.sh", b"if /bin/test x = x; then /bin/echo yes; fi\n");
         let Operation::Condition {
             predicate,
             if_true,
@@ -4747,10 +5044,7 @@ mod tests {
         let Operation::Condition { if_false, .. } = &node.operation else {
             panic!("expected condition")
         };
-        assert!(
-            if_false.is_some(),
-            "the else arm must survive: {node:#?}"
-        );
+        assert!(if_false.is_some(), "the else arm must survive: {node:#?}");
 
         // A form this does not model stays delegated rather than being guessed at.
         let node = body(
@@ -4774,11 +5068,7 @@ mod tests {
         // `cmd >file` was delegated whole. Redirections are the most common reason
         // a CI step leaves the native subset after `set`.
         let node = body("build.sh", b"/bin/echo hello >\"out.txt\"\n");
-        let Operation::Redirect {
-            redirections,
-            body,
-        } = &node.operation
-        else {
+        let Operation::Redirect { redirections, body } = &node.operation else {
             panic!("expected redirect: {node:#?}")
         };
         assert_eq!(
@@ -4857,15 +5147,21 @@ mod tests {
             })
         );
         assert_eq!(
-            set_statement("set +e", ShellOptions {
-                errexit: true,
-                nounset: false,
-                pipefail: false
-            }),
+            set_statement(
+                "set +e",
+                ShellOptions {
+                    errexit: true,
+                    nounset: false,
+                    pipefail: false
+                }
+            ),
             Some(ShellOptions::default())
         );
         assert_eq!(set_statement("set -f", ShellOptions::default()), None);
-        assert_eq!(set_statement("/bin/echo set -e", ShellOptions::default()), None);
+        assert_eq!(
+            set_statement("/bin/echo set -e", ShellOptions::default()),
+            None
+        );
     }
 
     #[test]
@@ -5374,12 +5670,12 @@ mod tests {
         };
         let call = |interpreter: &str| {
             delegated_node(DelegatedNodeArgs {
-                    path: "script",
-                    source: b"source",
-                    interpreter,
-                    reason: "delegated".into(),
-                    capabilities: vec![],
-                })
+                path: "script",
+                source: b"source",
+                interpreter,
+                reason: "delegated".into(),
+                capabilities: vec![],
+            })
         };
         let native = |operation| Node {
             id: String::new(),
@@ -5518,30 +5814,34 @@ mod tests {
         assert!(tokenize_posix("\"trailing\\", &mut inputs, &mut environment, &locals).is_err());
         assert!(
             parse_posix_word(ParsePosixWordArgs {
-                    source: "one two",
-                    allow_unquoted_expansion: false,
-                    inputs: &mut inputs,
-                    environment: &mut environment,
-                    locals: &locals,
-                }).is_err()
+                source: "one two",
+                allow_unquoted_expansion: false,
+                inputs: &mut inputs,
+                environment: &mut environment,
+                locals: &locals,
+            })
+            .is_err()
         );
-        let argument =
-            parse_posix_word(ParsePosixWordArgs {
-                    source: "$1",
-                    allow_unquoted_expansion: true,
-                    inputs: &mut inputs,
-                    environment: &mut environment,
-                    locals: &locals,
-                }).unwrap();
+        let argument = parse_posix_word(ParsePosixWordArgs {
+            source: "$1",
+            allow_unquoted_expansion: true,
+            inputs: &mut inputs,
+            environment: &mut environment,
+            locals: &locals,
+        })
+        .unwrap();
         assert!(matches!(argument.parts[0], TextPart::Argument { .. }));
         for expansion in ["$(date)", "${MISSING", "${}", "$"] {
-            assert!(parse_expansion(ParseExpansionArgs {
+            assert!(
+                parse_expansion(ParseExpansionArgs {
                     source: expansion,
                     start: 0,
                     inputs: &mut inputs,
                     environment: &mut environment,
                     locals: &locals,
-                }).is_err());
+                })
+                .is_err()
+            );
         }
     }
 
