@@ -3547,15 +3547,15 @@ fn emit_rust_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> 
             working_directory,
         } => {
             output.push_str(&format!("{indent}{{\n"));
-            emit_rust_command(
-                argv,
-                environment,
-                working_directory.as_ref(),
-                "deshell_command",
-                true,
-                output,
-                depth + 1,
-            )?;
+            emit_rust_command(EmitRustCommandArgs {
+                    argv: argv,
+                    environment: environment,
+                    working_directory: working_directory.as_ref(),
+                    variable: "deshell_command",
+                    force_mutable: true,
+                    output: output,
+                    depth: depth + 1,
+                })?;
             output.push_str(&format!(
                 concat!(
                     "{indent}    match deshell_command.status() {{\n",
@@ -3594,15 +3594,15 @@ fn emit_rust_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> 
                 else {
                     return Err("generator pipeline supports only Exec stages".into());
                 };
-                emit_rust_command(
-                    argv,
-                    environment,
-                    working_directory.as_ref(),
-                    "deshell_stage",
-                    false,
-                    output,
-                    depth + 1,
-                )?;
+                emit_rust_command(EmitRustCommandArgs {
+                        argv: argv,
+                        environment: environment,
+                        working_directory: working_directory.as_ref(),
+                        variable: "deshell_stage",
+                        force_mutable: false,
+                        output: output,
+                        depth: depth + 1,
+                    })?;
                 output.push_str(&format!(
                     "{indent}    deshell_commands.push(deshell_stage);\n"
                 ));
@@ -3695,15 +3695,33 @@ fn rust_node_uses_arguments(node: &crate::ir::Node) -> bool {
     }
 }
 
-fn emit_rust_command(
-    argv: &[crate::ir::TextExpression],
-    environment: &[crate::ir::NamedExpression],
-    working_directory: Option<&crate::ir::TextExpression>,
-    variable: &str,
+/// The inputs of [`emit_rust_command`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`emit_rust_command`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct EmitRustCommandArgs<'a> {
+    argv: &'a [crate::ir::TextExpression],
+    environment: &'a [crate::ir::NamedExpression],
+    working_directory: Option<&'a crate::ir::TextExpression>,
+    variable: &'a str,
     force_mutable: bool,
-    output: &mut String,
+    output: &'a mut String,
     depth: usize,
-) -> Result<(), String> {
+}
+
+fn emit_rust_command(parts: EmitRustCommandArgs<'_>) -> Result<(), String> {
+    // Destructured without `..`: see `EmitRustCommandArgs`.
+    let EmitRustCommandArgs {
+        argv,
+        environment,
+        working_directory,
+        variable,
+        force_mutable,
+        output,
+        depth,
+    } = parts;
     let indent = "    ".repeat(depth);
     let program = argv
         .first()
@@ -3870,14 +3888,14 @@ fn emit_go_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> Re
             working_directory,
         } => {
             output.push_str(&format!("{indent}{{\n"));
-            emit_go_command(
-                argv,
-                environment,
-                working_directory.as_ref(),
-                "deshellCommand",
-                output,
-                depth + 1,
-            )?;
+            emit_go_command(EmitGoCommandArgs {
+                    argv: argv,
+                    environment: environment,
+                    working_directory: working_directory.as_ref(),
+                    variable: "deshellCommand",
+                    output: output,
+                    depth: depth + 1,
+                })?;
             output.push_str(&format!(
                 "{indent}\tdeshellCommand.Stdin, deshellCommand.Stdout, deshellCommand.Stderr = os.Stdin, os.Stdout, os.Stderr\n"
             ));
@@ -3910,14 +3928,14 @@ fn emit_go_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> Re
                     return Err("generator pipeline supports only Exec stages".into());
                 };
                 let variable = format!("deshellStage{index}");
-                emit_go_command(
-                    argv,
-                    environment,
-                    working_directory.as_ref(),
-                    &variable,
-                    output,
-                    depth + 1,
-                )?;
+                emit_go_command(EmitGoCommandArgs {
+                        argv: argv,
+                        environment: environment,
+                        working_directory: working_directory.as_ref(),
+                        variable: &variable,
+                        output: output,
+                        depth: depth + 1,
+                    })?;
                 output.push_str(&format!(
                     "{indent}\tdeshellCommands = append(deshellCommands, {variable})\n"
                 ));
@@ -3951,14 +3969,31 @@ fn emit_go_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> Re
     Ok(())
 }
 
-fn emit_go_command(
-    argv: &[crate::ir::TextExpression],
-    environment: &[crate::ir::NamedExpression],
-    working_directory: Option<&crate::ir::TextExpression>,
-    variable: &str,
-    output: &mut String,
+/// The inputs of [`emit_go_command`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`emit_go_command`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct EmitGoCommandArgs<'a> {
+    argv: &'a [crate::ir::TextExpression],
+    environment: &'a [crate::ir::NamedExpression],
+    working_directory: Option<&'a crate::ir::TextExpression>,
+    variable: &'a str,
+    output: &'a mut String,
     depth: usize,
-) -> Result<(), String> {
+}
+
+fn emit_go_command(parts: EmitGoCommandArgs<'_>) -> Result<(), String> {
+    // Destructured without `..`: see `EmitGoCommandArgs`.
+    let EmitGoCommandArgs {
+        argv,
+        environment,
+        working_directory,
+        variable,
+        output,
+        depth,
+    } = parts;
     let indent = "\t".repeat(depth);
     let program = argv
         .first()

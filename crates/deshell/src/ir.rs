@@ -537,13 +537,29 @@ impl Plan {
     }
 }
 
-pub(crate) fn node_id(
-    normalized_path: &str,
-    start_byte: u64,
-    end_byte: u64,
-    operation: &str,
-    preorder: u64,
-) -> Result<String, String> {
+/// The inputs of [`node_id`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`node_id`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+pub(crate) struct NodeIdArgs<'a> {
+    pub(crate) normalized_path: &'a str,
+    pub(crate) start_byte: u64,
+    pub(crate) end_byte: u64,
+    pub(crate) operation: &'a str,
+    pub(crate) preorder: u64,
+}
+
+pub(crate) fn node_id(parts: NodeIdArgs<'_>) -> Result<String, String> {
+    // Destructured without `..`: see `NodeIdArgs`.
+    let NodeIdArgs {
+        normalized_path,
+        start_byte,
+        end_byte,
+        operation,
+        preorder,
+    } = parts;
     if end_byte < start_byte {
         return Err("node ID byte span is reversed".into());
     }
@@ -613,7 +629,13 @@ fn assign_node_id(node: &mut Node, preorder: &mut u64) -> Result<(), String> {
         Some(span) => (span.file.as_str(), span.start_byte, span.end_byte),
         None => ("", 0, 0),
     };
-    node.id = node_id(path, start, end, node.operation.name(), *preorder)?;
+    node.id = node_id(NodeIdArgs {
+            normalized_path: path,
+            start_byte: start,
+            end_byte: end,
+            operation: node.operation.name(),
+            preorder: *preorder,
+        })?;
     *preorder = preorder
         .checked_add(1)
         .ok_or_else(|| "node preorder overflow".to_owned())?;
@@ -816,7 +838,13 @@ fn validate_node<'a>(
         }
         None => ("", 0, 0),
     };
-    match node_id(path, start, end, node.operation.name(), *preorder) {
+    match node_id(NodeIdArgs {
+            normalized_path: path,
+            start_byte: start,
+            end_byte: end,
+            operation: node.operation.name(),
+            preorder: *preorder,
+        }) {
         Ok(expected) if node.id != expected => errors.push(format!(
             "node id {} is not deterministic; expected {expected}",
             node.id
@@ -1510,10 +1538,22 @@ mod tests {
     #[test]
     fn deterministic_node_id_has_a_fixed_vector() {
         assert_eq!(
-            node_id("scripts/build.sh", 12, 34, "exec", 5).unwrap(),
+            node_id(NodeIdArgs {
+                    normalized_path: "scripts/build.sh",
+                    start_byte: 12,
+                    end_byte: 34,
+                    operation: "exec",
+                    preorder: 5,
+                }).unwrap(),
             "680482a635998b2ac7bb4bd0782fb5a8"
         );
-        assert!(node_id("scripts/../escape.sh", 0, 1, "exec", 0).is_err());
+        assert!(node_id(NodeIdArgs {
+                normalized_path: "scripts/../escape.sh",
+                start_byte: 0,
+                end_byte: 1,
+                operation: "exec",
+                preorder: 0,
+            }).is_err());
     }
 
     #[test]
@@ -1772,7 +1812,13 @@ mod tests {
             ("build.sh", 0, 1, "", "operation name"),
             ("build.sh", 0, 1, "Exec", "operation name"),
         ] {
-            let error = node_id(path, start, end, operation, 0).unwrap_err();
+            let error = node_id(NodeIdArgs {
+                    normalized_path: path,
+                    start_byte: start,
+                    end_byte: end,
+                    operation: operation,
+                    preorder: 0,
+                }).unwrap_err();
             assert!(error.contains(expected), "unexpected {error:?}");
         }
 

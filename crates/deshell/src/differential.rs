@@ -161,13 +161,13 @@ pub(crate) fn evaluate(parts: Evaluation<'_>) -> Result<Outcome, String> {
         }
     };
     let comparison = crate::verify::compare(&expected, &actual)?;
-    let status = crate::verify::record_comparison(
-        evidence,
-        &scenario.name,
-        observer.name(),
-        key,
-        &comparison,
-    )?;
+    let status = crate::verify::record_comparison(crate::verify::RecordComparisonArgs {
+            evidence: evidence,
+            scenario: &scenario.name,
+            provider: observer.name(),
+            key: key,
+            comparison: &comparison,
+        })?;
     Ok(match status {
         crate::evidence::ObservationStatus::Nondeterministic => Outcome::Nondeterministic,
         _ if comparison.equivalent => Outcome::Verified,

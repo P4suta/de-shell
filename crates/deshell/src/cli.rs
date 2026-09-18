@@ -897,13 +897,13 @@ where
                 };
             }
         };
-        let mut report = command_report(
-            &spec,
-            code,
-            completed_failure.as_ref(),
-            &captured_stdout,
-            &captured_stderr,
-        );
+        let mut report = command_report(CommandReportArgs {
+                spec: &spec,
+                code: code,
+                failure: completed_failure.as_ref(),
+                stdout: &captured_stdout,
+                stderr: &captured_stderr,
+            });
         if report.next_actions.is_empty() {
             report.next_actions = spec.next_actions;
         }
@@ -954,13 +954,29 @@ fn completed_report_failure(failure: &Failure) -> bool {
             .contains("current scenarios have not been observed")
 }
 
-fn command_report(
-    spec: &ReportSpec,
+/// The inputs of [`command_report`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`command_report`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct CommandReportArgs<'a> {
+    spec: &'a ReportSpec,
     code: i32,
-    failure: Option<&Failure>,
-    stdout: &[u8],
-    stderr: &[u8],
-) -> crate::report::Report {
+    failure: Option<&'a Failure>,
+    stdout: &'a [u8],
+    stderr: &'a [u8],
+}
+
+fn command_report(parts: CommandReportArgs<'_>) -> crate::report::Report {
+    // Destructured without `..`: see `CommandReportArgs`.
+    let CommandReportArgs {
+        spec,
+        code,
+        failure,
+        stdout,
+        stderr,
+    } = parts;
     let stdout = String::from_utf8_lossy(stdout);
     let stderr = String::from_utf8_lossy(stderr);
     let not_ready = code == 0
@@ -2632,14 +2648,14 @@ fn run_plan(
     let entrypoint =
         selected_entry_from_config(&project.config, options.entrypoint.map(str::to_owned))?;
     if options.backend == BackendKind::Disposable {
-        return run_disposable(
-            options.root,
-            &entrypoint,
-            options.node_id,
-            options.arguments,
-            stdout,
-            stderr,
-        );
+        return run_disposable(RunDisposableArgs {
+                root: options.root,
+                entrypoint: &entrypoint,
+                node_id: options.node_id,
+                arguments: options.arguments,
+                stdout: stdout,
+                stderr: stderr,
+            });
     }
     let validated = project
         .entry(&entrypoint)
@@ -2735,14 +2751,31 @@ fn disposable_provider(lock: &crate::config::Lockfile) -> Result<crate::lab::Pro
     Ok(provider)
 }
 
-fn run_disposable(
-    root: &Path,
-    entrypoint: &str,
-    node_id: Option<&str>,
-    arguments: &[String],
-    stdout: &mut dyn Write,
-    stderr: &mut dyn Write,
-) -> Result<i32, Failure> {
+/// The inputs of [`run_disposable`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`run_disposable`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct RunDisposableArgs<'a> {
+    root: &'a Path,
+    entrypoint: &'a str,
+    node_id: Option<&'a str>,
+    arguments: &'a [String],
+    stdout: &'a mut dyn Write,
+    stderr: &'a mut dyn Write,
+}
+
+fn run_disposable(parts: RunDisposableArgs<'_>) -> Result<i32, Failure> {
+    // Destructured without `..`: see `RunDisposableArgs`.
+    let RunDisposableArgs {
+        root,
+        entrypoint,
+        node_id,
+        arguments,
+        stdout,
+        stderr,
+    } = parts;
     let workspace = crate::workspace::private_snapshot(root).map_err(Failure::io)?;
     let project = crate::project::ValidatedProject::load(workspace.path())
         .map_err(classify_project_errors)?;
@@ -3164,13 +3197,13 @@ fn observe_command(
             }
         };
         let comparison = crate::verify::compare(&expected, &actual).map_err(Failure::internal)?;
-        let status = crate::verify::record_comparison(
-            &mut evidence,
-            &scenario.name,
-            provider_name,
-            key,
-            &comparison,
-        )
+        let status = crate::verify::record_comparison(crate::verify::RecordComparisonArgs {
+                evidence: &mut evidence,
+                scenario: &scenario.name,
+                provider: provider_name,
+                key: key,
+                comparison: &comparison,
+            })
         .map_err(Failure::invalid)?;
         writeln_io(
             stdout,

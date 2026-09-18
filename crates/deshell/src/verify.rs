@@ -325,13 +325,29 @@ pub(crate) fn compare(expected: &RunResult, actual: &RunResult) -> Result<Compar
     })
 }
 
-pub(crate) fn record_comparison(
-    evidence: &mut Evidence,
-    scenario: &str,
-    provider: &str,
-    key: crate::evidence::ObservationKey,
-    comparison: &Comparison,
-) -> Result<ObservationStatus, String> {
+/// The inputs of [`record_comparison`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`record_comparison`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+pub(crate) struct RecordComparisonArgs<'a> {
+    pub(crate) evidence: &'a mut Evidence,
+    pub(crate) scenario: &'a str,
+    pub(crate) provider: &'a str,
+    pub(crate) key: crate::evidence::ObservationKey,
+    pub(crate) comparison: &'a Comparison,
+}
+
+pub(crate) fn record_comparison(parts: RecordComparisonArgs<'_>) -> Result<ObservationStatus, String> {
+    // Destructured without `..`: see `RecordComparisonArgs`.
+    let RecordComparisonArgs {
+        evidence,
+        scenario,
+        provider,
+        key,
+        comparison,
+    } = parts;
     let dimensions = comparison
         .differences
         .iter()
@@ -575,13 +591,13 @@ mod tests {
         let before = plan.encode_pretty().unwrap();
         let mut evidence = Evidence::from_plan(&plan, "build.sh", b"dynamic").unwrap();
         let comparison = compare(&result(0, b"same"), &result(0, b"same")).unwrap();
-        record_comparison(
-            &mut evidence,
-            "default",
-            "test-provider",
-            observation_key(),
-            &comparison,
-        )
+        record_comparison(RecordComparisonArgs {
+                evidence: &mut evidence,
+                scenario: "default",
+                provider: "test-provider",
+                key: observation_key(),
+                comparison: &comparison,
+            })
         .unwrap();
         assert_eq!(evidence.observations[0].status, ObservationStatus::Verified);
         assert_eq!(plan.encode_pretty().unwrap(), before);
@@ -592,13 +608,13 @@ mod tests {
         let plan = plan();
         let mut evidence = Evidence::from_plan(&plan, "build.sh", b"dynamic").unwrap();
         let comparison = compare(&result(0, b"a"), &result(1, b"b")).unwrap();
-        record_comparison(
-            &mut evidence,
-            "default",
-            "test-provider",
-            observation_key(),
-            &comparison,
-        )
+        record_comparison(RecordComparisonArgs {
+                evidence: &mut evidence,
+                scenario: "default",
+                provider: "test-provider",
+                key: observation_key(),
+                comparison: &comparison,
+            })
         .unwrap();
         assert_eq!(
             evidence.observations[0].status,
