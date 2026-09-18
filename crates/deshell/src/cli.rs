@@ -1345,6 +1345,22 @@ fn dispatch(
                             inventory.errors.len()
                         ),
                     )?;
+                    // A count alone says how much was inventoried, not how much of
+                    // it is understood. Five `bash` steps declared by a composite
+                    // action once sat inside forty low-confidence guesses, and only
+                    // a reader who went through every line would have seen them.
+                    let (mut high, mut medium, mut low) = (0_usize, 0_usize, 0_usize);
+                    for finding in &inventory.findings {
+                        match finding.interpreter_confidence {
+                            crate::scanner::InterpreterConfidence::High => high += 1,
+                            crate::scanner::InterpreterConfidence::Medium => medium += 1,
+                            crate::scanner::InterpreterConfidence::Low => low += 1,
+                        }
+                    }
+                    writeln_io(
+                        stdout,
+                        format_args!("confidence: {high} high; {medium} medium; {low} low"),
+                    )?;
                 }
             }
             Ok(exit)
@@ -4574,6 +4590,13 @@ mod tests {
         let human = String::from_utf8(human.1).unwrap();
         assert!(human.starts_with(report["summary"].as_str().unwrap()));
         assert!(human.contains("1 shell location(s) found; 0 skipped; 0 error(s)"));
+        // The count says how much was inventoried; this line says how much of it is
+        // understood. Without it a reader has to go through every row to notice
+        // that a declared interpreter was recorded as a guess.
+        assert!(
+            human.contains("confidence: 1 high; 0 medium; 0 low"),
+            "{human}"
+        );
     }
 
     #[test]
