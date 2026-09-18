@@ -67,11 +67,42 @@ Nushell), with both official Rust and Go generators where applicable.
   scan zero` for shell files and embedded sources across the seven interpreters,
   including input, environment, branch, failure, and parser-blocker cases.
 
-  Walked end to end for one bash file on macOS, following only the argv each
-  step printed: `init`, `scenario approve`, `matrix approve`, `migrate plan`,
+  Walked end to end on macOS, following only the argv each step printed:
+  `init`, `scenario approve`, `matrix approve`, `migrate plan`,
   `migrate verify`, `migrate evidence import`, `migrate apply`,
-  `verify --require shell-free`. It reaches `retired`, `build.sh` is gone,
-  `src/bin/deshell_build.rs` is there, and the shell-free gate passes.
+  `verify --require shell-free`.
+
+  | interpreter | |
+  | --- | --- |
+  | `sh`, `bash`, `zsh` | retired, shell-free |
+  | `nushell` | retired, shell-free |
+  | `powershell` | retired, shell-free |
+  | `fish`, `cmd` | plan reached `planned`; neither runtime is on this machine |
+
+  Each ends with the shell file gone and `src/bin/deshell_build.rs` in its
+  place. `fish` and `cmd` lower and plan; `migrate verify` runs the original,
+  which needs the interpreter, so those two wait for a runner that has one.
+
+  PowerShell was the one that taught something. Its first verification reported
+  `different` — the replacement wrote `one` and exit 0, the original wrote
+  nothing and exit 1. The original had failed to start, because `pwsh` here is
+  a `mise` shim and `agent_process` clears the environment before running
+  anything, deliberately. The tool was right on both counts: the difference was
+  real, and reporting it rather than passing is the whole point. It verifies
+  from a directory where `pwsh` resolves.
+
+  An embedded source walks the same flow. A workflow whose step is
+
+  ```yaml
+      - name: build
+        run: |
+          /bin/echo building
+  ```
+
+  reaches `retired` with the step rewritten to
+  `uses: ./.github/actions/deshell-f920c0703cce`, a local action holding the
+  generated program, and `verify --require shell-free` passing. The input,
+  environment, branch, failure and parser-blocker cases are still to walk.
 
   It did not reach `retired` before this round, and the reason was one this
   flow was the only thing that could find: `git ls-files` names a path the
