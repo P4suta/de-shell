@@ -799,6 +799,11 @@ fn is_known_structured_host(lower: &str, filename: &str) -> bool {
         return true;
     }
     [
+        // A composite action can live in any directory, so it is recognised by
+        // filename rather than by prefix. Its `shell:` key is mandatory, which
+        // makes it the easier of the two GitHub hosts to classify.
+        "action.yml",
+        "action.yaml",
         ".gitlab-ci.yml",
         ".gitlab-ci.yaml",
         "azure-pipelines.yml",
@@ -1113,6 +1118,10 @@ fn yaml_findings(path: &str, source: &str, lower: &str) -> Result<Vec<Finding>, 
     }
     let known = lower.starts_with(".github/workflows/")
         || lower.starts_with(".github/actions/")
+        || lower == "action.yml"
+        || lower == "action.yaml"
+        || lower.ends_with("/action.yml")
+        || lower.ends_with("/action.yaml")
         || lower == ".gitlab-ci.yml"
         || lower == ".gitlab-ci.yaml"
         || lower == "azure-pipelines.yml"
@@ -2618,6 +2627,37 @@ spawn(dynamicProgram, dynamicArguments);
             Some("powershell")
         );
         assert_eq!(inventory.findings[1].interpreter.as_deref(), Some("fish"));
+    }
+
+    #[test]
+    fn a_composite_action_declares_its_shell_and_is_not_a_mere_candidate() {
+        // `shell:` is optional in a workflow and mandatory in a composite action,
+        // so `action.yml` is the easier of the two to classify, not the harder.
+        // Reading it as an unknown YAML document instead reports `sh` at low
+        // confidence for a step that says `bash`, and sh and bash do not agree on
+        // arrays, `[[`, or `set -f`.
+        let temporary = tempfile::tempdir().unwrap();
+        write(
+            temporary.path(),
+            "action.yml",
+            b"name: probe\nruns:\n  using: composite\n  steps:\n    - run: printf composite\n      shell: bash\n    - run: Write-Output pwsh\n      shell: pwsh\n",
+        );
+        let inventory = scan(temporary.path()).unwrap();
+        assert_eq!(inventory.findings.len(), 2, "{:#?}", inventory.findings);
+        assert_eq!(inventory.findings[0].interpreter.as_deref(), Some("bash"));
+        assert_eq!(
+            inventory.findings[0].kind,
+            FindingKind::EmbeddedShell,
+            "a declared shell is not a guess"
+        );
+        assert_eq!(
+            inventory.findings[0].interpreter_confidence,
+            InterpreterConfidence::High
+        );
+        assert_eq!(
+            inventory.findings[1].interpreter.as_deref(),
+            Some("powershell")
+        );
     }
 
     #[test]
