@@ -1386,12 +1386,9 @@ fn case_arm(text: &str) -> Option<(Vec<&str>, &str)> {
 /// Returns `None` when a statement cannot belong to an arm — a body before any
 /// pattern, a `;&` or `;;&` fallthrough this does not model — so the `case` is
 /// delegated rather than lowered from a guess.
-fn case_arms<'a>(
-    source: &'a str,
-    statements: &[Range],
-) -> Option<Vec<(Vec<&'a str>, Option<Range>)>> {
-    let mut arms: Vec<(Vec<&'a str>, Option<Range>)> = Vec::new();
-    let mut open: Option<(Vec<&'a str>, Option<Range>)> = None;
+fn case_arms<'a>(source: &'a str, statements: &[Range]) -> Option<Vec<(Vec<&'a str>, Vec<Range>)>> {
+    let mut arms: Vec<(Vec<&'a str>, Vec<Range>)> = Vec::new();
+    let mut open: Option<(Vec<&'a str>, Vec<Range>)> = None;
     for statement in statements {
         let text = source[statement.start..statement.end].trim();
         if text.is_empty() {
@@ -1406,27 +1403,27 @@ fn case_arms<'a>(
             // so `case_arm` rejects it and the fallthrough is delegated.
             None => {
                 let (patterns, first) = case_arm(text)?;
-                let body = (!first.is_empty()).then(|| {
+                // The body is a list of statements, so the first one — which
+                // shares a line with the pattern — is the first element rather
+                // than the start of a range covering all of them. Covering them
+                // with one range joined them into a single command.
+                let mut body = Vec::new();
+                if !first.is_empty() {
                     let start = statement.start
                         + source[statement.start..statement.end]
                             .find(first)
                             .unwrap_or_default();
-                    Range {
+                    body.push(Range {
                         start,
                         end: start + first.len(),
-                    }
-                });
-                open = Some((patterns, body));
-            }
-            Some((_, body)) => match body {
-                Some(body) => body.end = statement.end,
-                None => {
-                    *body = Some(Range {
-                        start: statement.start,
-                        end: statement.end,
                     });
                 }
-            },
+                open = Some((patterns, body));
+            }
+            Some((_, body)) => body.push(Range {
+                start: statement.start,
+                end: statement.end,
+            }),
         }
     }
     // POSIX lets the final arm omit its `;;`; `esac` ends it.
@@ -1506,54 +1503,19 @@ fn lower_posix(path: &str, source: &str, interpreter: &Interpreter) -> Result<Lo
             && let Some((done_at, do_at)) = while_arms(source, &statements, index - 1)
         {
             let mut arm = |from: usize, to: usize, strip: &str| -> Result<Node, String> {
-                let mut pieces = Vec::new();
-                for statement in &statements[from..to] {
-                    let raw = source[statement.start..statement.end].trim();
-                    let text = raw.strip_prefix(strip).unwrap_or(raw).trim();
-                    if text.is_empty() {
-                        continue;
-                    }
-                    let offset = statement.start
-                        + source[statement.start..statement.end]
-                            .find(text)
-                            .ok_or("loop statement is not inside its range")?;
-                    pieces.push(lower_posix_control(LowerPosixControlArgs {
-                        path,
-                        source,
-                        range: Range {
-                            start: offset,
-                            end: offset + text.len(),
-                        },
-                        interpreter,
-                        inputs: &mut inputs,
-                        environment: &mut environment,
-                        locals: &mut locals,
-                        pipefail: options.pipefail,
-                    })?);
-                }
-                if pieces.len() == 1 {
-                    return Ok(pieces.remove(0));
-                }
-                let first = pieces
-                    .first()
-                    .and_then(|node| node.source.clone())
-                    .ok_or("loop arm is empty")?;
-                let last = pieces
-                    .last()
-                    .and_then(|node| node.source.clone())
-                    .ok_or("loop arm span is missing")?;
-                Ok(native_node(
-                    Operation::Sequence {
-                        nodes: pieces,
-                        on_failure: if options.errexit {
-                            crate::ir::SequenceFailure::Stop
-                        } else {
-                            crate::ir::SequenceFailure::Continue
-                        },
-                    },
-                    &format!("{}-static-sequence-v1", interpreter.name()),
-                    cover_spans(first, last),
-                ))
+                lower_statement_list(LowerStatementListArgs {
+                    path,
+                    source,
+                    statements: &statements[from..to],
+                    strip,
+                    interpreter,
+                    inputs: &mut inputs,
+                    environment: &mut environment,
+                    locals: &mut locals,
+                    errexit: options.errexit,
+                    pipefail: options.pipefail,
+                })?
+                .ok_or_else(|| "loop arm is empty".to_owned())
             };
             let condition = arm(index - 1, do_at, "while ");
             let loop_body = arm(do_at, done_at, "do");
@@ -1606,30 +1568,31 @@ fn lower_posix(path: &str, source: &str, interpreter: &Interpreter) -> Result<Lo
             match case_arms(source, &statements[index..esac_at]) {
                 Some(arms) => {
                     for (patterns, body) in arms {
+                        let lowered = lower_statement_list(LowerStatementListArgs {
+                            path,
+                            source,
+                            statements: &body,
+                            strip: "",
+                            interpreter,
+                            inputs: &mut inputs,
+                            environment: &mut environment,
+                            locals: &mut locals,
+                            errexit: options.errexit,
+                            pipefail: options.pipefail,
+                        });
                         // `a|b) ;;` is a real arm that does nothing, and it is
                         // how a script says "these values are fine". Running
                         // nothing is the behaviour, not a gap in the model.
-                        let node = match body {
-                            None => native_node(
+                        let node = match lowered {
+                            Ok(Some(node)) => node,
+                            Ok(None) => native_node(
                                 Operation::NoOp,
                                 &format!("{}-static-empty-arm-v1", interpreter.name()),
                                 span_for_range(path, source, range.start, range.end)?,
                             ),
-                            Some(body) => {
-                                let Ok(node) = lower_posix_control(LowerPosixControlArgs {
-                                    path,
-                                    source,
-                                    range: body,
-                                    interpreter,
-                                    inputs: &mut inputs,
-                                    environment: &mut environment,
-                                    locals: &mut locals,
-                                    pipefail: options.pipefail,
-                                }) else {
-                                    modelled = false;
-                                    break;
-                                };
-                                node
+                            Err(_) => {
+                                modelled = false;
+                                break;
                             }
                         };
                         for pattern in patterns {
@@ -1673,54 +1636,19 @@ fn lower_posix(path: &str, source: &str, interpreter: &Interpreter) -> Result<Lo
             && let Some((fi_at, then_at, else_at)) = if_arms(source, &statements, index - 1)
         {
             let mut branch = |from: usize, to: usize, strip: &str| -> Result<Node, String> {
-                let mut pieces = Vec::new();
-                for statement in &statements[from..to] {
-                    let raw = source[statement.start..statement.end].trim();
-                    let body = raw.strip_prefix(strip).unwrap_or(raw).trim();
-                    if body.is_empty() {
-                        continue;
-                    }
-                    let offset = statement.start
-                        + source[statement.start..statement.end]
-                            .find(body)
-                            .ok_or("branch statement is not inside its range")?;
-                    pieces.push(lower_posix_control(LowerPosixControlArgs {
-                        path,
-                        source,
-                        range: Range {
-                            start: offset,
-                            end: offset + body.len(),
-                        },
-                        interpreter,
-                        inputs: &mut inputs,
-                        environment: &mut environment,
-                        locals: &mut locals,
-                        pipefail: options.pipefail,
-                    })?);
-                }
-                let first = pieces.first().ok_or("branch is empty")?;
-                if pieces.len() == 1 {
-                    return Ok(pieces.remove(0));
-                }
-                let span = cover_spans(
-                    first.source.clone().ok_or("branch span is missing")?,
-                    pieces
-                        .last()
-                        .and_then(|node| node.source.clone())
-                        .ok_or("branch span is missing")?,
-                );
-                Ok(native_node(
-                    Operation::Sequence {
-                        nodes: pieces,
-                        on_failure: if options.errexit {
-                            crate::ir::SequenceFailure::Stop
-                        } else {
-                            crate::ir::SequenceFailure::Continue
-                        },
-                    },
-                    &format!("{}-static-sequence-v1", interpreter.name()),
-                    span,
-                ))
+                lower_statement_list(LowerStatementListArgs {
+                    path,
+                    source,
+                    statements: &statements[from..to],
+                    strip,
+                    interpreter,
+                    inputs: &mut inputs,
+                    environment: &mut environment,
+                    locals: &mut locals,
+                    errexit: options.errexit,
+                    pipefail: options.pipefail,
+                })?
+                .ok_or_else(|| "branch is empty".to_owned())
             };
             let predicate = branch(index - 1, then_at, "if ");
             let true_end = else_at.unwrap_or(fi_at);
@@ -1909,6 +1837,100 @@ fn trim_range(source: &str, mut start: usize, mut end: usize) -> Range {
 /// many-argument function stays invisible to every call site that already
 /// compiles. [`lower_posix_control`] takes this apart without `..`, so a field added here fails
 /// to compile until somebody gives it a destination.
+/// The inputs of [`lower_statement_list`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to
+/// this struct is a compile error at the call site rather than a default.
+struct LowerStatementListArgs<'a> {
+    path: &'a str,
+    source: &'a str,
+    /// The statements that make up the list, in source order.
+    statements: &'a [Range],
+    /// A keyword the first statement of the list carries — `if `, `then`,
+    /// `else` — or the empty string when the list has none.
+    strip: &'a str,
+    interpreter: &'a Interpreter,
+    inputs: &'a mut BTreeSet<String>,
+    environment: &'a mut BTreeSet<String>,
+    locals: &'a mut BTreeSet<String>,
+    /// Whether `set -e` is in effect, which is what a sequence records.
+    errexit: bool,
+    /// Whether `set -o pipefail` is in effect at these statements.
+    pipefail: bool,
+}
+
+/// Lower a run of statements into one node, or `None` if the run is empty.
+///
+/// A branch and a `case` arm are lists, not commands. Handing the whole byte
+/// range to [`lower_posix_control`] instead joined the statements into a single
+/// `Exec` — `echo a` followed by `echo b` became `echo a echo b` — and claimed
+/// it as native, which is the shape of defect this tool exists to report.
+fn lower_statement_list(parts: LowerStatementListArgs<'_>) -> Result<Option<Node>, String> {
+    // Destructured without `..`: see `LowerStatementListArgs`.
+    let LowerStatementListArgs {
+        path,
+        source,
+        statements,
+        strip,
+        interpreter,
+        inputs,
+        environment,
+        locals,
+        errexit,
+        pipefail,
+    } = parts;
+    let mut pieces = Vec::new();
+    for statement in statements {
+        let raw = source[statement.start..statement.end].trim();
+        let body = raw.strip_prefix(strip).unwrap_or(raw).trim();
+        if body.is_empty() {
+            continue;
+        }
+        let offset = statement.start
+            + source[statement.start..statement.end]
+                .find(body)
+                .ok_or("list statement is not inside its range")?;
+        pieces.push(lower_posix_control(LowerPosixControlArgs {
+            path,
+            source,
+            range: Range {
+                start: offset,
+                end: offset + body.len(),
+            },
+            interpreter,
+            inputs: &mut *inputs,
+            environment: &mut *environment,
+            locals: &mut *locals,
+            pipefail,
+        })?);
+    }
+    let Some(first) = pieces.first() else {
+        return Ok(None);
+    };
+    if pieces.len() == 1 {
+        return Ok(Some(pieces.remove(0)));
+    }
+    let span = cover_spans(
+        first.source.clone().ok_or("list span is missing")?,
+        pieces
+            .last()
+            .and_then(|node| node.source.clone())
+            .ok_or("list span is missing")?,
+    );
+    Ok(Some(native_node(
+        Operation::Sequence {
+            nodes: pieces,
+            on_failure: if errexit {
+                crate::ir::SequenceFailure::Stop
+            } else {
+                crate::ir::SequenceFailure::Continue
+            },
+        },
+        &format!("{}-static-sequence-v1", interpreter.name()),
+        span,
+    )))
+}
+
 struct LowerPosixControlArgs<'a> {
     path: &'a str,
     source: &'a str,
@@ -4577,6 +4599,44 @@ mod tests {
             .tasks
             .remove(0)
             .body
+    }
+
+    /// An arm's body is a list of statements, and every one of them runs.
+    ///
+    /// The first version of this lowering handed the arm's whole byte range to
+    /// the single-command path, which tokenised `echo a` followed by `echo b`
+    /// into one `Exec` of `echo a echo b` — and called it native. The earlier
+    /// test asserted only that an arm existed and that its body was an `Exec`,
+    /// which both held.
+    #[test]
+    fn every_statement_of_a_case_arm_is_its_own_command() {
+        let node = body(
+            "build.sh",
+            b"#!/bin/bash\ncase \"$1\" in\n  0)\n    /bin/echo a\n    /bin/echo b\n    ;;\nesac\n",
+        );
+        let Operation::Match { cases, .. } = &node.operation else {
+            panic!("expected match: {node:#?}")
+        };
+        let [case] = cases.as_slice() else {
+            panic!("expected one arm: {cases:#?}")
+        };
+        let Operation::Sequence { nodes, .. } = &case.body.operation else {
+            panic!("an arm of two statements is a sequence: {case:#?}")
+        };
+        assert_eq!(nodes.len(), 2, "{nodes:#?}");
+        for (node, expected) in nodes.iter().zip(["a", "b"]) {
+            let Operation::Exec { argv, .. } = &node.operation else {
+                panic!("expected exec: {node:#?}")
+            };
+            assert_eq!(
+                argv,
+                &[
+                    crate::ir::TextExpression::literal("/bin/echo"),
+                    crate::ir::TextExpression::literal(expected),
+                ],
+                "a statement of the arm ran with another statement's words"
+            );
+        }
     }
 
     /// The `echo` lowering writes the bytes bash writes, checked against a
