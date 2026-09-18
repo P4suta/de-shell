@@ -223,7 +223,7 @@ fn collect_identity<'a>(node: &'a Node, output: &mut Vec<(&'a str, &'a str, &'a 
 fn visit_children<'a>(node: &'a Node, mut visit: impl FnMut(&'a Node)) {
     match &node.operation {
         Operation::Pipeline { nodes, .. }
-        | Operation::Sequence { nodes }
+        | Operation::Sequence { nodes, .. }
         | Operation::Parallel { nodes } => {
             for child in nodes {
                 visit(child);
@@ -462,6 +462,7 @@ mod tests {
                     id: String::new(),
                     operation: Operation::Sequence {
                         nodes: vec![child, residual],
+                        on_failure: crate::ir::SequenceFailure::Continue,
                     },
                     guarantee: Guarantee::Native {
                         semantic_model: "test-sequence-v1".into(),

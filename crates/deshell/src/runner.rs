@@ -511,7 +511,7 @@ impl Executor<'_> {
                     context,
                 ))
             }
-            Operation::Sequence { nodes } => {
+            Operation::Sequence { nodes, on_failure } => {
                 let mut aggregate = RunResult::empty();
                 let mut next_context = context;
                 let mut input = stdin;
@@ -523,9 +523,17 @@ impl Executor<'_> {
                                 stdin: input,
                                 stack,
                             })?;
+                    let failed = result.exit_code != 0;
                     aggregate = combine(aggregate, result);
                     next_context = child_context;
                     input = Vec::new();
+                    // `set -e`. The statements of a sequence are the only untested
+                    // position, so stopping here is the whole of the option: a
+                    // failure inside `&&`, an `if` condition or `!` belongs to
+                    // another node and never reaches this loop.
+                    if failed && *on_failure == crate::ir::SequenceFailure::Stop {
+                        break;
+                    }
                 }
                 Ok((aggregate, next_context))
             }
@@ -1507,11 +1515,37 @@ mod tests {
         assert_eq!(run(&backend, pipeline).unwrap().stdout, b"HELLO");
         let sequence = node(Operation::Sequence {
             nodes: vec![exec(&["fail", "9"]), exec(&["emit", "after"])],
+            on_failure: crate::ir::SequenceFailure::Continue,
         });
         let result = run(&backend, sequence).unwrap();
         assert_eq!(result.exit_code, 0);
         assert_eq!(result.stdout, b"after");
         assert_eq!(result.stderr, b"failed");
+    }
+
+    #[test]
+    fn a_stopping_sequence_does_not_run_past_a_failure() {
+        let backend = MockBackend::default();
+        let sequence = node(Operation::Sequence {
+            nodes: vec![exec(&["fail", "9"]), exec(&["emit", "after"])],
+            on_failure: crate::ir::SequenceFailure::Stop,
+        });
+        let result = run(&backend, sequence).unwrap();
+        assert_eq!(result.exit_code, 9, "the failing status is the sequence's");
+        assert!(
+            result.stdout.is_empty(),
+            "the statement after the failure must not run: {:?}",
+            String::from_utf8_lossy(&result.stdout)
+        );
+
+        // The other direction: the same tree that continues past the failure is
+        // what the shell does without `set -e`, and it still does.
+        let sequence = node(Operation::Sequence {
+            nodes: vec![exec(&["fail", "9"]), exec(&["emit", "after"])],
+            on_failure: crate::ir::SequenceFailure::Continue,
+        });
+        let result = run(&backend, sequence).unwrap();
+        assert_eq!(result.stdout, b"after");
     }
 
     #[test]
@@ -1729,6 +1763,7 @@ mod tests {
                     uri: TextExpression::literal("https://example.invalid/value"),
                 }),
             ],
+            on_failure: crate::ir::SequenceFailure::Continue,
         });
         let result = run_plan_with_io(
             &backend,

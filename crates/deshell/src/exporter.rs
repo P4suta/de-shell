@@ -307,7 +307,7 @@ fn plan_capabilities(plan: &Plan) -> Vec<String> {
 fn node_children(node: &Node) -> Vec<&Node> {
     match &node.operation {
         Operation::Pipeline { nodes, .. }
-        | Operation::Sequence { nodes }
+        | Operation::Sequence { nodes, .. }
         | Operation::Parallel { nodes } => nodes.iter().collect(),
         Operation::Condition {
             predicate,
@@ -814,6 +814,7 @@ mod tests {
     fn strict_exporters_reject_sequence_status_semantics_they_cannot_preserve() {
         let sequence = plan(node(Operation::Sequence {
             nodes: vec![exec(&["one"]), exec(&["two"])],
+            on_failure: crate::ir::SequenceFailure::Continue,
         }));
         assert!(export(&sequence, Target::Cwl, Mode::Strict, None).is_err());
         assert!(export(&sequence, Target::Nushell, Mode::Strict, None).is_err());
@@ -902,6 +903,7 @@ mod tests {
                     })),
                 }),
             ],
+            on_failure: crate::ir::SequenceFailure::Continue,
         });
         let mut plan = plan(effects);
         plan.tasks[0].platform_capabilities.push("platform".into());

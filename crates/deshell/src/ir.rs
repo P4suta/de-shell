@@ -88,6 +88,25 @@ pub(crate) enum PipelineStatus {
     Pipefail,
 }
 
+/// What a sequence does when one of its statements fails.
+///
+/// `Continue` is the shell's default: a failing statement is reported and the
+/// next one runs anyway. `Stop` is what `set -e` selects.
+///
+/// The choice belongs to the sequence rather than to each statement because
+/// `set -e` stops only on commands that are *not tested*, and which commands
+/// those are is already the shape of the tree: the left of `&&`/`||`, an `if`
+/// condition and the operand of `!` each lower into their own node, so the only
+/// untested position is a statement of a sequence. Shell function definitions,
+/// where the option's meaning would depend on the call site, are delegated
+/// before they reach the lowering.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SequenceFailure {
+    Continue,
+    Stop,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct NamedExpression {
@@ -242,6 +261,8 @@ pub(crate) enum Operation {
     },
     Sequence {
         nodes: Vec<Node>,
+        /// Whether a failing statement ends the sequence. See [`SequenceFailure`].
+        on_failure: SequenceFailure,
     },
     Parallel {
         nodes: Vec<Node>,
@@ -654,7 +675,7 @@ fn visit_children_mut<E>(
 ) -> Result<(), E> {
     match operation {
         Operation::Pipeline { nodes, .. }
-        | Operation::Sequence { nodes }
+        | Operation::Sequence { nodes, .. }
         | Operation::Parallel { nodes } => {
             for node in nodes {
                 visit(node)?;
@@ -1026,7 +1047,7 @@ fn validate_node(parts: ValidateNodeArgs<'_>) {
                     });
             }
         }
-        Operation::Sequence { nodes } => {
+        Operation::Sequence { nodes, .. } => {
             if nodes.is_empty() {
                 errors.push("sequence must contain at least one node".into());
             }
@@ -1401,7 +1422,7 @@ fn contains_state_mutation(node: &Node) -> bool {
         | Operation::ClockRead { .. }
         | Operation::RandomBytes { .. } => true,
         Operation::Pipeline { nodes, .. }
-        | Operation::Sequence { nodes }
+        | Operation::Sequence { nodes, .. }
         | Operation::Parallel { nodes } => nodes.iter().any(contains_state_mutation),
         Operation::Condition {
             predicate,
@@ -1879,6 +1900,7 @@ mod tests {
                     length: 16,
                 }),
             ],
+            on_failure: crate::ir::SequenceFailure::Continue,
         });
         plan.assign_node_ids().unwrap();
         let encoded = plan.encode_pretty().unwrap();
@@ -2315,7 +2337,10 @@ mod tests {
                     status: PipelineStatus::Last,
                 }),
                 native(Operation::Parallel { nodes: vec![] }),
-                native(Operation::Sequence { nodes: vec![] }),
+                native(Operation::Sequence {
+                    nodes: vec![],
+                    on_failure: SequenceFailure::Continue,
+                }),
                 native(Operation::Condition {
                     predicate: Box::new(exec()),
                     if_true: Box::new(exec()),
@@ -2479,6 +2504,7 @@ mod tests {
                 invalid_interpreter_guarantee,
                 invalid_capsule_guarantee,
             ],
+            on_failure: crate::ir::SequenceFailure::Continue,
         });
         let mut worker = Task {
             name: "worker".into(),
@@ -2494,7 +2520,7 @@ mod tests {
             invocation: None,
             body: exec(),
         };
-        if let Operation::Sequence { nodes } = &mut plan.tasks[0].body.operation {
+        if let Operation::Sequence { nodes, .. } = &mut plan.tasks[0].body.operation {
             nodes.push(native(Operation::TaskCall {
                 task: "worker".into(),
                 arguments: vec![NamedExpression {

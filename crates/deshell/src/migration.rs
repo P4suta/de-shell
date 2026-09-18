@@ -3175,7 +3175,7 @@ fn delegated_blocker_location(reasons: &[String], source: &Location, kind: Sourc
 fn visit_node(node: &crate::ir::Node, mut visit: impl FnMut(&crate::ir::Node)) {
     match &node.operation {
         crate::ir::Operation::Pipeline { nodes, .. }
-        | crate::ir::Operation::Sequence { nodes }
+        | crate::ir::Operation::Sequence { nodes, .. }
         | crate::ir::Operation::Parallel { nodes } => {
             for child in nodes {
                 visit(child);
@@ -3585,7 +3585,7 @@ fn emit_rust_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> 
                 indent = indent
             ));
         }
-        crate::ir::Operation::Sequence { nodes } => {
+        crate::ir::Operation::Sequence { nodes, .. } => {
             let Some((last, preceding)) = nodes.split_last() else {
                 return Err("generator received an empty sequence".into());
             };
@@ -3666,7 +3666,7 @@ fn emit_rust_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> 
 fn rust_node_uses_pipeline(node: &crate::ir::Node) -> bool {
     match &node.operation {
         crate::ir::Operation::Pipeline { .. } => true,
-        crate::ir::Operation::Sequence { nodes } => nodes.iter().any(rust_node_uses_pipeline),
+        crate::ir::Operation::Sequence { nodes, .. } => nodes.iter().any(rust_node_uses_pipeline),
         crate::ir::Operation::Condition {
             predicate,
             if_true,
@@ -3697,7 +3697,7 @@ fn rust_node_uses_arguments(node: &crate::ir::Node) -> bool {
                 || environment.iter().any(|value| expression(&value.value))
                 || working_directory.as_ref().is_some_and(expression)
         }
-        crate::ir::Operation::Sequence { nodes } | crate::ir::Operation::Pipeline { nodes, .. } => {
+        crate::ir::Operation::Sequence { nodes, .. } | crate::ir::Operation::Pipeline { nodes, .. } => {
             nodes.iter().any(rust_node_uses_arguments)
         }
         crate::ir::Operation::Condition {
@@ -3925,7 +3925,7 @@ fn emit_go_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> Re
                 indent = indent
             ));
         }
-        crate::ir::Operation::Sequence { nodes } => {
+        crate::ir::Operation::Sequence { nodes, .. } => {
             for child in nodes {
                 emit_go_node(child, output, depth)?;
             }
@@ -5356,7 +5356,7 @@ fn execute_ir_node(
                 },
             )
         }
-        crate::ir::Operation::Sequence { nodes } => {
+        crate::ir::Operation::Sequence { nodes, .. } => {
             let mut aggregate = crate::agent_process::Outcome {
                 exit_code: 0,
                 stdout: Vec::new(),
@@ -7983,6 +7983,7 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
                     finalizer: Box::new(leaf()),
                 }),
             ],
+            on_failure: crate::ir::SequenceFailure::Continue,
         });
         let plan = plan_with_body(tree);
         let mut ids = Vec::new();
@@ -8013,6 +8014,7 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
         };
         let plan = plan_with_body(node(crate::ir::Operation::Sequence {
             nodes: vec![native, delegated, residual],
+            on_failure: crate::ir::SequenceFailure::Continue,
         }));
         assert_eq!(
             classify_coverage(&plan, 10),
@@ -8126,6 +8128,7 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
         ]);
         let plan = plan_with_body(node(crate::ir::Operation::Sequence {
             nodes: vec![network, curl],
+            on_failure: crate::ir::SequenceFailure::Continue,
         }));
         let requests = network_replay_requests(&plan).unwrap();
         assert_eq!(requests.len(), 2);
@@ -8197,6 +8200,7 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
         });
         let plan = plan_with_body(node(crate::ir::Operation::Sequence {
             nodes: vec![command, pipeline, condition],
+            on_failure: crate::ir::SequenceFailure::Continue,
         }));
         let rust = String::from_utf8(generate_rust(&plan).unwrap()).unwrap();
         let go = String::from_utf8(generate_go(&plan).unwrap()).unwrap();
@@ -8347,6 +8351,7 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
         });
         let plan = plan_with_body(node(crate::ir::Operation::Sequence {
             nodes: vec![simple, pipeline, condition],
+            on_failure: crate::ir::SequenceFailure::Continue,
         }));
         let directory = tempfile::tempdir().unwrap();
         let literal_rust_path = directory.path().join("literal.rs");

@@ -318,7 +318,7 @@ fn rebind_source_path(plan: &mut Plan, from: &str, to: &str) -> Result<(), Strin
         }
         match &mut node.operation {
             Operation::Pipeline { nodes, .. }
-            | Operation::Sequence { nodes }
+            | Operation::Sequence { nodes, .. }
             | Operation::Parallel { nodes } => {
                 for child in nodes {
                     visit(child, from, to);
@@ -760,7 +760,7 @@ fn bind_node_pin(node: &mut Node, pins: &crate::config::InterpreterPins) -> Resu
             .clone();
         }
         Operation::Pipeline { nodes, .. }
-        | Operation::Sequence { nodes }
+        | Operation::Sequence { nodes, .. }
         | Operation::Parallel { nodes } => {
             for child in nodes {
                 bind_node_pin(child, pins)?;
@@ -1193,30 +1193,65 @@ struct Range {
     end: usize,
 }
 
-/// Whether a statement is exactly a `pipefail` toggle, and which way.
+/// The shell options this frontend models.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ShellOptions {
+    errexit: bool,
+    pipefail: bool,
+}
+
+/// Read a `set` statement, if every option in it is one this frontend models.
 ///
-/// Only `-o pipefail` is recognised, and only on its own. `set -e` and `set -u`
-/// are deliberately not handled here: measured against bash 3.2.57, `set -e`
-/// stops on a command that is *not tested* — the left of `&&`/`||`, an `if`
-/// condition, the operand of `!`, every element of a pipeline but the last — and
-/// its meaning depends on the call site, since a function body that aborts when
-/// called directly runs to completion when called as `f || true`. A combined
-/// `set -euo pipefail` therefore stays delegated: recognising the `pipefail` part
-/// of it while silently dropping `-e` would change what the script does.
-fn pipefail_toggle(statement: &str) -> Option<bool> {
+/// Returns `None` — leaving the statement to be delegated — when the statement is
+/// not a `set`, or when it carries even one option that is not modelled. Taking
+/// the modelled part of `set -euo pipefail` and dropping `-u` would change what
+/// the script does, so an unmodelled option disqualifies the whole statement
+/// rather than only itself.
+///
+/// `-e` is modelled because which commands it stops on is decided by the shape of
+/// the tree rather than by the caller: the left of `&&`/`||`, an `if` condition
+/// and the operand of `!` each lower into their own node, so the only untested
+/// position is a statement of a sequence. The case where the option's meaning
+/// *would* depend on the call site — a shell function, whose body runs to
+/// completion when the call is tested — is delegated before reaching here,
+/// because function definitions are not in the native subset.
+///
+/// `-u` is not modelled: its exceptions (`${x:-}`, `${x+}`, `$@` with no
+/// arguments) are a table this frontend does not have. `-f` is `noglob` rather
+/// than `nosplit` and changes expansion; `-x` is a side effect.
+fn set_statement(statement: &str, current: ShellOptions) -> Option<ShellOptions> {
     let mut words = statement.split_whitespace();
     if words.next()? != "set" {
         return None;
     }
-    let enable = match words.next()? {
-        "-o" => true,
-        "+o" => false,
-        _ => return None,
-    };
-    if words.next()? != "pipefail" || words.next().is_some() {
-        return None;
+    let mut options = current;
+    let mut saw_one = false;
+    while let Some(word) = words.next() {
+        let enable = match word.chars().next()? {
+            '-' => true,
+            '+' => false,
+            _ => return None,
+        };
+        let rest = &word[1..];
+        if rest.is_empty() {
+            return None;
+        }
+        // Short options combine (`-eo pipefail` is `-e` plus `-o pipefail`), and
+        // `o` takes the next word, so it is only valid as the last letter.
+        let mut flags = rest.chars().peekable();
+        while let Some(flag) = flags.next() {
+            match flag {
+                'e' => options.errexit = enable,
+                'o' if flags.peek().is_none() => match words.next()? {
+                    "pipefail" => options.pipefail = enable,
+                    _ => return None,
+                },
+                _ => return None,
+            }
+        }
+        saw_one = true;
     }
-    Some(enable)
+    if saw_one { Some(options) } else { None }
 }
 
 fn lower_posix(path: &str, source: &str, interpreter: &Interpreter) -> Result<Lowered, String> {
@@ -1227,17 +1262,17 @@ fn lower_posix(path: &str, source: &str, interpreter: &Interpreter) -> Result<Lo
     let mut nodes = Vec::new();
     // Shell options apply from where they are set onwards, so this travels with
     // the statement cursor rather than being read once for the file.
-    let mut pipefail = false;
+    let mut options = ShellOptions::default();
     for range in statements {
         let text = &source[range.start..range.end];
         let trimmed = text.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        if let Some(enable) = pipefail_toggle(trimmed) {
-            // The toggle is a change of lowering state, not an operation: it emits
-            // no node, and the pipelines after it carry its effect instead.
-            pipefail = enable;
+        if let Some(updated) = set_statement(trimmed, options) {
+            // A `set` is a change of lowering state, not an operation: it emits no
+            // node, and the statements after it carry its effect instead.
+            options = updated;
             continue;
         }
         let node = lower_posix_control(LowerPosixControlArgs {
@@ -1248,7 +1283,7 @@ fn lower_posix(path: &str, source: &str, interpreter: &Interpreter) -> Result<Lo
                 inputs: &mut inputs,
                 environment: &mut environment,
                 locals: &mut locals,
-                pipefail,
+                pipefail: options.pipefail,
             })?;
         nodes.push(node);
     }
@@ -1267,7 +1302,14 @@ fn lower_posix(path: &str, source: &str, interpreter: &Interpreter) -> Result<Lo
             .and_then(|node| node.source.clone())
             .ok_or("sequence source span is missing")?;
         native_node(
-            Operation::Sequence { nodes },
+            Operation::Sequence {
+                nodes,
+                on_failure: if options.errexit {
+                    crate::ir::SequenceFailure::Stop
+                } else {
+                    crate::ir::SequenceFailure::Continue
+                },
+            },
             &format!("{}-static-sequence-v1", interpreter.name()),
             cover_spans(first, last),
         )
@@ -1793,7 +1835,10 @@ fn lower_fish(path: &str, source: &str) -> Result<Lowered, String> {
         let first = nodes.first().unwrap().source.clone().unwrap();
         let last = nodes.last().unwrap().source.clone().unwrap();
         native_node(
-            Operation::Sequence { nodes },
+            Operation::Sequence {
+                nodes,
+                on_failure: crate::ir::SequenceFailure::Continue,
+            },
             "fish-static-sequence-v1",
             cover_spans(first, last),
         )
@@ -2111,7 +2156,10 @@ fn lower_cmd(path: &str, source: &str) -> Result<Lowered, String> {
         let first = prologue.unwrap_or_else(|| nodes.first().unwrap().source.clone().unwrap());
         let last = nodes.last().unwrap().source.clone().unwrap();
         native_node(
-            Operation::Sequence { nodes },
+            Operation::Sequence {
+                nodes,
+                on_failure: crate::ir::SequenceFailure::Continue,
+            },
             "cmd-static-sequence-v1",
             cover_spans(first, last),
         )
@@ -2406,7 +2454,10 @@ fn lower_powershell(path: &str, source: &str) -> Result<Lowered, String> {
         let last =
             terminal_status_span.unwrap_or_else(|| nodes.last().unwrap().source.clone().unwrap());
         native_node(
-            Operation::Sequence { nodes },
+            Operation::Sequence {
+                nodes,
+                on_failure: crate::ir::SequenceFailure::Continue,
+            },
             "powershell-static-sequence-with-status-v1",
             cover_spans(first, last),
         )
@@ -2740,6 +2791,7 @@ fn lower_nushell(path: &str, source: &str, interpreter: &Interpreter) -> Result<
         body: native_node(
             Operation::Sequence {
                 nodes: vec![first, condition],
+                on_failure: crate::ir::SequenceFailure::Continue,
             },
             "nushell-static-main-sequence-v1",
             span,
@@ -3303,7 +3355,10 @@ fn lower_literal_family(
         let first = nodes.first().unwrap().source.clone().unwrap();
         let last = nodes.last().unwrap().source.clone().unwrap();
         native_node(
-            Operation::Sequence { nodes },
+            Operation::Sequence {
+                nodes,
+                on_failure: crate::ir::SequenceFailure::Continue,
+            },
             &format!("{}-static-sequence-v1", interpreter.name()),
             cover_spans(first, last),
         )
@@ -3567,7 +3622,7 @@ mod tests {
             "build.sh",
             b"/usr/bin/printf one | grep one\n/usr/bin/printf two\n",
         );
-        let Operation::Sequence { nodes } = node.operation else {
+        let Operation::Sequence { nodes, .. } = node.operation else {
             panic!("expected sequence")
         };
         assert!(matches!(nodes[0].operation, Operation::Pipeline { .. }));
@@ -3594,13 +3649,54 @@ mod tests {
     }
 
     #[test]
+    fn set_e_stops_a_sequence_and_an_unmodelled_option_does_not() {
+        // `set -e` stops on a command that is *not tested*, and which commands
+        // those are is already the shape of the tree, so the option is a property
+        // of the sequence.
+        let node = body("build.sh", b"set -e\n/bin/echo one\n/bin/echo two\n");
+        let Operation::Sequence { on_failure, .. } = &node.operation else {
+            panic!("expected sequence: {node:#?}")
+        };
+        assert_eq!(*on_failure, crate::ir::SequenceFailure::Stop);
+
+        let node = body("build.sh", b"/bin/echo one\n/bin/echo two\n");
+        let Operation::Sequence { on_failure, .. } = &node.operation else {
+            panic!("expected sequence: {node:#?}")
+        };
+        assert_eq!(*on_failure, crate::ir::SequenceFailure::Continue);
+
+        // `-u` is not modelled, so the whole statement is refused rather than
+        // having its `-e` and `pipefail` taken and its `-u` dropped.
+        assert_eq!(
+            set_statement("set -euo pipefail", ShellOptions::default()),
+            None
+        );
+        assert_eq!(
+            set_statement("set -eo pipefail", ShellOptions::default()),
+            Some(ShellOptions {
+                errexit: true,
+                pipefail: true
+            })
+        );
+        assert_eq!(
+            set_statement("set +e", ShellOptions {
+                errexit: true,
+                pipefail: false
+            }),
+            Some(ShellOptions::default())
+        );
+        assert_eq!(set_statement("set -f", ShellOptions::default()), None);
+        assert_eq!(set_statement("/bin/echo set -e", ShellOptions::default()), None);
+    }
+
+    #[test]
     fn a_pipeline_before_set_o_pipefail_keeps_last_status() {
         // The option applies from where it is set, not to the whole file.
         let node = body(
             "build.sh",
             b"/usr/bin/printf one | grep one\nset -o pipefail\n/usr/bin/printf two | grep two\n",
         );
-        let Operation::Sequence { nodes } = node.operation else {
+        let Operation::Sequence { nodes, .. } = node.operation else {
             panic!("expected sequence")
         };
         let Operation::Pipeline { status, .. } = &nodes[0].operation else {
@@ -3629,7 +3725,7 @@ mod tests {
         let task = &plan.tasks[0];
         assert_eq!(task.inputs[0].name, "1");
         assert_eq!(task.environment, ["CORPUS_ENV"]);
-        let Operation::Sequence { nodes } = &task.body.operation else {
+        let Operation::Sequence { nodes, .. } = &task.body.operation else {
             panic!("expected native fish sequence: {:#?}", task.body)
         };
         let Operation::Exec { argv, .. } = &nodes[0].operation else {
@@ -3695,7 +3791,7 @@ mod tests {
         let task = &plan.tasks[0];
         assert_eq!(task.inputs[0].name, "1");
         assert_eq!(task.environment, ["CORPUS_ENV"]);
-        let Operation::Sequence { nodes } = &task.body.operation else {
+        let Operation::Sequence { nodes, .. } = &task.body.operation else {
             panic!("expected native Nushell sequence: {:#?}", task.body)
         };
         assert!(matches!(nodes[0].operation, Operation::Exec { .. }));
@@ -3732,7 +3828,7 @@ mod tests {
         let task = &plan.tasks[0];
         assert_eq!(task.inputs[0].name, "1");
         assert_eq!(task.environment, ["CORPUS_ENV"]);
-        let Operation::Sequence { nodes } = &task.body.operation else {
+        let Operation::Sequence { nodes, .. } = &task.body.operation else {
             panic!("expected native PowerShell sequence: {:#?}", task.body)
         };
         let Operation::Exec { argv, .. } = &nodes[0].operation else {
@@ -3765,7 +3861,7 @@ mod tests {
         let task = &plan.tasks[0];
         assert_eq!(task.inputs[0].name, "1");
         assert_eq!(task.environment, ["CORPUS_ENV"]);
-        let Operation::Sequence { nodes } = &task.body.operation else {
+        let Operation::Sequence { nodes, .. } = &task.body.operation else {
             panic!("expected native cmd sequence: {:#?}", task.body)
         };
         let Operation::Exec { argv, .. } = &nodes[0].operation else {
@@ -4128,6 +4224,7 @@ mod tests {
                         body: Box::new(call("cmd")),
                     }),
                 ],
+                on_failure: crate::ir::SequenceFailure::Continue,
             })),
             finalizer: Box::new(Node::default()),
         });
@@ -4162,7 +4259,7 @@ mod tests {
             matches!(capture.operation, Operation::Sequence { .. }),
             "{capture:#?}"
         );
-        let Operation::Sequence { nodes } = capture.operation else {
+        let Operation::Sequence { nodes, .. } = capture.operation else {
             panic!("expected assignment sequence")
         };
         assert!(matches!(

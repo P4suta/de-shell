@@ -230,7 +230,7 @@ fn collect_nodes(node: &crate::ir::Node, output: &mut Vec<NodeEvidence>) {
     });
     match &node.operation {
         crate::ir::Operation::Pipeline { nodes, .. }
-        | crate::ir::Operation::Sequence { nodes }
+        | crate::ir::Operation::Sequence { nodes, .. }
         | crate::ir::Operation::Parallel { nodes } => {
             for child in nodes {
                 collect_nodes(child, output);
@@ -671,6 +671,7 @@ mod tests {
                     finalizer: Box::new(leaf()),
                 }),
             ],
+            on_failure: crate::ir::SequenceFailure::Continue,
         });
         let mut nodes = Vec::new();
         collect_nodes(&root, &mut nodes);

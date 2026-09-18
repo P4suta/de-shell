@@ -624,7 +624,7 @@ fn select_plan_node(mut plan: crate::ir::Plan, id: &str) -> Result<crate::ir::Pl
         let mut children = Vec::new();
         match &node.operation {
             crate::ir::Operation::Pipeline { nodes, .. }
-            | crate::ir::Operation::Sequence { nodes }
+            | crate::ir::Operation::Sequence { nodes, .. }
             | crate::ir::Operation::Parallel { nodes } => children.extend(nodes.iter()),
             crate::ir::Operation::Condition {
                 predicate,
@@ -1543,6 +1543,7 @@ mod tests {
                     predicate: Box::new(emit("predicate")),
                     if_true: Box::new(native(Operation::Sequence {
                         nodes: vec![emit("first"), target],
+                        on_failure: crate::ir::SequenceFailure::Continue,
                     })),
                     if_false: Some(Box::new(emit("false"))),
                 }),
@@ -1551,7 +1552,7 @@ mod tests {
         plan.assign_node_ids().unwrap();
         let selected_id = match &plan.tasks[0].body.operation {
             Operation::Condition { if_true, .. } => match &if_true.operation {
-                Operation::Sequence { nodes } => nodes[1].id.clone(),
+                Operation::Sequence { nodes, .. } => nodes[1].id.clone(),
                 _ => unreachable!(),
             },
             _ => unreachable!(),

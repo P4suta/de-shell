@@ -109,6 +109,20 @@ blocker DESHELL_BLOCKER_UNIMPLEMENTED_SEMANTIC action.yml@3963..6698:
   status, which is local and static. `-f` and `-x` stay delegated. Note that
   `-f` is `noglob`, not `nosplit`: measured, word splitting still happens under
   it, so modelling it as suppressing field splitting would be wrong.
+- [x] `-e` and `-o pipefail` are modelled. `Operation::Sequence` carries a
+  `SequenceFailure`, which `set -e` selects and the runner honours by stopping
+  after a failing statement; `PipelineStatus::Pipefail` was already in the IR and
+  is now selected by the option that names it. An unmodelled option disqualifies
+  the whole `set` statement rather than only itself, so `set -euo pipefail` is
+  still delegated: taking its `-e` and `pipefail` while dropping `-u` would
+  change what the script does.
+- [ ] Model `-u`, which is what OComment's `action.yml` still waits on — all five
+  of its `run:` blocks open with `set -euo pipefail`, so the work above moves
+  nothing there yet. The exceptions are a finite table (`${x:-}`, `${x+}`, `${x-}`,
+  `${x:?}`, `$@`/`$*` with no arguments) and the measured exit status is 127
+  rather than 1. Unlike `-e`, this one is not a property of the sequence: it
+  changes what an expansion does, so it needs a home in the text expression or
+  the task rather than in the statement list.
 - [ ] `-e` needs one new IR value, not a call-graph analysis. Which commands
   `set -e` stops on is already the shape of the tree: the left of `&&`/`||`, an
   `if` condition and the operand of `!` each lower into their own node, so the

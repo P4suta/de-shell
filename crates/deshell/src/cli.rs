@@ -3669,7 +3669,7 @@ fn find_node<'a>(node: &'a crate::ir::Node, id: &str) -> Option<&'a crate::ir::N
     }
     match &node.operation {
         crate::ir::Operation::Pipeline { nodes, .. }
-        | crate::ir::Operation::Sequence { nodes }
+        | crate::ir::Operation::Sequence { nodes, .. }
         | crate::ir::Operation::Parallel { nodes } => {
             nodes.iter().find_map(|node| find_node(node, id))
         }
@@ -3731,7 +3731,7 @@ fn collect_nodes<'a>(node: &'a crate::ir::Node, values: &mut Vec<&'a crate::ir::
     values.push(node);
     match &node.operation {
         crate::ir::Operation::Pipeline { nodes, .. }
-        | crate::ir::Operation::Sequence { nodes }
+        | crate::ir::Operation::Sequence { nodes, .. }
         | crate::ir::Operation::Parallel { nodes } => {
             for node in nodes {
                 collect_nodes(node, values);
