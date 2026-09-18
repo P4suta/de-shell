@@ -233,7 +233,13 @@ pub(crate) fn execute_pipeline(
         if index + 1 == count {
             let exceeded = std::sync::Arc::clone(&exceeded);
             stdout_reader = Some(std::thread::spawn(move || {
-                read_pipe(output, "stdout", limits.stdout_bytes, &exceeded, 1)
+                read_pipe(ReadPipeArgs {
+                    pipe: output,
+                    label: "stdout",
+                    limit: limits.stdout_bytes,
+                    exceeded: &exceeded,
+                    code: 1,
+                })
             }));
         } else {
             previous_stdout = Some(output);
@@ -245,14 +251,14 @@ pub(crate) fn execute_pipeline(
         let exceeded_reader = std::sync::Arc::clone(&exceeded);
         let stderr_total_reader = std::sync::Arc::clone(&stderr_total);
         stderr_readers.push(std::thread::spawn(move || {
-            read_pipe_shared(
-                error,
-                "stderr",
-                limits.stderr_bytes,
-                &stderr_total_reader,
-                &exceeded_reader,
-                2,
-            )
+            read_pipe_shared(ReadPipeSharedArgs {
+                pipe: error,
+                label: "stderr",
+                limit: limits.stderr_bytes,
+                total: &stderr_total_reader,
+                exceeded: &exceeded_reader,
+                code: 2,
+            })
         }));
         children.push(child);
     }
@@ -424,10 +430,22 @@ pub(crate) fn execute_with_clock(
     let stdout_limit = request.limits.stdout_bytes;
     let stderr_limit = request.limits.stderr_bytes;
     let stdout_reader = std::thread::spawn(move || {
-        read_pipe(child_stdout, "stdout", stdout_limit, &stdout_exceeded, 1)
+        read_pipe(ReadPipeArgs {
+            pipe: child_stdout,
+            label: "stdout",
+            limit: stdout_limit,
+            exceeded: &stdout_exceeded,
+            code: 1,
+        })
     });
     let stderr_reader = std::thread::spawn(move || {
-        read_pipe(child_stderr, "stderr", stderr_limit, &stderr_exceeded, 2)
+        read_pipe(ReadPipeArgs {
+            pipe: child_stderr,
+            label: "stderr",
+            limit: stderr_limit,
+            exceeded: &stderr_exceeded,
+            code: 2,
+        })
     });
     let input = request.stdin;
     let stdin_writer = std::thread::spawn(move || -> Result<(), String> {
@@ -699,13 +717,29 @@ fn terminate_children(children: &mut [std::process::Child]) {
     }
 }
 
-fn read_pipe(
-    mut pipe: impl std::io::Read,
-    label: &str,
+/// The inputs of [`read_pipe`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`read_pipe`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct ReadPipeArgs<'a, R: std::io::Read> {
+    pipe: R,
+    label: &'a str,
     limit: u64,
-    exceeded: &std::sync::atomic::AtomicU8,
+    exceeded: &'a std::sync::atomic::AtomicU8,
     code: u8,
-) -> Result<Vec<u8>, String> {
+}
+
+fn read_pipe<R: std::io::Read>(parts: ReadPipeArgs<'_, R>) -> Result<Vec<u8>, String> {
+    // Destructured without `..`: see `ReadPipeArgs`.
+    let ReadPipeArgs {
+        mut pipe,
+        label,
+        limit,
+        exceeded,
+        code,
+    } = parts;
     let mut output = Vec::new();
     let mut buffer = [0_u8; 16 * 1024];
     loop {
@@ -730,14 +764,31 @@ fn read_pipe(
     Ok(output)
 }
 
-fn read_pipe_shared(
-    mut pipe: impl std::io::Read,
-    label: &str,
+/// The inputs of [`read_pipe_shared`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`read_pipe_shared`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct ReadPipeSharedArgs<'a, R: std::io::Read> {
+    pipe: R,
+    label: &'a str,
     limit: u64,
-    total: &std::sync::atomic::AtomicU64,
-    exceeded: &std::sync::atomic::AtomicU8,
+    total: &'a std::sync::atomic::AtomicU64,
+    exceeded: &'a std::sync::atomic::AtomicU8,
     code: u8,
-) -> Result<Vec<u8>, String> {
+}
+
+fn read_pipe_shared<R: std::io::Read>(parts: ReadPipeSharedArgs<'_, R>) -> Result<Vec<u8>, String> {
+    // Destructured without `..`: see `ReadPipeSharedArgs`.
+    let ReadPipeSharedArgs {
+        mut pipe,
+        label,
+        limit,
+        total,
+        exceeded,
+        code,
+    } = parts;
     let mut output = Vec::new();
     let mut buffer = [0_u8; 16 * 1024];
     loop {
