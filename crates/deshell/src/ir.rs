@@ -526,7 +526,13 @@ impl Plan {
         let mut seen_ids = BTreeSet::new();
         let mut preorder = 0_u64;
         for task in &self.tasks {
-            validate_task(task, &task_table, &mut seen_ids, &mut preorder, &mut errors);
+            validate_task(ValidateTaskArgs {
+                    task,
+                    task_table: &task_table,
+                    seen_ids: &mut seen_ids,
+                    preorder: &mut preorder,
+                    errors: &mut errors,
+                });
         }
 
         if errors.is_empty() {
@@ -704,13 +710,29 @@ fn visit_children_mut<E>(
     Ok(())
 }
 
-fn validate_task<'a>(
-    task: &Task,
-    task_table: &BTreeMap<&'a str, &'a Task>,
-    seen_ids: &mut BTreeSet<String>,
-    preorder: &mut u64,
-    errors: &mut Vec<String>,
-) {
+/// The inputs of [`validate_task`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`validate_task`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct ValidateTaskArgs<'a> {
+    task: &'a Task,
+    task_table: &'a BTreeMap<&'a str, &'a Task>,
+    seen_ids: &'a mut BTreeSet<String>,
+    preorder: &'a mut u64,
+    errors: &'a mut Vec<String>,
+}
+
+fn validate_task(parts: ValidateTaskArgs<'_>) {
+    // Destructured without `..`: see `ValidateTaskArgs`.
+    let ValidateTaskArgs {
+        task,
+        task_table,
+        seen_ids,
+        preorder,
+        errors,
+    } = parts;
     let input_names = duplicate_strings(
         "input",
         task.inputs.iter().map(|binding| binding.name.as_str()),
@@ -794,24 +816,41 @@ fn validate_task<'a>(
             }
         }
     }
-    validate_node(
-        &task.body,
-        &input_names,
+    validate_node(ValidateNodeArgs {
+            node: &task.body,
+            inputs: &input_names,
+            task_table,
+            seen_ids: &mut *seen_ids,
+            preorder: &mut *preorder,
+            errors: &mut *errors,
+        });
+}
+
+/// The inputs of [`validate_node`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`validate_node`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct ValidateNodeArgs<'a> {
+    node: &'a Node,
+    inputs: &'a BTreeSet<String>,
+    task_table: &'a BTreeMap<&'a str, &'a Task>,
+    seen_ids: &'a mut BTreeSet<String>,
+    preorder: &'a mut u64,
+    errors: &'a mut Vec<String>,
+}
+
+fn validate_node(parts: ValidateNodeArgs<'_>) {
+    // Destructured without `..`: see `ValidateNodeArgs`.
+    let ValidateNodeArgs {
+        node,
+        inputs,
         task_table,
         seen_ids,
         preorder,
         errors,
-    );
-}
-
-fn validate_node<'a>(
-    node: &Node,
-    inputs: &BTreeSet<String>,
-    task_table: &BTreeMap<&'a str, &'a Task>,
-    seen_ids: &mut BTreeSet<String>,
-    preorder: &mut u64,
-    errors: &mut Vec<String>,
-) {
+    } = parts;
     if !seen_ids.insert(node.id.clone()) {
         errors.push(format!("duplicate node id: {}", node.id));
     }
@@ -954,7 +993,14 @@ fn validate_node<'a>(
                     }
                 }
             }
-            validate_node(body, inputs, task_table, seen_ids, preorder, errors);
+            validate_node(ValidateNodeArgs {
+                    node: body,
+                    inputs,
+                    task_table,
+                    seen_ids: &mut *seen_ids,
+                    preorder: &mut *preorder,
+                    errors: &mut *errors,
+                });
         }
         Operation::Pipeline { nodes, .. } | Operation::Parallel { nodes } => {
             if nodes.is_empty() {
@@ -970,7 +1016,14 @@ fn validate_node<'a>(
                 ));
             }
             for child in nodes {
-                validate_node(child, inputs, task_table, seen_ids, preorder, errors);
+                validate_node(ValidateNodeArgs {
+                        node: child,
+                        inputs,
+                        task_table,
+                        seen_ids: &mut *seen_ids,
+                        preorder: &mut *preorder,
+                        errors: &mut *errors,
+                    });
             }
         }
         Operation::Sequence { nodes } => {
@@ -978,7 +1031,14 @@ fn validate_node<'a>(
                 errors.push("sequence must contain at least one node".into());
             }
             for child in nodes {
-                validate_node(child, inputs, task_table, seen_ids, preorder, errors);
+                validate_node(ValidateNodeArgs {
+                        node: child,
+                        inputs,
+                        task_table,
+                        seen_ids: &mut *seen_ids,
+                        preorder: &mut *preorder,
+                        errors: &mut *errors,
+                    });
             }
         }
         Operation::Condition {
@@ -986,10 +1046,31 @@ fn validate_node<'a>(
             if_true,
             if_false,
         } => {
-            validate_node(predicate, inputs, task_table, seen_ids, preorder, errors);
-            validate_node(if_true, inputs, task_table, seen_ids, preorder, errors);
+            validate_node(ValidateNodeArgs {
+                    node: predicate,
+                    inputs,
+                    task_table,
+                    seen_ids: &mut *seen_ids,
+                    preorder: &mut *preorder,
+                    errors: &mut *errors,
+                });
+            validate_node(ValidateNodeArgs {
+                    node: if_true,
+                    inputs,
+                    task_table,
+                    seen_ids: &mut *seen_ids,
+                    preorder: &mut *preorder,
+                    errors: &mut *errors,
+                });
             if let Some(child) = if_false {
-                validate_node(child, inputs, task_table, seen_ids, preorder, errors);
+                validate_node(ValidateNodeArgs {
+                        node: child,
+                        inputs,
+                        task_table,
+                        seen_ids: &mut *seen_ids,
+                        preorder: &mut *preorder,
+                        errors: &mut *errors,
+                    });
             }
         }
         Operation::Match {
@@ -1006,10 +1087,24 @@ fn validate_node<'a>(
                 {
                     errors.push("duplicate literal match case".into());
                 }
-                validate_node(&case.body, inputs, task_table, seen_ids, preorder, errors);
+                validate_node(ValidateNodeArgs {
+                        node: &case.body,
+                        inputs,
+                        task_table,
+                        seen_ids: &mut *seen_ids,
+                        preorder: &mut *preorder,
+                        errors: &mut *errors,
+                    });
             }
             if let Some(child) = default {
-                validate_node(child, inputs, task_table, seen_ids, preorder, errors);
+                validate_node(ValidateNodeArgs {
+                        node: child,
+                        inputs,
+                        task_table,
+                        seen_ids: &mut *seen_ids,
+                        preorder: &mut *preorder,
+                        errors: &mut *errors,
+                    });
             }
         }
         Operation::Foreach {
@@ -1023,7 +1118,14 @@ fn validate_node<'a>(
             for item in items {
                 expression(item, errors);
             }
-            validate_node(body, inputs, task_table, seen_ids, preorder, errors);
+            validate_node(ValidateNodeArgs {
+                    node: body,
+                    inputs,
+                    task_table,
+                    seen_ids: &mut *seen_ids,
+                    preorder: &mut *preorder,
+                    errors: &mut *errors,
+                });
         }
         Operation::Scope {
             variables,
@@ -1062,14 +1164,35 @@ fn validate_node<'a>(
             if let Some(directory) = working_directory {
                 expression(directory, errors);
             }
-            validate_node(body, inputs, task_table, seen_ids, preorder, errors);
+            validate_node(ValidateNodeArgs {
+                    node: body,
+                    inputs,
+                    task_table,
+                    seen_ids: &mut *seen_ids,
+                    preorder: &mut *preorder,
+                    errors: &mut *errors,
+                });
         }
         Operation::TryFinally { body, finalizer } => {
             if contains_state_mutation(body) || contains_state_mutation(finalizer) {
                 errors.push("try/finally state mutation is undefined across failure paths".into());
             }
-            validate_node(body, inputs, task_table, seen_ids, preorder, errors);
-            validate_node(finalizer, inputs, task_table, seen_ids, preorder, errors);
+            validate_node(ValidateNodeArgs {
+                    node: body,
+                    inputs,
+                    task_table,
+                    seen_ids: &mut *seen_ids,
+                    preorder: &mut *preorder,
+                    errors: &mut *errors,
+                });
+            validate_node(ValidateNodeArgs {
+                    node: finalizer,
+                    inputs,
+                    task_table,
+                    seen_ids: &mut *seen_ids,
+                    preorder: &mut *preorder,
+                    errors: &mut *errors,
+                });
         }
         Operation::TaskCall { task, arguments } => {
             require_nonempty("task call target", task, errors);
@@ -1128,7 +1251,14 @@ fn validate_node<'a>(
             if *value_type != PrimitiveType::Text {
                 errors.push("stdout capture value_type must be text".into());
             }
-            validate_node(body, inputs, task_table, seen_ids, preorder, errors);
+            validate_node(ValidateNodeArgs {
+                    node: body,
+                    inputs,
+                    task_table,
+                    seen_ids: &mut *seen_ids,
+                    preorder: &mut *preorder,
+                    errors: &mut *errors,
+                });
         }
         Operation::Spawn { handle, body } => {
             if !valid_identifier(handle) {
@@ -1137,7 +1267,14 @@ fn validate_node<'a>(
             if contains_state_mutation(body) {
                 errors.push("spawned state mutation is undefined".into());
             }
-            validate_node(body, inputs, task_table, seen_ids, preorder, errors);
+            validate_node(ValidateNodeArgs {
+                    node: body,
+                    inputs,
+                    task_table,
+                    seen_ids: &mut *seen_ids,
+                    preorder: &mut *preorder,
+                    errors: &mut *errors,
+                });
         }
         Operation::Wait { handle } => {
             if !valid_identifier(handle) {
@@ -1816,7 +1953,7 @@ mod tests {
                     normalized_path: path,
                     start_byte: start,
                     end_byte: end,
-                    operation: operation,
+                    operation,
                     preorder: 0,
                 }).unwrap_err();
             assert!(error.contains(expected), "unexpected {error:?}");

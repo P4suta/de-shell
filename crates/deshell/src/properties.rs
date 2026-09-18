@@ -95,21 +95,21 @@ fn generated_node_ids_are_stable_and_domain_separated() {
                 start_byte: start,
                 end_byte: end,
                 operation: "exec",
-                preorder: preorder,
+                preorder,
             }).unwrap();
         let second = crate::ir::node_id(crate::ir::NodeIdArgs {
                 normalized_path: &path,
                 start_byte: start,
                 end_byte: end,
                 operation: "exec",
-                preorder: preorder,
+                preorder,
             }).unwrap();
         let other_operation = crate::ir::node_id(crate::ir::NodeIdArgs {
                 normalized_path: &path,
                 start_byte: start,
                 end_byte: end,
                 operation: "file_read",
-                preorder: preorder,
+                preorder,
             }).unwrap();
         assert_eq!(first, second);
         assert_ne!(first, other_operation);

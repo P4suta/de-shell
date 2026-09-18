@@ -63,6 +63,15 @@ jobs:
       - name: Run Rust unit, property, platform, and security tests
         run: cargo test --locked --workspace -- --test-threads=1
 
+      - name: Measure what this runner's shell does with set -e, -u and pipefail
+        # Reported, never failed. The corpus was measured on the bash Apple ships
+        # (3.2.57); Linux runners carry 5.x and Windows carries git-bash. Where
+        # they disagree is the list of places where a model of these options
+        # cannot be written without naming the interpreter version — which is the
+        # reason to run it on all three rather than on the one that recorded it.
+        shell: bash
+        run: cargo run --locked -p xtask -- bash-semantics
+
       - name: Run shared CLI, schema, golden, and agent conformance
         run: |
           cargo build --locked -p deshell

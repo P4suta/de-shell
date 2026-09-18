@@ -120,14 +120,31 @@ pub(crate) struct RunInputs<'a> {
     pub default_working_directory: Option<&'a str>,
 }
 
-pub(crate) fn run_plan(
-    backend: &dyn Backend,
-    policy: Policy,
-    plan: &Plan,
-    host_environment: &BTreeMap<String, String>,
-    named_inputs: &BTreeMap<String, String>,
-    arguments: &[String],
-) -> Result<RunResult, RunError> {
+/// The inputs of [`run_plan`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`run_plan`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+pub(crate) struct RunPlanArgs<'a> {
+    pub(crate) backend: &'a dyn Backend,
+    pub(crate) policy: Policy,
+    pub(crate) plan: &'a Plan,
+    pub(crate) host_environment: &'a BTreeMap<String, String>,
+    pub(crate) named_inputs: &'a BTreeMap<String, String>,
+    pub(crate) arguments: &'a [String],
+}
+
+pub(crate) fn run_plan(parts: RunPlanArgs<'_>) -> Result<RunResult, RunError> {
+    // Destructured without `..`: see `RunPlanArgs`.
+    let RunPlanArgs {
+        backend,
+        policy,
+        plan,
+        host_environment,
+        named_inputs,
+        arguments,
+    } = parts;
     run_plan_with_io(
         backend,
         policy,
@@ -304,8 +321,8 @@ impl Executor<'_> {
         next_stack.push(name.to_owned());
         self.run_node(RunNodeArgs {
                 node: &task.body,
-                context: context,
-                stdin: stdin,
+                context,
+                stdin,
                 stack: &next_stack,
             })
             .map(|(result, _)| result)
@@ -470,7 +487,7 @@ impl Executor<'_> {
                             node: child,
                             context: context.clone(),
                             stdin: input,
-                            stack: stack,
+                            stack,
                         })?;
                     input = result.stdout.clone();
                     stdout = result.stdout;
@@ -504,7 +521,7 @@ impl Executor<'_> {
                                 node: child,
                                 context: next_context,
                                 stdin: input,
-                                stack: stack,
+                                stack,
                             })?;
                     aggregate = combine(aggregate, result);
                     next_context = child_context;
@@ -513,10 +530,10 @@ impl Executor<'_> {
                 Ok((aggregate, next_context))
             }
             Operation::Parallel { nodes } => self.run_parallel(RunParallelArgs {
-                    nodes: nodes,
-                    context: context,
-                    stdin: stdin,
-                    stack: stack,
+                    nodes,
+                    context,
+                    stdin,
+                    stack,
                 }),
             Operation::Condition {
                 predicate,
@@ -526,9 +543,9 @@ impl Executor<'_> {
                 let (condition, predicate_context) =
                     self.run_node(RunNodeArgs {
                             node: predicate,
-                            context: context,
-                            stdin: stdin,
-                            stack: stack,
+                            context,
+                            stdin,
+                            stack,
                         })?;
                 let branch = if condition.exit_code == 0 {
                     Some(if_true.as_ref())
@@ -541,7 +558,7 @@ impl Executor<'_> {
                                 node: branch,
                                 context: predicate_context,
                                 stdin: Vec::new(),
-                                stack: stack,
+                                stack,
                             })?;
                     Ok((combine(condition, result), branch_context))
                 } else {
@@ -564,9 +581,9 @@ impl Executor<'_> {
                 if let Some(branch) = selected.or(default.as_deref()) {
                     self.run_node(RunNodeArgs {
                             node: branch,
-                            context: context,
-                            stdin: stdin,
-                            stack: stack,
+                            context,
+                            stdin,
+                            stack,
                         })
                 } else {
                     Ok((RunResult::empty(), context))
@@ -588,7 +605,7 @@ impl Executor<'_> {
                                 node: body,
                                 context: next_context,
                                 stdin: stdin.clone(),
-                                stack: stack,
+                                stack,
                             })?;
                     aggregate = combine(aggregate, result);
                     next_context = child_context;
@@ -607,14 +624,14 @@ impl Executor<'_> {
                 match self.run_node(RunNodeArgs {
                         node: body,
                         context: context.clone(),
-                        stdin: stdin,
-                        stack: stack,
+                        stdin,
+                        stack,
                     }) {
                     Err(body_error) => match self.run_node(RunNodeArgs {
                             node: finalizer,
-                            context: context,
+                            context,
                             stdin: Vec::new(),
-                            stack: stack,
+                            stack,
                         }) {
                         Ok(_) => Err(body_error),
                         Err(finalizer_error) => Err(RunError {
@@ -631,7 +648,7 @@ impl Executor<'_> {
                                     node: finalizer,
                                     context: body_context,
                                     stdin: Vec::new(),
-                                    stack: stack,
+                                    stack,
                                 })?;
                         let exit_code = if finalizer_result.exit_code != 0 {
                             finalizer_result.exit_code
@@ -651,7 +668,7 @@ impl Executor<'_> {
                         provided: &provided,
                         positional: &[],
                         stdin: Vec::new(),
-                        stack: stack,
+                        stack,
                     })?;
                 Ok((result, context))
             }
@@ -684,8 +701,8 @@ impl Executor<'_> {
                 let (mut captured, _) = self.run_node(RunNodeArgs {
                         node: body,
                         context: context.clone(),
-                        stdin: stdin,
-                        stack: stack,
+                        stdin,
+                        stack,
                     })?;
                 while captured.stdout.last() == Some(&b'\n') {
                     captured.stdout.pop();
@@ -891,10 +908,10 @@ impl Executor<'_> {
                         let Some(node) = nodes.get(index) else { break };
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             self.run_node(RunNodeArgs {
-                                    node: node,
+                                    node,
                                     context: context.clone(),
                                     stdin: stdin.clone(),
-                                    stack: stack,
+                                    stack,
                                 })
                         }))
                         .unwrap_or_else(|_| Err(execution("parallel worker panicked")));
@@ -1470,14 +1487,14 @@ mod tests {
     }
 
     fn run(backend: &MockBackend, body: Node) -> Result<RunResult, RunError> {
-        run_plan(
-            backend,
-            Policy::default(),
-            &plan(body),
-            &BTreeMap::new(),
-            &BTreeMap::new(),
-            &[],
-        )
+        run_plan(RunPlanArgs {
+                backend,
+                policy: Policy::default(),
+                plan: &plan(body),
+                host_environment: &BTreeMap::new(),
+                named_inputs: &BTreeMap::new(),
+                arguments: &[],
+            })
     }
 
     #[test]
@@ -1530,7 +1547,14 @@ mod tests {
             ("SECOND".into(), "wrong".into()),
         ]);
         let inputs = BTreeMap::from([("input".into(), "-${SECOND}".into())]);
-        let result = run_plan(&backend, Policy::default(), &plan, &host, &inputs, &[]).unwrap();
+        let result = run_plan(RunPlanArgs {
+                backend: &backend,
+                policy: Policy::default(),
+                plan: &plan,
+                host_environment: &host,
+                named_inputs: &inputs,
+                arguments: &[],
+            }).unwrap();
         assert_eq!(result.stdout, b"$SECOND-${SECOND}");
     }
 
@@ -1570,16 +1594,16 @@ mod tests {
         capsule.guarantee = Guarantee::Residual {
             reason: "non-UTF-8".into(),
         };
-        let error = run_plan(
-            &backend,
-            Policy {
+        let error = run_plan(RunPlanArgs {
+                backend: &backend,
+                policy: Policy {
                 ..Policy::default()
             },
-            &plan(capsule),
-            &BTreeMap::new(),
-            &BTreeMap::new(),
-            &["one".into()],
-        )
+                plan: &plan(capsule),
+                host_environment: &BTreeMap::new(),
+                named_inputs: &BTreeMap::new(),
+                arguments: &["one".into()],
+            })
         .unwrap_err();
         assert_eq!(error.kind, RunErrorKind::Policy);
         assert!(error.message.contains("residual-only"));
@@ -1604,14 +1628,14 @@ mod tests {
         plan.tasks[0].environment = vec!["TOKEN".into()];
         plan.tasks[0].secrets = vec!["TOKEN".into()];
         plan.assign_node_ids().unwrap();
-        let error = run_plan(
-            &backend,
-            Policy::default(),
-            &plan,
-            &BTreeMap::from([("TOKEN".into(), "super-secret-value".into())]),
-            &BTreeMap::new(),
-            &[],
-        )
+        let error = run_plan(RunPlanArgs {
+                backend: &backend,
+                policy: Policy::default(),
+                plan: &plan,
+                host_environment: &BTreeMap::from([("TOKEN".into(), "super-secret-value".into())]),
+                named_inputs: &BTreeMap::new(),
+                arguments: &[],
+            })
         .unwrap_err();
         assert!(!error.message.contains("super-secret-value"));
         assert!(error.message.contains("<redacted>"));
@@ -1802,14 +1826,14 @@ mod tests {
         task_plan.tasks.push(helper);
         task_plan.assign_node_ids().unwrap();
         assert_eq!(
-            run_plan(
-                &backend,
-                Policy::default(),
-                &task_plan,
-                &BTreeMap::new(),
-                &BTreeMap::new(),
-                &[],
-            )
+            run_plan(RunPlanArgs {
+                    backend: &backend,
+                    policy: Policy::default(),
+                    plan: &task_plan,
+                    host_environment: &BTreeMap::new(),
+                    named_inputs: &BTreeMap::new(),
+                    arguments: &[],
+                })
             .unwrap()
             .stdout,
             b"called"
@@ -1920,18 +1944,18 @@ mod tests {
                 append: false,
             },
         ] {
-            let error = run_plan(
-                &backend,
-                Policy {
+            let error = run_plan(RunPlanArgs {
+                    backend: &backend,
+                    policy: Policy {
                     allow_file_read: true,
                     allow_file_write: true,
                     ..Policy::default()
                 },
-                &plan(node(operation)),
-                &BTreeMap::new(),
-                &BTreeMap::new(),
-                &[],
-            )
+                    plan: &plan(node(operation)),
+                    host_environment: &BTreeMap::new(),
+                    named_inputs: &BTreeMap::new(),
+                    arguments: &[],
+                })
             .unwrap_err();
             assert_eq!(error.kind, RunErrorKind::Invalid);
         }
@@ -1952,19 +1976,19 @@ mod tests {
                 uri: TextExpression::literal("fail"),
             },
         ] {
-            let error = run_plan(
-                &backend,
-                Policy {
+            let error = run_plan(RunPlanArgs {
+                    backend: &backend,
+                    policy: Policy {
                     allow_file_read: true,
                     allow_file_write: true,
                     allow_network: true,
                     allow_delegation: false,
                 },
-                &plan(node(operation)),
-                &BTreeMap::new(),
-                &BTreeMap::new(),
-                &[],
-            )
+                    plan: &plan(node(operation)),
+                    host_environment: &BTreeMap::new(),
+                    named_inputs: &BTreeMap::new(),
+                    arguments: &[],
+                })
             .unwrap_err();
             assert_eq!(error.kind, RunErrorKind::Execution);
         }

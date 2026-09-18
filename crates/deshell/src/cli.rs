@@ -899,7 +899,7 @@ where
         };
         let mut report = command_report(CommandReportArgs {
                 spec: &spec,
-                code: code,
+                code,
                 failure: completed_failure.as_ref(),
                 stdout: &captured_stdout,
                 stderr: &captured_stderr,
@@ -1391,8 +1391,8 @@ fn dispatch(
                     root: &root,
                     name: &name,
                     digest: &digest,
-                    format: format,
-                    stdout: stdout,
+                    format,
+                    stdout,
                 }),
         },
         Command::Matrix { command } => match command {
@@ -1406,8 +1406,8 @@ fn dispatch(
                     root: &root,
                     cell: &cell,
                     digest: &digest,
-                    format: format,
-                    stdout: stdout,
+                    format,
+                    stdout,
                 }),
         },
         Command::Analyze { root, entry, .. } => {
@@ -1666,10 +1666,10 @@ fn dispatch(
             ..
         } => rewrite_command(RewriteCommandArgs {
                 root: &root,
-                entry: entry,
-                equivalent: equivalent,
-                apply: apply,
-                stdout: stdout,
+                entry,
+                equivalent,
+                apply,
+                stdout,
             }),
         Command::Modernize {
             root,
@@ -1679,10 +1679,10 @@ fn dispatch(
         } => modernize_command(ModernizeCommandArgs {
                 root: &root,
                 profile: &profile,
-                apply: apply,
-                diagnostic_mode: diagnostic_mode,
-                stdout: stdout,
-                stderr: stderr,
+                apply,
+                diagnostic_mode,
+                stdout,
+                stderr,
             }),
         Command::Harden { command } => harden_command(command, stdout),
         Command::Migrate { command } => match command {
@@ -1698,7 +1698,7 @@ fn dispatch(
                     plan: &plan,
                     cell: &cell,
                     output: &output,
-                    stdout: stdout,
+                    stdout,
                 }),
             MigrateCommand::Evidence { command } => match command {
                 MigrateEvidenceCommand::Import {
@@ -2669,8 +2669,8 @@ fn run_plan(
                 entrypoint: &entrypoint,
                 node_id: options.node_id,
                 arguments: options.arguments,
-                stdout: stdout,
-                stderr: stderr,
+                stdout,
+                stderr,
             });
     }
     let validated = project
@@ -2690,14 +2690,14 @@ fn run_plan(
             environment.insert(name.clone(), value);
         }
     }
-    let result = crate::runner::run_plan(
-        &backend,
-        policy_from_config(config, false),
-        &plan,
-        &environment,
-        &std::collections::BTreeMap::new(),
-        options.arguments,
-    )
+    let result = crate::runner::run_plan(crate::runner::RunPlanArgs {
+        backend: &backend,
+        policy: policy_from_config(config, false),
+        plan: &plan,
+        host_environment: &environment,
+        named_inputs: &std::collections::BTreeMap::new(),
+        arguments: options.arguments,
+    })
     .map_err(|error| match error.kind {
         crate::runner::RunErrorKind::Execution
             if error.message.contains("provider is unavailable") =>
@@ -3142,7 +3142,7 @@ fn observe_command(
                 script: entry.clone(),
             },
                 scenario: &scenario,
-                config: config,
+                config,
                 image: &lock.lab.image,
             })?;
         let actual = lab_scenario_request(LabScenarioRequestArgs {
@@ -3152,7 +3152,7 @@ fn observe_command(
                 node_id: None,
             },
                 scenario: &scenario,
-                config: config,
+                config,
                 image: &lock.lab.image,
             })?;
         let expected = match crate::lab::execute(provider, &original) {
@@ -3217,7 +3217,7 @@ fn observe_command(
                 evidence: &mut evidence,
                 scenario: &scenario.name,
                 provider: provider_name,
-                key: key,
+                key,
                 comparison: &comparison,
             })
         .map_err(Failure::invalid)?;

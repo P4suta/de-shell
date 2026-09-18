@@ -417,7 +417,7 @@ fn validate_migration_config(config: &ProjectConfig, errors: &mut Vec<String>) {
             generator: &config.migration.generator,
             target: config.migration.target,
             external: &config.migration.external_generators,
-            errors: errors,
+            errors,
         });
     let mut overrides = std::collections::BTreeSet::new();
     for location in &config.location_overrides {
@@ -446,7 +446,7 @@ fn validate_migration_config(config: &ProjectConfig, errors: &mut Vec<String>) {
                 generator: &location.generator,
                 target: location.target,
                 external: &config.migration.external_generators,
-                errors: errors,
+                errors,
             });
         if !overrides.insert((
             location.path.as_str(),
@@ -1721,8 +1721,8 @@ mod tests {
             let mut errors = Vec::new();
             validate_generator_selection(ValidateGeneratorSelectionArgs {
                     label: "test",
-                    generator: generator,
-                    target: target,
+                    generator,
+                    target,
                     external: &[],
                     errors: &mut errors,
                 });

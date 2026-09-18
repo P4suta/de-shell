@@ -107,6 +107,74 @@ fn repository_root() -> PathBuf {
         .expect("repository root")
 }
 
+/// Measure what the host's shell actually does with `set -e`, `set -u` and
+/// `set -o pipefail`, and print every case that disagrees with the recorded
+/// measurement.
+///
+/// A disagreement is reported, not failed. The corpus was measured on the bash
+/// Apple ships (3.2.57) and the CI matrix also runs Linux and Windows builds;
+/// where they differ is exactly the list of places where a model of these
+/// options cannot be written without naming the interpreter version. Failing
+/// here would only encourage someone to delete the case.
+///
+/// Being unable to measure at all *is* a failure: a corpus that silently
+/// measures nothing is worse than no corpus.
+fn run_bash_semantics(root: &Path) -> Result<(), Vec<String>> {
+    let path = root.join("contracts/golden/bash-set-semantics-v1.json");
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|error| vec![format!("cannot read {}: {error}", path.display())])?;
+    let corpus: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|error| vec![format!("malformed corpus: {error}")])?;
+    let cases = corpus["cases"]
+        .as_array()
+        .ok_or_else(|| vec!["corpus has no cases array".to_owned()])?;
+    if cases.is_empty() {
+        return Err(vec!["corpus is empty".to_owned()]);
+    }
+
+    let version = std::process::Command::new("bash")
+        .arg("--version")
+        .output()
+        .map_err(|error| vec![format!("cannot run bash: {error}")])?;
+    let banner = String::from_utf8_lossy(&version.stdout)
+        .lines()
+        .next()
+        .unwrap_or("unknown")
+        .to_owned();
+    println!("interpreter: {banner}");
+
+    let mut differences = 0_usize;
+    for case in cases {
+        let name = case["name"].as_str().ok_or_else(|| vec!["case has no name".to_owned()])?;
+        let script = case["script"].as_str().ok_or_else(|| vec!["case has no script".to_owned()])?;
+        let expected = case["expected"].as_i64().ok_or_else(|| vec!["case has no expected".to_owned()])?;
+        let status = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(script)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map_err(|error| vec![format!("cannot run case {name}: {error}")])?;
+        let actual = i64::from(status.code().unwrap_or(-1));
+        if actual == expected {
+            continue;
+        }
+        differences += 1;
+        println!("differs  {name}: expected {expected}, measured {actual}");
+        println!("         {script}");
+    }
+
+    if differences == 0 {
+        println!("{} case(s) agree with the recorded measurement", cases.len());
+    } else {
+        println!(
+            "{differences} of {} case(s) differ on this interpreter; each one is a place where an option model has to name the version",
+            cases.len()
+        );
+    }
+    Ok(())
+}
+
 fn validate_contract_tree(_root: &Path) -> Result<CliContract, Vec<String>> {
     let root = _root;
     let mut errors = Vec::new();
@@ -1115,6 +1183,7 @@ fn dispatch(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Vec<Str
                 .unwrap_or_else(|| root.join("target/debug/deshell"));
             run_conformance(root, &binary)
         }
+        Some("bash-semantics") => run_bash_semantics(root),
         Some("validate-contracts") => validate_contract_tree(root).map(|_| ()),
         Some("performance") => {
             let binary = arguments

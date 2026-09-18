@@ -1045,13 +1045,13 @@ fn build_request_and_proposal(
         );
         let expected_digest = current_target_digest(root, &target)?;
         let proposal = invoke_external_generator(InvokeExternalGeneratorArgs {
-                root: root,
-                config: config,
-                registration: registration,
+                root,
+                config,
+                registration,
                 request: &request,
                 target_path: &target,
-                expected_digest: expected_digest,
-                task: task,
+                expected_digest,
+                task,
             })
         .map_err(external_generator_blocker)?;
         for patch in &proposal.patches {
@@ -1133,11 +1133,11 @@ fn build_request_and_proposal(
         0o644,
     )?];
     let call_site_patches = official_call_site_patches(OfficialCallSitePatchesArgs {
-            root: root,
-            config: config,
+            root,
+            config,
             call_sites: &request.call_sites,
             retiring_source: &finding.path,
-            selection: selection,
+            selection,
             stem: &stem,
             generated_target: &target,
         })
@@ -1297,8 +1297,8 @@ fn official_call_site_patches(parts: OfficialCallSitePatchesArgs<'_>) -> Result<
                 let rewritten = rewrite_github_run_call_site(RewriteGithubRunCallSiteArgs {
                         path: &path,
                         contents: &contents,
-                        location: location,
-                        retiring_source: retiring_source,
+                        location,
+                        retiring_source,
                         replacement_argv: &replacement_argv,
                     })?;
                 contents = rewritten.0;
@@ -1984,10 +1984,10 @@ fn invoke_external_generator(parts: InvokeExternalGeneratorArgs<'_>) -> Result<P
     let proposal: Proposal = serde_json::from_value(result)
         .map_err(|error| format!("external generator returned an invalid Proposal v1: {error}"))?;
     validate_external_proposal(ValidateExternalProposalArgs {
-            root: root,
-            registration: registration,
-            request: request,
-            task: task,
+            root,
+            registration,
+            request,
+            task,
             validation: &validation,
             proposal: &proposal,
         })?;
@@ -2600,9 +2600,9 @@ fn generate_github_action_host(
     let (bytes, _workflow_span) =
         replace_structured_host_span(ReplaceStructuredHostSpanArgs {
                 host: &host,
-                finding: finding,
+                finding,
                 start: key_start,
-                end: end,
+                end,
                 replacement: uses.as_bytes(),
             });
     let program = serde_json::to_string(&argv[0]).map_err(|error| error.to_string())?;
@@ -2690,9 +2690,9 @@ fn generate_javascript_host(
     let (bytes, generated_span) =
         replace_structured_host_span(ReplaceStructuredHostSpanArgs {
                 host: &host,
-                finding: finding,
-                start: start,
-                end: end,
+                finding,
+                start,
+                end,
                 replacement: replacement.as_bytes(),
             });
     Ok(HostGeneration {
@@ -2766,9 +2766,9 @@ fn generate_python_host(
     let (bytes, generated_span) =
         replace_structured_host_span(ReplaceStructuredHostSpanArgs {
                 host: &host,
-                finding: finding,
-                start: start,
-                end: end,
+                finding,
+                start,
+                end,
                 replacement: replacement.as_bytes(),
             });
     Ok(HostGeneration {
@@ -3566,12 +3566,12 @@ fn emit_rust_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> 
         } => {
             output.push_str(&format!("{indent}{{\n"));
             emit_rust_command(EmitRustCommandArgs {
-                    argv: argv,
-                    environment: environment,
+                    argv,
+                    environment,
                     working_directory: working_directory.as_ref(),
                     variable: "deshell_command",
                     force_mutable: true,
-                    output: output,
+                    output,
                     depth: depth + 1,
                 })?;
             output.push_str(&format!(
@@ -3613,12 +3613,12 @@ fn emit_rust_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> 
                     return Err("generator pipeline supports only Exec stages".into());
                 };
                 emit_rust_command(EmitRustCommandArgs {
-                        argv: argv,
-                        environment: environment,
+                        argv,
+                        environment,
                         working_directory: working_directory.as_ref(),
                         variable: "deshell_stage",
                         force_mutable: false,
-                        output: output,
+                        output,
                         depth: depth + 1,
                     })?;
                 output.push_str(&format!(
@@ -3907,11 +3907,11 @@ fn emit_go_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> Re
         } => {
             output.push_str(&format!("{indent}{{\n"));
             emit_go_command(EmitGoCommandArgs {
-                    argv: argv,
-                    environment: environment,
+                    argv,
+                    environment,
                     working_directory: working_directory.as_ref(),
                     variable: "deshellCommand",
-                    output: output,
+                    output,
                     depth: depth + 1,
                 })?;
             output.push_str(&format!(
@@ -3947,11 +3947,11 @@ fn emit_go_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> Re
                 };
                 let variable = format!("deshellStage{index}");
                 emit_go_command(EmitGoCommandArgs {
-                        argv: argv,
-                        environment: environment,
+                        argv,
+                        environment,
                         working_directory: working_directory.as_ref(),
                         variable: &variable,
-                        output: output,
+                        output,
                         depth: depth + 1,
                     })?;
                 output.push_str(&format!(
@@ -5393,11 +5393,11 @@ fn execute_ir_node(
                 requests.push(ir_exec_request(IrExecRequestArgs {
                         _root: root,
                         node: child,
-                        variables: variables,
-                        arguments: arguments,
+                        variables,
+                        arguments,
                         stdin: if index == 0 { stdin } else { &[] },
-                        default_cwd: default_cwd,
-                        limits: limits,
+                        default_cwd,
+                        limits,
                     })?);
             }
             let outcomes = crate::agent_process::execute_pipeline(root, requests)?;

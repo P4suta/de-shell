@@ -39,14 +39,14 @@ pub(crate) enum Outcome {
 /// a seven-argument function stays invisible to every call site that already
 /// compiles. [`evaluate`] takes this apart without `..`, so a field added here
 /// fails to compile until it is given a destination.
-struct Evaluation<'a> {
-    observer: &'a dyn Observer,
-    backend: &'a dyn Backend,
-    policy: Policy,
-    plan: &'a Plan,
-    scenario: &'a Scenario,
-    runtime_lock_digest: &'a str,
-    evidence: &'a mut Evidence,
+pub(crate) struct Evaluation<'a> {
+    pub(crate) observer: &'a dyn Observer,
+    pub(crate) backend: &'a dyn Backend,
+    pub(crate) policy: Policy,
+    pub(crate) plan: &'a Plan,
+    pub(crate) scenario: &'a Scenario,
+    pub(crate) runtime_lock_digest: &'a str,
+    pub(crate) evidence: &'a mut Evidence,
 }
 
 
@@ -162,10 +162,10 @@ pub(crate) fn evaluate(parts: Evaluation<'_>) -> Result<Outcome, String> {
     };
     let comparison = crate::verify::compare(&expected, &actual)?;
     let status = crate::verify::record_comparison(crate::verify::RecordComparisonArgs {
-            evidence: evidence,
+            evidence,
             scenario: &scenario.name,
             provider: observer.name(),
-            key: key,
+            key,
             comparison: &comparison,
         })?;
     Ok(match status {

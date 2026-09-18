@@ -227,7 +227,7 @@ pub(crate) fn scan_with_interpreters(
                     interpreter_confidence: InterpreterConfidence::High,
                     locator: None,
                     span: ByteSpan::whole(&source),
-                    source: source,
+                    source,
                 })),
             Err(message) => {
                 push_interpreter_error(&mut inventory.errors, &configured.path, message)
@@ -699,7 +699,7 @@ fn findings_for_file(relative: &str, absolute: &Path) -> FileScan {
                 interpreter_confidence: InterpreterConfidence::High,
                 locator: None,
                 span: ByteSpan::whole(&source),
-                source: source,
+                source,
             })]);
     }
     if !path_is_relevant && !potential_structured_host {
@@ -1022,7 +1022,7 @@ fn package_findings(path: &str, source: &str) -> Result<Vec<Finding>, String> {
                 .filter(|script| !script.is_empty())
                 .map(|script| {
                     finding(FindingParts {
-                            path: path,
+                            path,
                             kind: FindingKind::EmbeddedShell,
                             interpreter: Some("package-shell".into()),
                             interpreter_confidence: InterpreterConfidence::Medium,
@@ -1046,7 +1046,7 @@ fn makefile_findings(path: &str, source: &str) -> Vec<Finding> {
                 .map(|command| {
                     let start = offsets[index] + 1;
                     finding(FindingParts {
-                            path: path,
+                            path,
                             kind: FindingKind::EmbeddedShell,
                             interpreter: Some("sh".into()),
                             interpreter_confidence: InterpreterConfidence::High,
@@ -1093,7 +1093,7 @@ fn dockerfile_findings(path: &str, source: &str) -> Result<Vec<Finding>, String>
                 }
             } else {
                 findings.push(finding(FindingParts {
-                        path: path,
+                        path,
                         kind: FindingKind::EmbeddedShell,
                         interpreter: Some("sh".into()),
                         interpreter_confidence: InterpreterConfidence::High,
@@ -1184,7 +1184,7 @@ fn yaml_findings(path: &str, source: &str, lower: &str) -> Result<Vec<Finding>, 
             let command = yaml_scalar(&block, &style);
             if !command.trim().is_empty() {
                 findings.push(finding(FindingParts {
-                        path: path,
+                        path,
                         kind: if known {
                         FindingKind::EmbeddedShell
                     } else {
@@ -1212,7 +1212,7 @@ fn yaml_findings(path: &str, source: &str, lower: &str) -> Result<Vec<Finding>, 
         }
         if !value.is_empty() && (known || looks_like_shell(&value)) {
             findings.push(finding(FindingParts {
-                    path: path,
+                    path,
                     kind: if known {
                     FindingKind::EmbeddedShell
                 } else {
@@ -1423,8 +1423,8 @@ fn json_candidate_findings(path: &str, source: &str) -> Result<Vec<Finding>, Str
         .map_err(|error| format!("malformed JSON: {error}"))?;
     let mut output = Vec::new();
     collect_json_candidates(CollectJsonCandidatesArgs {
-            path: path,
-            source: source,
+            path,
+            source,
             locator: "$",
             executable: false,
             value: &value,
@@ -1557,30 +1557,30 @@ fn collect_json_candidates(parts: CollectJsonCandidatesArgs<'_>) {
         serde_json::Value::Object(fields) => {
             for (name, value) in fields {
                 collect_json_candidates(CollectJsonCandidatesArgs {
-                        path: path,
-                        source: source,
+                        path,
+                        source,
                         locator: &format!("{locator}.{name}"),
                         executable: executable || executable_field(name),
-                        value: value,
-                        output: output,
+                        value,
+                        output,
                     });
             }
         }
         serde_json::Value::Array(values) => {
             for (index, value) in values.iter().enumerate() {
                 collect_json_candidates(CollectJsonCandidatesArgs {
-                        path: path,
-                        source: source,
+                        path,
+                        source,
                         locator: &format!("{locator}[{index}]"),
-                        executable: executable,
-                        value: value,
-                        output: output,
+                        executable,
+                        value,
+                        output,
                     });
             }
         }
         serde_json::Value::String(command) if executable && looks_like_shell(command) => output
             .push(finding(FindingParts {
-                    path: path,
+                    path,
                     kind: FindingKind::Candidate,
                     interpreter: None,
                     interpreter_confidence: InterpreterConfidence::Low,
@@ -1597,8 +1597,8 @@ fn toml_candidate_findings(path: &str, source: &str) -> Result<Vec<Finding>, Str
         .map_err(|error| format!("malformed TOML: {error}"))?;
     let mut output = Vec::new();
     collect_toml_candidates(CollectTomlCandidatesArgs {
-            path: path,
-            source: source,
+            path,
+            source,
             locator: "$",
             executable: false,
             value: &value,
@@ -1636,30 +1636,30 @@ fn collect_toml_candidates(parts: CollectTomlCandidatesArgs<'_>) {
         toml::Value::Table(fields) => {
             for (name, value) in fields {
                 collect_toml_candidates(CollectTomlCandidatesArgs {
-                        path: path,
-                        source: source,
+                        path,
+                        source,
                         locator: &format!("{locator}.{name}"),
                         executable: executable || executable_field(name),
-                        value: value,
-                        output: output,
+                        value,
+                        output,
                     });
             }
         }
         toml::Value::Array(values) => {
             for (index, value) in values.iter().enumerate() {
                 collect_toml_candidates(CollectTomlCandidatesArgs {
-                        path: path,
-                        source: source,
+                        path,
+                        source,
                         locator: &format!("{locator}[{index}]"),
-                        executable: executable,
-                        value: value,
-                        output: output,
+                        executable,
+                        value,
+                        output,
                     });
             }
         }
         toml::Value::String(command) if executable && looks_like_shell(command) => {
             output.push(finding(FindingParts {
-                    path: path,
+                    path,
                     kind: FindingKind::Candidate,
                     interpreter: None,
                     interpreter_confidence: InterpreterConfidence::Low,
@@ -1678,16 +1678,16 @@ fn host_findings(path: &str, source: &str, lower: &str) -> Vec<Finding> {
     if lower.ends_with(".py") {
         append_host_findings(AppendHostFindingsArgs {
                 output: &mut output,
-                path: path,
-                source: source,
+                path,
+                source,
                 line_offsets: &offsets,
                 regex: &PYTHON_OS_SYSTEM,
                 interpreter: "sh",
             });
         append_process_reference_findings(AppendProcessReferenceFindingsArgs {
                 output: &mut output,
-                path: path,
-                source: source,
+                path,
+                source,
                 line_offsets: &offsets,
                 start_regex: &PYTHON_SUBPROCESS_START,
                 syntax: ProcessSyntax::Python,
@@ -1699,8 +1699,8 @@ fn host_findings(path: &str, source: &str, lower: &str) -> Vec<Finding> {
         append_javascript_shell_findings(&mut output, path, source, &offsets);
         append_process_reference_findings(AppendProcessReferenceFindingsArgs {
                 output: &mut output,
-                path: path,
-                source: source,
+                path,
+                source,
                 line_offsets: &offsets,
                 start_regex: &JAVASCRIPT_PROCESS_START,
                 syntax: ProcessSyntax::Javascript,
@@ -1741,8 +1741,8 @@ fn append_javascript_shell_findings(
         let line = line_index + 1;
         let column = source[line_start..start.start()].chars().count();
         output.push(finding(FindingParts {
-                path: path,
-                kind: kind,
+                path,
+                kind,
                 interpreter: Some("sh".into()),
                 interpreter_confidence: confidence,
                 locator: Some(format!("line:{line}:column:{column}")),
@@ -1828,8 +1828,8 @@ fn append_process_reference_findings(parts: AppendProcessReferenceFindingsArgs<'
         let line = line_index + 1;
         let column = source[line_start..start.start()].chars().count();
         output.push(finding(FindingParts {
-                path: path,
-                kind: kind,
+                path,
+                kind,
                 interpreter: Some("sh".into()),
                 interpreter_confidence: if quoted_command {
                 InterpreterConfidence::High
@@ -1982,8 +1982,8 @@ fn append_host_findings(parts: AppendHostFindingsArgs<'_>) {
         let line = line_index + 1;
         let column = source[line_start..whole.start()].chars().count();
         output.push(finding(FindingParts {
-                path: path,
-                kind: kind,
+                path,
+                kind,
                 interpreter: Some(interpreter.into()),
                 interpreter_confidence: confidence,
                 locator: Some(format!("line:{line}:column:{column}")),

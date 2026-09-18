@@ -212,9 +212,9 @@ pub(crate) fn lower(
             } else {
                 delegated_node(DelegatedNodeArgs {
                         path: &normalized,
-                        source: source,
+                        source,
                         interpreter: interpreter.name(),
-                        reason: reason,
+                        reason,
                         capabilities: analysis.capabilities.clone(),
                     })
             };
@@ -1241,14 +1241,14 @@ fn lower_posix(path: &str, source: &str, interpreter: &Interpreter) -> Result<Lo
             continue;
         }
         let node = lower_posix_control(LowerPosixControlArgs {
-                path: path,
-                source: source,
-                range: range,
-                interpreter: interpreter,
+                path,
+                source,
+                range,
+                interpreter,
                 inputs: &mut inputs,
                 environment: &mut environment,
                 locals: &mut locals,
-                pipefail: pipefail,
+                pipefail,
             })?;
         nodes.push(node);
     }
@@ -1381,13 +1381,13 @@ fn lower_posix_control(parts: LowerPosixControlArgs<'_>) -> Result<Node, String>
     let controls = top_level_controls(source, range)?;
     if controls.is_empty() {
         return lower_posix_simple(LowerPosixSimpleArgs {
-                path: path,
-                source: source,
-                range: range,
-                interpreter: interpreter,
-                inputs: inputs,
-                environment: environment,
-                locals: locals,
+                path,
+                source,
+                range,
+                interpreter,
+                inputs,
+                environment,
+                locals,
             });
     }
     let kind = controls[0].1;
@@ -1413,13 +1413,13 @@ fn lower_posix_control(parts: LowerPosixControlArgs<'_>) -> Result<Node, String>
     let mut nodes = Vec::new();
     for piece in pieces {
         nodes.push(lower_posix_simple(LowerPosixSimpleArgs {
-                path: path,
-                source: source,
+                path,
+                source,
                 range: piece,
-                interpreter: interpreter,
-                inputs: inputs,
-                environment: environment,
-                locals: locals,
+                interpreter,
+                inputs,
+                environment,
+                locals,
             })?);
     }
     let span = span_for_range(path, source, range.start, range.end)?;
@@ -1591,13 +1591,13 @@ fn lower_posix_simple(parts: LowerPosixSimpleArgs<'_>) -> Result<Node, String> {
             let inner_start = range.start + raw.find("$(").unwrap() + 2;
             let inner_end = range.end - 1;
             let body = lower_posix_simple(LowerPosixSimpleArgs {
-                    path: path,
-                    source: source,
+                    path,
+                    source,
                     range: trim_range(source, inner_start, inner_end),
-                    interpreter: interpreter,
-                    inputs: inputs,
-                    environment: environment,
-                    locals: locals,
+                    interpreter,
+                    inputs,
+                    environment,
+                    locals,
                 })?;
             Operation::CaptureStdout {
                 name: name.to_owned(),
@@ -1608,9 +1608,9 @@ fn lower_posix_simple(parts: LowerPosixSimpleArgs<'_>) -> Result<Node, String> {
             let expression = parse_posix_word(ParsePosixWordArgs {
                     source: rhs,
                     allow_unquoted_expansion: true,
-                    inputs: inputs,
-                    environment: environment,
-                    locals: locals,
+                    inputs,
+                    environment,
+                    locals,
                 })?;
             Operation::SetVariable {
                 name: name.to_owned(),
@@ -1777,9 +1777,9 @@ fn lower_fish(path: &str, source: &str) -> Result<Lowered, String> {
             continue;
         }
         nodes.push(lower_fish_control(LowerFishControlArgs {
-                path: path,
-                source: source,
-                range: range,
+                path,
+                source,
+                range,
                 inputs: &mut inputs,
                 environment: &mut environment,
             })?);
@@ -1831,11 +1831,11 @@ fn lower_fish_control(parts: LowerFishControlArgs<'_>) -> Result<Node, String> {
     let controls = top_level_controls(source, range)?;
     if controls.is_empty() {
         return lower_fish_simple(LowerFishSimpleArgs {
-                path: path,
-                source: source,
-                range: range,
-                inputs: inputs,
-                environment: environment,
+                path,
+                source,
+                range,
+                inputs,
+                environment,
             });
     }
     if controls.iter().any(|(_, operator)| *operator != "&&") {
@@ -1860,11 +1860,11 @@ fn lower_fish_control(parts: LowerFishControlArgs<'_>) -> Result<Node, String> {
     let mut nodes = pieces
         .into_iter()
         .map(|piece| lower_fish_simple(LowerFishSimpleArgs {
-                path: path,
-                source: source,
+                path,
+                source,
                 range: piece,
-                inputs: inputs,
-                environment: environment,
+                inputs,
+                environment,
             }))
         .collect::<Result<Vec<_>, _>>()?
         .into_iter();
@@ -2090,9 +2090,9 @@ fn lower_cmd(path: &str, source: &str) -> Result<Lowered, String> {
             return Err("cmd command echo must be suppressed".into());
         }
         nodes.push(lower_cmd_control(LowerCmdControlArgs {
-                path: path,
-                source: source,
-                range: range,
+                path,
+                source,
+                range,
                 inputs: &mut inputs,
                 environment: &mut environment,
             })?);
@@ -2149,11 +2149,11 @@ fn lower_cmd_control(parts: LowerCmdControlArgs<'_>) -> Result<Node, String> {
     let controls = cmd_and_controls(source, range)?;
     if controls.is_empty() {
         return lower_cmd_simple(LowerCmdSimpleArgs {
-                path: path,
-                source: source,
-                range: range,
-                inputs: inputs,
-                environment: environment,
+                path,
+                source,
+                range,
+                inputs,
+                environment,
             });
     }
     let mut pieces = Vec::new();
@@ -2175,11 +2175,11 @@ fn lower_cmd_control(parts: LowerCmdControlArgs<'_>) -> Result<Node, String> {
     let mut nodes = pieces
         .into_iter()
         .map(|piece| lower_cmd_simple(LowerCmdSimpleArgs {
-                path: path,
-                source: source,
+                path,
+                source,
                 range: piece,
-                inputs: inputs,
-                environment: environment,
+                inputs,
+                environment,
             }))
         .collect::<Result<Vec<_>, _>>()?
         .into_iter();
@@ -2389,9 +2389,9 @@ fn lower_powershell(path: &str, source: &str) -> Result<Lowered, String> {
             continue;
         }
         nodes.push(lower_powershell_control(LowerPowershellControlArgs {
-                path: path,
-                source: source,
-                range: range,
+                path,
+                source,
+                range,
                 inputs: &mut inputs,
                 environment: &mut environment,
             })?);
@@ -2444,11 +2444,11 @@ fn lower_powershell_control(parts: LowerPowershellControlArgs<'_>) -> Result<Nod
     let controls = powershell_and_controls(source, range)?;
     if controls.is_empty() {
         return lower_powershell_simple(LowerPowershellSimpleArgs {
-                path: path,
-                source: source,
-                range: range,
-                inputs: inputs,
-                environment: environment,
+                path,
+                source,
+                range,
+                inputs,
+                environment,
             });
     }
     let mut pieces = Vec::new();
@@ -2470,11 +2470,11 @@ fn lower_powershell_control(parts: LowerPowershellControlArgs<'_>) -> Result<Nod
     let mut nodes = pieces
         .into_iter()
         .map(|piece| lower_powershell_simple(LowerPowershellSimpleArgs {
-                path: path,
-                source: source,
+                path,
+                source,
                 range: piece,
-                inputs: inputs,
-                environment: environment,
+                inputs,
+                environment,
             }))
         .collect::<Result<Vec<_>, _>>()?
         .into_iter();
@@ -2696,31 +2696,31 @@ fn lower_nushell(path: &str, source: &str, interpreter: &Interpreter) -> Result<
 
     let mut environment = BTreeSet::new();
     let first = lower_nushell_external(LowerNushellExternalArgs {
-            path: path,
-            source: source,
+            path,
+            source,
             range: lines[1].0,
-            parameter: parameter,
+            parameter,
             environment: &mut environment,
         })?;
     let predicate = lower_nushell_external(LowerNushellExternalArgs {
-            path: path,
-            source: source,
+            path,
+            source,
             range: lines[2].0,
-            parameter: parameter,
+            parameter,
             environment: &mut environment,
         })?;
     let if_true = lower_nushell_external(LowerNushellExternalArgs {
-            path: path,
-            source: source,
+            path,
+            source,
             range: lines[4].0,
-            parameter: parameter,
+            parameter,
             environment: &mut environment,
         })?;
     let if_false = lower_nushell_external(LowerNushellExternalArgs {
-            path: path,
-            source: source,
+            path,
+            source,
             range: lines[6].0,
-            parameter: parameter,
+            parameter,
             environment: &mut environment,
         })?;
     let condition = native_node(
@@ -2942,11 +2942,11 @@ fn tokenize_posix(
                 if byte == b'$' {
                     flush_literal(&mut parts, &mut literal);
                     let (part, next) = parse_expansion(ParseExpansionArgs {
-                            source: source,
+                            source,
                             start: index,
-                            inputs: inputs,
-                            environment: environment,
-                            locals: locals,
+                            inputs,
+                            environment,
+                            locals,
                         })?;
                     parts.push(part);
                     index = next;
@@ -3081,11 +3081,11 @@ fn parse_posix_word(parts: ParsePosixWordArgs<'_>) -> Result<TextExpression, Str
     } = parts;
     if allow_unquoted_expansion && source.starts_with('$') && !source.starts_with("$(") {
         let (part, end) = parse_expansion(ParseExpansionArgs {
-                source: source,
+                source,
                 start: 0,
-                inputs: inputs,
-                environment: environment,
-                locals: locals,
+                inputs,
+                environment,
+                locals,
             })?;
         if end == source.len() {
             return Ok(TextExpression { parts: vec![part] });
@@ -4067,7 +4067,7 @@ mod tests {
             delegated_node(DelegatedNodeArgs {
                     path: "script",
                     source: b"source",
-                    interpreter: interpreter,
+                    interpreter,
                     reason: "delegated".into(),
                     capabilities: vec![],
                 })
