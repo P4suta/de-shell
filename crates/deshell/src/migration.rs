@@ -3521,17 +3521,38 @@ fn generate_rust(plan: &crate::ir::Plan) -> Result<Vec<u8>, String> {
     // look, and an assignment needs somewhere to write. Emitting one without the
     // other produces code that does not compile, which is a defect this
     // repository has now produced three times.
-    let uses_variables = rust_node_sets_variables(&task.body)
-        || node_has_expression_part(&task.body, &|part| {
-            matches!(part, crate::ir::TextPart::Variable { .. })
-        });
-    let lookup_helper = if uses_variables {
+    // Each helper is emitted only if something calls it: an unused function is an
+    // error under the generated code's `-D warnings` gate, so "might be needed"
+    // is not good enough. `deshell_lookup` is written in terms of
+    // `deshell_lookup_opt`, so a plain expansion needs both and a default
+    // expansion needs only the second.
+    let uses_plain_expansion = node_has_expression_part(&task.body, &|part| {
+        matches!(part, crate::ir::TextPart::Variable { .. })
+    });
+    let uses_default_expansion = node_has_expression_part(&task.body, &|part| {
+        matches!(part, crate::ir::TextPart::DefaultValue { .. })
+    });
+    let uses_variables =
+        rust_node_sets_variables(&task.body) || uses_plain_expansion || uses_default_expansion;
+    let lookup_helper = if uses_plain_expansion {
         concat!(
+            "fn deshell_lookup_opt(\n",
+            "    name: &str,\n",
+            "    locals: &std::collections::BTreeMap<String, String>,\n",
+            ") -> Option<String> {\n",
+            "    locals.get(name).cloned().or_else(|| std::env::var(name).ok())\n",
+            "}\n\n",
             "fn deshell_lookup(name: &str, locals: &std::collections::BTreeMap<String, String>) -> String {\n",
-            "    locals\n",
-            "        .get(name)\n",
-            "        .cloned()\n",
-            "        .unwrap_or_else(|| std::env::var(name).unwrap_or_default())\n",
+            "    deshell_lookup_opt(name, locals).unwrap_or_default()\n",
+            "}\n\n"
+        )
+    } else if uses_default_expansion {
+        concat!(
+            "fn deshell_lookup_opt(\n",
+            "    name: &str,\n",
+            "    locals: &std::collections::BTreeMap<String, String>,\n",
+            ") -> Option<String> {\n",
+            "    locals.get(name).cloned().or_else(|| std::env::var(name).ok())\n",
             "}\n\n"
         )
     } else {
@@ -4101,7 +4122,16 @@ fn rust_expression(expression: &crate::ir::TextExpression) -> Result<String, Str
     for part in &expression.parts {
         match part {
             crate::ir::TextPart::Literal { value } => {
-                output.push_str(&format!(" deshell_value.push_str({value:?});"));
+                // `push_str` with a one-character literal is a hard error under
+                // the `-D warnings` gate the generated Rust is checked with, so
+                // the single-character case uses `push`. Only a literal that is
+                // one *char* qualifies: `"é"` is two bytes and one char, and
+                // `push` takes a char.
+                let mut chars = value.chars();
+                output.push_str(&match (chars.next(), chars.next()) {
+                    (Some(single), None) => format!(" deshell_value.push({single:?});"),
+                    _ => format!(" deshell_value.push_str({value:?});"),
+                });
             }
             crate::ir::TextPart::Variable { name } => {
                 // Locals shadow the environment, the way the shell resolves a
@@ -4119,13 +4149,15 @@ fn rust_expression(expression: &crate::ir::TextExpression) -> Result<String, Str
                 // `:-` substitutes an empty value as well as an unset one, so the
                 // two forms cannot share a lookup: `unwrap_or_default` would turn
                 // `${x-d}` with `x=""` into `d`, which the shell does not.
+                // Locals shadow the environment here too: `${x:-d}` after `x=v`
+                // is `v`, and reading only the environment would give `d`.
                 let lookup = if *empty_is_unset {
                     format!(
-                        "std::env::var({name:?}).ok().filter(|deshell_set| !deshell_set.is_empty()).unwrap_or_else(|| {fallback:?}.to_owned())"
+                        "deshell_lookup_opt({name:?}, &deshell_vars).filter(|deshell_set| !deshell_set.is_empty()).unwrap_or_else(|| {fallback:?}.to_owned())"
                     )
                 } else {
                     format!(
-                        "std::env::var({name:?}).unwrap_or_else(|_| {fallback:?}.to_owned())"
+                        "deshell_lookup_opt({name:?}, &deshell_vars).unwrap_or_else(|| {fallback:?}.to_owned())"
                     )
                 };
                 output.push_str(&format!(" deshell_value.push_str(&{lookup});"));
