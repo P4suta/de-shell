@@ -143,6 +143,9 @@ run = [
   "cargo run --locked -p xtask -- printf-semantics",
   "cargo run --locked -p xtask -- case-patterns",
   "cargo run --locked -p xtask -- shell-variables",
+  # An independent engine reading the schemas against real generated documents.
+  # The IR schema was six operations behind the enum until this was run by hand.
+  "python3 scripts/validate-json-contracts.py target/debug/deshell",
 ]
 
 [tasks.performance]

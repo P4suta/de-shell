@@ -706,6 +706,53 @@ pub(crate) enum Operation {
 }
 
 impl Operation {
+    /// Every `type` string an operation can carry.
+    ///
+    /// Beside [`Operation::name`] so the two are read together: the schema that
+    /// describes the IR has to name each of these, and a test compares the two
+    /// lists. The schema was six operations behind the enum before it did.
+    ///
+    /// The comparison is the gate, so the list is built for it rather than
+    /// carried into the binary unused.
+    #[cfg(test)]
+    pub(crate) const ALL_NAMES: &'static [&'static str] = &[
+        "capture_stdout",
+        "clock_read",
+        "condition",
+        "exec",
+        "exit",
+        "expand_words",
+        "file_metadata",
+        "file_read",
+        "file_remove",
+        "file_set_metadata",
+        "file_write",
+        "foreach",
+        "interpreter_call",
+        "match",
+        "network_request",
+        "no_op",
+        "not",
+        "opaque_capsule",
+        "parallel",
+        "pipeline",
+        "random_bytes",
+        "redirect",
+        "scope",
+        "send_signal",
+        "sequence",
+        "set_environment",
+        "set_variable",
+        "set_working_directory",
+        "spawn",
+        "task_call",
+        "test",
+        "try_finally",
+        "wait",
+        "while",
+        "write_stdout",
+    ];
+
     pub(crate) fn name(&self) -> &'static str {
         match self {
             Self::Exec { .. } => "exec",
@@ -2088,6 +2135,56 @@ mod tests {
             environment: vec![],
             working_directory: None,
         })
+    }
+
+    /// `ALL_NAMES` is every name `Operation::name` can return.
+    ///
+    /// Two statements of one fact, so they are compared: the `match` in
+    /// `name` is exhaustive and the list is not, and a variant added without a
+    /// line here would leave the schema gate checking a shorter list than the
+    /// IR can produce.
+    #[test]
+    fn all_names_holds_every_name_an_operation_can_carry() {
+        let every = [
+            Operation::Exec {
+                argv: vec![],
+                environment: vec![],
+                working_directory: None,
+            },
+            Operation::NoOp,
+            Operation::WriteStdout {
+                contents: TextExpression::literal(""),
+            },
+            Operation::Exit {
+                status: TextExpression::literal("0"),
+                non_numeric: NonNumericStatus::Unreachable,
+            },
+            Operation::Not {
+                body: Box::new(Node::default()),
+            },
+            Operation::While {
+                condition: Box::new(Node::default()),
+                body: Box::new(Node::default()),
+            },
+            Operation::Test {
+                predicate: TestPredicate::Empty {
+                    value: TextExpression::literal(""),
+                },
+            },
+        ];
+        for operation in every {
+            assert!(
+                Operation::ALL_NAMES.contains(&operation.name()),
+                "{} is not in ALL_NAMES",
+                operation.name()
+            );
+        }
+        // Sorted and unique, so a name added out of order reads as one line.
+        let mut sorted = Operation::ALL_NAMES.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(Operation::ALL_NAMES, sorted.as_slice());
+        sorted.dedup();
+        assert_eq!(sorted.len(), Operation::ALL_NAMES.len());
     }
 
     #[test]
