@@ -1,19 +1,151 @@
 {
-  "schema_version": 1,
-  "contract": "echo-builtin-semantics-v1",
-  "purpose": "Pin what each shell's `echo` builtin writes, so the frontend's native domain for `echo` is checked against a measurement rather than against a reading of the specification.",
-  "note": "`echo` is a builtin and never reaches the PATH lookup, so `/bin/echo` is a different program and not a substitute. The shells disagree: this file records the disagreement as data. A case marked modelled is one where bash writes exactly the arguments joined by a single space and a newline, which is the rule the frontend implements; a case marked unmodelled must break that rule, which is what earns the refusal.",
-  "cases": [
-    {"name": "plain", "arguments": ["hello"], "modelled": true, "bash": "hello\n", "sh": "hello\n", "zsh": "hello\n"},
-    {"name": "two-words", "arguments": ["a", "b"], "modelled": true, "bash": "a b\n", "sh": "a b\n", "zsh": "a b\n"},
-    {"name": "no-arguments", "arguments": [], "modelled": true, "bash": "\n", "sh": "\n", "zsh": "\n"},
-    {"name": "empty-argument", "arguments": [""], "modelled": true, "bash": "\n", "sh": "\n", "zsh": "\n"},
-    {"name": "colon-prefixed-annotation", "arguments": ["::error::failed"], "modelled": true, "bash": "::error::failed\n", "sh": "::error::failed\n", "zsh": "::error::failed\n"},
-    {"name": "option-after-first-argument", "arguments": ["a", "-n"], "modelled": true, "bash": "a -n\n", "sh": "a -n\n", "zsh": "a -n\n"},
-    {"name": "suppress-newline", "arguments": ["-n", "x"], "modelled": false, "bash": "x", "sh": "-n x\n", "zsh": "x"},
-    {"name": "enable-escapes", "arguments": ["-e", "a\\tb"], "modelled": false, "bash": "a\tb\n", "sh": "-e a\tb\n", "zsh": "a\tb\n"},
-    {"name": "disable-escapes", "arguments": ["-E", "x"], "modelled": false, "bash": "x\n", "sh": "-E x\n", "zsh": "x\n"},
-    {"name": "lone-dash", "arguments": ["-"], "modelled": false, "bash": "-\n", "sh": "-\n", "zsh": "\n"},
-    {"name": "backslash-t-unquoted-option", "arguments": ["a\\tb"], "modelled": true, "bash": "a\\tb\n", "sh": "a\tb\n", "zsh": "a\tb\n"}
-  ]
+ "schema_version": 1,
+ "contract": "echo-builtin-semantics-v1",
+ "purpose": "Pin what each shell's `echo` builtin writes, so the frontend's native domain for `echo` is checked against a measurement rather than against a reading of the specification.",
+ "note": "`echo` is a builtin and never reaches the PATH lookup, so `/bin/echo` is a different program and not a substitute. The shells disagree: this file records the disagreement as data. A case marked modelled is one where bash writes exactly the arguments joined by a single space and a newline, which is the rule the frontend implements; a case marked unmodelled must break that rule, which is what earns the refusal. Bash reads the first argument as an option only when the whole of it is `-` followed by nothing but `n`, `e` and `E`, which is why `-n is bad` is printed and `-ne` is not.",
+ "cases": [
+  {
+   "name": "plain",
+   "arguments": [
+    "hello"
+   ],
+   "modelled": true,
+   "bash": "hello\n",
+   "sh": "hello\n",
+   "zsh": "hello\n"
+  },
+  {
+   "name": "two-words",
+   "arguments": [
+    "a",
+    "b"
+   ],
+   "modelled": true,
+   "bash": "a b\n",
+   "sh": "a b\n",
+   "zsh": "a b\n"
+  },
+  {
+   "name": "no-arguments",
+   "arguments": [],
+   "modelled": true,
+   "bash": "\n",
+   "sh": "\n",
+   "zsh": "\n"
+  },
+  {
+   "name": "empty-argument",
+   "arguments": [
+    ""
+   ],
+   "modelled": true,
+   "bash": "\n",
+   "sh": "\n",
+   "zsh": "\n"
+  },
+  {
+   "name": "colon-prefixed-annotation",
+   "arguments": [
+    "::error::failed"
+   ],
+   "modelled": true,
+   "bash": "::error::failed\n",
+   "sh": "::error::failed\n",
+   "zsh": "::error::failed\n"
+  },
+  {
+   "name": "option-after-first-argument",
+   "arguments": [
+    "a",
+    "-n"
+   ],
+   "modelled": true,
+   "bash": "a -n\n",
+   "sh": "a -n\n",
+   "zsh": "a -n\n"
+  },
+  {
+   "name": "suppress-newline",
+   "arguments": [
+    "-n",
+    "x"
+   ],
+   "modelled": false,
+   "bash": "x",
+   "sh": "-n x\n",
+   "zsh": "x"
+  },
+  {
+   "name": "enable-escapes",
+   "arguments": [
+    "-e",
+    "a\\tb"
+   ],
+   "modelled": false,
+   "bash": "a\tb\n",
+   "sh": "-e a\tb\n",
+   "zsh": "a\tb\n"
+  },
+  {
+   "name": "disable-escapes",
+   "arguments": [
+    "-E",
+    "x"
+   ],
+   "modelled": false,
+   "bash": "x\n",
+   "sh": "-E x\n",
+   "zsh": "x\n"
+  },
+  {
+   "name": "lone-dash",
+   "arguments": [
+    "-"
+   ],
+   "modelled": false,
+   "bash": "-\n",
+   "sh": "-\n",
+   "zsh": "\n"
+  },
+  {
+   "name": "backslash-t-unquoted-option",
+   "arguments": [
+    "a\\tb"
+   ],
+   "modelled": true,
+   "bash": "a\\tb\n",
+   "sh": "a\tb\n",
+   "zsh": "a\tb\n"
+  },
+  {
+   "name": "option-spelling-needs-the-whole-argument",
+   "arguments": [
+    "-n is bad"
+   ],
+   "modelled": true,
+   "bash": "-n is bad\n",
+   "sh": "-n is bad\n",
+   "zsh": "-n is bad\n"
+  },
+  {
+   "name": "option-spelling-with-several-letters",
+   "arguments": [
+    "-ne"
+   ],
+   "modelled": false,
+   "bash": "",
+   "sh": "-ne\n",
+   "zsh": ""
+  },
+  {
+   "name": "option-followed-by-more-in-one-argument",
+   "arguments": [
+    "-n x"
+   ],
+   "modelled": true,
+   "bash": "-n x\n",
+   "sh": "-n x\n",
+   "zsh": "-n x\n"
+  }
+ ]
 }

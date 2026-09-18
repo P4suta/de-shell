@@ -3,7 +3,7 @@ use crate::ir::{
     Binding, Guarantee, NamedExpression, Node, Operation, Plan, PrimitiveType, SourceBytes,
     SourceSpan, Task, TextExpression, TextPart, ValueType,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Interpreter {
@@ -197,68 +197,76 @@ pub(crate) fn lower(
         },
     };
 
-    let (body, inputs, environment, invocation, platform_capabilities, nounset) = match lowered {
-        Ok(lowered) => (
-            lowered.body,
-            lowered.inputs,
-            lowered.environment,
-            None,
-            Vec::new(),
-            lowered.nounset,
-        ),
-        Err(reason) => {
-            let analysis = conservative_source_analysis(source, &interpreter, &reason);
-            let body = if matches!(interpreter, Interpreter::Unknown(_)) {
-                residual_node(&normalized, source, interpreter.name(), reason)
-            } else {
-                delegated_node(DelegatedNodeArgs {
-                    path: &normalized,
-                    source,
-                    interpreter: interpreter.name(),
-                    reason,
-                    capabilities: analysis.capabilities.clone(),
-                })
-            };
-            (
-                body,
-                analysis.inputs,
-                analysis.environment,
+    let (body, inputs, environment, invocation, platform_capabilities, nounset, mut tasks) =
+        match lowered {
+            Ok(lowered) => (
+                lowered.body,
+                lowered.inputs,
+                lowered.environment,
                 None,
                 Vec::new(),
-                // A delegated body runs under its own interpreter, which reads
-                // the option from the source it was handed.
-                false,
-            )
-        }
-    };
+                lowered.nounset,
+                lowered.tasks,
+            ),
+            Err(reason) => {
+                let analysis = conservative_source_analysis(source, &interpreter, &reason);
+                let body = if matches!(interpreter, Interpreter::Unknown(_)) {
+                    residual_node(&normalized, source, interpreter.name(), reason)
+                } else {
+                    delegated_node(DelegatedNodeArgs {
+                        path: &normalized,
+                        source,
+                        interpreter: interpreter.name(),
+                        reason,
+                        capabilities: analysis.capabilities.clone(),
+                    })
+                };
+                (
+                    body,
+                    analysis.inputs,
+                    analysis.environment,
+                    None,
+                    Vec::new(),
+                    // A delegated body runs under its own interpreter, which reads
+                    // the option from the source it was handed.
+                    false,
+                    // and defines its own functions inside that source.
+                    Vec::new(),
+                )
+            }
+        };
     let environment: Vec<String> = environment.into_iter().collect();
     let secrets = environment
         .iter()
         .filter(|name| secret_name(name))
         .cloned()
         .collect();
+    // The entry task first: `Plan::validate` looks a call's target up in a
+    // table built from all of them, so the order is for a reader.
+    let mut all_tasks = vec![Task {
+        name: "main".into(),
+        inputs: inputs
+            .into_iter()
+            .map(|name| Binding {
+                name,
+                value_type: ValueType::Primitive(PrimitiveType::Text),
+            })
+            .collect(),
+        outputs: vec![],
+        environment,
+        secrets,
+        platform_capabilities,
+        cacheable: false,
+        nounset,
+        invocation,
+        body,
+    }];
+    all_tasks.append(&mut tasks);
     let mut plan = Plan {
         schema_version: 1,
         generator: "deshell/0.1.0".into(),
         entrypoint: "main".into(),
-        tasks: vec![Task {
-            name: "main".into(),
-            inputs: inputs
-                .into_iter()
-                .map(|name| Binding {
-                    name,
-                    value_type: ValueType::Primitive(PrimitiveType::Text),
-                })
-                .collect(),
-            outputs: vec![],
-            environment,
-            secrets,
-            platform_capabilities,
-            cacheable: false,
-            nounset,
-            invocation,
-            body,
-        }],
+        tasks: all_tasks,
     };
     plan.assign_node_ids()?;
     plan.validate().map_err(|errors| errors.join("; "))?;
@@ -394,6 +402,13 @@ fn rebind_source_path(plan: &mut Plan, from: &str, to: &str) -> Result<(), Strin
 #[derive(Default)]
 struct Lowered {
     body: Node,
+    /// Tasks the entry body calls, in the order they were defined.
+    ///
+    /// A shell function is a task: keeping the definition and its call sites as
+    /// one definition and several calls carries "these are the same check" into
+    /// the generated program, which inlining them would leave only in a
+    /// reader's head.
+    tasks: Vec<crate::ir::Task>,
     inputs: BTreeSet<String>,
     environment: BTreeSet<String>,
     /// Whether `set -u` was in effect. Only the POSIX family reads it; the other
@@ -913,6 +928,7 @@ macro_rules! semantic_models {
 semantic_models! {
     AndIf => "and-if-v1", None;
     ExplicitCommand => "explicit-command-v1", None;
+    StaticFunctionCall => "static-function-call-v1", None;
     ExplicitRedirection => "explicit-redirection-v1", None;
     ImmutableAssignment => "immutable-assignment-v1", None;
     LastExitCondition => "last-exit-condition-v1", None;
@@ -1477,6 +1493,38 @@ fn case_end(source: &str, statements: &[Range], start: usize) -> Option<usize> {
     None
 }
 
+/// The name of the function a statement defines, if it defines one.
+///
+/// Only `name() {`, which is the form POSIX defines. `function name {` is a
+/// bash and zsh extension, and the two differ over whether the body's
+/// variables are local, so it is left alone.
+fn function_name(text: &str) -> Option<&str> {
+    let (name, rest) = text.split_once('(')?;
+    let name = name.trim();
+    let rest = rest.trim_start().strip_prefix(')')?.trim();
+    if rest != "{" || !valid_identifier(name) {
+        return None;
+    }
+    Some(name)
+}
+
+/// The statement index of the `}` that closes a function opened at `start`.
+///
+/// `None` for a definition inside another, so the file is delegated rather than
+/// lowered from a guess about which brace closes which.
+fn function_end(source: &str, statements: &[Range], start: usize) -> Option<usize> {
+    for index in start + 1..statements.len() {
+        let text = source[statements[index].start..statements[index].end].trim();
+        if text == "}" {
+            return Some(index);
+        }
+        if function_name(text).is_some() {
+            return None;
+        }
+    }
+    None
+}
+
 /// Split `PATTERN) BODY` into its patterns and its body.
 ///
 /// An alternation (`a|b`) becomes several patterns sharing one body, which is
@@ -1775,12 +1823,30 @@ fn printf_contents(arguments: &[crate::ir::TextExpression]) -> Option<Vec<TextPa
 /// for options at the first one that is not one.
 fn echo_contents(arguments: &[crate::ir::TextExpression]) -> Option<Vec<TextPart>> {
     if let Some(first) = arguments.first() {
-        match first.parts.first() {
-            Some(TextPart::Literal { value }) if !value.starts_with('-') => {}
-            // An empty first argument prints an empty field, which is not an
-            // option; anything else is unknown until the expansion happens.
-            Some(TextPart::Literal { value }) if value.is_empty() => {}
-            _ => return None,
+        // Bash reads the first argument as an option only when the whole of it
+        // is `-` followed by nothing but `n`, `e` and `E`. Measured: `echo "$1
+        // is bad"` with `$1` set to `-n` prints `-n is bad`, because `-n is
+        // bad` is not an option.
+        //
+        // So a first argument is safe when it cannot spell one: either it
+        // begins with a literal character that is not `-`, or one of its
+        // literal parts carries a character an option cannot contain. Only an
+        // argument that could still expand into an option — `echo "$1"` — is
+        // refused.
+        let begins_safely = matches!(
+            first.parts.first(),
+            Some(TextPart::Literal { value }) if !value.starts_with('-')
+        );
+        let carries_a_disqualifier = first.parts.iter().any(|part| match part {
+            TextPart::Literal { value } => value
+                .bytes()
+                .any(|byte| !matches!(byte, b'-' | b'n' | b'e' | b'E')),
+            TextPart::Variable { .. }
+            | TextPart::Argument { .. }
+            | TextPart::DefaultValue { .. } => false,
+        });
+        if !begins_safely && !carries_a_disqualifier {
+            return None;
         }
     }
     let mut parts: Vec<TextPart> = Vec::new();
@@ -1804,32 +1870,132 @@ fn echo_contents(arguments: &[crate::ir::TextExpression]) -> Option<Vec<TextPart
     Some(parts)
 }
 
-fn lower_posix(path: &str, source: &str, interpreter: &Interpreter) -> Result<Lowered, String> {
-    let statements = shell_statements(source)?;
-    let mut inputs = BTreeSet::new();
-    let mut environment = BTreeSet::new();
-    let mut locals = BTreeSet::new();
-    let mut nodes = Vec::new();
-    // Shell options apply from where they are set onwards, so this travels with
-    // the statement cursor rather than being read once for the file.
-    let mut options = ShellOptions::default();
-    // `Operation::Sequence` carries one `on_failure` for the whole list, so a file
-    // that changes `set -e` partway through has no honest lowering: the statements
-    // before the change stop on failure and the ones after do not. Recording only
-    // the final value would claim one region's behaviour for both.
-    //
-    // A bool records that an option was set; it cannot record where it applied.
-    // Rather than widen the IR here, the file is delegated when the region
-    // changes — a wrong `native` is worse than a `delegated`, because the first
-    // is a claim of equivalence.
-    let mut errexit_regions = 0_usize;
+/// The inputs of [`lower_statements`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to
+/// this struct is a compile error at the call site rather than a default.
+struct LowerStatementsArgs<'a> {
+    path: &'a str,
+    source: &'a str,
+    /// The statements to walk, in source order.
+    statements: &'a [Range],
+    /// A keyword the first statement carries — `then`, `else`, `do` — or the
+    /// empty string when it carries none.
+    strip: &'a str,
+    interpreter: &'a Interpreter,
+    inputs: &'a mut BTreeSet<String>,
+    environment: &'a mut BTreeSet<String>,
+    locals: &'a mut BTreeSet<String>,
+    functions: &'a mut BTreeMap<String, usize>,
+    tasks: &'a mut Vec<crate::ir::Task>,
+    /// Shell options travel with the cursor, because a `set` applies from where
+    /// it is written onwards.
+    options: &'a mut ShellOptions,
+    /// How many times `set -e` changed. A file that changes it partway through
+    /// has no honest lowering, and the count is the file's rather than a list's.
+    errexit_regions: &'a mut usize,
+}
+
+/// Lower a run of statements into the nodes they become.
+///
+/// One walk for the file, a branch, a loop body and a `case` arm. It was two:
+/// the file's handled `if`, `while` and `case`, and the one used for bodies
+/// handled a single command — so a `case` inside a function, or an `if` inside
+/// a `case` arm, delegated for no reason but which walk reached it.
+fn lower_statements(parts: LowerStatementsArgs<'_>) -> Result<Vec<Node>, String> {
+    // Destructured without `..`: see `LowerStatementsArgs`.
+    let LowerStatementsArgs {
+        path,
+        source,
+        statements,
+        strip,
+        interpreter,
+        inputs,
+        environment,
+        locals,
+        functions,
+        tasks,
+        options,
+        errexit_regions,
+    } = parts;
+    let statements = statements.to_vec();
+    let mut nodes: Vec<Node> = Vec::new();
     let mut index = 0;
     while index < statements.len() {
         let range = statements[index];
         index += 1;
         let text = &source[range.start..range.end];
-        let trimmed = text.trim();
+        // A branch's first statement carries the keyword that opened it —
+        // `then`, `else`, `do`. Stripping it here is what lets every construct
+        // below read a statement without knowing which arm it is in.
+        let trimmed = text
+            .trim()
+            .strip_prefix(strip)
+            .unwrap_or(text.trim())
+            .trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let range = Range {
+            start: range.start + text.find(trimmed).unwrap_or_default(),
+            end: range.start + text.find(trimmed).unwrap_or_default() + trimmed.len(),
+        };
+        // `name() { BODY }` becomes a task of its own.
+        if let Some(name) = function_name(trimmed) {
+            let Some(close_at) = function_end(source, &statements, index - 1) else {
+                return Err(
+                    "shell function definition requires pinned interpreter delegation".into(),
+                );
+            };
+            if functions.contains_key(name) {
+                return Err(
+                    "shell function is defined twice; delegation keeps the last one".into(),
+                );
+            }
+            let mut body_inputs = BTreeSet::new();
+            let mut body_environment = BTreeSet::new();
+            let mut body_locals = BTreeSet::new();
+            let body = lower_statement_list(LowerStatementListArgs {
+                path,
+                functions: &*functions,
+                source,
+                statements: &statements[index..close_at],
+                strip: "",
+                interpreter,
+                inputs: &mut body_inputs,
+                environment: &mut body_environment,
+                locals: &mut body_locals,
+                errexit: options.errexit,
+                pipefail: options.pipefail,
+            })?
+            .ok_or("shell function body is empty")?;
+            let arity = body_inputs
+                .iter()
+                .filter_map(|name| name.parse::<usize>().ok())
+                .max()
+                .unwrap_or(0);
+            // The caller's environment is the function's, so what the body reads
+            // is read by the file.
+            environment.extend(body_environment.iter().cloned());
+            functions.insert(name.to_owned(), arity);
+            tasks.push(crate::ir::Task {
+                name: name.to_owned(),
+                inputs: (1..=arity)
+                    .map(|position| Binding {
+                        name: position.to_string(),
+                        value_type: ValueType::Primitive(PrimitiveType::Text),
+                    })
+                    .collect(),
+                outputs: vec![],
+                environment: body_environment.into_iter().collect(),
+                secrets: vec![],
+                platform_capabilities: vec![],
+                cacheable: false,
+                nounset: false,
+                invocation: None,
+                body,
+            });
+            index = close_at + 1;
             continue;
         }
         // `while COND; do BODY; done`, rejoined the same way as `if`.
@@ -1839,13 +2005,14 @@ fn lower_posix(path: &str, source: &str, interpreter: &Interpreter) -> Result<Lo
             let mut arm = |from: usize, to: usize, strip: &str| -> Result<Node, String> {
                 lower_statement_list(LowerStatementListArgs {
                     path,
+                    functions: &*functions,
                     source,
                     statements: &statements[from..to],
                     strip,
                     interpreter,
-                    inputs: &mut inputs,
-                    environment: &mut environment,
-                    locals: &mut locals,
+                    inputs: &mut *inputs,
+                    environment: &mut *environment,
+                    locals: &mut *locals,
                     errexit: options.errexit,
                     pipefail: options.pipefail,
                 })?
@@ -1887,9 +2054,9 @@ fn lower_posix(path: &str, source: &str, interpreter: &Interpreter) -> Result<Lo
                     .ok_or("case word is not inside its range")?;
             let words = tokenize_posix(
                 &source[start_of_word..start_of_word + word.len()],
-                &mut inputs,
-                &mut environment,
-                &locals,
+                &mut *inputs,
+                &mut *environment,
+                locals,
             );
             let mut cases = Vec::new();
             let mut default = None;
@@ -1904,13 +2071,14 @@ fn lower_posix(path: &str, source: &str, interpreter: &Interpreter) -> Result<Lo
                     for (patterns, body) in arms {
                         let lowered = lower_statement_list(LowerStatementListArgs {
                             path,
+                            functions: &*functions,
                             source,
                             statements: &body,
                             strip: "",
                             interpreter,
-                            inputs: &mut inputs,
-                            environment: &mut environment,
-                            locals: &mut locals,
+                            inputs: &mut *inputs,
+                            environment: &mut *environment,
+                            locals: &mut *locals,
                             errexit: options.errexit,
                             pipefail: options.pipefail,
                         });
@@ -1983,13 +2151,14 @@ fn lower_posix(path: &str, source: &str, interpreter: &Interpreter) -> Result<Lo
             let mut branch = |from: usize, to: usize, strip: &str| -> Result<Node, String> {
                 lower_statement_list(LowerStatementListArgs {
                     path,
+                    functions: &*functions,
                     source,
                     statements: &statements[from..to],
                     strip,
                     interpreter,
-                    inputs: &mut inputs,
-                    environment: &mut environment,
-                    locals: &mut locals,
+                    inputs: &mut *inputs,
+                    environment: &mut *environment,
+                    locals: &mut *locals,
                     errexit: options.errexit,
                     pipefail: options.pipefail,
                 })?
@@ -2023,27 +2192,70 @@ fn lower_posix(path: &str, source: &str, interpreter: &Interpreter) -> Result<Lo
             }
             return Err("shell compound syntax requires pinned interpreter delegation".into());
         }
-        if let Some(updated) = set_statement(trimmed, options) {
+        if let Some(updated) = set_statement(trimmed, *options) {
             // A `set` is a change of lowering state, not an operation: it emits no
             // node, and the statements after it carry its effect instead.
             if updated.errexit != options.errexit && !nodes.is_empty() {
-                errexit_regions += 1;
+                *errexit_regions += 1;
             }
-            options = updated;
+            *options = updated;
             continue;
         }
         let node = lower_posix_control(LowerPosixControlArgs {
             path,
+            functions: &*functions,
             source,
             range,
             interpreter,
-            inputs: &mut inputs,
-            environment: &mut environment,
-            locals: &mut locals,
+            inputs: &mut *inputs,
+            environment: &mut *environment,
+            locals: &mut *locals,
             pipefail: options.pipefail,
         })?;
         nodes.push(node);
     }
+    Ok(nodes)
+}
+
+fn lower_posix(path: &str, source: &str, interpreter: &Interpreter) -> Result<Lowered, String> {
+    let statements = shell_statements(source)?;
+    let mut inputs = BTreeSet::new();
+    let mut environment = BTreeSet::new();
+    let mut locals = BTreeSet::new();
+    // Shell options apply from where they are set onwards, so this travels with
+    // the statement cursor rather than being read once for the file.
+    let mut options = ShellOptions::default();
+    // `Operation::Sequence` carries one `on_failure` for the whole list, so a file
+    // that changes `set -e` partway through has no honest lowering: the statements
+    // before the change stop on failure and the ones after do not. Recording only
+    // the final value would claim one region's behaviour for both.
+    //
+    // A bool records that an option was set; it cannot record where it applied.
+    // Rather than widen the IR here, the file is delegated when the region
+    // changes — a wrong `native` is worse than a `delegated`, because the first
+    // is a claim of equivalence.
+    let mut errexit_regions = 0_usize;
+    // A function is a task, and its call sites are `TaskCall`s. The arity is
+    // the highest `$N` its body reads, because a shell function's definition
+    // does not state one — so a call that passes a different number is refused
+    // rather than lowered with a `$2` that would be empty here and an error
+    // under `set -u` there.
+    let mut functions: BTreeMap<String, usize> = BTreeMap::new();
+    let mut tasks: Vec<crate::ir::Task> = Vec::new();
+    let mut nodes: Vec<Node> = lower_statements(LowerStatementsArgs {
+        path,
+        source,
+        statements: &statements,
+        strip: "",
+        interpreter,
+        inputs: &mut inputs,
+        environment: &mut environment,
+        locals: &mut locals,
+        functions: &mut functions,
+        tasks: &mut tasks,
+        options: &mut options,
+        errexit_regions: &mut errexit_regions,
+    })?;
     if nodes.is_empty() {
         return Err("script contains no statically lowerable operation".into());
     }
@@ -2081,6 +2293,7 @@ fn lower_posix(path: &str, source: &str, interpreter: &Interpreter) -> Result<Lo
         body,
         inputs,
         environment,
+        tasks,
         nounset: options.nounset,
     })
 }
@@ -2188,6 +2401,10 @@ fn trim_range(source: &str, mut start: usize, mut end: usize) -> Range {
 /// this struct is a compile error at the call site rather than a default.
 struct LowerStatementListArgs<'a> {
     path: &'a str,
+    /// The functions defined so far, and how many positional arguments each
+    /// body reads. A call to one becomes a task call rather than an exec of a
+    /// program with that name.
+    functions: &'a BTreeMap<String, usize>,
     source: &'a str,
     /// The statements that make up the list, in source order.
     statements: &'a [Range],
@@ -2214,6 +2431,7 @@ fn lower_statement_list(parts: LowerStatementListArgs<'_>) -> Result<Option<Node
     // Destructured without `..`: see `LowerStatementListArgs`.
     let LowerStatementListArgs {
         path,
+        functions,
         source,
         statements,
         strip,
@@ -2224,30 +2442,42 @@ fn lower_statement_list(parts: LowerStatementListArgs<'_>) -> Result<Option<Node
         errexit,
         pipefail,
     } = parts;
-    let mut pieces = Vec::new();
-    for statement in statements {
-        let raw = source[statement.start..statement.end].trim();
-        let body = raw.strip_prefix(strip).unwrap_or(raw).trim();
-        if body.is_empty() {
-            continue;
-        }
-        let offset = statement.start
-            + source[statement.start..statement.end]
-                .find(body)
-                .ok_or("list statement is not inside its range")?;
-        pieces.push(lower_posix_control(LowerPosixControlArgs {
-            path,
-            source,
-            range: Range {
-                start: offset,
-                end: offset + body.len(),
-            },
-            interpreter,
-            inputs: &mut *inputs,
-            environment: &mut *environment,
-            locals: &mut *locals,
-            pipefail,
-        })?);
+    let mut options = ShellOptions {
+        errexit,
+        pipefail,
+        nounset: false,
+    };
+    let mut errexit_regions = 0;
+    // A definition inside a branch would be visible after the branch in the
+    // shell and not here, so the walk is given a map it may read and a list it
+    // may not add to without this noticing.
+    let mut nested = functions.clone();
+    let mut nested_tasks = Vec::new();
+    let mut pieces = lower_statements(LowerStatementsArgs {
+        path,
+        source,
+        statements,
+        strip,
+        interpreter,
+        inputs,
+        environment,
+        locals,
+        functions: &mut nested,
+        tasks: &mut nested_tasks,
+        options: &mut options,
+        errexit_regions: &mut errexit_regions,
+    })?;
+    if !nested_tasks.is_empty() {
+        return Err(
+            "a function defined inside a branch outlives it and requires pinned interpreter delegation"
+                .into(),
+        );
+    }
+    if errexit_regions > 0 {
+        return Err(
+            "errexit changes partway through a branch and requires pinned interpreter delegation"
+                .into(),
+        );
     }
     let Some(first) = pieces.first() else {
         return Ok(None);
@@ -2278,6 +2508,10 @@ fn lower_statement_list(parts: LowerStatementListArgs<'_>) -> Result<Option<Node
 
 struct LowerPosixControlArgs<'a> {
     path: &'a str,
+    /// The functions defined so far, and how many positional arguments each
+    /// body reads. A call to one becomes a task call rather than an exec of a
+    /// program with that name.
+    functions: &'a BTreeMap<String, usize>,
     source: &'a str,
     range: Range,
     interpreter: &'a Interpreter,
@@ -2292,6 +2526,7 @@ fn lower_posix_control(parts: LowerPosixControlArgs<'_>) -> Result<Node, String>
     // Destructured without `..`: see `LowerPosixControlArgs`.
     let LowerPosixControlArgs {
         path,
+        functions,
         source,
         range,
         interpreter,
@@ -2304,6 +2539,7 @@ fn lower_posix_control(parts: LowerPosixControlArgs<'_>) -> Result<Node, String>
     if controls.is_empty() {
         return lower_posix_simple(LowerPosixSimpleArgs {
             path,
+            functions,
             source,
             range,
             interpreter,
@@ -2336,6 +2572,7 @@ fn lower_posix_control(parts: LowerPosixControlArgs<'_>) -> Result<Node, String>
     for piece in pieces {
         nodes.push(lower_posix_simple(LowerPosixSimpleArgs {
             path,
+            functions,
             source,
             range: piece,
             interpreter,
@@ -2472,6 +2709,10 @@ fn top_level_controls(source: &str, range: Range) -> Result<Vec<(usize, &'static
 /// to compile until somebody gives it a destination.
 struct LowerPosixSimpleArgs<'a> {
     path: &'a str,
+    /// The functions defined so far, and how many positional arguments each
+    /// body reads. A call to one becomes a task call rather than an exec of a
+    /// program with that name.
+    functions: &'a BTreeMap<String, usize>,
     source: &'a str,
     range: Range,
     interpreter: &'a Interpreter,
@@ -2484,6 +2725,7 @@ fn lower_posix_simple(parts: LowerPosixSimpleArgs<'_>) -> Result<Node, String> {
     // Destructured without `..`: see `LowerPosixSimpleArgs`.
     let LowerPosixSimpleArgs {
         path,
+        functions,
         source,
         range,
         interpreter,
@@ -2527,6 +2769,7 @@ fn lower_posix_simple(parts: LowerPosixSimpleArgs<'_>) -> Result<Node, String> {
             let inner_end = range.end - 1;
             let body = lower_posix_simple(LowerPosixSimpleArgs {
                 path,
+                functions,
                 source,
                 range: trim_range(source, inner_start, inner_end),
                 interpreter,
@@ -2571,6 +2814,7 @@ fn lower_posix_simple(parts: LowerPosixSimpleArgs<'_>) -> Result<Node, String> {
                 .ok_or("negated command is not inside its range")?;
         let inner = lower_posix_simple(LowerPosixSimpleArgs {
             path,
+            functions,
             source,
             range: Range {
                 start: offset,
@@ -2708,6 +2952,28 @@ fn lower_posix_simple(parts: LowerPosixSimpleArgs<'_>) -> Result<Node, String> {
             ));
         }
         return Err("exit status requires pinned interpreter delegation".into());
+    }
+    // A call to a function defined in this file is a task call, not an exec of
+    // a program that happens to share its name. The arity is checked here
+    // because a shell function has none: `$2` in the body is empty when the
+    // call passed one argument, and an error when `set -u` is on, so a call
+    // that does not line up has two behaviours rather than one.
+    if let Some(arity) = functions.get(&executable) {
+        if words.len() - 1 != *arity {
+            return Err(format!(
+                "call to {executable} passes {} argument(s) where its body reads {arity}; delegation keeps both meanings",
+                words.len() - 1
+            ));
+        }
+        return Ok(native_node(
+            Operation::TaskCall {
+                task: executable.clone(),
+                arguments: Vec::new(),
+                positional: words[1..].to_vec(),
+            },
+            SemanticModel::StaticFunctionCall.named(interpreter),
+            span_for_range(path, source, range.start, range.end)?,
+        ));
     }
     if executable == "printf"
         && let Some(parts) = printf_contents(&words[1..])
@@ -3175,6 +3441,8 @@ fn lower_fish(path: &str, source: &str) -> Result<Lowered, String> {
         )
     };
     Ok(Lowered {
+        // Only the POSIX frontend reads a function definition.
+        tasks: Vec::new(),
         body,
         inputs,
         environment,
@@ -3499,6 +3767,8 @@ fn lower_cmd(path: &str, source: &str) -> Result<Lowered, String> {
         )
     };
     Ok(Lowered {
+        // Only the POSIX frontend reads a function definition.
+        tasks: Vec::new(),
         body,
         inputs,
         environment,
@@ -3800,6 +4070,8 @@ fn lower_powershell(path: &str, source: &str) -> Result<Lowered, String> {
         )
     };
     Ok(Lowered {
+        // Only the POSIX frontend reads a function definition.
+        tasks: Vec::new(),
         body,
         inputs,
         environment,
@@ -4128,6 +4400,8 @@ fn lower_nushell(path: &str, source: &str, interpreter: &Interpreter) -> Result<
         condition.source.clone().unwrap(),
     );
     Ok(Lowered {
+        // Only the POSIX frontend reads a function definition.
+        tasks: Vec::new(),
         nounset: false,
         body: native_node(
             Operation::Sequence {
@@ -4872,6 +5146,8 @@ fn lower_literal_family(
         )
     };
     Ok(Lowered {
+        // Only the POSIX frontend reads a function definition.
+        tasks: Vec::new(),
         body,
         inputs: BTreeSet::new(),
         environment: BTreeSet::new(),
@@ -5334,6 +5610,73 @@ mod tests {
         assert!(
             lowered > 0 && refused > 0,
             "{lowered} lowered, {refused} refused"
+        );
+    }
+
+    /// A function is a task, and its call sites are calls.
+    ///
+    /// Inlining the body at each call site would produce a program that runs
+    /// the same and says less: the definition is where "these are the same
+    /// check" is written down, and the project being migrated is the one that
+    /// has to keep it true afterwards.
+    #[test]
+    fn a_shell_function_becomes_a_task_its_callers_call() {
+        let plan = lower(
+            "build.sh",
+            b"#!/bin/bash\nreject() {\n  case \"$2\" in\n    *x*)\n      echo \"$1 is bad\"\n      exit 2\n      ;;\n  esac\n}\nreject \"name\" \"$1\"\nreject \"other\" \"$2\"\n",
+            UnknownInterpreter::TraceOnly,
+        )
+        .unwrap();
+        assert_eq!(plan.tasks.len(), 2, "{plan:#?}");
+        let [main, reject] = plan.tasks.as_slice() else {
+            panic!("expected two tasks: {plan:#?}")
+        };
+        assert_eq!(reject.name, "reject");
+        // The arity is what the body reads, because the definition states none.
+        assert_eq!(
+            reject
+                .inputs
+                .iter()
+                .map(|b| b.name.as_str())
+                .collect::<Vec<_>>(),
+            ["1", "2"]
+        );
+
+        let Operation::Sequence { nodes, .. } = &main.body.operation else {
+            panic!("expected a sequence: {main:#?}")
+        };
+        assert_eq!(nodes.len(), 2, "{nodes:#?}");
+        for (node, expected) in nodes.iter().zip(["name", "other"]) {
+            let Operation::TaskCall {
+                task,
+                arguments,
+                positional,
+            } = &node.operation
+            else {
+                panic!("expected a task call: {node:#?}")
+            };
+            assert_eq!(task, "reject");
+            assert!(arguments.is_empty());
+            assert_eq!(positional.len(), 2);
+            assert_eq!(positional[0], crate::ir::TextExpression::literal(expected));
+        }
+    }
+
+    /// A call whose argument count does not match what the body reads is
+    /// delegated.
+    ///
+    /// A shell function has no arity, so `$2` in a body called with one
+    /// argument is empty here and an error under `set -u` — two behaviours
+    /// where a task call has one.
+    #[test]
+    fn a_call_that_does_not_match_the_body_is_delegated() {
+        let node = body(
+            "build.sh",
+            b"#!/bin/bash\nf() {\n  echo \"$1 $2\"\n}\nf one\n",
+        );
+        assert!(
+            matches!(node.operation, Operation::InterpreterCall { .. }),
+            "{node:#?}"
         );
     }
 

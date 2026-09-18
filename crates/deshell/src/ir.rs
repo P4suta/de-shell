@@ -1563,9 +1563,20 @@ fn validate_node(parts: ValidateNodeArgs<'_>) {
                 expression(&argument.value, errors);
             }
             if let Some(target) = task_table.get(task.as_str()) {
+                // An input named `1`, `2` and so on is supplied by position, not
+                // by name: that is what a shell function takes. Counting it as a
+                // named argument would demand a name the caller has no way to
+                // write.
                 let expected: BTreeSet<String> = target
                     .inputs
                     .iter()
+                    .filter(|input| {
+                        input
+                            .name
+                            .parse::<usize>()
+                            .map(|position| position == 0 || position > positional.len())
+                            .unwrap_or(true)
+                    })
                     .map(|input| input.name.clone())
                     .collect();
                 for unknown in names.difference(&expected) {
@@ -1573,6 +1584,18 @@ fn validate_node(parts: ValidateNodeArgs<'_>) {
                 }
                 for missing in expected.difference(&names) {
                     errors.push(format!("missing argument {missing} for task {task}"));
+                }
+                let positions = target
+                    .inputs
+                    .iter()
+                    .filter_map(|input| input.name.parse::<usize>().ok())
+                    .max()
+                    .unwrap_or(0);
+                if positional.len() > positions {
+                    errors.push(format!(
+                        "task {task} was given {} positional argument(s) and reads {positions}",
+                        positional.len()
+                    ));
                 }
             } else if !task.is_empty() {
                 errors.push(format!("task not found: {task}"));

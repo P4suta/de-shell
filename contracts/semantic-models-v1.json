@@ -37,6 +37,9 @@
   "static-external-command-v1": {
    "evidence": null
   },
+  "static-function-call-v1": {
+   "evidence": null
+  },
   "static-main-sequence-v1": {
    "evidence": null
   },
