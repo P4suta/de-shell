@@ -1044,15 +1044,15 @@ fn build_request_and_proposal(
             &finding.path,
         );
         let expected_digest = current_target_digest(root, &target)?;
-        let proposal = invoke_external_generator(
-            root,
-            config,
-            registration,
-            &request,
-            &target,
-            expected_digest,
-            task,
-        )
+        let proposal = invoke_external_generator(InvokeExternalGeneratorArgs {
+                root: root,
+                config: config,
+                registration: registration,
+                request: &request,
+                target_path: &target,
+                expected_digest: expected_digest,
+                task: task,
+            })
         .map_err(external_generator_blocker)?;
         for patch in &proposal.patches {
             if targets.contains(&patch.path) {
@@ -1276,13 +1276,13 @@ fn official_call_site_patches(
         let mut additional_files = Vec::new();
         for location in locations {
             if is_github_workflow_path(&path) {
-                let rewritten = rewrite_github_run_call_site(
-                    &path,
-                    &contents,
-                    location,
-                    retiring_source,
-                    &replacement_argv,
-                )?;
+                let rewritten = rewrite_github_run_call_site(RewriteGithubRunCallSiteArgs {
+                        path: &path,
+                        contents: &contents,
+                        location: location,
+                        retiring_source: retiring_source,
+                        replacement_argv: &replacement_argv,
+                    })?;
                 contents = rewritten.0;
                 additional_files.extend(rewritten.1);
                 continue;
@@ -1356,13 +1356,29 @@ fn rewrite_static_process_call(
     }
 }
 
-fn rewrite_github_run_call_site(
-    path: &str,
-    contents: &[u8],
-    location: &Location,
-    retiring_source: &str,
-    replacement_argv: &[String],
-) -> Result<(Vec<u8>, Vec<HostFile>), String> {
+/// The inputs of [`rewrite_github_run_call_site`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`rewrite_github_run_call_site`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct RewriteGithubRunCallSiteArgs<'a> {
+    path: &'a str,
+    contents: &'a [u8],
+    location: &'a Location,
+    retiring_source: &'a str,
+    replacement_argv: &'a [String],
+}
+
+fn rewrite_github_run_call_site(parts: RewriteGithubRunCallSiteArgs<'_>) -> Result<(Vec<u8>, Vec<HostFile>), String> {
+    // Destructured without `..`: see `RewriteGithubRunCallSiteArgs`.
+    let RewriteGithubRunCallSiteArgs {
+        path,
+        contents,
+        location,
+        retiring_source,
+        replacement_argv,
+    } = parts;
     let start = usize::try_from(location.start_byte)
         .map_err(|_| "DESHELL_BLOCKER_UNSUPPORTED_CALL_SITE: span is too large")?;
     let end = usize::try_from(location.end_byte)
@@ -1829,15 +1845,33 @@ fn current_target_digest(root: &Path, target: &str) -> Result<Option<String>, St
     }
 }
 
-fn invoke_external_generator(
-    root: &Path,
-    config: &crate::config::ProjectConfig,
-    registration: &crate::config::ExternalGenerator,
-    request: &MigrationRequest,
-    target_path: &str,
+/// The inputs of [`invoke_external_generator`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`invoke_external_generator`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct InvokeExternalGeneratorArgs<'a> {
+    root: &'a Path,
+    config: &'a crate::config::ProjectConfig,
+    registration: &'a crate::config::ExternalGenerator,
+    request: &'a MigrationRequest,
+    target_path: &'a str,
     expected_digest: Option<String>,
-    task: &crate::ir::Task,
-) -> Result<Proposal, String> {
+    task: &'a crate::ir::Task,
+}
+
+fn invoke_external_generator(parts: InvokeExternalGeneratorArgs<'_>) -> Result<Proposal, String> {
+    // Destructured without `..`: see `InvokeExternalGeneratorArgs`.
+    let InvokeExternalGeneratorArgs {
+        root,
+        config,
+        registration,
+        request,
+        target_path,
+        expected_digest,
+        task,
+    } = parts;
     if !config.migration.allow_agent_network {
         return Err(
             "DESHELL_BLOCKER_GENERATOR_NETWORK_POLICY: external generator execution requires explicit allow_agent_network because this host has no enforced network sandbox"
@@ -1887,14 +1921,14 @@ fn invoke_external_generator(
         "method": "deshell.handshake",
         "params": {"protocol_version": 1}
     });
-    let handshake_result = execute_external_rpc(
-        isolated.path(),
-        &copied,
-        &handshake_request,
-        &serde_json::json!("handshake"),
-        config.limits,
-        crate::protocol::MAX_MESSAGE_BYTES,
-    );
+    let handshake_result = execute_external_rpc(ExecuteExternalRpcArgs {
+            root: isolated.path(),
+            executable: &copied,
+            request: &handshake_request,
+            id: &serde_json::json!("handshake"),
+            project_limits: config.limits,
+            frame_limit: crate::protocol::MAX_MESSAGE_BYTES,
+        });
     ensure_isolated_tree_unchanged(isolated.path(), &baseline)?;
     ensure_guarded_project_tree_unchanged(root, &project_baseline)?;
     let handshake_value = handshake_result?;
@@ -1918,20 +1952,27 @@ fn invoke_external_generator(
             "validation": validation
         }
     });
-    let proposal_result = execute_external_rpc(
-        isolated.path(),
-        &copied,
-        &propose_request,
-        &serde_json::json!("proposal"),
-        config.limits,
-        handshake.max_frame_bytes as usize,
-    );
+    let proposal_result = execute_external_rpc(ExecuteExternalRpcArgs {
+            root: isolated.path(),
+            executable: &copied,
+            request: &propose_request,
+            id: &serde_json::json!("proposal"),
+            project_limits: config.limits,
+            frame_limit: handshake.max_frame_bytes as usize,
+        });
     ensure_isolated_tree_unchanged(isolated.path(), &baseline)?;
     ensure_guarded_project_tree_unchanged(root, &project_baseline)?;
     let result = proposal_result?;
     let proposal: Proposal = serde_json::from_value(result)
         .map_err(|error| format!("external generator returned an invalid Proposal v1: {error}"))?;
-    validate_external_proposal(root, registration, request, task, &validation, &proposal)?;
+    validate_external_proposal(ValidateExternalProposalArgs {
+            root: root,
+            registration: registration,
+            request: request,
+            task: task,
+            validation: &validation,
+            proposal: &proposal,
+        })?;
     Ok(proposal)
 }
 
@@ -1971,14 +2012,31 @@ fn validate_external_handshake(
     Ok(())
 }
 
-fn execute_external_rpc(
-    root: &Path,
-    executable: &Path,
-    request: &serde_json::Value,
-    id: &serde_json::Value,
+/// The inputs of [`execute_external_rpc`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`execute_external_rpc`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct ExecuteExternalRpcArgs<'a> {
+    root: &'a Path,
+    executable: &'a Path,
+    request: &'a serde_json::Value,
+    id: &'a serde_json::Value,
     project_limits: crate::config::ResourceLimits,
     frame_limit: usize,
-) -> Result<serde_json::Value, String> {
+}
+
+fn execute_external_rpc(parts: ExecuteExternalRpcArgs<'_>) -> Result<serde_json::Value, String> {
+    // Destructured without `..`: see `ExecuteExternalRpcArgs`.
+    let ExecuteExternalRpcArgs {
+        root,
+        executable,
+        request,
+        id,
+        project_limits,
+        frame_limit,
+    } = parts;
     let mut input = crate::canonical_json::canonical_bytes(request)?;
     if input.len() > frame_limit || input.len() > crate::protocol::MAX_MESSAGE_BYTES {
         return Err("external generator request exceeds its negotiated frame limit".into());
@@ -2028,14 +2086,31 @@ fn execute_external_rpc(
     crate::protocol::decode_response(frames[0], id)
 }
 
-fn validate_external_proposal(
-    root: &Path,
-    registration: &crate::config::ExternalGenerator,
-    request: &MigrationRequest,
-    task: &crate::ir::Task,
-    validation: &[Vec<String>],
-    proposal: &Proposal,
-) -> Result<(), String> {
+/// The inputs of [`validate_external_proposal`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`validate_external_proposal`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct ValidateExternalProposalArgs<'a> {
+    root: &'a Path,
+    registration: &'a crate::config::ExternalGenerator,
+    request: &'a MigrationRequest,
+    task: &'a crate::ir::Task,
+    validation: &'a [Vec<String>],
+    proposal: &'a Proposal,
+}
+
+fn validate_external_proposal(parts: ValidateExternalProposalArgs<'_>) -> Result<(), String> {
+    // Destructured without `..`: see `ValidateExternalProposalArgs`.
+    let ValidateExternalProposalArgs {
+        root,
+        registration,
+        request,
+        task,
+        validation,
+        proposal,
+    } = parts;
     validate_proposal(proposal)?;
     if proposal.request_digest != request.request_id
         || proposal.generator_digest != registration.digest
@@ -2505,7 +2580,13 @@ fn generate_github_action_host(
     let action_directory = format!(".github/actions/deshell-{action_id}");
     let uses = format!("uses: ./{action_directory}");
     let (bytes, _workflow_span) =
-        replace_structured_host_span(&host, finding, key_start, end, uses.as_bytes());
+        replace_structured_host_span(ReplaceStructuredHostSpanArgs {
+                host: &host,
+                finding: finding,
+                start: key_start,
+                end: end,
+                replacement: uses.as_bytes(),
+            });
     let program = serde_json::to_string(&argv[0]).map_err(|error| error.to_string())?;
     let arguments = serde_json::to_string(&argv[1..]).map_err(|error| error.to_string())?;
     let javascript = format!(
@@ -2589,7 +2670,13 @@ fn generate_javascript_host(
     let arguments = serde_json::to_string(&argv[1..]).map_err(|error| error.to_string())?;
     let replacement = format!("child_process.execFileSync({program},{arguments}, {options})");
     let (bytes, generated_span) =
-        replace_structured_host_span(&host, finding, start, end, replacement.as_bytes());
+        replace_structured_host_span(ReplaceStructuredHostSpanArgs {
+                host: &host,
+                finding: finding,
+                start: start,
+                end: end,
+                replacement: replacement.as_bytes(),
+            });
     Ok(HostGeneration {
         bytes,
         build_argv: vec!["node".into(), "--check".into(), finding.path.clone()],
@@ -2659,7 +2746,13 @@ fn generate_python_host(
         }
     );
     let (bytes, generated_span) =
-        replace_structured_host_span(&host, finding, start, end, replacement.as_bytes());
+        replace_structured_host_span(ReplaceStructuredHostSpanArgs {
+                host: &host,
+                finding: finding,
+                start: start,
+                end: end,
+                replacement: replacement.as_bytes(),
+            });
     Ok(HostGeneration {
         bytes,
         build_argv: vec![
@@ -2723,13 +2816,29 @@ fn structured_host_span<'a>(
     Ok((start, end, original))
 }
 
-fn replace_structured_host_span(
-    host: &[u8],
-    finding: &crate::scanner::Finding,
+/// The inputs of [`replace_structured_host_span`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`replace_structured_host_span`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct ReplaceStructuredHostSpanArgs<'a> {
+    host: &'a [u8],
+    finding: &'a crate::scanner::Finding,
     start: usize,
     end: usize,
-    replacement: &[u8],
-) -> (Vec<u8>, Location) {
+    replacement: &'a [u8],
+}
+
+fn replace_structured_host_span(parts: ReplaceStructuredHostSpanArgs<'_>) -> (Vec<u8>, Location) {
+    // Destructured without `..`: see `ReplaceStructuredHostSpanArgs`.
+    let ReplaceStructuredHostSpanArgs {
+        host,
+        finding,
+        start,
+        end,
+        replacement,
+    } = parts;
     let mut generated = Vec::with_capacity(host.len() - (end - start) + replacement.len());
     generated.extend_from_slice(&host[..start]);
     generated.extend_from_slice(replacement);
@@ -5034,14 +5143,14 @@ fn observe_replacement(
     ensure_safe_directory(workspace.path(), ".deshell/verification")?;
     let build_environment = verification_build_environment(workspace.path(), &proposal.build_argv);
     let build_limits = verification_build_limits(&proposal.build_argv, scenario.limits);
-    let build = execute_exact(
-        workspace.path(),
-        &proposal.build_argv,
-        &build_environment,
-        None,
-        &[],
-        build_limits,
-    )?;
+    let build = execute_exact(ExecuteExactArgs {
+            root: workspace.path(),
+            argv: &proposal.build_argv,
+            environment: &build_environment,
+            cwd: None,
+            stdin: &[],
+            limits: build_limits,
+        })?;
     if build.exit_code != 0 || build.timed_out || build.limit_exceeded.is_some() {
         return Err(format!(
             "replacement build failed with exit {}: {}",
@@ -5054,14 +5163,14 @@ fn observe_replacement(
     let environment = replay_environment(scenario_environment(scenario), proxy.as_ref());
     let mut argv = proposal.run_argv.clone();
     argv.extend(scenario.argv.clone());
-    let outcome = execute_exact(
-        workspace.path(),
-        &argv,
-        &environment,
-        scenario.cwd.clone(),
-        &scenario_stdin(scenario)?,
-        scenario.limits,
-    )?;
+    let outcome = execute_exact(ExecuteExactArgs {
+            root: workspace.path(),
+            argv: &argv,
+            environment: &environment,
+            cwd: scenario.cwd.clone(),
+            stdin: &scenario_stdin(scenario)?,
+            limits: scenario.limits,
+        })?;
     let network = finish_replay_proxy(proxy)?;
     observation_from_outcome(workspace.path(), &before, outcome, network)
 }
@@ -5413,14 +5522,31 @@ fn scenario_stdin(scenario: &crate::config::Scenario) -> Result<Vec<u8>, String>
         .map(|value| value.unwrap_or_default())
 }
 
-fn execute_exact(
-    root: &Path,
-    argv: &[String],
-    environment: &[(String, String)],
+/// The inputs of [`execute_exact`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`execute_exact`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct ExecuteExactArgs<'a> {
+    root: &'a Path,
+    argv: &'a [String],
+    environment: &'a [(String, String)],
     cwd: Option<String>,
-    stdin: &[u8],
+    stdin: &'a [u8],
     limits: crate::config::ResourceLimits,
-) -> Result<crate::agent_process::Outcome, String> {
+}
+
+fn execute_exact(parts: ExecuteExactArgs<'_>) -> Result<crate::agent_process::Outcome, String> {
+    // Destructured without `..`: see `ExecuteExactArgs`.
+    let ExecuteExactArgs {
+        root,
+        argv,
+        environment,
+        cwd,
+        stdin,
+        limits,
+    } = parts;
     validate_exact_argv(argv)?;
     let mut argv = argv.to_vec();
     if argv[0].contains('/') && !Path::new(&argv[0]).is_absolute() {
@@ -5632,14 +5758,14 @@ fn verify_validation_commands(
     let validation_environment = verification_validation_environment(workspace.path());
     let mut output = Vec::new();
     for command in &plan.validation_commands {
-        let outcome = execute_exact(
-            workspace.path(),
-            &command.argv,
-            &validation_environment,
-            None,
-            &[],
-            plan.validation_limits,
-        )?;
+        let outcome = execute_exact(ExecuteExactArgs {
+                root: workspace.path(),
+                argv: &command.argv,
+                environment: &validation_environment,
+                cwd: None,
+                stdin: &[],
+                limits: plan.validation_limits,
+            })?;
         output.push(ValidationEvidence {
             name: command.name.clone(),
             argv: command.argv.clone(),
@@ -7510,14 +7636,14 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
         .unwrap();
         std::fs::set_permissions(&generator, std::fs::Permissions::from_mode(0o500)).unwrap();
 
-        let error = execute_external_rpc(
-            directory.path(),
-            &generator,
-            &serde_json::json!({"id": "proposal", "jsonrpc": "2.0", "method": "test"}),
-            &serde_json::json!("proposal"),
-            crate::config::ResourceLimits::DEFAULT,
-            1024,
-        )
+        let error = execute_external_rpc(ExecuteExternalRpcArgs {
+                root: directory.path(),
+                executable: &generator,
+                request: &serde_json::json!({"id": "proposal", "jsonrpc": "2.0", "method": "test"}),
+                id: &serde_json::json!("proposal"),
+                project_limits: crate::config::ResourceLimits::DEFAULT,
+                frame_limit: 1024,
+            })
         .unwrap_err();
         assert!(error.contains("negotiated frame limit"), "{error}");
     }

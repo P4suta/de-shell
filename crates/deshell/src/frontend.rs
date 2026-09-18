@@ -210,13 +210,13 @@ pub(crate) fn lower(
             let body = if matches!(interpreter, Interpreter::Unknown(_)) {
                 residual_node(&normalized, source, interpreter.name(), reason)
             } else {
-                delegated_node(
-                    &normalized,
-                    source,
-                    interpreter.name(),
-                    reason,
-                    analysis.capabilities.clone(),
-                )
+                delegated_node(DelegatedNodeArgs {
+                        path: &normalized,
+                        source: source,
+                        interpreter: interpreter.name(),
+                        reason: reason,
+                        capabilities: analysis.capabilities.clone(),
+                    })
             };
             (
                 body,
@@ -581,13 +581,13 @@ fn conservative_source_analysis(
             }
             if byte == b'$' {
                 let locals = BTreeSet::new();
-                if let Ok((_, end)) = parse_expansion(
-                    text,
-                    index,
-                    &mut analysis.inputs,
-                    &mut analysis.environment,
-                    &locals,
-                ) {
+                if let Ok((_, end)) = parse_expansion(ParseExpansionArgs {
+                        source: text,
+                        start: index,
+                        inputs: &mut analysis.inputs,
+                        environment: &mut analysis.environment,
+                        locals: &locals,
+                    }) {
                     index = end;
                     continue;
                 }
@@ -684,13 +684,29 @@ fn identifier_end(bytes: &[u8], start: usize) -> usize {
     end
 }
 
-fn delegated_node(
-    path: &str,
-    source: &[u8],
-    interpreter: &str,
+/// The inputs of [`delegated_node`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`delegated_node`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct DelegatedNodeArgs<'a> {
+    path: &'a str,
+    source: &'a [u8],
+    interpreter: &'a str,
     reason: String,
     capabilities: Vec<String>,
-) -> Node {
+}
+
+fn delegated_node(parts: DelegatedNodeArgs<'_>) -> Node {
+    // Destructured without `..`: see `DelegatedNodeArgs`.
+    let DelegatedNodeArgs {
+        path,
+        source,
+        interpreter,
+        reason,
+        capabilities,
+    } = parts;
     let span = source_span_for_bytes(path, source);
     Node {
         id: String::new(),
@@ -1189,15 +1205,15 @@ fn lower_posix(path: &str, source: &str, interpreter: &Interpreter) -> Result<Lo
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        let node = lower_posix_control(
-            path,
-            source,
-            range,
-            interpreter,
-            &mut inputs,
-            &mut environment,
-            &mut locals,
-        )?;
+        let node = lower_posix_control(LowerPosixControlArgs {
+                path: path,
+                source: source,
+                range: range,
+                interpreter: interpreter,
+                inputs: &mut inputs,
+                environment: &mut environment,
+                locals: &mut locals,
+            })?;
         nodes.push(node);
     }
     if nodes.is_empty() {
@@ -1296,26 +1312,44 @@ fn trim_range(source: &str, mut start: usize, mut end: usize) -> Range {
     Range { start, end }
 }
 
-fn lower_posix_control(
-    path: &str,
-    source: &str,
+/// The inputs of [`lower_posix_control`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`lower_posix_control`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct LowerPosixControlArgs<'a> {
+    path: &'a str,
+    source: &'a str,
     range: Range,
-    interpreter: &Interpreter,
-    inputs: &mut BTreeSet<String>,
-    environment: &mut BTreeSet<String>,
-    locals: &mut BTreeSet<String>,
-) -> Result<Node, String> {
+    interpreter: &'a Interpreter,
+    inputs: &'a mut BTreeSet<String>,
+    environment: &'a mut BTreeSet<String>,
+    locals: &'a mut BTreeSet<String>,
+}
+
+fn lower_posix_control(parts: LowerPosixControlArgs<'_>) -> Result<Node, String> {
+    // Destructured without `..`: see `LowerPosixControlArgs`.
+    let LowerPosixControlArgs {
+        path,
+        source,
+        range,
+        interpreter,
+        inputs,
+        environment,
+        locals,
+    } = parts;
     let controls = top_level_controls(source, range)?;
     if controls.is_empty() {
-        return lower_posix_simple(
-            path,
-            source,
-            range,
-            interpreter,
-            inputs,
-            environment,
-            locals,
-        );
+        return lower_posix_simple(LowerPosixSimpleArgs {
+                path: path,
+                source: source,
+                range: range,
+                interpreter: interpreter,
+                inputs: inputs,
+                environment: environment,
+                locals: locals,
+            });
     }
     let kind = controls[0].1;
     if controls.iter().any(|(_, current)| *current != kind) {
@@ -1339,15 +1373,15 @@ fn lower_posix_control(
 
     let mut nodes = Vec::new();
     for piece in pieces {
-        nodes.push(lower_posix_simple(
-            path,
-            source,
-            piece,
-            interpreter,
-            inputs,
-            environment,
-            locals,
-        )?);
+        nodes.push(lower_posix_simple(LowerPosixSimpleArgs {
+                path: path,
+                source: source,
+                range: piece,
+                interpreter: interpreter,
+                inputs: inputs,
+                environment: environment,
+                locals: locals,
+            })?);
     }
     let span = span_for_range(path, source, range.start, range.end)?;
     match kind {
@@ -1452,15 +1486,33 @@ fn top_level_controls(source: &str, range: Range) -> Result<Vec<(usize, &'static
     Ok(output)
 }
 
-fn lower_posix_simple(
-    path: &str,
-    source: &str,
+/// The inputs of [`lower_posix_simple`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`lower_posix_simple`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct LowerPosixSimpleArgs<'a> {
+    path: &'a str,
+    source: &'a str,
     range: Range,
-    interpreter: &Interpreter,
-    inputs: &mut BTreeSet<String>,
-    environment: &mut BTreeSet<String>,
-    locals: &mut BTreeSet<String>,
-) -> Result<Node, String> {
+    interpreter: &'a Interpreter,
+    inputs: &'a mut BTreeSet<String>,
+    environment: &'a mut BTreeSet<String>,
+    locals: &'a mut BTreeSet<String>,
+}
+
+fn lower_posix_simple(parts: LowerPosixSimpleArgs<'_>) -> Result<Node, String> {
+    // Destructured without `..`: see `LowerPosixSimpleArgs`.
+    let LowerPosixSimpleArgs {
+        path,
+        source,
+        range,
+        interpreter,
+        inputs,
+        environment,
+        locals,
+    } = parts;
     let raw = source[range.start..range.end].trim();
     for reserved in [
         "if ",
@@ -1495,22 +1547,28 @@ fn lower_posix_simple(
         let operation = if rhs.starts_with("$(") && rhs.ends_with(')') {
             let inner_start = range.start + raw.find("$(").unwrap() + 2;
             let inner_end = range.end - 1;
-            let body = lower_posix_simple(
-                path,
-                source,
-                trim_range(source, inner_start, inner_end),
-                interpreter,
-                inputs,
-                environment,
-                locals,
-            )?;
+            let body = lower_posix_simple(LowerPosixSimpleArgs {
+                    path: path,
+                    source: source,
+                    range: trim_range(source, inner_start, inner_end),
+                    interpreter: interpreter,
+                    inputs: inputs,
+                    environment: environment,
+                    locals: locals,
+                })?;
             Operation::CaptureStdout {
                 name: name.to_owned(),
                 value_type: PrimitiveType::Text,
                 body: Box::new(body),
             }
         } else {
-            let expression = parse_posix_word(rhs, true, inputs, environment, locals)?;
+            let expression = parse_posix_word(ParsePosixWordArgs {
+                    source: rhs,
+                    allow_unquoted_expansion: true,
+                    inputs: inputs,
+                    environment: environment,
+                    locals: locals,
+                })?;
             Operation::SetVariable {
                 name: name.to_owned(),
                 value_type: infer_value_type(&expression),
@@ -1675,13 +1733,13 @@ fn lower_fish(path: &str, source: &str) -> Result<Lowered, String> {
         if raw.is_empty() || raw.starts_with('#') {
             continue;
         }
-        nodes.push(lower_fish_control(
-            path,
-            source,
-            range,
-            &mut inputs,
-            &mut environment,
-        )?);
+        nodes.push(lower_fish_control(LowerFishControlArgs {
+                path: path,
+                source: source,
+                range: range,
+                inputs: &mut inputs,
+                environment: &mut environment,
+            })?);
     }
     if nodes.is_empty() {
         return Err("fish script contains no static external invocation".into());
@@ -1704,16 +1762,38 @@ fn lower_fish(path: &str, source: &str) -> Result<Lowered, String> {
     })
 }
 
-fn lower_fish_control(
-    path: &str,
-    source: &str,
+/// The inputs of [`lower_fish_control`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`lower_fish_control`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct LowerFishControlArgs<'a> {
+    path: &'a str,
+    source: &'a str,
     range: Range,
-    inputs: &mut BTreeSet<String>,
-    environment: &mut BTreeSet<String>,
-) -> Result<Node, String> {
+    inputs: &'a mut BTreeSet<String>,
+    environment: &'a mut BTreeSet<String>,
+}
+
+fn lower_fish_control(parts: LowerFishControlArgs<'_>) -> Result<Node, String> {
+    // Destructured without `..`: see `LowerFishControlArgs`.
+    let LowerFishControlArgs {
+        path,
+        source,
+        range,
+        inputs,
+        environment,
+    } = parts;
     let controls = top_level_controls(source, range)?;
     if controls.is_empty() {
-        return lower_fish_simple(path, source, range, inputs, environment);
+        return lower_fish_simple(LowerFishSimpleArgs {
+                path: path,
+                source: source,
+                range: range,
+                inputs: inputs,
+                environment: environment,
+            });
     }
     if controls.iter().any(|(_, operator)| *operator != "&&") {
         return Err("fish control syntax is outside the static && subset".into());
@@ -1736,7 +1816,13 @@ fn lower_fish_control(
     let span = span_for_range(path, source, range.start, range.end)?;
     let mut nodes = pieces
         .into_iter()
-        .map(|piece| lower_fish_simple(path, source, piece, inputs, environment))
+        .map(|piece| lower_fish_simple(LowerFishSimpleArgs {
+                path: path,
+                source: source,
+                range: piece,
+                inputs: inputs,
+                environment: environment,
+            }))
         .collect::<Result<Vec<_>, _>>()?
         .into_iter();
     let mut result = nodes.next().expect("fish && pieces are non-empty");
@@ -1754,13 +1840,29 @@ fn lower_fish_control(
     Ok(result)
 }
 
-fn lower_fish_simple(
-    path: &str,
-    source: &str,
+/// The inputs of [`lower_fish_simple`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`lower_fish_simple`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct LowerFishSimpleArgs<'a> {
+    path: &'a str,
+    source: &'a str,
     range: Range,
-    inputs: &mut BTreeSet<String>,
-    environment: &mut BTreeSet<String>,
-) -> Result<Node, String> {
+    inputs: &'a mut BTreeSet<String>,
+    environment: &'a mut BTreeSet<String>,
+}
+
+fn lower_fish_simple(parts: LowerFishSimpleArgs<'_>) -> Result<Node, String> {
+    // Destructured without `..`: see `LowerFishSimpleArgs`.
+    let LowerFishSimpleArgs {
+        path,
+        source,
+        range,
+        inputs,
+        environment,
+    } = parts;
     let words = tokenize_fish(&source[range.start..range.end], inputs, environment)?;
     if words.len() < 2 || literal_expression(&words[0]).as_deref() != Some("command") {
         return Err("fish command is not an explicit external invocation".into());
@@ -1944,13 +2046,13 @@ fn lower_cmd(path: &str, source: &str) -> Result<Lowered, String> {
         if !echo_off && !raw.starts_with('@') {
             return Err("cmd command echo must be suppressed".into());
         }
-        nodes.push(lower_cmd_control(
-            path,
-            source,
-            range,
-            &mut inputs,
-            &mut environment,
-        )?);
+        nodes.push(lower_cmd_control(LowerCmdControlArgs {
+                path: path,
+                source: source,
+                range: range,
+                inputs: &mut inputs,
+                environment: &mut environment,
+            })?);
     }
     if nodes.is_empty() {
         return Err("cmd script contains no static external invocation".into());
@@ -1978,16 +2080,38 @@ fn lower_cmd(path: &str, source: &str) -> Result<Lowered, String> {
     })
 }
 
-fn lower_cmd_control(
-    path: &str,
-    source: &str,
+/// The inputs of [`lower_cmd_control`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`lower_cmd_control`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct LowerCmdControlArgs<'a> {
+    path: &'a str,
+    source: &'a str,
     range: Range,
-    inputs: &mut BTreeSet<String>,
-    environment: &mut BTreeSet<String>,
-) -> Result<Node, String> {
+    inputs: &'a mut BTreeSet<String>,
+    environment: &'a mut BTreeSet<String>,
+}
+
+fn lower_cmd_control(parts: LowerCmdControlArgs<'_>) -> Result<Node, String> {
+    // Destructured without `..`: see `LowerCmdControlArgs`.
+    let LowerCmdControlArgs {
+        path,
+        source,
+        range,
+        inputs,
+        environment,
+    } = parts;
     let controls = cmd_and_controls(source, range)?;
     if controls.is_empty() {
-        return lower_cmd_simple(path, source, range, inputs, environment);
+        return lower_cmd_simple(LowerCmdSimpleArgs {
+                path: path,
+                source: source,
+                range: range,
+                inputs: inputs,
+                environment: environment,
+            });
     }
     let mut pieces = Vec::new();
     let mut cursor = range.start;
@@ -2007,7 +2131,13 @@ fn lower_cmd_control(
     let span = span_for_range(path, source, range.start, range.end)?;
     let mut nodes = pieces
         .into_iter()
-        .map(|piece| lower_cmd_simple(path, source, piece, inputs, environment))
+        .map(|piece| lower_cmd_simple(LowerCmdSimpleArgs {
+                path: path,
+                source: source,
+                range: piece,
+                inputs: inputs,
+                environment: environment,
+            }))
         .collect::<Result<Vec<_>, _>>()?
         .into_iter();
     let mut result = nodes.next().expect("cmd && pieces are non-empty");
@@ -2056,13 +2186,29 @@ fn cmd_and_controls(source: &str, range: Range) -> Result<Vec<usize>, String> {
     Ok(output)
 }
 
-fn lower_cmd_simple(
-    path: &str,
-    source: &str,
+/// The inputs of [`lower_cmd_simple`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`lower_cmd_simple`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct LowerCmdSimpleArgs<'a> {
+    path: &'a str,
+    source: &'a str,
     range: Range,
-    inputs: &mut BTreeSet<String>,
-    environment: &mut BTreeSet<String>,
-) -> Result<Node, String> {
+    inputs: &'a mut BTreeSet<String>,
+    environment: &'a mut BTreeSet<String>,
+}
+
+fn lower_cmd_simple(parts: LowerCmdSimpleArgs<'_>) -> Result<Node, String> {
+    // Destructured without `..`: see `LowerCmdSimpleArgs`.
+    let LowerCmdSimpleArgs {
+        path,
+        source,
+        range,
+        inputs,
+        environment,
+    } = parts;
     let raw = source[range.start..range.end].trim();
     let command = raw.strip_prefix('@').unwrap_or(raw).trim_start();
     let argv = tokenize_cmd(command, inputs, environment)?;
@@ -2199,13 +2345,13 @@ fn lower_powershell(path: &str, source: &str) -> Result<Lowered, String> {
             terminal_status_span = Some(span_for_range(path, source, range.start, range.end)?);
             continue;
         }
-        nodes.push(lower_powershell_control(
-            path,
-            source,
-            range,
-            &mut inputs,
-            &mut environment,
-        )?);
+        nodes.push(lower_powershell_control(LowerPowershellControlArgs {
+                path: path,
+                source: source,
+                range: range,
+                inputs: &mut inputs,
+                environment: &mut environment,
+            })?);
     }
     if nodes.is_empty() {
         return Err("PowerShell script contains no static external invocation".into());
@@ -2229,16 +2375,38 @@ fn lower_powershell(path: &str, source: &str) -> Result<Lowered, String> {
     })
 }
 
-fn lower_powershell_control(
-    path: &str,
-    source: &str,
+/// The inputs of [`lower_powershell_control`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`lower_powershell_control`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct LowerPowershellControlArgs<'a> {
+    path: &'a str,
+    source: &'a str,
     range: Range,
-    inputs: &mut BTreeSet<String>,
-    environment: &mut BTreeSet<String>,
-) -> Result<Node, String> {
+    inputs: &'a mut BTreeSet<String>,
+    environment: &'a mut BTreeSet<String>,
+}
+
+fn lower_powershell_control(parts: LowerPowershellControlArgs<'_>) -> Result<Node, String> {
+    // Destructured without `..`: see `LowerPowershellControlArgs`.
+    let LowerPowershellControlArgs {
+        path,
+        source,
+        range,
+        inputs,
+        environment,
+    } = parts;
     let controls = powershell_and_controls(source, range)?;
     if controls.is_empty() {
-        return lower_powershell_simple(path, source, range, inputs, environment);
+        return lower_powershell_simple(LowerPowershellSimpleArgs {
+                path: path,
+                source: source,
+                range: range,
+                inputs: inputs,
+                environment: environment,
+            });
     }
     let mut pieces = Vec::new();
     let mut cursor = range.start;
@@ -2258,7 +2426,13 @@ fn lower_powershell_control(
     let span = span_for_range(path, source, range.start, range.end)?;
     let mut nodes = pieces
         .into_iter()
-        .map(|piece| lower_powershell_simple(path, source, piece, inputs, environment))
+        .map(|piece| lower_powershell_simple(LowerPowershellSimpleArgs {
+                path: path,
+                source: source,
+                range: piece,
+                inputs: inputs,
+                environment: environment,
+            }))
         .collect::<Result<Vec<_>, _>>()?
         .into_iter();
     let mut result = nodes.next().expect("PowerShell && pieces are non-empty");
@@ -2316,13 +2490,29 @@ fn powershell_and_controls(source: &str, range: Range) -> Result<Vec<usize>, Str
     Ok(output)
 }
 
-fn lower_powershell_simple(
-    path: &str,
-    source: &str,
+/// The inputs of [`lower_powershell_simple`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`lower_powershell_simple`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct LowerPowershellSimpleArgs<'a> {
+    path: &'a str,
+    source: &'a str,
     range: Range,
-    inputs: &mut BTreeSet<String>,
-    environment: &mut BTreeSet<String>,
-) -> Result<Node, String> {
+    inputs: &'a mut BTreeSet<String>,
+    environment: &'a mut BTreeSet<String>,
+}
+
+fn lower_powershell_simple(parts: LowerPowershellSimpleArgs<'_>) -> Result<Node, String> {
+    // Destructured without `..`: see `LowerPowershellSimpleArgs`.
+    let LowerPowershellSimpleArgs {
+        path,
+        source,
+        range,
+        inputs,
+        environment,
+    } = parts;
     let words = tokenize_powershell(&source[range.start..range.end], inputs, environment)?;
     if words.len() < 2 || literal_expression(&words[0]).as_deref() != Some("&") {
         return Err("PowerShell command is not an explicit call-operator invocation".into());
@@ -2462,10 +2652,34 @@ fn lower_nushell(path: &str, source: &str, interpreter: &Interpreter) -> Result<
     }
 
     let mut environment = BTreeSet::new();
-    let first = lower_nushell_external(path, source, lines[1].0, parameter, &mut environment)?;
-    let predicate = lower_nushell_external(path, source, lines[2].0, parameter, &mut environment)?;
-    let if_true = lower_nushell_external(path, source, lines[4].0, parameter, &mut environment)?;
-    let if_false = lower_nushell_external(path, source, lines[6].0, parameter, &mut environment)?;
+    let first = lower_nushell_external(LowerNushellExternalArgs {
+            path: path,
+            source: source,
+            range: lines[1].0,
+            parameter: parameter,
+            environment: &mut environment,
+        })?;
+    let predicate = lower_nushell_external(LowerNushellExternalArgs {
+            path: path,
+            source: source,
+            range: lines[2].0,
+            parameter: parameter,
+            environment: &mut environment,
+        })?;
+    let if_true = lower_nushell_external(LowerNushellExternalArgs {
+            path: path,
+            source: source,
+            range: lines[4].0,
+            parameter: parameter,
+            environment: &mut environment,
+        })?;
+    let if_false = lower_nushell_external(LowerNushellExternalArgs {
+            path: path,
+            source: source,
+            range: lines[6].0,
+            parameter: parameter,
+            environment: &mut environment,
+        })?;
     let condition = native_node(
         Operation::Condition {
             predicate: Box::new(predicate),
@@ -2516,13 +2730,29 @@ fn nontrivia_line_ranges(source: &str) -> Vec<(Range, &str)> {
     output
 }
 
-fn lower_nushell_external(
-    path: &str,
-    source: &str,
+/// The inputs of [`lower_nushell_external`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`lower_nushell_external`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct LowerNushellExternalArgs<'a> {
+    path: &'a str,
+    source: &'a str,
     range: Range,
-    parameter: &str,
-    environment: &mut BTreeSet<String>,
-) -> Result<Node, String> {
+    parameter: &'a str,
+    environment: &'a mut BTreeSet<String>,
+}
+
+fn lower_nushell_external(parts: LowerNushellExternalArgs<'_>) -> Result<Node, String> {
+    // Destructured without `..`: see `LowerNushellExternalArgs`.
+    let LowerNushellExternalArgs {
+        path,
+        source,
+        range,
+        parameter,
+        environment,
+    } = parts;
     let mut argv =
         tokenize_nushell_external(&source[range.start..range.end], parameter, environment)?;
     let executable = argv
@@ -2668,7 +2898,13 @@ fn tokenize_posix(
                 }
                 if byte == b'$' {
                     flush_literal(&mut parts, &mut literal);
-                    let (part, next) = parse_expansion(source, index, inputs, environment, locals)?;
+                    let (part, next) = parse_expansion(ParseExpansionArgs {
+                            source: source,
+                            start: index,
+                            inputs: inputs,
+                            environment: environment,
+                            locals: locals,
+                        })?;
                     parts.push(part);
                     index = next;
                     token_started = true;
@@ -2777,15 +3013,37 @@ fn tokenize_posix(
     Ok(words)
 }
 
-fn parse_posix_word(
-    source: &str,
+/// The inputs of [`parse_posix_word`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`parse_posix_word`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct ParsePosixWordArgs<'a> {
+    source: &'a str,
     allow_unquoted_expansion: bool,
-    inputs: &mut BTreeSet<String>,
-    environment: &mut BTreeSet<String>,
-    locals: &BTreeSet<String>,
-) -> Result<TextExpression, String> {
+    inputs: &'a mut BTreeSet<String>,
+    environment: &'a mut BTreeSet<String>,
+    locals: &'a BTreeSet<String>,
+}
+
+fn parse_posix_word(parts: ParsePosixWordArgs<'_>) -> Result<TextExpression, String> {
+    // Destructured without `..`: see `ParsePosixWordArgs`.
+    let ParsePosixWordArgs {
+        source,
+        allow_unquoted_expansion,
+        inputs,
+        environment,
+        locals,
+    } = parts;
     if allow_unquoted_expansion && source.starts_with('$') && !source.starts_with("$(") {
-        let (part, end) = parse_expansion(source, 0, inputs, environment, locals)?;
+        let (part, end) = parse_expansion(ParseExpansionArgs {
+                source: source,
+                start: 0,
+                inputs: inputs,
+                environment: environment,
+                locals: locals,
+            })?;
         if end == source.len() {
             return Ok(TextExpression { parts: vec![part] });
         }
@@ -2797,13 +3055,29 @@ fn parse_posix_word(
     Ok(words.into_iter().next().unwrap())
 }
 
-fn parse_expansion(
-    source: &str,
+/// The inputs of [`parse_expansion`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`parse_expansion`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct ParseExpansionArgs<'a> {
+    source: &'a str,
     start: usize,
-    inputs: &mut BTreeSet<String>,
-    environment: &mut BTreeSet<String>,
-    locals: &BTreeSet<String>,
-) -> Result<(TextPart, usize), String> {
+    inputs: &'a mut BTreeSet<String>,
+    environment: &'a mut BTreeSet<String>,
+    locals: &'a BTreeSet<String>,
+}
+
+fn parse_expansion(parts: ParseExpansionArgs<'_>) -> Result<(TextPart, usize), String> {
+    // Destructured without `..`: see `ParseExpansionArgs`.
+    let ParseExpansionArgs {
+        source,
+        start,
+        inputs,
+        environment,
+        locals,
+    } = parts;
     let bytes = source.as_bytes();
     if bytes.get(start + 1) == Some(&b'(') {
         return Err("command substitution requires pinned interpreter delegation".into());
@@ -3708,7 +3982,13 @@ mod tests {
             nushell: "pin-nushell".into(),
         };
         let call = |interpreter: &str| {
-            delegated_node("script", b"source", interpreter, "delegated".into(), vec![])
+            delegated_node(DelegatedNodeArgs {
+                    path: "script",
+                    source: b"source",
+                    interpreter: interpreter,
+                    reason: "delegated".into(),
+                    capabilities: vec![],
+                })
         };
         let native = |operation| Node {
             id: String::new(),
@@ -3845,13 +4125,31 @@ mod tests {
         );
         assert!(tokenize_posix("\"trailing\\", &mut inputs, &mut environment, &locals).is_err());
         assert!(
-            parse_posix_word("one two", false, &mut inputs, &mut environment, &locals).is_err()
+            parse_posix_word(ParsePosixWordArgs {
+                    source: "one two",
+                    allow_unquoted_expansion: false,
+                    inputs: &mut inputs,
+                    environment: &mut environment,
+                    locals: &locals,
+                }).is_err()
         );
         let argument =
-            parse_posix_word("$1", true, &mut inputs, &mut environment, &locals).unwrap();
+            parse_posix_word(ParsePosixWordArgs {
+                    source: "$1",
+                    allow_unquoted_expansion: true,
+                    inputs: &mut inputs,
+                    environment: &mut environment,
+                    locals: &locals,
+                }).unwrap();
         assert!(matches!(argument.parts[0], TextPart::Argument { .. }));
         for expansion in ["$(date)", "${MISSING", "${}", "$"] {
-            assert!(parse_expansion(expansion, 0, &mut inputs, &mut environment, &locals).is_err());
+            assert!(parse_expansion(ParseExpansionArgs {
+                    source: expansion,
+                    start: 0,
+                    inputs: &mut inputs,
+                    environment: &mut environment,
+                    locals: &locals,
+                }).is_err());
         }
     }
 

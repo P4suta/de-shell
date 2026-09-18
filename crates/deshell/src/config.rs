@@ -412,13 +412,13 @@ fn validate_migration_config(config: &ProjectConfig, errors: &mut Vec<String>) {
             ));
         }
     }
-    validate_generator_selection(
-        "migration",
-        &config.migration.generator,
-        config.migration.target,
-        &config.migration.external_generators,
-        errors,
-    );
+    validate_generator_selection(ValidateGeneratorSelectionArgs {
+            label: "migration",
+            generator: &config.migration.generator,
+            target: config.migration.target,
+            external: &config.migration.external_generators,
+            errors: errors,
+        });
     let mut overrides = std::collections::BTreeSet::new();
     for location in &config.location_overrides {
         validate_contract_path("location override", &location.path, errors);
@@ -441,13 +441,13 @@ fn validate_migration_config(config: &ProjectConfig, errors: &mut Vec<String>) {
                 location.path
             ));
         }
-        validate_generator_selection(
-            "location override",
-            &location.generator,
-            location.target,
-            &config.migration.external_generators,
-            errors,
-        );
+        validate_generator_selection(ValidateGeneratorSelectionArgs {
+                label: "location override",
+                generator: &location.generator,
+                target: location.target,
+                external: &config.migration.external_generators,
+                errors: errors,
+            });
         if !overrides.insert((
             location.path.as_str(),
             location.start_byte,
@@ -557,13 +557,29 @@ fn validate_migration_config(config: &ProjectConfig, errors: &mut Vec<String>) {
     }
 }
 
-fn validate_generator_selection(
-    label: &str,
-    generator: &str,
+/// The inputs of [`validate_generator_selection`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`validate_generator_selection`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct ValidateGeneratorSelectionArgs<'a> {
+    label: &'a str,
+    generator: &'a str,
     target: MigrationTarget,
-    external: &[ExternalGenerator],
-    errors: &mut Vec<String>,
-) {
+    external: &'a [ExternalGenerator],
+    errors: &'a mut Vec<String>,
+}
+
+fn validate_generator_selection(parts: ValidateGeneratorSelectionArgs<'_>) {
+    // Destructured without `..`: see `ValidateGeneratorSelectionArgs`.
+    let ValidateGeneratorSelectionArgs {
+        label,
+        generator,
+        target,
+        external,
+        errors,
+    } = parts;
     if let Some(name) = generator.strip_prefix("external:") {
         let Some(registration) = external.iter().find(|entry| entry.name == name) else {
             errors.push(format!(
@@ -1703,7 +1719,13 @@ mod tests {
             ),
         ] {
             let mut errors = Vec::new();
-            validate_generator_selection("test", generator, target, &[], &mut errors);
+            validate_generator_selection(ValidateGeneratorSelectionArgs {
+                    label: "test",
+                    generator: generator,
+                    target: target,
+                    external: &[],
+                    errors: &mut errors,
+                });
             assert!(errors.join("; ").contains(expected));
         }
     }

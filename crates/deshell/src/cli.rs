@@ -1355,7 +1355,13 @@ fn dispatch(
                 name,
                 digest,
                 format,
-            } => scenario_approve_command(&root, &name, &digest, format, stdout),
+            } => scenario_approve_command(ScenarioApproveCommandArgs {
+                    root: &root,
+                    name: &name,
+                    digest: &digest,
+                    format: format,
+                    stdout: stdout,
+                }),
         },
         Command::Matrix { command } => match command {
             MatrixCommand::List { root, format } => matrix_review_command(&root, format, stdout),
@@ -1364,7 +1370,13 @@ fn dispatch(
                 cell,
                 digest,
                 format,
-            } => matrix_approve_command(&root, &cell, &digest, format, stdout),
+            } => matrix_approve_command(MatrixApproveCommandArgs {
+                    root: &root,
+                    cell: &cell,
+                    digest: &digest,
+                    format: format,
+                    stdout: stdout,
+                }),
         },
         Command::Analyze { root, entry, .. } => {
             for entry in selected_entries(&root, entry)? {
@@ -1620,13 +1632,26 @@ fn dispatch(
             equivalent,
             apply,
             ..
-        } => rewrite_command(&root, entry, equivalent, apply, stdout),
+        } => rewrite_command(RewriteCommandArgs {
+                root: &root,
+                entry: entry,
+                equivalent: equivalent,
+                apply: apply,
+                stdout: stdout,
+            }),
         Command::Modernize {
             root,
             profile,
             apply,
             ..
-        } => modernize_command(&root, &profile, apply, diagnostic_mode, stdout, stderr),
+        } => modernize_command(ModernizeCommandArgs {
+                root: &root,
+                profile: &profile,
+                apply: apply,
+                diagnostic_mode: diagnostic_mode,
+                stdout: stdout,
+                stderr: stderr,
+            }),
         Command::Harden { command } => harden_command(command, stdout),
         Command::Migrate { command } => match command {
             MigrateCommand::Plan { root, .. } => migrate_plan_command(&root, stdout),
@@ -1636,7 +1661,13 @@ fn dispatch(
                 cell,
                 output,
                 ..
-            } => migrate_verify_command(&root, &plan, &cell, &output, stdout),
+            } => migrate_verify_command(MigrateVerifyCommandArgs {
+                    root: &root,
+                    plan: &plan,
+                    cell: &cell,
+                    output: &output,
+                    stdout: stdout,
+                }),
             MigrateCommand::Evidence { command } => match command {
                 MigrateEvidenceCommand::Import {
                     root, plan, files, ..
@@ -2132,13 +2163,29 @@ fn scenario_review_command(
     Ok(0)
 }
 
-fn scenario_approve_command(
-    root: &Path,
-    name: &str,
-    digest: &str,
+/// The inputs of [`scenario_approve_command`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`scenario_approve_command`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct ScenarioApproveCommandArgs<'a> {
+    root: &'a Path,
+    name: &'a str,
+    digest: &'a str,
     format: OutputFormat,
-    stdout: &mut dyn Write,
-) -> Result<i32, Failure> {
+    stdout: &'a mut dyn Write,
+}
+
+fn scenario_approve_command(parts: ScenarioApproveCommandArgs<'_>) -> Result<i32, Failure> {
+    // Destructured without `..`: see `ScenarioApproveCommandArgs`.
+    let ScenarioApproveCommandArgs {
+        root,
+        name,
+        digest,
+        format,
+        stdout,
+    } = parts;
     let approval = crate::approval::approve_scenario(root, name, digest).map_err(|message| {
         if message.starts_with("review digest mismatch") {
             Failure::policy(message)
@@ -2216,13 +2263,29 @@ fn matrix_review_command(
     Ok(0)
 }
 
-fn matrix_approve_command(
-    root: &Path,
-    cell: &str,
-    digest: &str,
+/// The inputs of [`matrix_approve_command`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`matrix_approve_command`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct MatrixApproveCommandArgs<'a> {
+    root: &'a Path,
+    cell: &'a str,
+    digest: &'a str,
     format: OutputFormat,
-    stdout: &mut dyn Write,
-) -> Result<i32, Failure> {
+    stdout: &'a mut dyn Write,
+}
+
+fn matrix_approve_command(parts: MatrixApproveCommandArgs<'_>) -> Result<i32, Failure> {
+    // Destructured without `..`: see `MatrixApproveCommandArgs`.
+    let MatrixApproveCommandArgs {
+        root,
+        cell,
+        digest,
+        format,
+        stdout,
+    } = parts;
     let approval = crate::approval::approve_matrix(root, cell, digest).map_err(|message| {
         if message.starts_with("review digest mismatch") {
             Failure::policy(message)
@@ -3023,26 +3086,26 @@ fn observe_command(
         };
         let original_workspace = crate::workspace::private_snapshot(base).map_err(Failure::io)?;
         let actual_workspace = crate::workspace::private_snapshot(base).map_err(Failure::io)?;
-        let original = lab_scenario_request(
-            original_workspace.path(),
-            crate::lab::Target::Original {
+        let original = lab_scenario_request(LabScenarioRequestArgs {
+                workspace: original_workspace.path(),
+                target: crate::lab::Target::Original {
                 interpreter: interpreter.clone(),
                 script: entry.clone(),
             },
-            &scenario,
-            config,
-            &lock.lab.image,
-        )?;
-        let actual = lab_scenario_request(
-            actual_workspace.path(),
-            crate::lab::Target::Plan {
+                scenario: &scenario,
+                config: config,
+                image: &lock.lab.image,
+            })?;
+        let actual = lab_scenario_request(LabScenarioRequestArgs {
+                workspace: actual_workspace.path(),
+                target: crate::lab::Target::Plan {
                 entrypoint: entry.clone(),
                 node_id: None,
             },
-            &scenario,
-            config,
-            &lock.lab.image,
-        )?;
+                scenario: &scenario,
+                config: config,
+                image: &lock.lab.image,
+            })?;
         let expected = match crate::lab::execute(provider, &original) {
             Ok(result) => result,
             Err(error) => {
@@ -3125,13 +3188,29 @@ fn observe_command(
     Ok(exit)
 }
 
-fn lab_scenario_request(
-    workspace: &Path,
+/// The inputs of [`lab_scenario_request`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`lab_scenario_request`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct LabScenarioRequestArgs<'a> {
+    workspace: &'a Path,
     target: crate::lab::Target,
-    scenario: &crate::config::Scenario,
-    config: &crate::config::ProjectConfig,
-    image: &str,
-) -> Result<crate::lab::Request, Failure> {
+    scenario: &'a crate::config::Scenario,
+    config: &'a crate::config::ProjectConfig,
+    image: &'a str,
+}
+
+fn lab_scenario_request(parts: LabScenarioRequestArgs<'_>) -> Result<crate::lab::Request, Failure> {
+    // Destructured without `..`: see `LabScenarioRequestArgs`.
+    let LabScenarioRequestArgs {
+        workspace,
+        target,
+        scenario,
+        config,
+        image,
+    } = parts;
     let output = workspace.join(".deshell/provider-result.json");
     Ok(crate::lab::Request {
         workspace: path_string(workspace, "private workspace")?,
@@ -3638,13 +3717,29 @@ fn collect_nodes<'a>(node: &'a crate::ir::Node, values: &mut Vec<&'a crate::ir::
     }
 }
 
-fn rewrite_command(
-    root: &Path,
+/// The inputs of [`rewrite_command`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`rewrite_command`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct RewriteCommandArgs<'a> {
+    root: &'a Path,
     entry: Option<String>,
     equivalent: bool,
     apply: bool,
-    stdout: &mut dyn Write,
-) -> Result<i32, Failure> {
+    stdout: &'a mut dyn Write,
+}
+
+fn rewrite_command(parts: RewriteCommandArgs<'_>) -> Result<i32, Failure> {
+    // Destructured without `..`: see `RewriteCommandArgs`.
+    let RewriteCommandArgs {
+        root,
+        entry,
+        equivalent,
+        apply,
+        stdout,
+    } = parts;
     if !equivalent {
         return Err(Failure::usage("rewrite requires --equivalent"));
     }
@@ -3704,14 +3799,31 @@ fn rewrite_command(
     Ok(0)
 }
 
-fn modernize_command(
-    root: &Path,
-    profile: &str,
+/// The inputs of [`modernize_command`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`modernize_command`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct ModernizeCommandArgs<'a> {
+    root: &'a Path,
+    profile: &'a str,
     apply: bool,
     diagnostic_mode: crate::diagnostics::Mode,
-    stdout: &mut dyn Write,
-    stderr: &mut dyn Write,
-) -> Result<i32, Failure> {
+    stdout: &'a mut dyn Write,
+    stderr: &'a mut dyn Write,
+}
+
+fn modernize_command(parts: ModernizeCommandArgs<'_>) -> Result<i32, Failure> {
+    // Destructured without `..`: see `ModernizeCommandArgs`.
+    let ModernizeCommandArgs {
+        root,
+        profile,
+        apply,
+        diagnostic_mode,
+        stdout,
+        stderr,
+    } = parts;
     let profiles = parse_profiles(profile)?;
     let inventory = crate::project::scan(root).map_err(Failure::io)?;
     if !inventory.errors.is_empty() || !inventory.skipped.is_empty() {
@@ -3952,13 +4064,29 @@ fn migrate_plan_command(root: &Path, stdout: &mut dyn Write) -> Result<i32, Fail
     }
 }
 
-fn migrate_verify_command(
-    root: &Path,
-    plan: &str,
-    cell: &str,
-    output: &Path,
-    stdout: &mut dyn Write,
-) -> Result<i32, Failure> {
+/// The inputs of [`migrate_verify_command`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`migrate_verify_command`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct MigrateVerifyCommandArgs<'a> {
+    root: &'a Path,
+    plan: &'a str,
+    cell: &'a str,
+    output: &'a Path,
+    stdout: &'a mut dyn Write,
+}
+
+fn migrate_verify_command(parts: MigrateVerifyCommandArgs<'_>) -> Result<i32, Failure> {
+    // Destructured without `..`: see `MigrateVerifyCommandArgs`.
+    let MigrateVerifyCommandArgs {
+        root,
+        plan,
+        cell,
+        output,
+        stdout,
+    } = parts;
     let evidence = crate::migration::verify(root, plan, cell).map_err(Failure::policy)?;
     let status = evidence.status;
     atomic_write(output, evidence.encode_pretty().map_err(Failure::invalid)?)?;
