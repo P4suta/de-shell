@@ -88,6 +88,18 @@ All notable changes are documented here. No compatibility contract predates
 - Stopped a value the scanner cannot locate from claiming the whole file as its
   span; it gets the line it was found on.
 
+- Stopped a parser process from deciding which interpreter answers. It ran in
+  its own scratch directory, and a version-manager shim on `PATH` resolves its
+  version from the configuration nearest the working directory, so de-shell
+  could not use any interpreter installed through `mise`, `asdf` or `volta`: it
+  reported `runtime unavailable` and delegated a block whose runtime was
+  present. A parser now runs where de-shell runs, which is the rule already
+  applied to `PATH`.
+- Separated a parser that ran out of its time or memory budget from one that
+  answered. Both used to be `runtime unavailable`, so a block was delegated or
+  lowered natively depending on how busy the machine was; a budget failure is
+  now an error, because nobody measured.
+
 ### Removed
 
 - Pre-v1 Effect IR and lock migration promises.
