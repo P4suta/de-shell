@@ -1838,6 +1838,31 @@ fn printf_format(format: &str) -> Option<Vec<FormatPiece>> {
     Some(pieces)
 }
 
+/// What a shell ends with when `exit` is given something that is not a number.
+///
+/// Measured, per interpreter: bash and `/bin/sh` end with 255, zsh with 0. A
+/// plan names the interpreter its source runs under, so there is no choosing
+/// between them — the answer is that one's, and a caller reading `$?` sees what
+/// it would have seen. `contracts/golden/exit-builtin-semantics-v1.json`
+/// records it.
+///
+/// An interpreter this has not measured is refused rather than given a borrowed
+/// answer.
+fn non_numeric_exit_status(interpreter: &Interpreter) -> Result<u8, String> {
+    match interpreter {
+        Interpreter::Bash | Interpreter::Sh => Ok(255),
+        Interpreter::Zsh => Ok(0),
+        Interpreter::Fish
+        | Interpreter::Powershell
+        | Interpreter::Cmd
+        | Interpreter::Nushell
+        | Interpreter::Unknown(_) => Err(format!(
+            "what {} does with a non-numeric exit status is not measured; the status requires pinned interpreter delegation",
+            interpreter.name()
+        )),
+    }
+}
+
 /// The bytes `printf` writes for these arguments, if that is provable.
 ///
 /// The format is reused until the arguments run out, and the last pass fills
@@ -3067,7 +3092,9 @@ fn lower_posix_simple(parts: LowerPosixSimpleArgs<'_>) -> Result<Node, String> {
                     ),
                     None => (
                         status.clone(),
-                        crate::ir::NonNumericStatus::Refuse,
+                        crate::ir::NonNumericStatus::Ends {
+                            status: non_numeric_exit_status(interpreter)?,
+                        },
                         SemanticModel::StaticExitChecked,
                     ),
                 };
@@ -6063,13 +6090,32 @@ mod tests {
             let Operation::Exit { non_numeric, .. } = &node.operation else {
                 panic!("expected an exit: {node:#?}")
             };
-            assert_eq!(*non_numeric, crate::ir::NonNumericStatus::Refuse);
-            let Guarantee::Native { semantic_model } = &node.guarantee else {
-                panic!("expected a native guarantee: {node:#?}")
+            // bash's answer, which is what this script pins.
+            assert_eq!(
+                *non_numeric,
+                crate::ir::NonNumericStatus::Ends { status: 255 }
+            );
+        }
+
+        // A zsh script carries zsh's answer. There is no choosing between the
+        // shells: a plan names the interpreter its source runs under.
+        for source in [
+            "#!/bin/zsh\nexit \"$1\"\n".as_bytes(),
+            "#!/bin/sh\nexit \"$1\"\n".as_bytes(),
+        ] {
+            let node = body("build.sh", source);
+            let Operation::Exit { non_numeric, .. } = &node.operation else {
+                panic!("expected an exit: {node:#?}")
             };
-            // A different model, because it is a different claim.
-            let NativeBasis(expected) = SemanticModel::StaticExitChecked.named(&Interpreter::Bash);
-            assert_eq!(semantic_model, &expected);
+            let expected = if source.starts_with(b"#!/bin/zsh") {
+                0
+            } else {
+                255
+            };
+            assert_eq!(
+                *non_numeric,
+                crate::ir::NonNumericStatus::Ends { status: expected }
+            );
         }
 
         // A literal integer is the whole claim, under the model that says so.

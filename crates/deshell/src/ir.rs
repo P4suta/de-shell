@@ -162,19 +162,27 @@ pub(crate) enum UnsetPolicy {
 /// under. `contracts/golden/exit-builtin-semantics-v1.json` records it.
 ///
 /// So the two cases are separate values. `Unreachable` says the lowering read
-/// the status and it is a number, which is the whole claim. `Refuse` says the
-/// status arrives at run time, the plan matches the shells for every value they
-/// agree on, and for the rest it stops and says so — loudly, where the shells
-/// differ quietly.
+/// the status and it is a number, which is the whole claim.
+///
+/// `Ends` says the status arrives at run time and carries what the pinned
+/// interpreter does with a value that is not a number. There is no choosing
+/// between the shells here: a plan names the interpreter its source runs
+/// under, so the answer is that interpreter's — 255 for bash and `/bin/sh`, 0
+/// for zsh, measured. A caller reading `$?` sees what it would have seen.
+///
+/// What cannot be reproduced is the message. bash writes one naming its own
+/// path and a line number; zsh writes none. The generated program writes one
+/// that names the value, which is a difference in bytes a person reads on a
+/// path that ends the script either way.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum NonNumericStatus {
     /// The lowering proved the status is a decimal integer.
     #[default]
     Unreachable,
-    /// The status is read at run time, and a value outside the domain stops the
-    /// plan rather than choosing a shell to imitate.
-    Refuse,
+    /// The status is read at run time, and this is what the pinned interpreter
+    /// ends with when it is not a number.
+    Ends { status: u8 },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

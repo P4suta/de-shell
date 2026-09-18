@@ -389,14 +389,16 @@ Three things follow, and they are open:
   that got closer.
 - [ ] Give `deshell migrate plan` a way to say *why* a count changed between two
   runs against the same file — which blocks moved, and in which direction.
-- [ ] Decide what to do with a status that is native over a domain. `exit 2` is
-  modelled and `exit "${EXIT_CODE:-2}"` is refused, and the only difference is
-  whether the value can be read at lowering time. The shells agree on every
-  numeric status and disagree only outside that domain — bash exits 255 with a
-  message naming its own path, zsh exits 0 in silence — so the claim that wants
-  making is "native where the status is a number, and nothing outside it". The
-  guarantee vocabulary has no way to say that, which is why the whole block is
-  delegated for a case that never arises in the script that wrote it.
+- [x] A status that is native over a domain. Settled by removing the domain
+  rather than describing it: the shells disagree about a non-numeric status
+  only because they are different shells, and a plan names the one its source
+  runs under. `NonNumericStatus::Ends` carries that interpreter's answer — 255
+  for bash and `/bin/sh`, 0 for zsh, measured — so a caller reading the status
+  sees what it would have seen. The first version stopped with 70 and said the
+  shells disagree, which the OComment session pointed out is an observable
+  change of behaviour inside a `migrate`, and claiming less is not the same as
+  doing something different. What is left unreproduced is the message bash
+  writes, which names the interpreter's own path and a line number.
 
 ## After 0.1.0
 

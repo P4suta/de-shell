@@ -4211,10 +4211,12 @@ fn emit_rust_node(
                 rust_exit_status(status)?
             )),
             // The status arrives at run time. Every shell reduces a decimal one
-            // modulo 256 and agrees; outside that they do not agree at all, so
-            // the program stops and says which value it was rather than picking
-            // one shell's answer.
-            crate::ir::NonNumericStatus::Refuse => output.push_str(&format!(
+            // modulo 256 and agrees; outside that the plan carries what the
+            // interpreter it names does, so a caller reading `$?` sees what it
+            // would have seen. What cannot be reproduced is the message — bash
+            // writes one naming its own path and a line number — so the program
+            // names the value instead.
+            crate::ir::NonNumericStatus::Ends { status: ends } => output.push_str(&format!(
                 concat!(
                     "{indent}{{\n",
                     "{indent}    let deshell_status = {status};\n",
@@ -4224,15 +4226,15 @@ fn emit_rust_node(
                     "{indent}        ),\n",
                     "{indent}        Err(_) => {{\n",
                     "{indent}            eprintln!(\n",
-                    "{indent}                \"exit status {{deshell_status:?}} is not a number; \\\n",
-                    "{indent}                 the shells do not agree on what that means\"\n",
+                    "{indent}                \"exit status {{deshell_status:?}} is not a number\"\n",
                     "{indent}            );\n",
-                    "{indent}            std::process::exit(70)\n",
+                    "{indent}            std::process::exit({ends})\n",
                     "{indent}        }}\n",
                     "{indent}    }}\n",
                     "{indent}}}"
                 ),
                 indent = indent,
+                ends = ends,
                 status = rust_expression(status, locals)?
             )),
         },
@@ -5664,7 +5666,7 @@ fn generate_go(plan: &crate::ir::Plan) -> Result<Vec<u8>, String> {
 /// Whether any `exit` under this node reads its status at run time.
 fn go_node_checks_exit_status(node: &crate::ir::Node) -> bool {
     if let crate::ir::Operation::Exit { non_numeric, .. } = &node.operation
-        && *non_numeric == crate::ir::NonNumericStatus::Refuse
+        && matches!(non_numeric, crate::ir::NonNumericStatus::Ends { .. })
     {
         return true;
     }
@@ -5830,7 +5832,7 @@ fn emit_go_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> Re
             crate::ir::NonNumericStatus::Unreachable => {
                 output.push_str(&format!("{indent}os.Exit({})\n", rust_exit_status(status)?))
             }
-            crate::ir::NonNumericStatus::Refuse => output.push_str(&format!(
+            crate::ir::NonNumericStatus::Ends { status: ends } => output.push_str(&format!(
                 concat!(
                     "{indent}{{\n",
                     "{indent}\tdeshellStatus := {status}\n",
@@ -5838,16 +5840,16 @@ fn emit_go_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> Re
                     "strings.TrimSpace(deshellStatus), 10, 64)\n",
                     "{indent}\tif deshellErr != nil {{\n",
                     "{indent}\t\tfmt.Fprintf(os.Stderr,\n",
-                    "{indent}\t\t\t\"exit status %q is not a number; \"+\n",
-                    "{indent}\t\t\t\t\"the shells do not agree on what that means\\n\",\n",
+                    "{indent}\t\t\t\"exit status %q is not a number\\n\",\n",
                     "{indent}\t\t\tdeshellStatus)\n",
-                    "{indent}\t\tos.Exit(70)\n",
+                    "{indent}\t\tos.Exit({ends})\n",
                     "{indent}\t}}\n",
                     "{indent}\tdeshellCode = ((deshellCode % 256) + 256) % 256\n",
                     "{indent}\tos.Exit(int(deshellCode))\n",
                     "{indent}}}\n"
                 ),
                 indent = indent,
+                ends = ends,
                 status = go_expression(status)?
             )),
         },
@@ -10724,7 +10726,11 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
         else {
             panic!("expected an exit: {plan:#?}")
         };
-        assert_eq!(*non_numeric, crate::ir::NonNumericStatus::Refuse);
+        // bash, which this script pins. Measured, not assumed.
+        assert_eq!(
+            *non_numeric,
+            crate::ir::NonNumericStatus::Ends { status: 255 }
+        );
         assert_eq!(
             status.parts,
             [crate::ir::TextPart::Variable {
@@ -10785,20 +10791,27 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
             }
         }
 
-        // Outside it: the shells part, so the programs stop and name the value
-        // rather than picking one of them to imitate.
+        // Outside it: the status is the one the pinned interpreter ends with,
+        // so a caller reading `$?` sees what it would have seen. The message is
+        // the part that cannot be reproduced — bash's names its own path and a
+        // line number — so the program names the value instead.
+        let shell = std::process::Command::new("bash")
+            .arg("end.sh")
+            .env("DESHELL_TEST_CODE", "not-a-number")
+            .current_dir(directory.path())
+            .output()
+            .unwrap();
+        assert_eq!(shell.status.code(), Some(255));
         for program in ["./end-rust", "./end-go"] {
             let ran = std::process::Command::new(program)
                 .env("DESHELL_TEST_CODE", "not-a-number")
                 .current_dir(directory.path())
                 .output()
                 .unwrap();
-            assert_eq!(ran.status.code(), Some(70), "{program}");
+            assert_eq!(ran.status.code(), shell.status.code(), "{program}");
+            assert_eq!(ran.stdout, shell.stdout, "{program}");
             let stderr = String::from_utf8_lossy(&ran.stderr);
-            assert!(
-                stderr.contains("not-a-number") && stderr.contains("do not agree"),
-                "{program}: {stderr}"
-            );
+            assert!(stderr.contains("not-a-number"), "{program}: {stderr}");
         }
     }
 
