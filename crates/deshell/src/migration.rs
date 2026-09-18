@@ -1132,15 +1132,15 @@ fn build_request_and_proposal(
         generated.clone(),
         0o644,
     )?];
-    let call_site_patches = official_call_site_patches(
-        root,
-        config,
-        &request.call_sites,
-        &finding.path,
-        selection,
-        &stem,
-        &target,
-    )
+    let call_site_patches = official_call_site_patches(OfficialCallSitePatchesArgs {
+            root: root,
+            config: config,
+            call_sites: &request.call_sites,
+            retiring_source: &finding.path,
+            selection: selection,
+            stem: &stem,
+            generated_target: &target,
+        })
     .unwrap_or_default();
     for patch in call_site_patches {
         if !targets.insert(patch.path.clone()) {
@@ -1196,15 +1196,33 @@ fn build_request_and_proposal(
     Ok((request, proposal))
 }
 
-fn official_call_site_patches(
-    root: &Path,
-    config: &crate::config::ProjectConfig,
-    call_sites: &[Location],
-    retiring_source: &str,
-    selection: GeneratorSelection<'_>,
-    stem: &str,
-    generated_target: &str,
-) -> Result<Vec<GeneratorPatch>, String> {
+/// The inputs of [`official_call_site_patches`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`official_call_site_patches`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct OfficialCallSitePatchesArgs<'a> {
+    root: &'a Path,
+    config: &'a crate::config::ProjectConfig,
+    call_sites: &'a [Location],
+    retiring_source: &'a str,
+    selection: GeneratorSelection<'a>,
+    stem: &'a str,
+    generated_target: &'a str,
+}
+
+fn official_call_site_patches(parts: OfficialCallSitePatchesArgs<'_>) -> Result<Vec<GeneratorPatch>, String> {
+    // Destructured without `..`: see `OfficialCallSitePatchesArgs`.
+    let OfficialCallSitePatchesArgs {
+        root,
+        config,
+        call_sites,
+        retiring_source,
+        selection,
+        stem,
+        generated_target,
+    } = parts;
     if call_sites.is_empty() {
         return Ok(Vec::new());
     }
