@@ -190,6 +190,21 @@ blocker DESHELL_BLOCKER_UNIMPLEMENTED_SEMANTIC action.yml@3963..6698:
   3.2 and Linux runners ship 5.x; the CI matrix spans both. A tool that claims
   equivalence has to say which interpreter it is equivalent to, and the `set -e`
   rules above were only measured on 3.2.
+- [ ] Give the shell options a region rather than a bool. `set -e` applies from
+  where it is set until it is unset, and `Operation::Sequence` carries one
+  `on_failure` for the whole list, so a file that turns it on and back off has no
+  honest lowering. It currently delegates on that shape, which is correct but
+  coarse: the statements above the change were lowerable.
+
+  The same question applies to subshells and `&&` chains, where the option's
+  reach differs again. A bool records that an option was set; it cannot record
+  where it applied, and anything downstream of a rangeless record has to guess.
+
+  Found by the OComment maintainers, who hit the identical shape from the other
+  side: a `valid: bool` on their scan report could say a file failed to parse but
+  not how far the parse got, and every consumer of it defaulted to the optimistic
+  reading. Theirs deleted source code.
+
 - [ ] Separate "no decision" from `delegated`. A node delegated because `set` is
   unmodelled is a decision: the source was read and isolation was chosen. A node
   delegated because the parser timed out is the absence of one, and it is

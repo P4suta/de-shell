@@ -1339,6 +1339,16 @@ fn lower_posix(path: &str, source: &str, interpreter: &Interpreter) -> Result<Lo
     // Shell options apply from where they are set onwards, so this travels with
     // the statement cursor rather than being read once for the file.
     let mut options = ShellOptions::default();
+    // `Operation::Sequence` carries one `on_failure` for the whole list, so a file
+    // that changes `set -e` partway through has no honest lowering: the statements
+    // before the change stop on failure and the ones after do not. Recording only
+    // the final value would claim one region's behaviour for both.
+    //
+    // A bool records that an option was set; it cannot record where it applied.
+    // Rather than widen the IR here, the file is delegated when the region
+    // changes — a wrong `native` is worse than a `delegated`, because the first
+    // is a claim of equivalence.
+    let mut errexit_regions = 0_usize;
     let mut index = 0;
     while index < statements.len() {
         let range = statements[index];
@@ -1514,6 +1524,9 @@ fn lower_posix(path: &str, source: &str, interpreter: &Interpreter) -> Result<Lo
         if let Some(updated) = set_statement(trimmed, options) {
             // A `set` is a change of lowering state, not an operation: it emits no
             // node, and the statements after it carry its effect instead.
+            if updated.errexit != options.errexit && !nodes.is_empty() {
+                errexit_regions += 1;
+            }
             options = updated;
             continue;
         }
@@ -1531,6 +1544,12 @@ fn lower_posix(path: &str, source: &str, interpreter: &Interpreter) -> Result<Lo
     }
     if nodes.is_empty() {
         return Err("script contains no statically lowerable operation".into());
+    }
+    if errexit_regions > 0 {
+        return Err(
+            "errexit changes partway through the script and requires pinned interpreter delegation"
+                .into(),
+        );
     }
     let body = if nodes.len() == 1 {
         nodes.remove(0)
@@ -4310,6 +4329,40 @@ mod tests {
         );
         assert_eq!(set_statement("set -f", ShellOptions::default()), None);
         assert_eq!(set_statement("/bin/echo set -e", ShellOptions::default()), None);
+    }
+
+    #[test]
+    fn a_sequence_whose_errexit_changes_partway_is_not_claimed_as_native() {
+        // `Operation::Sequence` carries one `on_failure` for the whole list, so a
+        // file that turns `set -e` on and back off has no honest lowering: the
+        // statements before `set +e` stop on failure and the ones after do not.
+        //
+        // Taking the last value seen would have claimed `continue` for the whole
+        // sequence, which is wrong for every statement above the `set +e` — a
+        // failure there ends the script in the shell and would not here. A bool
+        // records that the option was set; it cannot record where it applied.
+        let node = body(
+            "build.sh",
+            b"set -e\n/bin/echo one\nset +e\n/bin/echo two\n",
+        );
+        assert!(
+            matches!(node.operation, Operation::InterpreterCall { .. }),
+            "a sequence with two errexit regions must delegate: {node:#?}"
+        );
+
+        // One region throughout is still native, in either state.
+        let node = body("build.sh", b"set -e\n/bin/echo one\n/bin/echo two\n");
+        let Operation::Sequence { on_failure, .. } = &node.operation else {
+            panic!("expected sequence: {node:#?}")
+        };
+        assert_eq!(*on_failure, crate::ir::SequenceFailure::Stop);
+
+        // Setting the same value again does not split anything.
+        let node = body(
+            "build.sh",
+            b"set -e\n/bin/echo one\nset -e\n/bin/echo two\n",
+        );
+        assert!(matches!(node.operation, Operation::Sequence { .. }));
     }
 
     #[test]
