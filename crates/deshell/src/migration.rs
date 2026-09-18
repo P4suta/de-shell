@@ -3542,6 +3542,7 @@ fn generate_rust(plan: &crate::ir::Plan) -> Result<Vec<u8>, String> {
     // decided over every task rather than over the entry alone: a pipeline
     // inside a function would otherwise call a helper the generator had chosen
     // not to define.
+    let locals = Locals::of(plan);
     let bodies: Vec<&crate::ir::Node> = plan.tasks.iter().map(|task| &task.body).collect();
     let any =
         |predicate: &dyn Fn(&crate::ir::Node) -> bool| bodies.iter().any(|body| predicate(body));
@@ -3554,7 +3555,7 @@ fn generate_rust(plan: &crate::ir::Plan) -> Result<Vec<u8>, String> {
             ));
         }
         let mut other_body = String::new();
-        emit_rust_node(&other.body, &mut other_body, 2)?;
+        emit_rust_node(&other.body, &mut other_body, 2, locals)?;
         // The parameter is named the same as the entry's binding, so `$1` in a
         // function body reads the call's arguments with no special case and the
         // body is emitted by the same code either way.
@@ -3568,7 +3569,7 @@ fn generate_rust(plan: &crate::ir::Plan) -> Result<Vec<u8>, String> {
                 "}}\n\n"
             ),
             name = other.name,
-            locals = rust_variable_binding(&other.body),
+            locals = rust_variable_binding(&other.body, locals),
             body = other_body,
         ));
     }
@@ -3578,7 +3579,7 @@ fn generate_rust(plan: &crate::ir::Plan) -> Result<Vec<u8>, String> {
         .any(|task| rust_node_uses_pipeline(&task.body));
     let arguments = rust_node_uses_arguments(&task.body);
     let mut body = String::new();
-    emit_rust_node(&task.body, &mut body, 2)?;
+    emit_rust_node(&task.body, &mut body, 2, locals)?;
     // `Stdio` is named by a pipeline and by a redirection, which are the two
     // places a command's descriptors are set to something other than the
     // parent's.
@@ -3707,53 +3708,79 @@ fn generate_rust(plan: &crate::ir::Plan) -> Result<Vec<u8>, String> {
     // answers an empty string for both is a program with the option silently
     // off, which is what `unwrap_or_default` did — the `Option` was already
     // there and the answer was being thrown away.
-    let lookup_helper = if uses_plain_expansion && task.nounset {
+    // Built from three answers rather than four spellings: whether an
+    // expansion reads a name at all, whether `set -u` is on, and whether there
+    // is a locals map to look in. Four `concat!` blocks said the same thing
+    // four times, and the third answer had to be added to each of them.
+    let lookup_opt = format!(
         concat!(
             "fn deshell_lookup_opt(\n",
-            "    name: &str,\n",
-            "    locals: &std::collections::BTreeMap<String, String>,\n",
-            ") -> Option<String> {\n",
-            "    locals.get(name).cloned().or_else(|| std::env::var(name).ok())\n",
-            "}\n\n",
-            "/// Read a name the script requires to be set.\n",
-            "///\n",
-            "/// The retired script ran under `set -u`, where reading an unset\n",
-            "/// name ends the script rather than producing an empty string.\n",
-            "fn deshell_lookup(name: &str, locals: &std::collections::BTreeMap<String, String>) -> String {\n",
-            "    match deshell_lookup_opt(name, locals) {\n",
-            "        Some(value) => value,\n",
-            "        None => {\n",
-            "            eprintln!(\"{name}: unbound variable\");\n",
-            "            std::process::exit(1)\n",
-            "        }\n",
-            "    }\n",
-            "}\n\n"
-        )
-    } else if uses_plain_expansion {
-        concat!(
-            "fn deshell_lookup_opt(\n",
-            "    name: &str,\n",
-            "    locals: &std::collections::BTreeMap<String, String>,\n",
-            ") -> Option<String> {\n",
-            "    locals.get(name).cloned().or_else(|| std::env::var(name).ok())\n",
-            "}\n\n",
-            "fn deshell_lookup(name: &str, locals: &std::collections::BTreeMap<String, String>) -> String {\n",
-            "    deshell_lookup_opt(name, locals).unwrap_or_default()\n",
-            "}\n\n"
-        )
-    } else if uses_default_expansion {
-        concat!(
-            "fn deshell_lookup_opt(\n",
-            "    name: &str,\n",
-            "    locals: &std::collections::BTreeMap<String, String>,\n",
-            ") -> Option<String> {\n",
-            "    locals.get(name).cloned().or_else(|| std::env::var(name).ok())\n",
-            "}\n\n"
+            "    name: &str{parameter},\n",
+            ") -> Option<String> {{\n",
+            "{read}",
+            "}}\n\n"
+        ),
+        parameter = locals.parameter(),
+        read = locals.read(),
+    );
+    let lookup = if task.nounset {
+        format!(
+            concat!(
+                "/// Read a name the script requires to be set.\n",
+                "///\n",
+                "/// The retired script ran under `set -u`, where reading an unset\n",
+                "/// name ends the script rather than producing an empty string.\n",
+                "fn deshell_lookup(name: &str{parameter}) -> String {{\n",
+                "    match deshell_lookup_opt(name{inner}) {{\n",
+                "        Some(value) => value,\n",
+                "        None => {{\n",
+                "            eprintln!(\"{{name}}: unbound variable\");\n",
+                "            std::process::exit(1)\n",
+                "        }}\n",
+                "    }}\n",
+                "}}\n\n"
+            ),
+            parameter = locals
+                .parameter()
+                .trim_end_matches('\n')
+                .replace(",\n    ", ", "),
+            // Inside the helper the map is its own parameter, not the caller's
+            // binding: `&deshell_vars` here would name something out of scope.
+            inner = match locals {
+                Locals::Kept => ", locals",
+                Locals::None => "",
+            },
         )
     } else {
-        ""
+        format!(
+            concat!(
+                "fn deshell_lookup(name: &str{parameter}) -> String {{\n",
+                "    deshell_lookup_opt(name{inner}).unwrap_or_default()\n",
+                "}}\n\n"
+            ),
+            parameter = locals
+                .parameter()
+                .trim_end_matches('\n')
+                .replace(",\n    ", ", "),
+            // Inside the helper the map is its own parameter, not the caller's
+            // binding: `&deshell_vars` here would name something out of scope.
+            inner = match locals {
+                Locals::Kept => ", locals",
+                Locals::None => "",
+            },
+        )
     };
-    let variable_binding = rust_variable_binding(&task.body);
+    // Each helper is emitted only if something calls it: an unused function is
+    // an error under the generated code's `-D warnings` gate, so "might be
+    // needed" is not good enough. `deshell_lookup` is written in terms of
+    // `deshell_lookup_opt`, so a plain expansion needs both and a default
+    // expansion needs only the second.
+    let lookup_helper = match (uses_plain_expansion, uses_default_expansion) {
+        (true, _) => format!("{lookup_opt}{lookup}"),
+        (false, true) => lookup_opt,
+        (false, false) => String::new(),
+    };
+    let variable_binding = rust_variable_binding(&task.body, locals);
     let source = format!(
         concat!(
             "//! Generated by de-shell from a retired shell script.\n",
@@ -3816,7 +3843,69 @@ fn rust_function_name(name: &str) -> bool {
 /// A function has its own: the shell's locals are the caller's, but a body that
 /// only reads them still needs somewhere to look, and `mut` on a map nothing
 /// writes is a warning the generated code is checked against.
-fn rust_variable_binding(body: &crate::ir::Node) -> String {
+/// Whether the generated program keeps a map of shell-local names.
+///
+/// Only a plan that assigns to one has locals to keep; without an assignment
+/// the map is always empty, and emitting it makes a reader follow a type and a
+/// parameter to find out they do nothing.
+///
+/// A type rather than a `bool` so a call site cannot pass the wrong one of two
+/// flags, and so the answer reads as what it is where it is used.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Locals {
+    /// Something assigns to a shell-local name, so the program keeps a map.
+    Kept,
+    /// Nothing does, so an expansion reads the environment and no map exists.
+    None,
+}
+
+impl Locals {
+    /// The plan's answer.
+    fn of(plan: &crate::ir::Plan) -> Self {
+        if plan
+            .tasks
+            .iter()
+            .any(|task| rust_node_sets_variables(&task.body))
+        {
+            Self::Kept
+        } else {
+            Self::None
+        }
+    }
+
+    /// The argument a lookup helper takes, which is nothing when there is no
+    /// map to pass.
+    fn argument(self) -> &'static str {
+        match self {
+            Self::Kept => ", &deshell_vars",
+            Self::None => "",
+        }
+    }
+
+    /// The parameter a lookup helper declares.
+    fn parameter(self) -> &'static str {
+        match self {
+            Self::Kept => ",\n    locals: &std::collections::BTreeMap<String, String>",
+            Self::None => "",
+        }
+    }
+
+    /// Where a lookup helper reads from.
+    fn read(self) -> &'static str {
+        match self {
+            Self::Kept => "    locals.get(name).cloned().or_else(|| std::env::var(name).ok())\n",
+            Self::None => "    std::env::var(name).ok()\n",
+        }
+    }
+}
+
+fn rust_variable_binding(body: &crate::ir::Node, locals: Locals) -> String {
+    // No map when nothing assigns to a local: the lookups read the environment
+    // directly, and a binding nothing refers to is an error under the generated
+    // code's own gate.
+    if locals == Locals::None {
+        return String::new();
+    }
     let reads = node_has_expression_part(body, &|part| {
         matches!(
             part,
@@ -3861,7 +3950,12 @@ fn rustfmt_generated(source: &[u8]) -> Result<Vec<u8>, String> {
     }
 }
 
-fn emit_rust_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> Result<(), String> {
+fn emit_rust_node(
+    node: &crate::ir::Node,
+    output: &mut String,
+    depth: usize,
+    locals: Locals,
+) -> Result<(), String> {
     let indent = "    ".repeat(depth);
     match &node.operation {
         crate::ir::Operation::Exec {
@@ -3871,6 +3965,7 @@ fn emit_rust_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> 
         } => {
             output.push_str(&format!("{indent}{{\n"));
             emit_rust_command(EmitRustCommandArgs {
+                locals,
                 argv,
                 environment,
                 working_directory: working_directory.as_ref(),
@@ -3895,10 +3990,10 @@ fn emit_rust_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> 
             output.push_str(&format!("{indent}    let mut deshell_last = 0;\n"));
             output.push_str(&format!("{indent}    loop {{\n"));
             output.push_str(&format!("{indent}        if (\n"));
-            emit_rust_node(condition, output, depth + 3)?;
+            emit_rust_node(condition, output, depth + 3, locals)?;
             output.push_str(&format!("\n{indent}        ) != 0 {{ break; }}\n"));
             output.push_str(&format!("{indent}        deshell_last =\n"));
-            emit_rust_node(body, output, depth + 3)?;
+            emit_rust_node(body, output, depth + 3, locals)?;
             output.push_str(&format!(";\n{indent}    }}\n"));
             output.push_str(&format!("{indent}    deshell_last\n{indent}}}"));
         }
@@ -3906,7 +4001,7 @@ fn emit_rust_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> 
             // `!` inverts to a boolean, so a body exiting 2 yields 0 just as one
             // exiting 1 does.
             output.push_str(&format!("{indent}i32::from(\n"));
-            emit_rust_node(body, output, depth + 1)?;
+            emit_rust_node(body, output, depth + 1, locals)?;
             output.push_str(&format!("\n{indent}    == 0)"));
         }
         // `test` succeeds with 0 and fails with 1, so a node that is one becomes
@@ -3915,7 +4010,7 @@ fn emit_rust_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> 
         crate::ir::Operation::Test { predicate } => {
             output.push_str(&format!(
                 "{indent}i32::from(!({}))",
-                rust_test_condition(predicate)?
+                rust_test_condition(predicate, locals)?
             ));
         }
         // Running nothing succeeds, which is what the shell reports for an arm
@@ -3942,19 +4037,19 @@ fn emit_rust_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> 
             output.push_str(&format!(
                 "{indent}{{\n{indent}    let {}deshell_subject = {};\n",
                 if reads_subject { "" } else { "_" },
-                rust_expression(value)?
+                rust_expression(value, locals)?
             ));
             for case in cases {
                 output.push_str(&format!(
                     "{indent}    if {} {{\n",
                     rust_pattern_test(&case.pattern, "deshell_subject")?
                 ));
-                emit_rust_node(&case.body, output, depth + 2)?;
+                emit_rust_node(&case.body, output, depth + 2, locals)?;
                 output.push_str(&format!("\n{indent}    }} else "));
             }
             output.push_str(&format!("{indent}    {{\n"));
             match default {
-                Some(default) => emit_rust_node(default, output, depth + 2)?,
+                Some(default) => emit_rust_node(default, output, depth + 2, locals)?,
                 None => output.push_str(&format!("{indent}        0")),
             }
             output.push_str(&format!("\n{indent}    }}\n{indent}}}"));
@@ -3977,6 +4072,7 @@ fn emit_rust_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> 
             };
             output.push_str(&format!("{indent}{{\n"));
             emit_rust_command(EmitRustCommandArgs {
+                locals,
                 argv,
                 environment,
                 working_directory: working_directory.as_ref(),
@@ -4030,7 +4126,7 @@ fn emit_rust_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> 
                     indent = indent,
                     append = append,
                     truncate = !append,
-                    path = rust_expression_borrowed(path)?,
+                    path = rust_expression_borrowed(path, locals)?,
                     sink = sink,
                 ));
                 closers += 1;
@@ -4068,7 +4164,7 @@ fn emit_rust_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> 
             }
             let mut values = Vec::new();
             for value in positional {
-                values.push(rust_expression(value)?);
+                values.push(rust_expression(value, locals)?);
             }
             output.push_str(&format!("{indent}{task}(&[{}])", values.join(", ")));
         }
@@ -4105,7 +4201,7 @@ fn emit_rust_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> 
                     "{indent}}}"
                 ),
                 indent = indent,
-                status = rust_expression(status)?
+                status = rust_expression(status, locals)?
             )),
         },
         // One helper rather than eight lines at each site, for the same reason
@@ -4114,7 +4210,7 @@ fn emit_rust_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> 
         crate::ir::Operation::WriteStdout { contents } => {
             output.push_str(&format!(
                 "{indent}deshell_write({})",
-                rust_expression_as_str(contents)?
+                rust_expression_as_str(contents, locals)?
             ));
         }
         // Destructured without `..`: `on_failure` is `set -e`, and discarding
@@ -4132,24 +4228,24 @@ fn emit_rust_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> 
                 match on_failure {
                     crate::ir::SequenceFailure::Continue => {
                         output.push_str(&format!("{indent}    let _ =\n"));
-                        emit_rust_node(child, output, depth + 2)?;
+                        emit_rust_node(child, output, depth + 2, locals)?;
                         output.push_str(";\n");
                     }
                     crate::ir::SequenceFailure::Stop if node_always_exits(child) => {
                         output.push_str(&format!("{indent}    let _ =\n"));
-                        emit_rust_node(child, output, depth + 2)?;
+                        emit_rust_node(child, output, depth + 2, locals)?;
                         output.push_str(";\n");
                     }
                     crate::ir::SequenceFailure::Stop => {
                         output.push_str(&format!("{indent}    let deshell_step =\n"));
-                        emit_rust_node(child, output, depth + 2)?;
+                        emit_rust_node(child, output, depth + 2, locals)?;
                         output.push_str(&format!(
                             ";\n{indent}    if deshell_step != 0 {{\n{indent}        return deshell_step;\n{indent}    }}\n"
                         ));
                     }
                 }
             }
-            emit_rust_node(last, output, depth + 1)?;
+            emit_rust_node(last, output, depth + 1, locals)?;
             output.push_str(&format!("\n{indent}}}"));
         }
         crate::ir::Operation::Pipeline { nodes, status } => {
@@ -4167,6 +4263,7 @@ fn emit_rust_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> 
                     return Err("generator pipeline supports only Exec stages".into());
                 };
                 emit_rust_command(EmitRustCommandArgs {
+                    locals,
                     argv,
                     environment,
                     working_directory: working_directory.as_ref(),
@@ -4197,25 +4294,25 @@ fn emit_rust_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> 
             {
                 output.push_str(&format!(
                     "{indent}if {} {{\n",
-                    rust_test_condition(predicate)?
+                    rust_test_condition(predicate, locals)?
                 ));
-                emit_rust_node(if_true, output, depth + 1)?;
+                emit_rust_node(if_true, output, depth + 1, locals)?;
                 output.push_str(&format!("\n{indent}}} else {{\n"));
                 let if_false = if_false.as_ref().expect("checked above");
-                emit_rust_node(if_false, output, depth + 1)?;
+                emit_rust_node(if_false, output, depth + 1, locals)?;
                 output.push_str(&format!("\n{indent}}}"));
                 return Ok(());
             }
             output.push_str(&format!(
                 "{indent}{{\n{indent}    let deshell_predicate =\n"
             ));
-            emit_rust_node(predicate, output, depth + 2)?;
+            emit_rust_node(predicate, output, depth + 2, locals)?;
             output.push_str(&format!(";\n{indent}    if deshell_predicate == 0 {{\n"));
-            emit_rust_node(if_true, output, depth + 2)?;
+            emit_rust_node(if_true, output, depth + 2, locals)?;
             output.push('\n');
             if let Some(if_false) = if_false {
                 output.push_str(&format!("{indent}    }} else {{\n"));
-                emit_rust_node(if_false, output, depth + 2)?;
+                emit_rust_node(if_false, output, depth + 2, locals)?;
                 output.push('\n');
             } else {
                 output.push_str(&format!(
@@ -4227,7 +4324,7 @@ fn emit_rust_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> 
         crate::ir::Operation::SetVariable { name, value, .. } => {
             output.push_str(&format!(
                 "{indent}{{\n{indent}    deshell_vars.insert({name:?}.to_owned(), {});\n{indent}    0\n{indent}}}",
-                rust_expression(value)?
+                rust_expression(value, locals)?
             ));
         }
         crate::ir::Operation::CaptureStdout { name, body, .. } => {
@@ -4244,6 +4341,7 @@ fn emit_rust_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> 
             };
             output.push_str(&format!("{indent}{{\n"));
             emit_rust_command(EmitRustCommandArgs {
+                locals,
                 argv,
                 environment,
                 working_directory: working_directory.as_ref(),
@@ -4537,38 +4635,49 @@ fn pattern_shape(pattern: &crate::ir::PatternExpression) -> PatternShape<'_> {
 }
 
 /// The bool a `test` predicate is.
-fn rust_test_condition(predicate: &crate::ir::TestPredicate) -> Result<String, String> {
+fn rust_test_condition(
+    predicate: &crate::ir::TestPredicate,
+    locals: Locals,
+) -> Result<String, String> {
     Ok(match predicate {
         crate::ir::TestPredicate::NonEmpty { value } => {
-            format!("!{}.is_empty()", rust_expression(value)?)
+            format!("!{}.is_empty()", rust_expression(value, locals)?)
         }
         crate::ir::TestPredicate::Empty { value } => {
-            format!("{}.is_empty()", rust_expression(value)?)
+            format!("{}.is_empty()", rust_expression(value, locals)?)
         }
         crate::ir::TestPredicate::StringEqual { left, right } => {
-            format!("{} == {}", rust_expression(left)?, rust_expression(right)?)
+            format!(
+                "{} == {}",
+                rust_expression(left, locals)?,
+                rust_expression(right, locals)?
+            )
         }
         crate::ir::TestPredicate::StringNotEqual { left, right } => {
-            format!("{} != {}", rust_expression(left)?, rust_expression(right)?)
+            format!(
+                "{} != {}",
+                rust_expression(left, locals)?,
+                rust_expression(right, locals)?
+            )
         }
         crate::ir::TestPredicate::StartsWith { value, prefix } => {
             format!(
                 "{}.starts_with({})",
-                rust_expression(value)?,
+                rust_expression(value, locals)?,
                 rust_needle(prefix)
             )
         }
         crate::ir::TestPredicate::EndsWith { value, suffix } => {
             format!(
                 "{}.ends_with({})",
-                rust_expression(value)?,
+                rust_expression(value, locals)?,
                 rust_needle(suffix)
             )
         }
         crate::ir::TestPredicate::Contains { value, infix } => {
             format!(
                 "{}.contains({})",
-                rust_expression(value)?,
+                rust_expression(value, locals)?,
                 rust_needle(infix)
             )
         }
@@ -5055,6 +5164,8 @@ fn node_has_expression_part(
 /// compiles. [`emit_rust_command`] takes this apart without `..`, so a field added here fails
 /// to compile until somebody gives it a destination.
 struct EmitRustCommandArgs<'a> {
+    /// Whether the program keeps a map of shell-local names. See [`Locals`].
+    locals: Locals,
     argv: &'a [crate::ir::TextExpression],
     environment: &'a [crate::ir::NamedExpression],
     working_directory: Option<&'a crate::ir::TextExpression>,
@@ -5067,6 +5178,7 @@ struct EmitRustCommandArgs<'a> {
 fn emit_rust_command(parts: EmitRustCommandArgs<'_>) -> Result<(), String> {
     // Destructured without `..`: see `EmitRustCommandArgs`.
     let EmitRustCommandArgs {
+        locals,
         argv,
         environment,
         working_directory,
@@ -5083,26 +5195,26 @@ fn emit_rust_command(parts: EmitRustCommandArgs<'_>) -> Result<(), String> {
         force_mutable || argv.len() > 1 || !environment.is_empty() || working_directory.is_some();
     output.push_str(&format!(
         "{indent}let {mutable}{variable} = Command::new({});\n",
-        rust_expression_borrowed(program)?,
+        rust_expression_borrowed(program, locals)?,
         mutable = if mutable { "mut " } else { "" },
     ));
     for argument in &argv[1..] {
         output.push_str(&format!(
             "{indent}{variable}.arg({});\n",
-            rust_expression_borrowed(argument)?
+            rust_expression_borrowed(argument, locals)?
         ));
     }
     for value in environment {
         output.push_str(&format!(
             "{indent}{variable}.env({:?}, {});\n",
             value.name,
-            rust_expression(&value.value)?
+            rust_expression(&value.value, locals)?
         ));
     }
     if let Some(directory) = working_directory {
         output.push_str(&format!(
             "{indent}{variable}.current_dir({});\n",
-            rust_expression(directory)?
+            rust_expression(directory, locals)?
         ));
     }
     Ok(())
@@ -5118,19 +5230,25 @@ fn emit_rust_command(parts: EmitRustCommandArgs<'_>) -> Result<(), String> {
 /// Decided by how the expression was built rather than by reading the text it
 /// produced: a single literal is already a `&str`, and anything else is a
 /// `String` that needs borrowing.
-fn rust_expression_as_str(expression: &crate::ir::TextExpression) -> Result<String, String> {
+fn rust_expression_as_str(
+    expression: &crate::ir::TextExpression,
+    locals: Locals,
+) -> Result<String, String> {
     if let [crate::ir::TextPart::Literal { value }] = expression.parts.as_slice() {
         return Ok(format!("{value:?}"));
     }
-    Ok(format!("&{}", rust_expression(expression)?))
+    Ok(format!("&{}", rust_expression(expression, locals)?))
 }
 
-fn rust_expression_borrowed(expression: &crate::ir::TextExpression) -> Result<String, String> {
+fn rust_expression_borrowed(
+    expression: &crate::ir::TextExpression,
+    locals: Locals,
+) -> Result<String, String> {
     // An owning expression of one part ends in `.to_owned()`, which a caller
     // taking `impl AsRef<_>` does not need and `clippy::pedantic` names.
     // Trimming the suffix rather than rebuilding the expression keeps the two
     // forms from drifting: the suffix is written in one place, just below.
-    let owned = rust_expression(expression)?;
+    let owned = rust_expression(expression, locals)?;
     if expression.parts.len() == 1
         && let Some(borrowed) = owned.strip_suffix(".to_owned()")
     {
@@ -5139,7 +5257,10 @@ fn rust_expression_borrowed(expression: &crate::ir::TextExpression) -> Result<St
     Ok(owned)
 }
 
-fn rust_expression(expression: &crate::ir::TextExpression) -> Result<String, String> {
+fn rust_expression(
+    expression: &crate::ir::TextExpression,
+    locals: Locals,
+) -> Result<String, String> {
     // An expression of one part is that part. Building it with a `String::new()`
     // and a `push_str` produces the same bytes and gives the reader of the
     // migration four lines to read where one would do — and `$1` alone is the
@@ -5147,7 +5268,7 @@ fn rust_expression(expression: &crate::ir::TextExpression) -> Result<String, Str
     match expression.parts.as_slice() {
         [crate::ir::TextPart::Literal { value }] => return Ok(format!("{value:?}.to_owned()")),
         [crate::ir::TextPart::Variable { name }] => {
-            return Ok(format!("deshell_lookup({name:?}, &deshell_vars)"));
+            return Ok(format!("deshell_lookup({name:?}{})", locals.argument()));
         }
         [crate::ir::TextPart::Argument { name }] => {
             return Ok(format!(
@@ -5171,7 +5292,7 @@ fn rust_expression(expression: &crate::ir::TextExpression) -> Result<String, Str
             }
             crate::ir::TextPart::Variable { name } => {
                 template.push_str("{}");
-                values.push(format!("deshell_lookup({name:?}, &deshell_vars)"));
+                values.push(format!("deshell_lookup({name:?}{})", locals.argument()));
             }
             crate::ir::TextPart::Argument { name } => {
                 template.push_str("{}");
@@ -5186,7 +5307,7 @@ fn rust_expression(expression: &crate::ir::TextExpression) -> Result<String, Str
                 empty_is_unset,
             } => {
                 template.push_str("{}");
-                values.push(rust_default_value(name, fallback, *empty_is_unset));
+                values.push(rust_default_value(name, fallback, *empty_is_unset, locals));
             }
         }
     }
@@ -5204,15 +5325,14 @@ fn rust_expression(expression: &crate::ir::TextExpression) -> Result<String, Str
 /// into `d`, which the shell does not. Locals shadow the environment here too —
 /// `${x:-d}` after `x=v` is `v`, and reading only the environment would give
 /// `d`.
-fn rust_default_value(name: &str, fallback: &str, empty_is_unset: bool) -> String {
+fn rust_default_value(name: &str, fallback: &str, empty_is_unset: bool, locals: Locals) -> String {
+    let argument = locals.argument();
     if empty_is_unset {
         format!(
-            "deshell_lookup_opt({name:?}, &deshell_vars).filter(|deshell_set| !deshell_set.is_empty()).unwrap_or_else(|| {fallback:?}.to_owned())"
+            "deshell_lookup_opt({name:?}{argument}).filter(|deshell_set| !deshell_set.is_empty()).unwrap_or_else(|| {fallback:?}.to_owned())"
         )
     } else {
-        format!(
-            "deshell_lookup_opt({name:?}, &deshell_vars).unwrap_or_else(|| {fallback:?}.to_owned())"
-        )
+        format!("deshell_lookup_opt({name:?}{argument}).unwrap_or_else(|| {fallback:?}.to_owned())")
     }
 }
 
@@ -10252,7 +10372,7 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
             }],
         };
         assert!(
-            rust_expression(&named)
+            rust_expression(&named, Locals::None)
                 .unwrap_err()
                 .contains("named argument")
         );
@@ -10741,6 +10861,69 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
                 std::fs::read_to_string(&target).unwrap(),
                 "appended\nappended\n",
                 "{program} wrote other bytes"
+            );
+        }
+    }
+
+    /// A program with no locals carries no map for them.
+    ///
+    /// A script that assigns to no shell-local name has none, and the generated
+    /// program used to carry an always-empty `BTreeMap`, a type and a parameter
+    /// threading it — three things for a reader of the migration to follow to
+    /// find out they do nothing. The OComment session named it reading a
+    /// generated file.
+    ///
+    /// The answer is the plan's, so it is carried as a value rather than looked
+    /// up: a first attempt used a thread-local, which is the hidden global this
+    /// repository removes from its walks.
+    #[test]
+    fn a_program_with_no_locals_carries_no_map_for_them() {
+        let read_only = crate::frontend::lower(
+            "read.sh",
+            b"#!/bin/bash\n/bin/echo \"${GITHUB_OUTPUT}\"\n",
+            crate::config::UnknownInterpreter::TraceOnly,
+        )
+        .unwrap();
+        let rust = String::from_utf8(generate_rust(&read_only).unwrap()).unwrap();
+        assert!(!rust.contains("BTreeMap"), "{rust}");
+        assert!(rust.contains("deshell_lookup(\"GITHUB_OUTPUT\")"), "{rust}");
+
+        // A script that assigns keeps the map, and the lookups take it.
+        let assigns = crate::frontend::lower(
+            "assign.sh",
+            b"#!/bin/bash\nname=value\n/bin/echo \"${name}\"\n",
+            crate::config::UnknownInterpreter::TraceOnly,
+        )
+        .unwrap();
+        let rust = String::from_utf8(generate_rust(&assigns).unwrap()).unwrap();
+        assert!(rust.contains("deshell_vars"), "{rust}");
+        assert!(
+            rust.contains("deshell_lookup(\"name\", &deshell_vars)"),
+            "{rust}"
+        );
+
+        // Both still compile under the gate a reader would use.
+        let directory = tempfile::tempdir().unwrap();
+        for (name, plan) in [("read", &read_only), ("assign", &assigns)] {
+            let path = directory.path().join(format!("{name}.rs"));
+            std::fs::write(&path, generate_rust(plan).unwrap()).unwrap();
+            let built = std::process::Command::new("rustc")
+                .arg(&path)
+                .args([
+                    "--edition=2024",
+                    "-D",
+                    "warnings",
+                    "-D",
+                    "missing_docs",
+                    "-o",
+                ])
+                .arg(directory.path().join(name))
+                .output()
+                .unwrap();
+            assert!(
+                built.status.success(),
+                "rustc rejected {name}:\n{}",
+                String::from_utf8_lossy(&built.stderr)
             );
         }
     }
