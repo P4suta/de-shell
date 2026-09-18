@@ -7462,7 +7462,8 @@ fn observe_ir(
         depth: 0,
     };
     let outcome = verifier
-        .node(&task.body, &scenario_stdin(scenario)?)?
+        .node(&task.body, &scenario_stdin(scenario)?)
+        .map_err(|error| error.to_string())?
         .outcome;
     let visited = verifier.visited;
     let network = finish_replay_proxy(proxy)?;
@@ -7580,19 +7581,133 @@ fn ir_combine(
     aggregate
 }
 
-/// Refuse an operation by name, saying why it is not run here.
+/// Why the independent IR verifier does not run an operation.
 ///
-/// This replaces a `other => Err("does not support {name}")` arm. A catch-all
-/// says two different things in one sentence — "nobody has implemented this"
-/// and "this cannot honestly be checked here" — and, being a catch-all, it also
-/// grew silently: the verifier ran four of the thirty-five operations and
-/// nothing named the other thirty-one. `contracts/golden/ir-verifier-coverage-v1.json`
-/// now records the ledger and `cargo xtask verifier-coverage` compares it.
-fn ir_refuse(operation: &crate::ir::Operation, reason: &str) -> Result<IrStep, String> {
-    Err(format!(
-        "independent IR verifier does not run {}: {reason}",
-        operation.name()
-    ))
+/// A type rather than only a sentence, because a sentence is not checked. Each
+/// value carries one consequence a test can hold it to, which is the whole
+/// reason to have the type at all — a classification nothing branches on is a
+/// summary whose mistakes are merely harder to notice than a paragraph's.
+///
+/// Three values rather than two, for the same reason the builtin ledger has
+/// three: when a thirty-sixth operation arrives, "nobody has decided yet" needs
+/// somewhere to land that is not a wrong claim. That is how this verifier ran
+/// four of thirty-five for as long as it did.
+/// How many operations the verifier could run and does not.
+///
+/// A ceiling, compared for equality: above it is a new gap, and below it is a
+/// ceiling that has stopped holding anything. Implementing one of these is
+/// welcome — lower the number in the same change.
+#[cfg(test)]
+const IR_VERIFIER_UNIMPLEMENTED_CEILING: usize = 15;
+
+/// How many operations nobody has classified. Zero, and it stays zero unless
+/// somebody raises it deliberately and says why.
+#[cfg(test)]
+const IR_VERIFIER_UNEXAMINED_CEILING: usize = 0;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IrRefusal {
+    /// Running it here would be wrong, not merely absent. The consequence:
+    /// it must never become verified, and the golden ledger fails if it does.
+    Permanent,
+    /// It could be run here and is not. The consequence: the count is a tight
+    /// ratchet, so it can only go down.
+    Unimplemented,
+    /// Nobody has decided which of the two it is. The consequence: the count is
+    /// a tight ratchet at zero, so landing here is a deliberate, visible act
+    /// rather than the quiet default a catch-all used to provide.
+    ///
+    /// Unconstructed on purpose, and that is the assertion, not an oversight:
+    /// `IR_VERIFIER_UNEXAMINED_CEILING` is zero. The value exists so that the
+    /// thirty-sixth operation has somewhere honest to land instead of being
+    /// given a classification somebody guessed.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the ledger's ceiling for this value is zero, so nothing constructs it until an operation arrives that nobody has classified; the vocabulary test constructs it"
+        )
+    )]
+    Unexamined,
+}
+
+impl IrRefusal {
+    /// The name the coverage ledger records.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the coverage ledger is the only consumer, and it is a test; the release build carries the classification without naming it"
+        )
+    )]
+    fn name(self) -> &'static str {
+        match self {
+            Self::Permanent => "permanent",
+            Self::Unimplemented => "unimplemented",
+            Self::Unexamined => "unexamined",
+        }
+    }
+}
+
+/// What went wrong in the independent IR verifier.
+///
+/// A refusal is a different thing from a failure, and the two used to be one
+/// `String`. Separating them is what lets the coverage ledger be derived from
+/// the verifier instead of written beside it: the classification is the value
+/// the ledger branches on, and the sentence is the explanation next to it, so a
+/// wrong sentence cannot make the classification wrong.
+#[derive(Clone, Debug)]
+enum IrError {
+    Refused {
+        operation: &'static str,
+        /// Read by the coverage ledger, which is a test; the `Display` below
+        /// deliberately does not render it, because a reader of a diagnostic
+        /// wants the sentence and a machine wants the value.
+        #[cfg_attr(
+            not(test),
+            expect(
+                dead_code,
+                reason = "the coverage ledger is the only consumer and it is a test; `Display` renders the reason, not the classification"
+            )
+        )]
+        refusal: IrRefusal,
+        reason: &'static str,
+    },
+    Failed(String),
+}
+
+impl std::fmt::Display for IrError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused {
+                operation,
+                refusal: _,
+                reason,
+            } => write!(
+                formatter,
+                "independent IR verifier does not run {operation}: {reason}"
+            ),
+            Self::Failed(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl From<String> for IrError {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
+fn ir_refuse(
+    operation: &crate::ir::Operation,
+    refusal: IrRefusal,
+    reason: &'static str,
+) -> Result<IrStep, IrError> {
+    Err(IrError::Refused {
+        operation: operation.name(),
+        refusal,
+        reason,
+    })
 }
 
 /// How deep a chain of task calls may go before the verifier gives up.
@@ -7702,7 +7817,7 @@ impl IrVerifier<'_> {
         clippy::too_many_lines,
         reason = "one arm per operation: splitting the match would let an operation be handled in a helper that no exhaustiveness check covers"
     )]
-    fn node(&mut self, node: &crate::ir::Node, stdin: &[u8]) -> Result<IrStep, String> {
+    fn node(&mut self, node: &crate::ir::Node, stdin: &[u8]) -> Result<IrStep, IrError> {
         self.visited.insert(node.id.clone());
         // No `_ =>` arm and no `..` in a destructuring: an operation added to the
         // IR, or a field added to one, has to be given a destination here before
@@ -7999,16 +8114,17 @@ impl IrVerifier<'_> {
                     .iter()
                     .find(|candidate| candidate.name == *task)
                     .ok_or_else(|| format!("IR calls task {task}, which the plan does not hold"))?;
+                // A property of this callee, not of `task_call`, so it is a
+                // failure rather than a refusal the coverage ledger records.
                 if callee.invocation.is_some() {
-                    return ir_refuse(
-                        &node.operation,
-                        "the callee declares a PowerShell invocation, whose parameter binding this verifier does not model",
-                    );
+                    return Err(IrError::Failed(format!(
+                        "task {task} declares a PowerShell invocation, whose parameter binding this verifier does not model"
+                    )));
                 }
                 if self.depth >= IR_CALL_DEPTH_LIMIT {
-                    return Err(format!(
+                    return Err(IrError::Failed(format!(
                         "IR task calls nested more than {IR_CALL_DEPTH_LIMIT} deep at {task}, which reads as recursion"
-                    ));
+                    )));
                 }
                 let mut provided = BTreeMap::new();
                 for argument in arguments {
@@ -8025,10 +8141,10 @@ impl IrVerifier<'_> {
                             format!("IR call to {task} passes an unexpected positional argument")
                         })?;
                     if provided.insert(binding.name.clone(), value).is_some() {
-                        return Err(format!(
+                        return Err(IrError::Failed(format!(
                             "IR call to {task} gives input {} twice",
                             binding.name
-                        ));
+                        )));
                     }
                 }
                 // A call has its own argument frame and its own `set -u`; the
@@ -8056,11 +8172,16 @@ impl IrVerifier<'_> {
                 value_type,
                 value,
             } => {
+                // Not `ir_refuse`: the verifier does run `set_variable`, and
+                // this is one value type inside it. A refusal is about a whole
+                // operation, which is the axis the coverage ledger carries; a
+                // per-value one recorded there would make the ledger say
+                // something about `set_variable` that is true of only some of
+                // them.
                 if !value_type.is_plain_text() {
-                    return ir_refuse(
-                        &node.operation,
-                        "a typed assignment is normalised by the runner's value model, and a second definition of that normalisation here could disagree with it",
-                    );
+                    return Err(IrError::Failed(format!(
+                        "assignment to {name} has a type the runner's value model normalises, and a second definition of that normalisation here could disagree with it"
+                    )));
                 }
                 let value = self.text(value)?;
                 self.variables.insert(name.clone(), value);
@@ -8071,11 +8192,11 @@ impl IrVerifier<'_> {
                 value_type,
                 body,
             } => {
+                // See the note on `set_variable` above.
                 if !value_type.is_text() {
-                    return ir_refuse(
-                        &node.operation,
-                        "a typed capture is normalised by the runner's value model, and a second definition of that normalisation here could disagree with it",
-                    );
+                    return Err(IrError::Failed(format!(
+                        "capture into {name} has a type the runner's value model normalises, and a second definition of that normalisation here could disagree with it"
+                    )));
                 }
                 // A substitution runs in its own process, so `$(exit 3)` ends
                 // that process and leaves 3 as its status; the shell reading it
@@ -8097,6 +8218,7 @@ impl IrVerifier<'_> {
             // claimed here" stay different sentences.
             crate::ir::Operation::Parallel { nodes: _ } => ir_refuse(
                 &node.operation,
+                IrRefusal::Unimplemented,
                 "the branches run at once, and running them one after another would compare a different program",
             ),
             crate::ir::Operation::ExpandWords {
@@ -8106,6 +8228,7 @@ impl IrVerifier<'_> {
                 glob: _,
             } => ir_refuse(
                 &node.operation,
+                IrRefusal::Unimplemented,
                 "field splitting and globbing are the shell's, and this verifier has no measured model of either",
             ),
             crate::ir::Operation::Redirect {
@@ -8113,6 +8236,7 @@ impl IrVerifier<'_> {
                 body: _,
             } => ir_refuse(
                 &node.operation,
+                IrRefusal::Unimplemented,
                 "a redirection binds file descriptors around a child, which this verifier does not set up",
             ),
             crate::ir::Operation::Scope {
@@ -8127,10 +8251,12 @@ impl IrVerifier<'_> {
                 secret: _,
             } => ir_refuse(
                 &node.operation,
+                IrRefusal::Unimplemented,
                 "the binding may be a secret, and this verifier has no redaction path to keep one out of the evidence it writes",
             ),
             crate::ir::Operation::SetWorkingDirectory { path: _ } => ir_refuse(
                 &node.operation,
+                IrRefusal::Unimplemented,
                 "the directory outlives the node, and this verifier holds no working directory that a later node would read",
             ),
             crate::ir::Operation::Spawn { handle: _, body: _ }
@@ -8141,6 +8267,7 @@ impl IrVerifier<'_> {
                 process_group: _,
             } => ir_refuse(
                 &node.operation,
+                IrRefusal::Unimplemented,
                 "background jobs need a process table that outlives the node, which this verifier does not keep",
             ),
             crate::ir::Operation::FileRead { path: _ }
@@ -8162,10 +8289,12 @@ impl IrVerifier<'_> {
                 follow_symlinks: _,
             } => ir_refuse(
                 &node.operation,
+                IrRefusal::Unimplemented,
                 "a direct file effect bypasses the sandbox that bounds every process this verifier starts",
             ),
             crate::ir::Operation::NetworkRequest { method: _, uri: _ } => ir_refuse(
                 &node.operation,
+                IrRefusal::Unimplemented,
                 "a request would have to go through the replay proxy, which this verifier starts for child processes only",
             ),
             crate::ir::Operation::ClockRead {
@@ -8177,6 +8306,7 @@ impl IrVerifier<'_> {
                 length: _,
             } => ir_refuse(
                 &node.operation,
+                IrRefusal::Permanent,
                 "the value differs on every run, so an observation of it could not be compared with another",
             ),
             crate::ir::Operation::InterpreterCall {
@@ -8193,6 +8323,7 @@ impl IrVerifier<'_> {
                 path: _,
             } => ir_refuse(
                 &node.operation,
+                IrRefusal::Permanent,
                 "running the pinned interpreter here would re-run the original shell, and an oracle that consults the original is not independent of it",
             ),
         }
@@ -10444,16 +10575,25 @@ mod tests {
                 "the ledger case labelled {name} builds a different operation"
             );
             let outcome = ir_verifier(workspace.path(), &tasks).node(&subject, &[]);
-            let refusal = match &outcome {
-                Err(message) => message
-                    .strip_prefix(&format!("independent IR verifier does not run {name}: "))
-                    .map(str::to_owned),
-                Ok(_) => None,
+            // A refusal is the value; the sentence beside it is the
+            // explanation. A wrong sentence cannot make the classification
+            // wrong, which is the only reason to carry both.
+            let refused = match &outcome {
+                Err(IrError::Refused {
+                    operation,
+                    refusal,
+                    reason,
+                }) => {
+                    assert_eq!(*operation, name, "a refusal named a different operation");
+                    Some((*refusal, *reason))
+                }
+                Err(IrError::Failed(_)) | Ok(_) => None,
             };
             ledger.push(serde_json::json!({
                 "operation": name,
-                "verified": refusal.is_none(),
-                "reason": refusal,
+                "verified": refused.is_none(),
+                "refusal": refused.map(|(refusal, _)| refusal.name()),
+                "reason": refused.map(|(_, reason)| reason),
             }));
         }
         let names: Vec<&str> = ledger
@@ -10466,6 +10606,36 @@ mod tests {
             sorted,
             crate::ir::Operation::ALL_NAMES,
             "the ledger and Operation::ALL_NAMES disagree about which operations exist"
+        );
+
+        // Each value carries one consequence a test holds it to. Without that a
+        // classification is a summary whose mistakes are merely harder to
+        // notice than a paragraph's.
+        let count = |wanted: &str| {
+            ledger
+                .iter()
+                .filter(|entry| entry["refusal"].as_str() == Some(wanted))
+                .count()
+        };
+        // `permanent` means running it would be wrong, not that nobody has got
+        // to it. The consequence is that it never becomes verified — which the
+        // golden below fails on, because a verified entry has no `refusal` at
+        // all.
+        assert!(
+            count("permanent") > 0,
+            "the ledger records no permanent refusal, so the value branches on nothing"
+        );
+        // Tight ratchets: below the ceiling means the ceiling is stale and has
+        // stopped holding anything.
+        assert_eq!(
+            count("unimplemented"),
+            IR_VERIFIER_UNIMPLEMENTED_CEILING,
+            "implementing one of these is welcome; lower IR_VERIFIER_UNIMPLEMENTED_CEILING with it"
+        );
+        assert_eq!(
+            count("unexamined"),
+            IR_VERIFIER_UNEXAMINED_CEILING,
+            "an operation nobody has classified; decide whether it is permanent or unimplemented, or raise the ceiling and say why"
         );
 
         let mut sorted_ledger = ledger;
@@ -10486,6 +10656,25 @@ mod tests {
             recorded.trim_end(),
             produced,
             "the IR verifier's coverage changed; re-record with DESHELL_UPDATE_GOLDEN=1 and say why in the commit"
+        );
+    }
+
+    /// The refusal vocabulary is the three values the ledger can record.
+    ///
+    /// Pinned because the names go into
+    /// `contracts/golden/ir-verifier-coverage-v1.json`, which something outside
+    /// this repository may branch on. This is also what constructs
+    /// `IrRefusal::Unexamined`, whose ceiling is zero.
+    #[test]
+    fn the_refusal_vocabulary_is_permanent_unimplemented_and_unexamined() {
+        assert_eq!(
+            [
+                IrRefusal::Permanent,
+                IrRefusal::Unimplemented,
+                IrRefusal::Unexamined,
+            ]
+            .map(IrRefusal::name),
+            ["permanent", "unimplemented", "unexamined"]
         );
     }
 

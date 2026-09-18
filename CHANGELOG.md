@@ -52,7 +52,11 @@ All notable changes are documented here. No compatibility contract predates
   operations instead of four, and replaced its `other => Err(...)` catch-all
   with an exhaustive `match`. `contracts/golden/ir-verifier-coverage-v1.json`
   records what each of the other nineteen is refused for, so "nobody
-  implemented this" is a value rather than an absence.
+  implemented this" is a value rather than an absence. A refusal is classified
+  `permanent`, `unimplemented`, or `unexamined`, and each value carries one
+  check: a permanent refusal may never become verified, the unimplemented count
+  is a tight ratchet, and the unexamined count is a tight ratchet at zero so
+  that a new operation has somewhere honest to land.
 - Stopped the independent IR verifier from dropping `set -e`: the arm read
   `Sequence { nodes, .. }`, and the `..` discarded `on_failure`, so the
   statement after a failing one ran during verification.
