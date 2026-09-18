@@ -7441,18 +7441,30 @@ fn observe_ir(
         .iter()
         .map(|value| (value.name.clone(), value.value.clone()))
         .collect::<BTreeMap<_, _>>();
-    let mut visited = BTreeSet::new();
-    let outcome = execute_ir_node(
-        workspace.path(),
-        &task.body,
-        &variables,
-        &arguments,
-        &scenario.argv,
-        &scenario_stdin(scenario)?,
-        scenario.cwd.as_deref(),
-        scenario.limits,
-        &mut visited,
-    )?;
+    // The scenario's argv reaches the entrypoint the way a call would pass it,
+    // rather than being dropped. It used to be handed to the walk and discarded
+    // there (`let _ = positional;`), so a script that read `$1` was verified
+    // against an empty string.
+    let arguments = bind_ir_positional(task, arguments, &scenario.argv)?;
+    let mut verifier = IrVerifier {
+        root: workspace.path(),
+        tasks: &plan.tasks,
+        variables,
+        arguments,
+        default_cwd: scenario.cwd.as_deref(),
+        limits: scenario.limits,
+        unset: if task.nounset {
+            crate::ir::UnsetPolicy::Refuse
+        } else {
+            crate::ir::UnsetPolicy::Empty
+        },
+        visited: BTreeSet::new(),
+        depth: 0,
+    };
+    let outcome = verifier
+        .node(&task.body, &scenario_stdin(scenario)?)?
+        .outcome;
+    let visited = verifier.visited;
     let network = finish_replay_proxy(proxy)?;
     Ok((
         observation_from_outcome(workspace.path(), &before, outcome, network)?,
@@ -7460,238 +7472,731 @@ fn observe_ir(
     ))
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the arguments are a contract record; grouping them into a struct would hide which fields the caller must supply"
-)]
-fn execute_ir_node(
-    root: &Path,
-    node: &crate::ir::Node,
-    variables: &BTreeMap<String, String>,
-    arguments: &BTreeMap<String, String>,
+/// The entrypoint task's positional arguments, bound to its declared inputs.
+///
+/// The same rule a `TaskCall` uses, stated once: a shell function reads `$1`
+/// through an input named `1`, and a task that declares no inputs at all takes
+/// the argv without binding anything.
+fn bind_ir_positional(
+    task: &crate::ir::Task,
+    mut arguments: BTreeMap<String, String>,
     positional: &[String],
-    stdin: &[u8],
-    default_cwd: Option<&str>,
+) -> Result<BTreeMap<String, String>, String> {
+    if positional.is_empty() || task.inputs.is_empty() {
+        return Ok(arguments);
+    }
+    for (index, value) in positional.iter().enumerate() {
+        let numeric = (index + 1).to_string();
+        let binding = task
+            .inputs
+            .iter()
+            .find(|binding| binding.name == numeric)
+            .or_else(|| task.inputs.get(index));
+        let Some(binding) = binding else {
+            return Err(format!(
+                "scenario passes positional argument {} that task {} does not declare",
+                index + 1,
+                task.name
+            ));
+        };
+        // A scenario can name `$1` twice — once in `argv`, once in `arguments`.
+        // Saying it twice is not an error; saying two different things is, and
+        // it used to be neither: `arguments` was read by the IR walk and `argv`
+        // by the shell, so a contradiction was observed as the replacement
+        // disagreeing with the original rather than as a scenario that describes
+        // two different runs.
+        match arguments.entry(binding.name.clone()) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(value.clone());
+            }
+            std::collections::btree_map::Entry::Occupied(slot) if slot.get() == value => {}
+            std::collections::btree_map::Entry::Occupied(slot) => {
+                return Err(format!(
+                    "scenario argv[{index}] is {value:?} but input {} is {:?}; the two name the same argument and cannot differ",
+                    binding.name,
+                    slot.get()
+                ));
+            }
+        }
+    }
+    Ok(arguments)
+}
+
+/// Whether the task carries on after a node.
+///
+/// The verifier used to have no term for this, so `Operation::Exit` had nowhere
+/// to report that the task had ended and was refused outright. Reusing
+/// `crate::runner::Flow` would have tied the two implementations together; this
+/// is the same distinction stated separately, which is the point of a second
+/// implementation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IrFlow {
+    Continue,
+    Exited,
+}
+
+/// What a node left behind: the bytes and status, and whether the task ended.
+struct IrStep {
+    outcome: crate::agent_process::Outcome,
+    flow: IrFlow,
+}
+
+impl IrStep {
+    fn next(outcome: crate::agent_process::Outcome) -> Self {
+        Self {
+            outcome,
+            flow: IrFlow::Continue,
+        }
+    }
+}
+
+fn ir_empty_outcome() -> crate::agent_process::Outcome {
+    crate::agent_process::Outcome {
+        exit_code: 0,
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+        timed_out: false,
+        limit_exceeded: None,
+        signal: None,
+    }
+}
+
+/// One outcome followed by another.
+///
+/// The status is the later node's, the bytes are both in order, and a limit hit
+/// by the earlier node is not forgotten — the field used to be overwritten with
+/// the later node's `None`, which turned "the first statement ran out of time"
+/// into "nothing was limited".
+fn ir_combine(
+    mut aggregate: crate::agent_process::Outcome,
+    next: crate::agent_process::Outcome,
+) -> crate::agent_process::Outcome {
+    aggregate.stdout.extend(next.stdout);
+    aggregate.stderr.extend(next.stderr);
+    aggregate.exit_code = next.exit_code;
+    aggregate.timed_out |= next.timed_out;
+    aggregate.signal = next.signal;
+    aggregate.limit_exceeded = next.limit_exceeded.or(aggregate.limit_exceeded);
+    aggregate
+}
+
+/// Refuse an operation by name, saying why it is not run here.
+///
+/// This replaces a `other => Err("does not support {name}")` arm. A catch-all
+/// says two different things in one sentence — "nobody has implemented this"
+/// and "this cannot honestly be checked here" — and, being a catch-all, it also
+/// grew silently: the verifier ran four of the thirty-five operations and
+/// nothing named the other thirty-one. `contracts/golden/ir-verifier-coverage-v1.json`
+/// now records the ledger and `cargo xtask verifier-coverage` compares it.
+fn ir_refuse(operation: &crate::ir::Operation, reason: &str) -> Result<IrStep, String> {
+    Err(format!(
+        "independent IR verifier does not run {}: {reason}",
+        operation.name()
+    ))
+}
+
+/// How deep a chain of task calls may go before the verifier gives up.
+///
+/// A shell function that calls itself is a program the verifier would follow
+/// until the stack ran out, which reports as a crash rather than as a refusal.
+/// The bound is stated rather than tuned: nothing the frontend lowers nests
+/// task calls this far, so reaching it means recursion.
+const IR_CALL_DEPTH_LIMIT: usize = 64;
+
+/// The independent IR verifier.
+///
+/// Independent of [`crate::runner`] on purpose: the runner is what executes a
+/// plan in production, so a verifier that called it would be comparing a program
+/// with itself. What the two do share is the *definition* of the IR — pattern
+/// matching lives in [`crate::ir::PatternExpression::matches`] and is called
+/// from both, so a `case` cannot mean two things.
+struct IrVerifier<'a> {
+    root: &'a Path,
+    tasks: &'a [crate::ir::Task],
+    variables: BTreeMap<String, String>,
+    arguments: BTreeMap<String, String>,
+    default_cwd: Option<&'a str>,
     limits: crate::config::ResourceLimits,
-    visited: &mut BTreeSet<String>,
-) -> Result<crate::agent_process::Outcome, String> {
-    visited.insert(node.id.clone());
-    match &node.operation {
-        crate::ir::Operation::Exec {
+    /// `set -u`. Carried from the task rather than fixed at
+    /// [`crate::ir::UnsetPolicy::Empty`], which is what it was: a script under
+    /// `set -u` that read an unset name failed, and the verifier read an empty
+    /// string and called the two the same.
+    unset: crate::ir::UnsetPolicy,
+    visited: BTreeSet<String>,
+    depth: usize,
+}
+
+impl IrVerifier<'_> {
+    fn text(&self, expression: &crate::ir::TextExpression) -> Result<String, String> {
+        expression.evaluate(&self.variables, &self.arguments, self.unset)
+    }
+
+    fn list(&self, expressions: &[crate::ir::TextExpression]) -> Result<Vec<String>, String> {
+        expressions.iter().map(|value| self.text(value)).collect()
+    }
+
+    /// The process a node names, if it names one.
+    ///
+    /// Takes the node rather than its pieces so that the destructuring below is
+    /// the only place the pieces are named, and so that it can be exhaustive: a
+    /// field added to `Exec` fails to compile here until it is given a
+    /// destination, which an argument list could never do.
+    fn exec_request(
+        &self,
+        node: &crate::ir::Node,
+        stdin: &[u8],
+    ) -> Result<crate::agent_process::Request, String> {
+        let crate::ir::Operation::Exec {
             argv,
             environment,
             working_directory,
-        } => {
-            let argv = argv
-                .iter()
-                .map(|value| value.evaluate(variables, arguments, crate::ir::UnsetPolicy::Empty))
-                .collect::<Result<Vec<_>, _>>()?;
-            let mut process_environment = variables.clone();
-            for value in environment {
-                process_environment.insert(
-                    value.name.clone(),
-                    value
-                        .value
-                        .evaluate(variables, arguments, crate::ir::UnsetPolicy::Empty)?,
-                );
-            }
-            let working_directory = working_directory
-                .as_ref()
-                .map(|value| value.evaluate(variables, arguments, crate::ir::UnsetPolicy::Empty))
-                .transpose()?
-                .or_else(|| default_cwd.map(str::to_owned));
-            let _ = positional;
-            crate::agent_process::execute(
-                root,
-                crate::agent_process::Request {
-                    argv,
-                    environment: process_environment.into_iter().collect(),
-                    working_directory,
-                    stdin: stdin.to_vec(),
-                    limits: limits.into(),
-                },
-            )
+        } = &node.operation
+        else {
+            return Err(format!(
+                "independent IR verifier starts a process for {}, and only exec names one",
+                node.operation.name()
+            ));
+        };
+        let argv = self.list(argv)?;
+        let mut process_environment = self.variables.clone();
+        for value in environment {
+            process_environment.insert(value.name.clone(), self.text(&value.value)?);
         }
-        crate::ir::Operation::Sequence { nodes, .. } => {
-            let mut aggregate = crate::agent_process::Outcome {
-                exit_code: 0,
-                stdout: Vec::new(),
-                stderr: Vec::new(),
-                timed_out: false,
-                limit_exceeded: None,
-                signal: None,
-            };
-            for (index, child) in nodes.iter().enumerate() {
-                let result = execute_ir_node(
-                    root,
-                    child,
-                    variables,
-                    arguments,
-                    positional,
-                    if index == 0 { stdin } else { &[] },
-                    default_cwd,
-                    limits,
-                    visited,
-                )?;
-                aggregate.stdout.extend(result.stdout);
-                aggregate.stderr.extend(result.stderr);
-                aggregate.exit_code = result.exit_code;
-                aggregate.timed_out |= result.timed_out;
-                aggregate.signal = result.signal;
-                aggregate.limit_exceeded = result.limit_exceeded;
+        let working_directory = working_directory
+            .as_ref()
+            .map(|value| self.text(value))
+            .transpose()?
+            .or_else(|| self.default_cwd.map(str::to_owned));
+        Ok(crate::agent_process::Request {
+            argv,
+            environment: process_environment.into_iter().collect(),
+            working_directory,
+            stdin: stdin.to_vec(),
+            limits: self.limits.into(),
+        })
+    }
+
+    /// The pieces of a `case` pattern with each literal already expanded.
+    ///
+    /// Expanded first and matched second, which is the order the shell uses:
+    /// quoting is resolved during word expansion, so whether a `*` is a glob was
+    /// already decided by the time anything is compared.
+    fn pattern_pieces<'p>(
+        &self,
+        pattern: &'p crate::ir::PatternExpression,
+    ) -> Result<Vec<crate::ir::MatchPiece<'p>>, String> {
+        pattern
+            .pieces
+            .iter()
+            .map(|piece| match piece {
+                crate::ir::PatternPiece::Literal { value } => {
+                    Ok(crate::ir::MatchPiece::Literal(self.text(value)?.into()))
+                }
+                crate::ir::PatternPiece::AnyRun => Ok(crate::ir::MatchPiece::AnyRun),
+                crate::ir::PatternPiece::AnyCharacter => Ok(crate::ir::MatchPiece::AnyCharacter),
+            })
+            .collect()
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one arm per operation: splitting the match would let an operation be handled in a helper that no exhaustiveness check covers"
+    )]
+    fn node(&mut self, node: &crate::ir::Node, stdin: &[u8]) -> Result<IrStep, String> {
+        self.visited.insert(node.id.clone());
+        // No `_ =>` arm and no `..` in a destructuring: an operation added to the
+        // IR, or a field added to one, has to be given a destination here before
+        // this compiles. Both mechanisms are load-bearing — `Sequence { nodes, .. }`
+        // is how `set -e` went missing from this verifier.
+        match &node.operation {
+            crate::ir::Operation::Exec {
+                argv: _,
+                environment: _,
+                working_directory: _,
+            } => {
+                // Destructured inside `exec_request`, which is the one place the
+                // fields are read.
+                let request = self.exec_request(node, stdin)?;
+                Ok(IrStep::next(crate::agent_process::execute(
+                    self.root, request,
+                )?))
             }
-            Ok(aggregate)
-        }
-        crate::ir::Operation::Pipeline { nodes, status } => {
-            let mut requests = Vec::new();
-            for (index, child) in nodes.iter().enumerate() {
-                visited.insert(child.id.clone());
-                requests.push(ir_exec_request(IrExecRequestArgs {
-                    _root: root,
-                    node: child,
-                    variables,
-                    arguments,
-                    stdin: if index == 0 { stdin } else { &[] },
-                    default_cwd,
-                    limits,
-                })?);
+            crate::ir::Operation::Sequence { nodes, on_failure } => {
+                let mut aggregate = ir_empty_outcome();
+                let mut input = stdin;
+                for child in nodes {
+                    let step = self.node(child, input)?;
+                    input = &[];
+                    let failed = step.outcome.exit_code != 0;
+                    let flow = step.flow;
+                    aggregate = ir_combine(aggregate, step.outcome);
+                    // `exit` ends the task whatever `on_failure` says, and
+                    // whether or not the statement failed.
+                    if flow == IrFlow::Exited {
+                        return Ok(IrStep {
+                            outcome: aggregate,
+                            flow,
+                        });
+                    }
+                    // `set -e`. A sequence's statements are the only untested
+                    // position; a failure inside `&&`, an `if` condition or a
+                    // `!` belongs to another node and never reaches this loop.
+                    if failed && *on_failure == crate::ir::SequenceFailure::Stop {
+                        break;
+                    }
+                }
+                Ok(IrStep::next(aggregate))
             }
-            let outcomes = crate::agent_process::execute_pipeline(root, requests)?;
-            let selected = match status {
-                crate::ir::PipelineStatus::Last => outcomes.len().saturating_sub(1),
-                crate::ir::PipelineStatus::Pipefail => outcomes
-                    .iter()
-                    .rposition(|outcome| outcome.exit_code != 0)
-                    .unwrap_or_else(|| outcomes.len().saturating_sub(1)),
-            };
-            let mut aggregate = crate::agent_process::Outcome {
-                exit_code: outcomes
-                    .get(selected)
-                    .map_or(0, |outcome| outcome.exit_code),
-                stdout: outcomes
-                    .last()
-                    .map_or_else(Vec::new, |outcome| outcome.stdout.clone()),
-                stderr: Vec::new(),
-                timed_out: outcomes.iter().any(|outcome| outcome.timed_out),
-                limit_exceeded: outcomes
-                    .iter()
-                    .find_map(|outcome| outcome.limit_exceeded.clone()),
-                signal: outcomes.get(selected).and_then(|outcome| outcome.signal),
-            };
-            for outcome in outcomes {
-                aggregate.stderr.extend(outcome.stderr);
+            crate::ir::Operation::Pipeline { nodes, status } => {
+                let mut requests = Vec::new();
+                for (index, child) in nodes.iter().enumerate() {
+                    self.visited.insert(child.id.clone());
+                    requests.push(self.exec_request(child, if index == 0 { stdin } else { &[] })?);
+                }
+                let outcomes = crate::agent_process::execute_pipeline(self.root, requests)?;
+                let selected = match status {
+                    crate::ir::PipelineStatus::Last => outcomes.len().saturating_sub(1),
+                    crate::ir::PipelineStatus::Pipefail => outcomes
+                        .iter()
+                        .rposition(|outcome| outcome.exit_code != 0)
+                        .unwrap_or_else(|| outcomes.len().saturating_sub(1)),
+                };
+                let mut aggregate = crate::agent_process::Outcome {
+                    exit_code: outcomes
+                        .get(selected)
+                        .map_or(0, |outcome| outcome.exit_code),
+                    stdout: outcomes
+                        .last()
+                        .map_or_else(Vec::new, |outcome| outcome.stdout.clone()),
+                    stderr: Vec::new(),
+                    timed_out: outcomes.iter().any(|outcome| outcome.timed_out),
+                    limit_exceeded: outcomes
+                        .iter()
+                        .find_map(|outcome| outcome.limit_exceeded.clone()),
+                    signal: outcomes.get(selected).and_then(|outcome| outcome.signal),
+                };
+                for outcome in outcomes {
+                    aggregate.stderr.extend(outcome.stderr);
+                }
+                Ok(IrStep::next(aggregate))
             }
-            Ok(aggregate)
-        }
-        crate::ir::Operation::Condition {
-            predicate,
-            if_true,
-            if_false,
-        } => {
-            let mut aggregate = execute_ir_node(
-                root,
+            crate::ir::Operation::Condition {
                 predicate,
-                variables,
+                if_true,
+                if_false,
+            } => {
+                let step = self.node(predicate, stdin)?;
+                // An `exit` in the condition ends the task: neither branch runs,
+                // and the status is not read as a branch selector.
+                if step.flow == IrFlow::Exited {
+                    return Ok(step);
+                }
+                let passed = step.outcome.exit_code == 0;
+                let mut aggregate = step.outcome;
+                let branch = if passed {
+                    Some(if_true.as_ref())
+                } else {
+                    if_false.as_deref()
+                };
+                match branch {
+                    None => Ok(IrStep::next(aggregate)),
+                    Some(branch) => {
+                        let step = self.node(branch, &[])?;
+                        aggregate = ir_combine(aggregate, step.outcome);
+                        Ok(IrStep {
+                            outcome: aggregate,
+                            flow: step.flow,
+                        })
+                    }
+                }
+            }
+            crate::ir::Operation::Match {
+                value,
+                cases,
+                default,
+            } => {
+                let subject = self.text(value)?;
+                let mut selected = None;
+                for case in cases {
+                    let pieces = self.pattern_pieces(&case.pattern)?;
+                    if crate::ir::PatternExpression::matches(&pieces, &subject) {
+                        selected = Some(&case.body);
+                        break;
+                    }
+                }
+                match selected.or(default.as_deref()) {
+                    Some(branch) => self.node(branch, stdin),
+                    // `case x in a) ;; esac` with nothing matching succeeds and
+                    // writes nothing, which is what every measured shell does.
+                    None => Ok(IrStep::next(ir_empty_outcome())),
+                }
+            }
+            crate::ir::Operation::While { condition, body } => {
+                let mut aggregate = ir_empty_outcome();
+                let mut input = stdin;
+                loop {
+                    let test = self.node(condition, &[])?;
+                    let passed = test.outcome.exit_code == 0;
+                    // An `exit` in the condition ends the task with its own
+                    // status, so unlike a condition that merely failed, this one
+                    // does become the loop's status.
+                    if test.flow == IrFlow::Exited {
+                        return Ok(IrStep {
+                            outcome: ir_combine(aggregate, test.outcome),
+                            flow: IrFlow::Exited,
+                        });
+                    }
+                    // The condition's own status is not the loop's: a `while`
+                    // that never enters its body reports 0, not the failing test.
+                    let carried = aggregate.exit_code;
+                    aggregate = ir_combine(aggregate, test.outcome);
+                    aggregate.exit_code = carried;
+                    if !passed {
+                        return Ok(IrStep::next(aggregate));
+                    }
+                    let step = self.node(body, input)?;
+                    input = &[];
+                    let flow = step.flow;
+                    aggregate = ir_combine(aggregate, step.outcome);
+                    if flow == IrFlow::Exited {
+                        return Ok(IrStep {
+                            outcome: aggregate,
+                            flow,
+                        });
+                    }
+                }
+            }
+            crate::ir::Operation::Foreach {
+                variable,
+                items,
+                body,
+            } => {
+                let values = self.list(items)?;
+                let previous = self.variables.get(variable).cloned();
+                let mut aggregate = ir_empty_outcome();
+                let mut exited = false;
+                for value in values {
+                    self.variables.insert(variable.clone(), value);
+                    let step = self.node(body, stdin)?;
+                    let flow = step.flow;
+                    aggregate = ir_combine(aggregate, step.outcome);
+                    if flow == IrFlow::Exited {
+                        exited = true;
+                        break;
+                    }
+                }
+                match previous {
+                    Some(value) => self.variables.insert(variable.clone(), value),
+                    None => self.variables.remove(variable),
+                };
+                Ok(IrStep {
+                    outcome: aggregate,
+                    flow: if exited {
+                        IrFlow::Exited
+                    } else {
+                        IrFlow::Continue
+                    },
+                })
+            }
+            // `! cmd` inverts the status to a boolean: a body that exits 2 makes
+            // this exit 0, the same as one that exits 1. Output passes through.
+            crate::ir::Operation::Not { body } => {
+                let step = self.node(body, stdin)?;
+                // `! exit 1` never reaches the inversion: the shell has already
+                // left, and inverting would report 0 for a task that ended with 1.
+                if step.flow == IrFlow::Exited {
+                    return Ok(step);
+                }
+                let mut outcome = step.outcome;
+                outcome.exit_code = i32::from(outcome.exit_code == 0);
+                Ok(IrStep::next(outcome))
+            }
+            crate::ir::Operation::Test { predicate } => {
+                let truth = match predicate {
+                    crate::ir::TestPredicate::NonEmpty { value } => !self.text(value)?.is_empty(),
+                    crate::ir::TestPredicate::Empty { value } => self.text(value)?.is_empty(),
+                    crate::ir::TestPredicate::StringEqual { left, right } => {
+                        self.text(left)? == self.text(right)?
+                    }
+                    crate::ir::TestPredicate::StringNotEqual { left, right } => {
+                        self.text(left)? != self.text(right)?
+                    }
+                    crate::ir::TestPredicate::StartsWith { value, prefix } => {
+                        self.text(value)?.starts_with(prefix)
+                    }
+                    crate::ir::TestPredicate::EndsWith { value, suffix } => {
+                        self.text(value)?.ends_with(suffix)
+                    }
+                    crate::ir::TestPredicate::Contains { value, infix } => {
+                        self.text(value)?.contains(infix)
+                    }
+                };
+                let mut outcome = ir_empty_outcome();
+                outcome.exit_code = i32::from(!truth);
+                Ok(IrStep::next(outcome))
+            }
+            crate::ir::Operation::WriteStdout { contents } => {
+                let mut outcome = ir_empty_outcome();
+                outcome.stdout = self.text(contents)?.into_bytes();
+                Ok(IrStep::next(outcome))
+            }
+            crate::ir::Operation::Exit {
+                status,
+                // Read to say the two cases are the same here: the verifier stops
+                // either way, and the difference is whether the lowering had
+                // already ruled the value out. The generated programs do differ,
+                // because one of them is a constant.
+                non_numeric: _,
+            } => {
+                let text = self.text(status)?;
+                let parsed = text.trim().parse::<i64>().map_err(|_| {
+                    // The shells disagree here — bash exits 255 with a message
+                    // naming itself, zsh exits 0 in silence — so there is no
+                    // status to report that is not one shell impersonating
+                    // another.
+                    format!("exit status is not an integer: {text}")
+                })?;
+                // Measured: every shell reduces modulo 256, negatives and values
+                // above 255 alike.
+                let exit_code = i32::try_from(parsed.rem_euclid(256))
+                    .map_err(|error| format!("exit status is out of range: {error}"))?;
+                Ok(IrStep {
+                    outcome: crate::agent_process::Outcome {
+                        exit_code,
+                        ..ir_empty_outcome()
+                    },
+                    flow: IrFlow::Exited,
+                })
+            }
+            crate::ir::Operation::NoOp => Ok(IrStep::next(ir_empty_outcome())),
+            crate::ir::Operation::TryFinally { body, finalizer } => {
+                let body_step = self.node(body, stdin)?;
+                // The finalizer runs even when the body exited — that is what it
+                // is for — but the task still ends afterwards.
+                let finalizer_step = self.node(finalizer, &[])?;
+                let exit_code = if finalizer_step.outcome.exit_code == 0 {
+                    body_step.outcome.exit_code
+                } else {
+                    finalizer_step.outcome.exit_code
+                };
+                let mut outcome = ir_combine(body_step.outcome, finalizer_step.outcome);
+                outcome.exit_code = exit_code;
+                Ok(IrStep {
+                    outcome,
+                    flow: match (body_step.flow, finalizer_step.flow) {
+                        (IrFlow::Continue, IrFlow::Continue) => IrFlow::Continue,
+                        (IrFlow::Exited, _) | (_, IrFlow::Exited) => IrFlow::Exited,
+                    },
+                })
+            }
+            crate::ir::Operation::TaskCall {
+                task,
                 arguments,
                 positional,
-                stdin,
-                default_cwd,
-                limits,
-                visited,
-            )?;
-            let branch = if aggregate.exit_code == 0 {
-                Some(if_true.as_ref())
-            } else {
-                if_false.as_deref()
-            };
-            if let Some(branch) = branch {
-                let outcome = execute_ir_node(
-                    root,
-                    branch,
-                    variables,
-                    arguments,
-                    positional,
-                    &[],
-                    default_cwd,
-                    limits,
-                    visited,
-                )?;
-                aggregate.stdout.extend(outcome.stdout);
-                aggregate.stderr.extend(outcome.stderr);
-                aggregate.exit_code = outcome.exit_code;
-                aggregate.timed_out |= outcome.timed_out;
-                aggregate.limit_exceeded = outcome.limit_exceeded;
-                aggregate.signal = outcome.signal;
+            } => {
+                let callee = self
+                    .tasks
+                    .iter()
+                    .find(|candidate| candidate.name == *task)
+                    .ok_or_else(|| format!("IR calls task {task}, which the plan does not hold"))?;
+                if callee.invocation.is_some() {
+                    return ir_refuse(
+                        &node.operation,
+                        "the callee declares a PowerShell invocation, whose parameter binding this verifier does not model",
+                    );
+                }
+                if self.depth >= IR_CALL_DEPTH_LIMIT {
+                    return Err(format!(
+                        "IR task calls nested more than {IR_CALL_DEPTH_LIMIT} deep at {task}, which reads as recursion"
+                    ));
+                }
+                let mut provided = BTreeMap::new();
+                for argument in arguments {
+                    provided.insert(argument.name.clone(), self.text(&argument.value)?);
+                }
+                for (index, value) in self.list(positional)?.into_iter().enumerate() {
+                    let numeric = (index + 1).to_string();
+                    let binding = callee
+                        .inputs
+                        .iter()
+                        .find(|binding| binding.name == numeric)
+                        .or_else(|| callee.inputs.get(index))
+                        .ok_or_else(|| {
+                            format!("IR call to {task} passes an unexpected positional argument")
+                        })?;
+                    if provided.insert(binding.name.clone(), value).is_some() {
+                        return Err(format!(
+                            "IR call to {task} gives input {} twice",
+                            binding.name
+                        ));
+                    }
+                }
+                // A call has its own argument frame and its own `set -u`; the
+                // caller's are restored below whatever the body did.
+                let outer_arguments = std::mem::replace(&mut self.arguments, provided);
+                let outer_unset = std::mem::replace(
+                    &mut self.unset,
+                    if callee.nounset {
+                        crate::ir::UnsetPolicy::Refuse
+                    } else {
+                        crate::ir::UnsetPolicy::Empty
+                    },
+                );
+                self.depth += 1;
+                let step = self.node(&callee.body, &[]);
+                self.depth -= 1;
+                self.arguments = outer_arguments;
+                self.unset = outer_unset;
+                // `exit` inside a shell function ends the whole task, so the flow
+                // travels out of the call rather than stopping at it.
+                step
             }
-            Ok(aggregate)
+            crate::ir::Operation::SetVariable {
+                name,
+                value_type,
+                value,
+            } => {
+                if !value_type.is_plain_text() {
+                    return ir_refuse(
+                        &node.operation,
+                        "a typed assignment is normalised by the runner's value model, and a second definition of that normalisation here could disagree with it",
+                    );
+                }
+                let value = self.text(value)?;
+                self.variables.insert(name.clone(), value);
+                Ok(IrStep::next(ir_empty_outcome()))
+            }
+            crate::ir::Operation::CaptureStdout {
+                name,
+                value_type,
+                body,
+            } => {
+                if !value_type.is_text() {
+                    return ir_refuse(
+                        &node.operation,
+                        "a typed capture is normalised by the runner's value model, and a second definition of that normalisation here could disagree with it",
+                    );
+                }
+                // A substitution runs in its own process, so `$(exit 3)` ends
+                // that process and leaves 3 as its status; the shell reading it
+                // carries on. The captured bytes do not reach stdout.
+                let step = self.node(body, stdin)?;
+                let mut captured = step.outcome;
+                while captured.stdout.last() == Some(&b'\n') {
+                    captured.stdout.pop();
+                }
+                let text = std::str::from_utf8(&captured.stdout)
+                    .map_err(|error| format!("stdout capture {name} is not valid UTF-8: {error}"))?
+                    .to_owned();
+                self.variables.insert(name.clone(), text);
+                captured.stdout.clear();
+                Ok(IrStep::next(captured))
+            }
+            // Everything below is refused by name. Each says what it would take
+            // to run it honestly, so that "not implemented" and "cannot be
+            // claimed here" stay different sentences.
+            crate::ir::Operation::Parallel { nodes: _ } => ir_refuse(
+                &node.operation,
+                "the branches run at once, and running them one after another would compare a different program",
+            ),
+            crate::ir::Operation::ExpandWords {
+                name: _,
+                value: _,
+                field_splitting: _,
+                glob: _,
+            } => ir_refuse(
+                &node.operation,
+                "field splitting and globbing are the shell's, and this verifier has no measured model of either",
+            ),
+            crate::ir::Operation::Redirect {
+                redirections: _,
+                body: _,
+            } => ir_refuse(
+                &node.operation,
+                "a redirection binds file descriptors around a child, which this verifier does not set up",
+            ),
+            crate::ir::Operation::Scope {
+                variables: _,
+                environment: _,
+                working_directory: _,
+                body: _,
+            }
+            | crate::ir::Operation::SetEnvironment {
+                name: _,
+                value: _,
+                secret: _,
+            } => ir_refuse(
+                &node.operation,
+                "the binding may be a secret, and this verifier has no redaction path to keep one out of the evidence it writes",
+            ),
+            crate::ir::Operation::SetWorkingDirectory { path: _ } => ir_refuse(
+                &node.operation,
+                "the directory outlives the node, and this verifier holds no working directory that a later node would read",
+            ),
+            crate::ir::Operation::Spawn { handle: _, body: _ }
+            | crate::ir::Operation::Wait { handle: _ }
+            | crate::ir::Operation::SendSignal {
+                handle: _,
+                signal: _,
+                process_group: _,
+            } => ir_refuse(
+                &node.operation,
+                "background jobs need a process table that outlives the node, which this verifier does not keep",
+            ),
+            crate::ir::Operation::FileRead { path: _ }
+            | crate::ir::Operation::FileWrite {
+                path: _,
+                contents: _,
+                append: _,
+            }
+            | crate::ir::Operation::FileRemove { path: _ }
+            | crate::ir::Operation::FileMetadata {
+                path: _,
+                output: _,
+                follow_symlinks: _,
+            }
+            | crate::ir::Operation::FileSetMetadata {
+                path: _,
+                permissions: _,
+                executable: _,
+                follow_symlinks: _,
+            } => ir_refuse(
+                &node.operation,
+                "a direct file effect bypasses the sandbox that bounds every process this verifier starts",
+            ),
+            crate::ir::Operation::NetworkRequest { method: _, uri: _ } => ir_refuse(
+                &node.operation,
+                "a request would have to go through the replay proxy, which this verifier starts for child processes only",
+            ),
+            crate::ir::Operation::ClockRead {
+                clock: _,
+                output: _,
+            }
+            | crate::ir::Operation::RandomBytes {
+                output: _,
+                length: _,
+            } => ir_refuse(
+                &node.operation,
+                "the value differs on every run, so an observation of it could not be compared with another",
+            ),
+            crate::ir::Operation::InterpreterCall {
+                interpreter: _,
+                interpreter_pin: _,
+                source: _,
+                source_span: _,
+                capabilities: _,
+                reason: _,
+            }
+            | crate::ir::Operation::OpaqueCapsule {
+                interpreter: _,
+                source: _,
+                path: _,
+            } => ir_refuse(
+                &node.operation,
+                "running the pinned interpreter here would re-run the original shell, and an oracle that consults the original is not independent of it",
+            ),
         }
-        other => Err(format!(
-            "independent IR verifier does not support {}",
-            other.name()
-        )),
     }
-}
-
-/// The inputs of [`ir_exec_request`].
-///
-/// An argument list admits no exhaustive destructuring, so a parameter added to a
-/// many-argument function stays invisible to every call site that already
-/// compiles. [`ir_exec_request`] takes this apart without `..`, so a field added here fails
-/// to compile until somebody gives it a destination.
-struct IrExecRequestArgs<'a> {
-    _root: &'a Path,
-    node: &'a crate::ir::Node,
-    variables: &'a BTreeMap<String, String>,
-    arguments: &'a BTreeMap<String, String>,
-    stdin: &'a [u8],
-    default_cwd: Option<&'a str>,
-    limits: crate::config::ResourceLimits,
-}
-
-fn ir_exec_request(parts: IrExecRequestArgs<'_>) -> Result<crate::agent_process::Request, String> {
-    // Destructured without `..`: see `IrExecRequestArgs`.
-    let IrExecRequestArgs {
-        _root,
-        node,
-        variables,
-        arguments,
-        stdin,
-        default_cwd,
-        limits,
-    } = parts;
-    let crate::ir::Operation::Exec {
-        argv,
-        environment,
-        working_directory,
-    } = &node.operation
-    else {
-        return Err("independent IR verifier pipeline supports only Exec stages".into());
-    };
-    let argv = argv
-        .iter()
-        .map(|value| value.evaluate(variables, arguments, crate::ir::UnsetPolicy::Empty))
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut process_environment = variables.clone();
-    for value in environment {
-        process_environment.insert(
-            value.name.clone(),
-            value
-                .value
-                .evaluate(variables, arguments, crate::ir::UnsetPolicy::Empty)?,
-        );
-    }
-    let working_directory = working_directory
-        .as_ref()
-        .map(|value| value.evaluate(variables, arguments, crate::ir::UnsetPolicy::Empty))
-        .transpose()?
-        .or_else(|| default_cwd.map(str::to_owned));
-    Ok(crate::agent_process::Request {
-        argv,
-        environment: process_environment.into_iter().collect(),
-        working_directory,
-        stdin: stdin.to_vec(),
-        limits: limits.into(),
-    })
 }
 
 fn prepared_workspace(
@@ -9630,6 +10135,509 @@ fn archive_executable(_metadata: &std::fs::Metadata) -> bool {
 )]
 mod tests {
     use super::*;
+
+    /// A verifier for building the coverage ledger and for the behaviour tests
+    /// below: no variables, no arguments, and the workspace it is given.
+    fn ir_verifier<'a>(root: &'a Path, tasks: &'a [crate::ir::Task]) -> IrVerifier<'a> {
+        IrVerifier {
+            root,
+            tasks,
+            variables: BTreeMap::new(),
+            arguments: BTreeMap::new(),
+            default_cwd: None,
+            limits: crate::config::ResourceLimits {
+                timeout_ms: 30_000,
+                memory_bytes: 1 << 30,
+                processes: 512,
+                stdout_bytes: 16 << 20,
+                stderr_bytes: 16 << 20,
+            },
+            unset: crate::ir::UnsetPolicy::Empty,
+            visited: BTreeSet::new(),
+            depth: 0,
+        }
+    }
+
+    /// One harmless node per operation the IR can name.
+    ///
+    /// Built here rather than derived, so that an operation added to the enum
+    /// fails `ir_verifier_coverage_ledger_names_every_operation` until somebody
+    /// says what the verifier does with it.
+    fn one_node_per_operation() -> Vec<(&'static str, crate::ir::Node)> {
+        let nothing = || Box::new(node(crate::ir::Operation::NoOp));
+        let text = crate::ir::TextExpression::literal;
+        vec![
+            (
+                "exec",
+                node(crate::ir::Operation::Exec {
+                    argv: vec![text("/usr/bin/true")],
+                    environment: Vec::new(),
+                    working_directory: None,
+                }),
+            ),
+            (
+                "expand_words",
+                node(crate::ir::Operation::ExpandWords {
+                    name: "words".into(),
+                    value: text(""),
+                    field_splitting: crate::ir::FieldSplitting::None,
+                    glob: crate::ir::GlobBehavior::Disabled,
+                }),
+            ),
+            (
+                "redirect",
+                node(crate::ir::Operation::Redirect {
+                    redirections: Vec::new(),
+                    body: nothing(),
+                }),
+            ),
+            (
+                "pipeline",
+                node(crate::ir::Operation::Pipeline {
+                    nodes: Vec::new(),
+                    status: crate::ir::PipelineStatus::Last,
+                }),
+            ),
+            (
+                "sequence",
+                node(crate::ir::Operation::Sequence {
+                    nodes: Vec::new(),
+                    on_failure: crate::ir::SequenceFailure::Continue,
+                }),
+            ),
+            (
+                "parallel",
+                node(crate::ir::Operation::Parallel { nodes: Vec::new() }),
+            ),
+            (
+                "write_stdout",
+                node(crate::ir::Operation::WriteStdout { contents: text("") }),
+            ),
+            (
+                "exit",
+                node(crate::ir::Operation::Exit {
+                    status: text("0"),
+                    non_numeric: crate::ir::NonNumericStatus::Unreachable,
+                }),
+            ),
+            ("no_op", node(crate::ir::Operation::NoOp)),
+            (
+                "condition",
+                node(crate::ir::Operation::Condition {
+                    predicate: nothing(),
+                    if_true: nothing(),
+                    if_false: None,
+                }),
+            ),
+            (
+                "test",
+                node(crate::ir::Operation::Test {
+                    predicate: crate::ir::TestPredicate::Empty { value: text("") },
+                }),
+            ),
+            (
+                "while",
+                node(crate::ir::Operation::While {
+                    // Fails on the first test, so the loop ends.
+                    condition: Box::new(node(crate::ir::Operation::Test {
+                        predicate: crate::ir::TestPredicate::NonEmpty { value: text("") },
+                    })),
+                    body: nothing(),
+                }),
+            ),
+            ("not", node(crate::ir::Operation::Not { body: nothing() })),
+            (
+                "match",
+                node(crate::ir::Operation::Match {
+                    value: text(""),
+                    cases: Vec::new(),
+                    default: None,
+                }),
+            ),
+            (
+                "foreach",
+                node(crate::ir::Operation::Foreach {
+                    variable: "item".into(),
+                    items: Vec::new(),
+                    body: nothing(),
+                }),
+            ),
+            (
+                "scope",
+                node(crate::ir::Operation::Scope {
+                    variables: Vec::new(),
+                    environment: Vec::new(),
+                    working_directory: None,
+                    body: nothing(),
+                }),
+            ),
+            (
+                "try_finally",
+                node(crate::ir::Operation::TryFinally {
+                    body: nothing(),
+                    finalizer: nothing(),
+                }),
+            ),
+            (
+                "task_call",
+                node(crate::ir::Operation::TaskCall {
+                    task: "main".into(),
+                    arguments: Vec::new(),
+                    positional: Vec::new(),
+                }),
+            ),
+            (
+                "set_variable",
+                node(crate::ir::Operation::SetVariable {
+                    name: "name".into(),
+                    value_type: crate::ir::ValueType::Primitive(crate::ir::PrimitiveType::Text),
+                    value: text(""),
+                }),
+            ),
+            (
+                "set_environment",
+                node(crate::ir::Operation::SetEnvironment {
+                    name: "NAME".into(),
+                    value: None,
+                    secret: false,
+                }),
+            ),
+            (
+                "set_working_directory",
+                node(crate::ir::Operation::SetWorkingDirectory { path: text(".") }),
+            ),
+            (
+                "capture_stdout",
+                node(crate::ir::Operation::CaptureStdout {
+                    name: "name".into(),
+                    value_type: crate::ir::PrimitiveType::Text,
+                    body: nothing(),
+                }),
+            ),
+            (
+                "spawn",
+                node(crate::ir::Operation::Spawn {
+                    handle: "handle".into(),
+                    body: nothing(),
+                }),
+            ),
+            (
+                "wait",
+                node(crate::ir::Operation::Wait {
+                    handle: "handle".into(),
+                }),
+            ),
+            (
+                "send_signal",
+                node(crate::ir::Operation::SendSignal {
+                    handle: "handle".into(),
+                    signal: 15,
+                    process_group: false,
+                }),
+            ),
+            (
+                "file_read",
+                node(crate::ir::Operation::FileRead { path: text("f") }),
+            ),
+            (
+                "file_write",
+                node(crate::ir::Operation::FileWrite {
+                    path: text("f"),
+                    contents: text(""),
+                    append: false,
+                }),
+            ),
+            (
+                "file_remove",
+                node(crate::ir::Operation::FileRemove { path: text("f") }),
+            ),
+            (
+                "file_metadata",
+                node(crate::ir::Operation::FileMetadata {
+                    path: text("f"),
+                    output: "out".into(),
+                    follow_symlinks: false,
+                }),
+            ),
+            (
+                "file_set_metadata",
+                node(crate::ir::Operation::FileSetMetadata {
+                    path: text("f"),
+                    permissions: None,
+                    executable: None,
+                    follow_symlinks: false,
+                }),
+            ),
+            (
+                "network_request",
+                node(crate::ir::Operation::NetworkRequest {
+                    method: text("GET"),
+                    uri: text("https://example.invalid/"),
+                }),
+            ),
+            (
+                "clock_read",
+                node(crate::ir::Operation::ClockRead {
+                    clock: crate::ir::ClockKind::Monotonic,
+                    output: "out".into(),
+                }),
+            ),
+            (
+                "random_bytes",
+                node(crate::ir::Operation::RandomBytes {
+                    output: "out".into(),
+                    length: 1,
+                }),
+            ),
+            (
+                "interpreter_call",
+                node(crate::ir::Operation::InterpreterCall {
+                    interpreter: "bash".into(),
+                    interpreter_pin: "sha256:0".into(),
+                    source: crate::ir::SourceBytes::from_bytes(b""),
+                    source_span: crate::ir::SourceSpan {
+                        file: "build.sh".into(),
+                        start_line: 0,
+                        start_column: 0,
+                        end_line: 0,
+                        end_column: 0,
+                        start_byte: 0,
+                        end_byte: 0,
+                    },
+                    capabilities: Vec::new(),
+                    reason: "test".into(),
+                }),
+            ),
+            (
+                "opaque_capsule",
+                node(crate::ir::Operation::OpaqueCapsule {
+                    interpreter: "bash".into(),
+                    source: crate::ir::SourceBytes::from_bytes(b""),
+                    path: None,
+                }),
+            ),
+        ]
+    }
+
+    /// What the independent IR verifier does with every operation, recorded.
+    ///
+    /// The ledger is *derived by running the verifier*, not written beside it:
+    /// a second hand-maintained table would be a second claim that could
+    /// disagree with the code. The golden file is what makes a change loud —
+    /// the verifier ran four of the thirty-five operations behind an
+    /// `other => Err(...)` catch-all arm, and no test said so, because "nobody
+    /// implemented this" had no place to be a value.
+    ///
+    /// A `verified: false` entry is not a defect to be cleared. Some of these
+    /// must stay refused: running `interpreter_call` here would re-run the
+    /// original shell, and an oracle that consults the original is not
+    /// independent of it.
+    #[test]
+    fn ir_verifier_coverage_ledger_names_every_operation() {
+        let workspace = tempfile::tempdir().unwrap();
+        let tasks: Vec<crate::ir::Task> = Vec::new();
+        let mut ledger = Vec::new();
+        for (name, subject) in one_node_per_operation() {
+            assert_eq!(
+                subject.operation.name(),
+                name,
+                "the ledger case labelled {name} builds a different operation"
+            );
+            let outcome = ir_verifier(workspace.path(), &tasks).node(&subject, &[]);
+            let refusal = match &outcome {
+                Err(message) => message
+                    .strip_prefix(&format!("independent IR verifier does not run {name}: "))
+                    .map(str::to_owned),
+                Ok(_) => None,
+            };
+            ledger.push(serde_json::json!({
+                "operation": name,
+                "verified": refusal.is_none(),
+                "reason": refusal,
+            }));
+        }
+        let names: Vec<&str> = ledger
+            .iter()
+            .map(|entry| entry["operation"].as_str().unwrap())
+            .collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            sorted,
+            crate::ir::Operation::ALL_NAMES,
+            "the ledger and Operation::ALL_NAMES disagree about which operations exist"
+        );
+
+        let mut sorted_ledger = ledger;
+        sorted_ledger.sort_by_key(|entry| entry["operation"].as_str().unwrap().to_owned());
+        let document = serde_json::json!({
+            "schema_version": 1,
+            "operations": sorted_ledger,
+        });
+        let produced =
+            String::from_utf8(crate::canonical_json::canonical_bytes(&document).unwrap()).unwrap();
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("contracts/golden/ir-verifier-coverage-v1.json");
+        if std::env::var_os("DESHELL_UPDATE_GOLDEN").is_some() {
+            std::fs::write(&path, format!("{produced}\n")).unwrap();
+        }
+        let recorded = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            recorded.trim_end(),
+            produced,
+            "the IR verifier's coverage changed; re-record with DESHELL_UPDATE_GOLDEN=1 and say why in the commit"
+        );
+    }
+
+    /// `set -e` reaches the independent verifier.
+    ///
+    /// It did not: the arm read `Sequence { nodes, .. }`, and the `..` dropped
+    /// `on_failure`. A script of `set -e; /usr/bin/false; echo unreachable`
+    /// exited 1 in the shell and in the generated program, and the verifier —
+    /// the thing that decides whether the two agree — ran the `echo` and
+    /// reported 0. It disagreed with both, so the migration was reported
+    /// `different`; a verifier that is wrong in the other direction reports
+    /// agreement that is not there.
+    #[test]
+    fn a_sequence_under_set_e_stops_at_the_first_failure() {
+        let workspace = tempfile::tempdir().unwrap();
+        let tasks: Vec<crate::ir::Task> = Vec::new();
+        let statements = || {
+            vec![
+                node(crate::ir::Operation::Exec {
+                    argv: vec![crate::ir::TextExpression::literal("/usr/bin/false")],
+                    environment: Vec::new(),
+                    working_directory: None,
+                }),
+                node(crate::ir::Operation::WriteStdout {
+                    contents: crate::ir::TextExpression::literal("unreachable\n"),
+                }),
+            ]
+        };
+
+        let stopped = ir_verifier(workspace.path(), &tasks)
+            .node(
+                &node(crate::ir::Operation::Sequence {
+                    nodes: statements(),
+                    on_failure: crate::ir::SequenceFailure::Stop,
+                }),
+                &[],
+            )
+            .unwrap();
+        assert_eq!(stopped.outcome.exit_code, 1);
+        assert_eq!(stopped.outcome.stdout, b"");
+
+        // The other half of the option, so the test cannot pass by the verifier
+        // refusing to run the second statement at all.
+        let carried_on = ir_verifier(workspace.path(), &tasks)
+            .node(
+                &node(crate::ir::Operation::Sequence {
+                    nodes: statements(),
+                    on_failure: crate::ir::SequenceFailure::Continue,
+                }),
+                &[],
+            )
+            .unwrap();
+        assert_eq!(carried_on.outcome.exit_code, 0);
+        assert_eq!(carried_on.outcome.stdout, b"unreachable\n");
+    }
+
+    /// `exit` ends the task in the independent verifier.
+    ///
+    /// The operation was refused outright before, because the verifier had no
+    /// term for "the task ended" — so a plan holding a native `exit` could not
+    /// be verified and could not retire.
+    #[test]
+    fn exit_ends_the_task_and_the_statements_after_it_do_not_run() {
+        let workspace = tempfile::tempdir().unwrap();
+        let tasks: Vec<crate::ir::Task> = Vec::new();
+        let step = ir_verifier(workspace.path(), &tasks)
+            .node(
+                &node(crate::ir::Operation::Sequence {
+                    nodes: vec![
+                        node(crate::ir::Operation::Exit {
+                            status: crate::ir::TextExpression::literal("3"),
+                            non_numeric: crate::ir::NonNumericStatus::Unreachable,
+                        }),
+                        node(crate::ir::Operation::WriteStdout {
+                            contents: crate::ir::TextExpression::literal("after\n"),
+                        }),
+                    ],
+                    // `exit` ends the task whatever this says.
+                    on_failure: crate::ir::SequenceFailure::Continue,
+                }),
+                &[],
+            )
+            .unwrap();
+        assert_eq!(step.flow, IrFlow::Exited);
+        assert_eq!(step.outcome.exit_code, 3);
+        assert_eq!(step.outcome.stdout, b"");
+    }
+
+    /// `set -u` reaches the independent verifier.
+    ///
+    /// The walk passed `UnsetPolicy::Empty` as a constant, so a script that read
+    /// an unset name under `set -u` failed in the shell and expanded to an empty
+    /// string here.
+    #[test]
+    fn nounset_makes_an_unset_name_an_error_rather_than_an_empty_string() {
+        let workspace = tempfile::tempdir().unwrap();
+        let tasks: Vec<crate::ir::Task> = Vec::new();
+        let subject = node(crate::ir::Operation::WriteStdout {
+            contents: crate::ir::TextExpression {
+                parts: vec![crate::ir::TextPart::Variable {
+                    name: "DESHELL_NEVER_SET".into(),
+                }],
+            },
+        });
+
+        let mut permissive = ir_verifier(workspace.path(), &tasks);
+        assert_eq!(permissive.node(&subject, &[]).unwrap().outcome.stdout, b"");
+
+        let mut strict = ir_verifier(workspace.path(), &tasks);
+        strict.unset = crate::ir::UnsetPolicy::Refuse;
+        assert!(strict.node(&subject, &[]).is_err());
+    }
+
+    /// A scenario cannot say two different things about one argument.
+    ///
+    /// `argv` and `arguments` both name `$1`. The walk read `arguments` and the
+    /// shell read `argv`, so a scenario that disagreed with itself was observed
+    /// as the replacement disagreeing with the original — a real difference
+    /// reported for a reason that was not in either program.
+    #[test]
+    fn a_scenario_that_names_one_argument_twice_must_not_contradict_itself() {
+        let task = crate::ir::Task {
+            name: "main".into(),
+            inputs: vec![crate::ir::Binding {
+                name: "1".into(),
+                value_type: crate::ir::ValueType::Primitive(crate::ir::PrimitiveType::Text),
+            }],
+            outputs: Vec::new(),
+            environment: Vec::new(),
+            secrets: Vec::new(),
+            platform_capabilities: Vec::new(),
+            cacheable: false,
+            nounset: false,
+            invocation: None,
+            body: node(crate::ir::Operation::NoOp),
+        };
+        let agreeing = BTreeMap::from([("1".to_owned(), "a".to_owned())]);
+        assert_eq!(
+            bind_ir_positional(&task, agreeing.clone(), &["a".to_owned()]).unwrap(),
+            agreeing
+        );
+        let message =
+            bind_ir_positional(&task, agreeing, &["b".to_owned()]).expect_err("contradiction");
+        assert!(message.contains("cannot differ"), "{message}");
+
+        // Nothing declared, nothing bound: the argv still reaches the shell.
+        assert!(
+            bind_ir_positional(&task, BTreeMap::new(), &[])
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     #[test]
     fn go_build_environment_is_private_complete_and_not_applied_to_other_tools() {

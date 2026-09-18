@@ -158,6 +158,7 @@ mod tests {
             "contracts/golden/printf-builtin-semantics-v1.json",
             "contracts/golden/case-pattern-semantics-v1.json",
             "contracts/golden/shell-variable-inventory-v1.json",
+            "contracts/golden/ir-verifier-coverage-v1.json",
             "contracts/semantic-models-v1.json",
         ] {
             assert!(root().join(relative).is_file(), "missing {relative}");

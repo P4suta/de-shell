@@ -113,6 +113,36 @@ pub(crate) enum PrimitiveType {
     Bytes,
 }
 
+impl PrimitiveType {
+    /// Whether a value of this type is plain text.
+    ///
+    /// Asked in a `match` rather than with `== PrimitiveType::Text`, so that a
+    /// primitive added to the value model has to state its answer here instead
+    /// of inheriting `false` from an equality test that still compiles.
+    pub(crate) fn is_text(&self) -> bool {
+        match self {
+            Self::Text => true,
+            Self::Bool | Self::Int | Self::Path | Self::Bytes => false,
+        }
+    }
+}
+
+impl ValueType {
+    /// Whether this is plain text with no normalisation attached to it.
+    ///
+    /// A list, a record and a secret each carry rules about the bytes they
+    /// hold; text carries none. See [`PrimitiveType::is_text`] for why this is
+    /// a `match`.
+    pub(crate) fn is_plain_text(&self) -> bool {
+        match self {
+            Self::Primitive(primitive) => primitive.is_text(),
+            Self::List { list: _ } | Self::Record { record: _ } | Self::Secret { secret: _ } => {
+                false
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum PipelineStatus {
@@ -519,7 +549,6 @@ pub(crate) enum Operation {
     },
     Sequence {
         nodes: Vec<Node>,
-        /// Whether a failing statement ends the sequence. See [`SequenceFailure`].
         /// Whether a failing statement ends the sequence. See [`SequenceFailure`].
         on_failure: SequenceFailure,
     },

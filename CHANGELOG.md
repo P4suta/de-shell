@@ -46,6 +46,25 @@ All notable changes are documented here. No compatibility contract predates
 - Moved all maintained schemas and golden contracts under `contracts/`.
 - Retained OCaml only as an unpublished, opt-in deterministic reference.
 
+### Fixed
+
+- Made the independent IR verifier run sixteen of the IR's thirty-five
+  operations instead of four, and replaced its `other => Err(...)` catch-all
+  with an exhaustive `match`. `contracts/golden/ir-verifier-coverage-v1.json`
+  records what each of the other nineteen is refused for, so "nobody
+  implemented this" is a value rather than an absence.
+- Stopped the independent IR verifier from dropping `set -e`: the arm read
+  `Sequence { nodes, .. }`, and the `..` discarded `on_failure`, so the
+  statement after a failing one ran during verification.
+- Carried `set -u` into the independent IR verifier, which read
+  `UnsetPolicy::Empty` as a constant and expanded an unset name to an empty
+  string where the shell failed.
+- Bound a scenario's `argv` to the entrypoint task's inputs during
+  verification; it was passed to the walk and discarded there, so a script
+  reading `$1` was verified against an empty string. A scenario that gives one
+  argument two different values through `argv` and `arguments` is now refused
+  by name instead of surfacing as an observed difference.
+
 ### Removed
 
 - Pre-v1 Effect IR and lock migration promises.

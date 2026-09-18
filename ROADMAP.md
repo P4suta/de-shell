@@ -101,8 +101,51 @@ Nushell), with both official Rust and Go generators where applicable.
 
   reaches `retired` with the step rewritten to
   `uses: ./.github/actions/deshell-f920c0703cce`, a local action holding the
-  generated program, and `verify --require shell-free` passing. The input,
-  environment, branch, failure and parser-blocker cases are still to walk.
+  generated program, and `verify --require shell-free` passing.
+
+  The five remaining cases walked next, and three of them ended somewhere other
+  than `retired` for reasons that are the tool working:
+
+  | case | source | outcome |
+  | --- | --- | --- |
+  | input | `/bin/echo "$1"` | retired, shell-free |
+  | environment | `/bin/echo "${HOME}"` | retired, shell-free |
+  | branch | `if [ "$1" = a ]` | retired, shell-free, once a second scenario observed the other arm |
+  | failure | `set -e` then a command that always fails | refused at `apply`: `DESHELL_BLOCKER_COVERAGE_INCOMPLETE` |
+  | parser-blocker | `eval "/bin/echo $1"` | `blocked`; `eval` is a parser blocker and never reaches a plan |
+
+  `branch` first reported `DESHELL_BLOCKER_COVERAGE_INCOMPLETE`, naming the node
+  no scenario had entered. A second scenario with `argv = ["a"]` covers it and
+  the file retires. `failure` is the same refusal and stays: `set -e` makes the
+  statement after the failing one unreachable, so no scenario can observe it,
+  and de-shell will not retire a file holding a node nobody has seen run. That
+  is the right answer — the alternative is generating a translation of code that
+  was never compared against anything.
+
+  Two defects surfaced here, both in the independent IR verifier, and both the
+  same shape as ones found earlier on the generation side.
+
+  `Operation::Sequence { nodes, .. }` — the `..` dropped `on_failure`, so the
+  verifier ran the statement after a failing one under `set -e`. This is the
+  third time that option has been lost to a destructuring that compiled. The
+  walk also read `UnsetPolicy::Empty` as a constant, so `set -u` never reached
+  the verifier either.
+
+  Behind them was the larger one: the verifier ran four of the IR's thirty-five
+  operations, and the rest fell into an `other => Err("does not support {name}")`
+  arm. A catch-all made "nobody implemented this" and "this cannot honestly be
+  checked here" the same sentence, and nothing counted either. The match is now
+  exhaustive with no `_` arm and no `..` in any destructuring, sixteen
+  operations run, and `contracts/golden/ir-verifier-coverage-v1.json` records
+  what the other nineteen are refused for. Several must stay refused:
+  `interpreter_call` would re-run the original shell, and an oracle that
+  consults the original is not independent of it.
+
+  A third came from the walk's own scenario. `argv` and `arguments` both name
+  `$1`; the verifier read one and the shell read the other, so a scenario that
+  disagreed with itself was reported as the replacement disagreeing with the
+  original — a real difference, for a reason present in neither program. Saying
+  it twice is now fine and saying two different things is refused by name.
 
   It did not reach `retired` before this round, and the reason was one this
   flow was the only thing that could find: `git ls-files` names a path the
