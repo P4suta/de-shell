@@ -592,6 +592,80 @@ fn run_posix_divergence(root: &Path) -> Result<(), Vec<String>> {
     Err(errors)
 }
 
+/// Check each shell's `printf` builtin against the recording.
+///
+/// Unlike `echo`, every shell measured writes the same bytes for every case
+/// here, which is why the frontend models `printf` for all of them. A column
+/// that starts to disagree is the reason that stops being true, so it fails
+/// rather than reports.
+fn run_printf_semantics(root: &Path) -> Result<(), Vec<String>> {
+    let path = root.join("contracts/golden/printf-builtin-semantics-v1.json");
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|error| vec![format!("cannot read {}: {error}", path.display())])?;
+    let corpus: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|error| vec![format!("malformed corpus: {error}")])?;
+    let shells: Vec<&str> = corpus["shells"]
+        .as_array()
+        .ok_or_else(|| vec!["corpus has no shells array".to_owned()])?
+        .iter()
+        .filter_map(|value| value.as_str())
+        .collect();
+    let cases = corpus["cases"]
+        .as_array()
+        .ok_or_else(|| vec!["corpus has no cases array".to_owned()])?;
+    if cases.is_empty() || shells.is_empty() {
+        return Err(vec!["corpus is empty".to_owned()]);
+    }
+    let mut errors = Vec::new();
+    let mut checked = 0_usize;
+    for case in cases {
+        let name = case["name"].as_str().unwrap_or("<unnamed>");
+        let arguments: Vec<String> = case["arguments"]
+            .as_array()
+            .ok_or_else(|| vec![format!("{name} has no arguments")])?
+            .iter()
+            .map(|value| value.as_str().unwrap_or_default().to_owned())
+            .collect();
+        let quoted = arguments
+            .iter()
+            .map(|argument| format!("'{}'", argument.replace('\'', "'\\''")))
+            .collect::<Vec<_>>()
+            .join(" ");
+        for shell in &shells {
+            let Some(recorded) = case[*shell].as_str() else {
+                errors.push(format!("{name} has no {shell} column"));
+                continue;
+            };
+            let output = std::process::Command::new(shell)
+                .arg("-c")
+                .arg(format!("printf {quoted}"))
+                .output();
+            let output = match output {
+                Ok(output) => output,
+                Err(error) => {
+                    println!("skipped  {name}/{shell}: {error}");
+                    continue;
+                }
+            };
+            let actual = String::from_utf8_lossy(&output.stdout).into_owned();
+            checked += 1;
+            if actual != recorded {
+                errors.push(format!(
+                    "{name}/{shell}: recorded {recorded:?}, observed {actual:?}"
+                ));
+            }
+        }
+    }
+    if errors.is_empty() {
+        println!(
+            "{} printf case(s) match the recording across {checked} shell observation(s)",
+            cases.len()
+        );
+        return Ok(());
+    }
+    Err(errors)
+}
+
 fn run_test_semantics(root: &Path) -> Result<(), Vec<String>> {
     let path = root.join("contracts/golden/test-builtin-semantics-v1.json");
     let raw = std::fs::read_to_string(&path)
@@ -1669,6 +1743,7 @@ fn dispatch(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Vec<Str
         Some("exit-semantics") => run_exit_semantics(root),
         Some("builtin-table") => run_builtin_table(root),
         Some("posix-divergence") => run_posix_divergence(root),
+        Some("printf-semantics") => run_printf_semantics(root),
         Some("validate-contracts") => validate_contract_tree(root).map(|_| ()),
         Some("performance") => {
             let binary = arguments

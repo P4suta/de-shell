@@ -1,0 +1,209 @@
+{
+ "schema_version": 1,
+ "contract": "printf-builtin-semantics-v1",
+ "purpose": "Pin what each shell's `printf` builtin writes, so the frontend's native domain for `printf` is checked against a measurement rather than against a reading of the specification.",
+ "note": "`printf` is a builtin in every shell measured here, so /usr/bin/printf is a different program and not a substitute. Unlike `echo`, all four agree on every case recorded here \u2014 which is why the frontend models `printf` for every interpreter and `echo` for bash alone. A case marked modelled is one the frontend lowers; its bytes must match the measurement in every column. A case marked unmodelled names a conversion or an escape that is a different function of its argument than `%s` is.",
+ "shells": [
+  "bash",
+  "sh",
+  "zsh",
+  "dash"
+ ],
+ "cases": [
+  {
+   "name": "plain",
+   "arguments": [
+    "%s\\n",
+    "a"
+   ],
+   "modelled": true,
+   "bash": "a\n",
+   "sh": "a\n",
+   "zsh": "a\n",
+   "dash": "a\n"
+  },
+  {
+   "name": "two-conversions",
+   "arguments": [
+    "%s<<%s\\n",
+    "a",
+    "b"
+   ],
+   "modelled": true,
+   "bash": "a<<b\n",
+   "sh": "a<<b\n",
+   "zsh": "a<<b\n",
+   "dash": "a<<b\n"
+  },
+  {
+   "name": "format-is-reused",
+   "arguments": [
+    "%s\\n",
+    "a",
+    "b"
+   ],
+   "modelled": true,
+   "bash": "a\nb\n",
+   "sh": "a\nb\n",
+   "zsh": "a\nb\n",
+   "dash": "a\nb\n"
+  },
+  {
+   "name": "no-arguments",
+   "arguments": [
+    "%s\\n"
+   ],
+   "modelled": true,
+   "bash": "\n",
+   "sh": "\n",
+   "zsh": "\n",
+   "dash": "\n"
+  },
+  {
+   "name": "fewer-arguments-than-conversions",
+   "arguments": [
+    "%s-%s\\n",
+    "a"
+   ],
+   "modelled": true,
+   "bash": "a-\n",
+   "sh": "a-\n",
+   "zsh": "a-\n",
+   "dash": "a-\n"
+  },
+  {
+   "name": "exactly-two-passes",
+   "arguments": [
+    "%s-%s|",
+    "a",
+    "b",
+    "c",
+    "d"
+   ],
+   "modelled": true,
+   "bash": "a-b|c-d|",
+   "sh": "a-b|c-d|",
+   "zsh": "a-b|c-d|",
+   "dash": "a-b|c-d|"
+  },
+  {
+   "name": "no-trailing-newline",
+   "arguments": [
+    "%s",
+    "a"
+   ],
+   "modelled": true,
+   "bash": "a",
+   "sh": "a",
+   "zsh": "a",
+   "dash": "a"
+  },
+  {
+   "name": "tab-and-carriage-return",
+   "arguments": [
+    "%s\\t%s\\r\\n",
+    "a",
+    "b"
+   ],
+   "modelled": true,
+   "bash": "a\tb\r\n",
+   "sh": "a\tb\r\n",
+   "zsh": "a\tb\r\n",
+   "dash": "a\tb\r\n"
+  },
+  {
+   "name": "literal-percent",
+   "arguments": [
+    "100%%\\n"
+   ],
+   "modelled": true,
+   "bash": "100%\n",
+   "sh": "100%\n",
+   "zsh": "100%\n",
+   "dash": "100%\n"
+  },
+  {
+   "name": "escaped-backslash",
+   "arguments": [
+    "a\\\\\\\\b\\n"
+   ],
+   "modelled": true,
+   "bash": "a\\\\b\n",
+   "sh": "a\\\\b\n",
+   "zsh": "a\\\\b\n",
+   "dash": "a\\\\b\n"
+  },
+  {
+   "name": "no-conversion-ignores-arguments",
+   "arguments": [
+    "x",
+    "a",
+    "b"
+   ],
+   "modelled": true,
+   "bash": "x",
+   "sh": "x",
+   "zsh": "x",
+   "dash": "x"
+  },
+  {
+   "name": "backslash-in-argument-is-not-rescanned",
+   "arguments": [
+    "%s\\n",
+    "a\\tb"
+   ],
+   "modelled": true,
+   "bash": "a\\tb\n",
+   "sh": "a\\tb\n",
+   "zsh": "a\\tb\n",
+   "dash": "a\\tb\n"
+  },
+  {
+   "name": "argument-looks-like-an-option",
+   "arguments": [
+    "%s\\n",
+    "-n"
+   ],
+   "modelled": true,
+   "bash": "-n\n",
+   "sh": "-n\n",
+   "zsh": "-n\n",
+   "dash": "-n\n"
+  },
+  {
+   "name": "percent-b-rescans-its-argument",
+   "arguments": [
+    "%b\\n",
+    "a\\tb"
+   ],
+   "modelled": false,
+   "bash": "a\tb\n",
+   "sh": "a\tb\n",
+   "zsh": "a\tb\n",
+   "dash": "a\tb\n"
+  },
+  {
+   "name": "percent-d-is-not-a-string",
+   "arguments": [
+    "%d\\n",
+    "42"
+   ],
+   "modelled": false,
+   "bash": "42\n",
+   "sh": "42\n",
+   "zsh": "42\n",
+   "dash": "42\n"
+  },
+  {
+   "name": "unknown-escape-is-undefined",
+   "arguments": [
+    "a\\qb\\n"
+   ],
+   "modelled": false,
+   "bash": "a\\qb\n",
+   "sh": "a\\qb\n",
+   "zsh": "a\\qb\n",
+   "dash": "a\\qb\n"
+  }
+ ]
+}

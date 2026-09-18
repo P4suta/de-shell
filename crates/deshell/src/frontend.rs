@@ -1433,6 +1433,107 @@ fn case_arms<'a>(source: &'a str, statements: &[Range]) -> Option<Vec<(Vec<&'a s
     Some(arms)
 }
 
+/// One literal or conversion of a `printf` format string.
+enum FormatPiece {
+    /// Bytes written as they are, with the escapes already resolved.
+    Literal(String),
+    /// A `%s`, which writes one argument.
+    String,
+}
+
+/// Split a `printf` format string into its pieces, or `None` if it holds a
+/// conversion or an escape this does not model.
+///
+/// Narrow on purpose. `%d` rejects an argument that is not a number, `%b`
+/// rescans its argument for escapes, and `%q` quotes for re-input — each is a
+/// different function of the argument, so admitting them without modelling them
+/// would write different bytes. An unknown escape is left as written by every
+/// measured shell, but only because they all chose the same thing to do with a
+/// sequence the standard leaves undefined, so it is refused rather than relied
+/// on.
+fn printf_format(format: &str) -> Option<Vec<FormatPiece>> {
+    let mut pieces = Vec::new();
+    let mut literal = String::new();
+    let mut rest = format.chars();
+    while let Some(character) = rest.next() {
+        match character {
+            '\\' => match rest.next()? {
+                'n' => literal.push('\n'),
+                't' => literal.push('\t'),
+                'r' => literal.push('\r'),
+                '\\' => literal.push('\\'),
+                _ => return None,
+            },
+            '%' => match rest.next()? {
+                '%' => literal.push('%'),
+                's' => {
+                    if !literal.is_empty() {
+                        pieces.push(FormatPiece::Literal(std::mem::take(&mut literal)));
+                    }
+                    pieces.push(FormatPiece::String);
+                }
+                _ => return None,
+            },
+            other => literal.push(other),
+        }
+    }
+    if !literal.is_empty() {
+        pieces.push(FormatPiece::Literal(literal));
+    }
+    Some(pieces)
+}
+
+/// The bytes `printf` writes for these arguments, if that is provable.
+///
+/// The format is reused until the arguments run out, and the last pass fills
+/// the conversions it has no argument for with nothing. Both counts are known
+/// here, so the passes are written out rather than looped: the result is one
+/// expression whose bytes are the ones the shell would have written.
+fn printf_contents(arguments: &[crate::ir::TextExpression]) -> Option<Vec<TextPart>> {
+    let (format, values) = arguments.split_first()?;
+    let format = literal_expression(format)?;
+    let pieces = printf_format(&format)?;
+    let conversions = pieces
+        .iter()
+        .filter(|piece| matches!(piece, FormatPiece::String))
+        .count();
+    // With no conversion the format is written once and the arguments are
+    // ignored, which every measured shell does.
+    let passes = match conversions {
+        0 => 1,
+        conversions => values.len().div_ceil(conversions).max(1),
+    };
+
+    let mut parts: Vec<TextPart> = Vec::new();
+    // The canonical form has no two adjacent literals, and writing the passes
+    // out creates them wherever a pass ends in one and the next begins in one.
+    let mut push = |part: TextPart| match (parts.last_mut(), &part) {
+        (Some(TextPart::Literal { value }), TextPart::Literal { value: next }) => {
+            value.push_str(next);
+        }
+        _ => parts.push(part),
+    };
+    let mut next = 0_usize;
+    for _ in 0..passes {
+        for piece in &pieces {
+            match piece {
+                FormatPiece::Literal(value) => push(TextPart::Literal {
+                    value: value.clone(),
+                }),
+                FormatPiece::String => {
+                    if let Some(value) = values.get(next) {
+                        for part in &value.parts {
+                            push(part.clone());
+                        }
+                    }
+                    next += 1;
+                }
+            }
+        }
+    }
+    Some(parts)
+}
+
 /// The bytes bash's `echo` writes for these arguments, if that is provable.
 ///
 /// `None` means the first argument could begin with `-`, so bash might read it
@@ -2364,6 +2465,20 @@ fn lower_posix_simple(parts: LowerPosixSimpleArgs<'_>) -> Result<Node, String> {
         }
         return Err("exit status requires pinned interpreter delegation".into());
     }
+    if executable == "printf"
+        && let Some(parts) = printf_contents(&words[1..])
+    {
+        // Unlike `echo`, all four measured shells agree on `printf` — which is
+        // why this is modelled for every interpreter rather than for bash alone.
+        // `contracts/golden/printf-builtin-semantics-v1.json` records it.
+        return Ok(native_node(
+            Operation::WriteStdout {
+                contents: crate::ir::TextExpression { parts },
+            },
+            &format!("{}-static-printf-v1", interpreter.name()),
+            span_for_range(path, source, range.start, range.end)?,
+        ));
+    }
     if let Some(treatment) = builtin_treatment(&executable) {
         // Reaching here means no branch above lowered the name, so whatever the
         // table says, this call is delegated. The reason says which of the two
@@ -2664,7 +2779,7 @@ const SHELL_BUILTINS: &[(&str, BuiltinTreatment)] = &[
     ("noglob", BuiltinTreatment::Unexamined),
     ("popd", BuiltinTreatment::Unexamined),
     ("print", BuiltinTreatment::Unexamined),
-    ("printf", BuiltinTreatment::Unexamined),
+    ("printf", BuiltinTreatment::Modelled),
     ("private", BuiltinTreatment::Unexamined),
     ("pushd", BuiltinTreatment::Unexamined),
     ("pushln", BuiltinTreatment::Unexamined),
@@ -4920,6 +5035,68 @@ mod tests {
         }
     }
 
+    /// The `printf` lowering writes the bytes the shells write.
+    ///
+    /// Reads the same file `cargo xtask printf-semantics` measures. Unlike the
+    /// `echo` corpus, every column has to agree — `printf` is modelled for every
+    /// interpreter, so a disagreement is the reason that would stop being true.
+    #[test]
+    fn the_printf_lowering_writes_what_the_shells_write() {
+        let raw = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/contracts/golden/printf-builtin-semantics-v1.json"
+        ))
+        .expect("corpus is readable");
+        let corpus: serde_json::Value = serde_json::from_str(&raw).expect("corpus is JSON");
+        let shells: Vec<&str> = corpus["shells"]
+            .as_array()
+            .expect("corpus lists shells")
+            .iter()
+            .map(|value| value.as_str().expect("shell is a string"))
+            .collect();
+        let cases = corpus["cases"].as_array().expect("corpus has cases");
+        assert!(!cases.is_empty());
+        for case in cases {
+            let name = case["name"].as_str().expect("case has a name");
+            let arguments: Vec<String> = case["arguments"]
+                .as_array()
+                .expect("case has arguments")
+                .iter()
+                .map(|value| value.as_str().expect("argument is a string").to_owned())
+                .collect();
+            let modelled = case["modelled"].as_bool().expect("case says modelled");
+            let quoted = arguments
+                .iter()
+                .map(|argument| format!("'{}'", argument.replace('\'', "'\\''")))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let node = body(
+                "build.sh",
+                format!("#!/bin/bash\nprintf {quoted}\n").as_bytes(),
+            );
+            let Operation::WriteStdout { contents } = &node.operation else {
+                assert!(!modelled, "{name} is modelled but delegated: {node:#?}");
+                continue;
+            };
+            assert!(modelled, "{name} is not modelled but lowered: {node:#?}");
+            let written: String = contents
+                .parts
+                .iter()
+                .map(|part| match part {
+                    TextPart::Literal { value } => value.clone(),
+                    other => panic!("{name} has a non-literal part: {other:#?}"),
+                })
+                .collect();
+            for shell in &shells {
+                assert_eq!(
+                    written,
+                    case[*shell].as_str().expect("case records this shell"),
+                    "{name} writes different bytes than {shell}"
+                );
+            }
+        }
+    }
+
     /// `echo` is modelled for bash only, because the builtins disagree.
     ///
     /// The same corpus records `/bin/sh` interpreting `\t` and printing `-n`
@@ -5906,14 +6083,39 @@ mod tests {
     #[test]
     fn shell_builtins_are_delegated_instead_of_masquerading_as_external_execs() {
         for source in [
-            b"printf value\n".as_slice(),
-            b"echo value\n".as_slice(),
+            // A `printf` whose format holds a conversion this does not model.
+            b"printf '%d' 1\n".as_slice(),
             b"true\n".as_slice(),
             b"test -f input\n".as_slice(),
+            // A zsh builtin that is also a program in `/usr/bin`. It was absent
+            // from the table, so it became an `Exec` of the program — a
+            // different one, with a different output format.
+            b"which cargo\n".as_slice(),
+            b"print value\n".as_slice(),
+            b"whence -p cargo\n".as_slice(),
         ] {
             let node = body("build.sh", source);
-            assert!(matches!(node.guarantee, Guarantee::Delegated { .. }));
-            assert!(matches!(node.operation, Operation::InterpreterCall { .. }));
+            assert!(
+                matches!(node.guarantee, Guarantee::Delegated { .. }),
+                "{node:#?}"
+            );
+            assert!(
+                matches!(node.operation, Operation::InterpreterCall { .. }),
+                "{node:#?}"
+            );
+        }
+
+        // `echo` and `printf` are modelled, and the reason each of them is is a
+        // measurement rather than a name: see the corpora those two tests read.
+        for source in [
+            b"#!/bin/bash\necho value\n".as_slice(),
+            b"#!/bin/bash\nprintf '%s' value\n".as_slice(),
+        ] {
+            let node = body("build.sh", source);
+            assert!(
+                matches!(node.operation, Operation::WriteStdout { .. }),
+                "{node:#?}"
+            );
         }
     }
 

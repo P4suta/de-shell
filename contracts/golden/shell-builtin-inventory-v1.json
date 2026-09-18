@@ -296,7 +296,7 @@
   "noglob": "unexamined",
   "popd": "unexamined",
   "print": "unexamined",
-  "printf": "unexamined",
+  "printf": "modelled",
   "private": "unexamined",
   "pushd": "unexamined",
   "pushln": "unexamined",
