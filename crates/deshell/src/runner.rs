@@ -414,6 +414,15 @@ impl Executor<'_> {
                     crate::ir::TestPredicate::StringNotEqual { left, right } => {
                         evaluate(left, &context)? != evaluate(right, &context)?
                     }
+                    crate::ir::TestPredicate::StartsWith { value, prefix } => {
+                        evaluate(value, &context)?.starts_with(prefix.as_str())
+                    }
+                    crate::ir::TestPredicate::EndsWith { value, suffix } => {
+                        evaluate(value, &context)?.ends_with(suffix.as_str())
+                    }
+                    crate::ir::TestPredicate::Contains { value, infix } => {
+                        evaluate(value, &context)?.contains(infix.as_str())
+                    }
                 };
                 Ok((
                     RunResult {

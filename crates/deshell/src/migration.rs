@@ -3685,6 +3685,15 @@ fn emit_rust_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> 
                 crate::ir::TestPredicate::StringNotEqual { left, right } => {
                     format!("{} != {}", rust_expression(left)?, rust_expression(right)?)
                 }
+                crate::ir::TestPredicate::StartsWith { value, prefix } => {
+                    format!("{}.starts_with({prefix:?})", rust_expression(value)?)
+                }
+                crate::ir::TestPredicate::EndsWith { value, suffix } => {
+                    format!("{}.ends_with({suffix:?})", rust_expression(value)?)
+                }
+                crate::ir::TestPredicate::Contains { value, infix } => {
+                    format!("{}.contains({infix:?})", rust_expression(value)?)
+                }
             };
             output.push_str(&format!("{indent}i32::from(!({condition}))"));
         }
@@ -3817,12 +3826,24 @@ fn emit_rust_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> 
     Ok(())
 }
 
-/// Whether the tree contains a `CaptureStdout`.
+/// Whether the generated Go will need the `strings` package.
 ///
-/// Reuses the shape `rust_node_sets_variables` walks, narrowed to the one
-/// operation whose generated Go needs an extra import.
+/// A capture trims the output; a pattern predicate calls `HasPrefix` and friends.
+/// Go rejects an unused import outright, so this has to be exact rather than
+/// generous.
 fn node_captures_stdout(node: &crate::ir::Node) -> bool {
-    if matches!(node.operation, crate::ir::Operation::CaptureStdout { .. }) {
+    if matches!(node.operation, crate::ir::Operation::CaptureStdout { .. })
+        || matches!(
+            &node.operation,
+            crate::ir::Operation::Test { predicate }
+                if matches!(
+                    predicate,
+                    crate::ir::TestPredicate::StartsWith { .. }
+                        | crate::ir::TestPredicate::EndsWith { .. }
+                        | crate::ir::TestPredicate::Contains { .. }
+                )
+        )
+    {
         return true;
     }
     match &node.operation {
@@ -4072,6 +4093,9 @@ fn node_has_expression_part(
             | crate::ir::TestPredicate::StringNotEqual { left, right } => {
                 left.parts.iter().any(wanted) || right.parts.iter().any(wanted)
             }
+            crate::ir::TestPredicate::StartsWith { value, .. }
+            | crate::ir::TestPredicate::EndsWith { value, .. }
+            | crate::ir::TestPredicate::Contains { value, .. } => value.parts.iter().any(wanted),
         },
         crate::ir::Operation::Not { body }
         | crate::ir::Operation::Redirect { body, .. }
@@ -4454,6 +4478,21 @@ fn emit_go_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> Re
                 crate::ir::TestPredicate::StringNotEqual { left, right } => {
                     format!("{} != {}", go_expression(left)?, go_expression(right)?)
                 }
+                crate::ir::TestPredicate::StartsWith { value, prefix } => format!(
+                    "strings.HasPrefix({}, {})",
+                    go_expression(value)?,
+                    go_string(prefix)?
+                ),
+                crate::ir::TestPredicate::EndsWith { value, suffix } => format!(
+                    "strings.HasSuffix({}, {})",
+                    go_expression(value)?,
+                    go_string(suffix)?
+                ),
+                crate::ir::TestPredicate::Contains { value, infix } => format!(
+                    "strings.Contains({}, {})",
+                    go_expression(value)?,
+                    go_string(infix)?
+                ),
             };
             output.push_str(&format!(
                 concat!(

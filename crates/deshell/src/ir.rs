@@ -246,6 +246,26 @@ pub(crate) enum TestPredicate {
         left: TextExpression,
         right: TextExpression,
     },
+    /// `[[ STRING == PREFIX* ]]`.
+    ///
+    /// Only the three anchored shapes of a glob are modelled — a trailing `*`, a
+    /// leading one, and both. A pattern with `?`, a bracket class, or an interior
+    /// `*` is delegated: matching it with a neighbouring rule would answer a
+    /// different question, and these three cover what a release workflow asks.
+    StartsWith {
+        value: TextExpression,
+        prefix: String,
+    },
+    /// `[[ STRING == *SUFFIX ]]`.
+    EndsWith {
+        value: TextExpression,
+        suffix: String,
+    },
+    /// `[[ STRING == *INFIX* ]]`.
+    Contains {
+        value: TextExpression,
+        infix: String,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1069,6 +1089,9 @@ fn validate_node(parts: ValidateNodeArgs<'_>) {
                 expression(left, errors);
                 expression(right, errors);
             }
+            TestPredicate::StartsWith { value, .. }
+            | TestPredicate::EndsWith { value, .. }
+            | TestPredicate::Contains { value, .. } => expression(value, errors),
         },
         Operation::Exec {
             argv,

@@ -2078,10 +2078,36 @@ fn lower_posix_simple(parts: LowerPosixSimpleArgs<'_>) -> Result<Node, String> {
             span_for_range(path, source, range.start, range.end)?,
         ));
     }
-    // `[ ... ]` has to be recognised before tokenizing, because `[` and `]` are in
-    // the glob character set the tokenizer refuses. The brackets are the builtin's
-    // syntax here, not a pattern.
+    // `[ ... ]` and `[[ ... ]]` have to be recognised before tokenizing, because
+    // `[` and `]` are in the glob character set the tokenizer refuses. The
+    // brackets are syntax here, not a pattern.
     let statement = source[range.start..range.end].trim();
+    if let Some(inner) = statement
+        .strip_prefix("[[ ")
+        .and_then(|rest| rest.strip_suffix(" ]]"))
+    {
+        // `[[` is a keyword rather than a builtin: it does not split words or
+        // expand globs in its operands, and `==` matches a pattern. The operand
+        // text is read before tokenizing for the same reason as `[`.
+        let offset = range.start
+            + source[range.start..range.end]
+                .find(inner)
+                .ok_or("test operands are not inside their range")?;
+        let predicate = double_bracket_predicate(DoubleBracketArgs {
+            path,
+            source,
+            offset,
+            text: inner,
+            inputs,
+            environment,
+            locals,
+        })?;
+        return Ok(native_node(
+            Operation::Test { predicate },
+            &format!("{}-static-double-bracket-v1", interpreter.name()),
+            span_for_range(path, source, range.start, range.end)?,
+        ));
+    }
     if let Some(inner) = statement
         .strip_prefix("[ ")
         .and_then(|rest| rest.strip_suffix(" ]"))
@@ -2170,6 +2196,114 @@ fn lower_posix_simple(parts: LowerPosixSimpleArgs<'_>) -> Result<Node, String> {
         &format!("{}-explicit-redirection-v1", interpreter.name()),
         span,
     ))
+}
+
+/// The inputs of [`double_bracket_predicate`].
+struct DoubleBracketArgs<'a> {
+    path: &'a str,
+    source: &'a str,
+    offset: usize,
+    text: &'a str,
+    inputs: &'a mut BTreeSet<String>,
+    environment: &'a mut BTreeSet<String>,
+    locals: &'a BTreeSet<String>,
+}
+
+/// Read the operands of `[[ ... ]]`.
+///
+/// `==` and `!=` take a pattern on the right. Only the three anchored shapes are
+/// modelled — `p*`, `*s`, `*i*` — and a pattern with `?`, a bracket class or an
+/// interior `*` leaves the statement delegated. The remaining operators are the
+/// ones `[` has, read the same way.
+fn double_bracket_predicate(parts: DoubleBracketArgs<'_>) -> Result<crate::ir::TestPredicate, String> {
+    // Destructured without `..`: see `DoubleBracketArgs`.
+    let DoubleBracketArgs {
+        path,
+        source,
+        offset,
+        text,
+        inputs,
+        environment,
+        locals,
+    } = parts;
+    let _ = path;
+    // The pattern operand is taken from the raw text rather than the tokenizer,
+    // because `*` is exactly what the tokenizer refuses.
+    let comparison = text
+        .split_once(" == ")
+        .map(|halves| (halves, true))
+        .or_else(|| text.split_once(" != ").map(|halves| (halves, false)));
+    if let Some(((left_text, right_text), equal)) = comparison {
+        let left_words = tokenize_posix(left_text.trim(), inputs, environment, locals)?;
+        let [value] = left_words.as_slice() else {
+            return Err("double-bracket comparison needs one word on the left".into());
+        };
+        let pattern = right_text.trim().trim_matches('"');
+        if let Some(predicate) = anchored_pattern(value, pattern) {
+            if !equal {
+                return Err("a negated pattern match is not modelled".into());
+            }
+            return Ok(predicate);
+        }
+        if pattern
+            .bytes()
+            .any(|byte| matches!(byte, b'*' | b'?' | b'[' | b']'))
+        {
+            return Err("unmodelled shell pattern requires pinned interpreter delegation".into());
+        }
+        let right_expression = crate::ir::TextExpression::literal(pattern);
+        return Ok(if equal {
+            crate::ir::TestPredicate::StringEqual {
+                left: value.clone(),
+                right: right_expression,
+            }
+        } else {
+            crate::ir::TestPredicate::StringNotEqual {
+                left: value.clone(),
+                right: right_expression,
+            }
+        });
+    }
+    let operands = tokenize_posix(text, inputs, environment, locals).map_err(|_| {
+        let _ = (source, offset);
+        "double-bracket operands are outside the static subset".to_owned()
+    })?;
+    test_predicate(&operands)
+        .ok_or_else(|| "unmodelled test operator requires pinned interpreter delegation".into())
+}
+
+/// A glob with exactly one anchor, as one of the three modelled predicates.
+fn anchored_pattern(
+    value: &TextExpression,
+    pattern: &str,
+) -> Option<crate::ir::TestPredicate> {
+    let body = pattern.strip_prefix('*');
+    let leading = body.is_some();
+    let body = body.unwrap_or(pattern);
+    let trailing = body.ends_with('*');
+    let body = body.strip_suffix('*').unwrap_or(body);
+    if body.is_empty()
+        || body
+            .bytes()
+            .any(|byte| matches!(byte, b'*' | b'?' | b'[' | b']'))
+    {
+        return None;
+    }
+    match (leading, trailing) {
+        (false, true) => Some(crate::ir::TestPredicate::StartsWith {
+            value: value.clone(),
+            prefix: body.to_owned(),
+        }),
+        (true, false) => Some(crate::ir::TestPredicate::EndsWith {
+            value: value.clone(),
+            suffix: body.to_owned(),
+        }),
+        (true, true) => Some(crate::ir::TestPredicate::Contains {
+            value: value.clone(),
+            infix: body.to_owned(),
+        }),
+        (false, false) => None,
+    }
 }
 
 /// Map a `test` operand list onto a modelled predicate.
@@ -4432,6 +4566,55 @@ mod tests {
         assert!(
             matches!(node.operation, Operation::InterpreterCall { .. }),
             "until is not modelled: {node:#?}"
+        );
+    }
+
+    #[test]
+    fn a_double_bracket_test_lowers_with_its_pattern() {
+        // `[[` is a bash keyword, not a builtin: it does not split words or expand
+        // globs in its operands, and `==` matches a pattern rather than comparing
+        // strings. `[[ "$REF" == v* ]]` is how a release workflow asks whether a
+        // ref is a tag.
+        let node = body("build.sh", b"[[ \"$REF\" == v* ]]\n");
+        let Operation::Test { predicate } = &node.operation else {
+            panic!("expected test: {node:#?}")
+        };
+        assert_eq!(
+            predicate,
+            &crate::ir::TestPredicate::StartsWith {
+                value: crate::ir::TextExpression {
+                    parts: vec![TextPart::Variable { name: "REF".into() }]
+                },
+                prefix: "v".into(),
+            }
+        );
+
+        // Without a pattern, `==` is a string comparison.
+        let node = body("build.sh", b"[[ \"$A\" == \"b\" ]]\n");
+        let Operation::Test { predicate } = &node.operation else {
+            panic!("expected test")
+        };
+        assert!(matches!(
+            predicate,
+            crate::ir::TestPredicate::StringEqual { .. }
+        ));
+
+        // The operators `[` has work here too.
+        let node = body("build.sh", b"[[ -n \"$VALUE\" ]]\n");
+        let Operation::Test { predicate } = &node.operation else {
+            panic!("expected test")
+        };
+        assert!(matches!(
+            predicate,
+            crate::ir::TestPredicate::NonEmpty { .. }
+        ));
+
+        // A pattern this does not model keeps the statement delegated rather than
+        // matching something else.
+        let node = body("build.sh", b"[[ \"$REF\" == v?.[0-9] ]]\n");
+        assert!(
+            matches!(node.operation, Operation::InterpreterCall { .. }),
+            "an unmodelled pattern must delegate: {node:#?}"
         );
     }
 
