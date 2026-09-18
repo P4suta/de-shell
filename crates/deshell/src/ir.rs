@@ -152,6 +152,31 @@ pub(crate) enum UnsetPolicy {
 /// position that reaches this loop is a statement of a sequence. Shell function definitions,
 /// where the option's meaning would depend on the call site, are delegated
 /// before they reach the lowering.
+/// What an `exit` does when its status is not a decimal integer.
+///
+/// Every measured shell reduces a decimal status modulo 256 and agrees on the
+/// result. Outside that they do not agree at all: bash and `/bin/sh` end with
+/// 255 and write a message naming the interpreter's own path and a line number;
+/// zsh ends with 0 in silence. There is no behaviour to reproduce, because
+/// reproducing one would mean impersonating a shell the script may not run
+/// under. `contracts/golden/exit-builtin-semantics-v1.json` records it.
+///
+/// So the two cases are separate values. `Unreachable` says the lowering read
+/// the status and it is a number, which is the whole claim. `Refuse` says the
+/// status arrives at run time, the plan matches the shells for every value they
+/// agree on, and for the rest it stops and says so — loudly, where the shells
+/// differ quietly.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NonNumericStatus {
+    /// The lowering proved the status is a decimal integer.
+    #[default]
+    Unreachable,
+    /// The status is read at run time, and a value outside the domain stops the
+    /// plan rather than choosing a shell to imitate.
+    Refuse,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum SequenceFailure {
@@ -487,6 +512,7 @@ pub(crate) enum Operation {
     Sequence {
         nodes: Vec<Node>,
         /// Whether a failing statement ends the sequence. See [`SequenceFailure`].
+        /// Whether a failing statement ends the sequence. See [`SequenceFailure`].
         on_failure: SequenceFailure,
     },
     Parallel {
@@ -521,6 +547,12 @@ pub(crate) enum Operation {
     /// measurement.
     Exit {
         status: TextExpression,
+        /// What happens when the status is not a decimal integer.
+        ///
+        /// Carried as a value rather than settled by the lowering, because the
+        /// two cases are different claims: see [`NonNumericStatus`].
+        #[serde(default)]
+        non_numeric: NonNumericStatus,
     },
     /// Runs nothing and succeeds.
     ///
@@ -1257,7 +1289,7 @@ fn validate_node(parts: ValidateNodeArgs<'_>) {
         // Children are validated by the walk over them; nothing here is its own.
         Operation::NoOp | Operation::Not { .. } | Operation::While { .. } => {}
         Operation::WriteStdout { contents } => expression(contents, errors),
-        Operation::Exit { status } => expression(status, errors),
+        Operation::Exit { status, .. } => expression(status, errors),
         Operation::Test { predicate } => match predicate {
             TestPredicate::NonEmpty { value } | TestPredicate::Empty { value } => {
                 expression(value, errors);

@@ -937,6 +937,7 @@ semantic_models! {
     StaticEcho => "static-echo-v1", Some("contracts/golden/echo-builtin-semantics-v1.json");
     StaticEmptyArm => "static-empty-arm-v1", None;
     StaticExit => "static-exit-v1", Some("contracts/golden/exit-builtin-semantics-v1.json");
+    StaticExitChecked => "static-exit-checked-v1", Some("contracts/golden/exit-builtin-semantics-v1.json");
     StaticExternalCommand => "static-external-command-v1", None;
     StaticMainSequence => "static-main-sequence-v1", None;
     StaticMatch => "static-match-v1", None;
@@ -3019,19 +3020,41 @@ fn lower_posix_simple(parts: LowerPosixSimpleArgs<'_>) -> Result<Node, String> {
         //
         // A bare `exit` ends with the last command's status, which the IR has no
         // term for, so it is delegated rather than reported as 0.
-        if let [status] = &words[1..]
-            && let Some(literal) = literal_expression(status)
-            && literal.trim().parse::<i64>().is_ok()
-        {
+        if let [status] = &words[1..] {
+            // A status the lowering can read is the whole claim; one that
+            // arrives at run time makes the claim over the domain the shells
+            // agree on, and the plan stops outside it rather than choosing a
+            // shell to imitate.
+            let (status, non_numeric, model) =
+                match literal_expression(status) {
+                    Some(literal) if literal.trim().parse::<i64>().is_ok() => (
+                        crate::ir::TextExpression::literal(literal.trim()),
+                        crate::ir::NonNumericStatus::Unreachable,
+                        SemanticModel::StaticExit,
+                    ),
+                    // A literal that is not a number is where the shells part, and
+                    // it is knowable here, so it is refused rather than deferred to
+                    // a run that would stop anyway.
+                    Some(_) => return Err(
+                        "exit status is not a number and requires pinned interpreter delegation"
+                            .into(),
+                    ),
+                    None => (
+                        status.clone(),
+                        crate::ir::NonNumericStatus::Refuse,
+                        SemanticModel::StaticExitChecked,
+                    ),
+                };
             return Ok(native_node(
                 Operation::Exit {
-                    status: crate::ir::TextExpression::literal(literal.trim()),
+                    status,
+                    non_numeric,
                 },
-                SemanticModel::StaticExit.named(interpreter),
+                model.named(interpreter),
                 span_for_range(path, source, range.start, range.end)?,
             ));
         }
-        return Err("exit status requires pinned interpreter delegation".into());
+        return Err("exit takes one status here and requires pinned interpreter delegation".into());
     }
     // A call to a function defined in this file is a task call, not an exec of
     // a program that happens to share its name. The arity is checked here
@@ -5922,7 +5945,10 @@ mod tests {
                 "build.sh",
                 format!("#!/bin/bash\nexit '{}'\n", status.replace('\'', "'\\''")).as_bytes(),
             );
-            let Operation::Exit { status: lowered } = &node.operation else {
+            let Operation::Exit {
+                status: lowered, ..
+            } = &node.operation
+            else {
                 assert!(!modelled, "{name} is modelled but delegated: {node:#?}");
                 continue;
             };
@@ -5939,21 +5965,51 @@ mod tests {
         }
     }
 
-    /// A bare `exit` ends with the last command's status, which the IR cannot
-    /// say — so it is delegated rather than reported as 0.
+    /// A bare `exit` is delegated; a status read at run time is not.
+    ///
+    /// A bare `exit` ends with the last command's status, which the IR has no
+    /// term for. A status that arrives at run time does have one: the claim is
+    /// made over the domain every shell agrees on and `NonNumericStatus` says
+    /// what happens outside it, which is a value rather than a silent choice.
     #[test]
-    fn a_bare_exit_and_a_dynamic_status_are_delegated() {
+    fn a_bare_exit_is_delegated_and_a_run_time_status_states_its_domain() {
+        let node = body("build.sh", b"#!/bin/bash\nexit\n");
+        assert!(
+            matches!(node.operation, Operation::InterpreterCall { .. }),
+            "a bare exit must delegate: {node:#?}"
+        );
+
+        // A literal that is not a number is knowable here, and the shells part
+        // over it, so it is refused at lowering rather than at a run.
+        let node = body("build.sh", b"#!/bin/bash\nexit abc\n");
+        assert!(
+            matches!(node.operation, Operation::InterpreterCall { .. }),
+            "a non-numeric literal must delegate: {node:#?}"
+        );
+
         for source in [
-            "#!/bin/bash\nexit\n".as_bytes(),
             "#!/bin/bash\nexit \"$1\"\n".as_bytes(),
             "#!/bin/bash\nexit \"${CODE:-2}\"\n".as_bytes(),
         ] {
             let node = body("build.sh", source);
-            assert!(
-                matches!(node.operation, Operation::InterpreterCall { .. }),
-                "must delegate: {node:#?}"
-            );
+            let Operation::Exit { non_numeric, .. } = &node.operation else {
+                panic!("expected an exit: {node:#?}")
+            };
+            assert_eq!(*non_numeric, crate::ir::NonNumericStatus::Refuse);
+            let Guarantee::Native { semantic_model } = &node.guarantee else {
+                panic!("expected a native guarantee: {node:#?}")
+            };
+            // A different model, because it is a different claim.
+            let NativeBasis(expected) = SemanticModel::StaticExitChecked.named(&Interpreter::Bash);
+            assert_eq!(semantic_model, &expected);
         }
+
+        // A literal integer is the whole claim, under the model that says so.
+        let node = body("build.sh", b"#!/bin/bash\nexit 2\n");
+        let Operation::Exit { non_numeric, .. } = &node.operation else {
+            panic!("expected an exit: {node:#?}")
+        };
+        assert_eq!(*non_numeric, crate::ir::NonNumericStatus::Unreachable);
     }
 
     /// The `printf` lowering writes the bytes the shells write.

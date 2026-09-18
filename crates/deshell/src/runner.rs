@@ -493,14 +493,20 @@ impl Executor<'_> {
             }
             // `test` succeeds with 0 and fails with 1, and produces no output.
             Operation::NoOp => Ok(Step::next(RunResult::empty(), context)),
-            Operation::Exit { status } => {
+            Operation::Exit {
+                status,
+                // Read to say the two cases are the same here: the runner stops
+                // either way, and the difference is whether the lowering had
+                // already ruled the value out. The generated programs do differ,
+                // because one of them is a constant.
+                non_numeric: _,
+            } => {
                 let text = evaluate(status, &context)?;
                 let parsed = text.trim().parse::<i64>().map_err(|_| {
                     // The shells disagree here — bash exits 255 with a message
                     // naming itself, zsh exits 0 in silence — so there is no
                     // status to report that is not one shell impersonating
-                    // another. The frontend refuses a status it cannot read, so
-                    // reaching this means the plan was built by hand.
+                    // another.
                     invalid(format!("exit status is not an integer: {text}"))
                 })?;
                 // Measured: every shell reduces modulo 256, negatives and
@@ -1858,6 +1864,7 @@ mod tests {
         let exit = |status: &str| {
             node(Operation::Exit {
                 status: TextExpression::literal(status),
+                non_numeric: crate::ir::NonNumericStatus::Unreachable,
             })
         };
         let backend = MockBackend::default();

@@ -2,7 +2,7 @@
  "schema_version": 1,
  "contract": "semantic-models-v1",
  "purpose": "Name every claim a native node is allowed to make, and say what each claim rests on, so a guarantee cannot cite a model that does not exist or a measurement nobody took.",
- "note": "`Guarantee::Native` carries a `semantic_model` string and the validator asked only that it not be empty. The frontend now builds the string from a closed vocabulary, and this file records the same vocabulary along with the recording behind each entry. A model with evidence is one whose behaviour was measured across the shells and whose measurement a gate re-runs. A model without evidence is one whose meaning is the IR operation's own definition - a sequence runs its statements in order - where there is nothing to measure; that is a different claim from having measured nothing, which is why the field is present and null rather than absent. The interpreter's name is prefixed at use, so an entry here is a suffix.",
+ "note": "`Guarantee::Native` carries a `semantic_model` string and the validator asked only that it not be empty. The frontend now builds the string from a closed vocabulary, and this file records the same vocabulary along with the recording behind each entry. A model with evidence is one whose behaviour was measured across the shells and whose measurement a gate re-runs. A model without evidence is one whose meaning is the IR operation's own definition - a sequence runs its statements in order - where there is nothing to measure; that is a different claim from having measured nothing, which is why the field is present and null rather than absent. The interpreter's name is prefixed at use, so an entry here is a suffix. `static-exit-checked-v1` is the one model that claims less than the whole of its operation: the status arrives at run time, the claim holds for every value the shells agree on -- a decimal integer, reduced modulo 256 -- and outside that the plan stops and says so, because the shells themselves differ there and reproducing one would be impersonating a shell the script may not run under. The domain is carried in the IR as `NonNumericStatus`, so it is a value a reader and a gate can see rather than a note.",
  "models": {
   "and-if-v1": {
    "evidence": null
@@ -30,6 +30,9 @@
   },
   "static-empty-arm-v1": {
    "evidence": null
+  },
+  "static-exit-checked-v1": {
+   "evidence": "contracts/golden/exit-builtin-semantics-v1.json"
   },
   "static-exit-v1": {
    "evidence": "contracts/golden/exit-builtin-semantics-v1.json"

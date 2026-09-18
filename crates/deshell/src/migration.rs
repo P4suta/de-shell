@@ -3659,10 +3659,10 @@ fn generate_rust(plan: &crate::ir::Plan) -> Result<Vec<u8>, String> {
             "fn main() {{\n",
             "{argument_binding}",
             "{variable_binding}",
-            "    let deshell_status =\n",
+            "{binding}",
             "{body}",
             ";\n",
-            "    std::process::exit(deshell_status);\n",
+            "{ending}",
             "}}\n"
         ),
         import = import,
@@ -3671,6 +3671,19 @@ fn generate_rust(plan: &crate::ir::Plan) -> Result<Vec<u8>, String> {
         functions = functions,
         argument_binding = argument_binding,
         variable_binding = variable_binding,
+        // A body that always exits leaves nothing after it to run, and the
+        // generated program's own `-D warnings` build rejects an unreachable
+        // statement. The status is the body's either way.
+        binding = if node_always_exits(&task.body) {
+            "    let _: i32 =\n"
+        } else {
+            "    let deshell_status =\n"
+        },
+        ending = if node_always_exits(&task.body) {
+            ""
+        } else {
+            "    std::process::exit(deshell_status);\n"
+        },
         body = body,
     );
     rustfmt_generated(source.as_bytes())
@@ -3966,15 +3979,42 @@ fn emit_rust_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> 
             }
             output.push_str(&format!("{indent}{task}(&[{}])", values.join(", ")));
         }
-        // The frontend lowers only a literal integer status, so this is a
-        // constant. `process::exit` returns `!`, which is why it stands where
-        // the surrounding expression wants an `i32`.
-        crate::ir::Operation::Exit { status } => {
-            output.push_str(&format!(
+        // `process::exit` returns `!`, which is why it stands where the
+        // surrounding expression wants an `i32`.
+        crate::ir::Operation::Exit {
+            status,
+            non_numeric,
+        } => match non_numeric {
+            crate::ir::NonNumericStatus::Unreachable => output.push_str(&format!(
                 "{indent}std::process::exit({})",
                 rust_exit_status(status)?
-            ));
-        }
+            )),
+            // The status arrives at run time. Every shell reduces a decimal one
+            // modulo 256 and agrees; outside that they do not agree at all, so
+            // the program stops and says which value it was rather than picking
+            // one shell's answer.
+            crate::ir::NonNumericStatus::Refuse => output.push_str(&format!(
+                concat!(
+                    "{indent}{{\n",
+                    "{indent}    let deshell_status = {status};\n",
+                    "{indent}    match deshell_status.trim().parse::<i64>() {{\n",
+                    "{indent}        Ok(status) => std::process::exit(\n",
+                    "{indent}            i32::try_from(status.rem_euclid(256)).unwrap_or(255),\n",
+                    "{indent}        ),\n",
+                    "{indent}        Err(_) => {{\n",
+                    "{indent}            eprintln!(\n",
+                    "{indent}                \"exit status {{deshell_status:?}} is not a number; \\\n",
+                    "{indent}                 the shells do not agree on what that means\"\n",
+                    "{indent}            );\n",
+                    "{indent}            std::process::exit(70)\n",
+                    "{indent}        }}\n",
+                    "{indent}    }}\n",
+                    "{indent}}}"
+                ),
+                indent = indent,
+                status = rust_expression(status)?
+            )),
+        },
         // `echo` returns 1 when the write fails, so the status is the write's.
         // The `use` is local to the block: the import list is decided before the
         // body is walked, and an unconditional `std::io::Write` would be unused
@@ -4709,7 +4749,7 @@ fn node_has_expression_part(
     match &node.operation {
         crate::ir::Operation::NoOp => false,
         crate::ir::Operation::WriteStdout { contents } => expression(contents),
-        crate::ir::Operation::Exit { status } => expression(status),
+        crate::ir::Operation::Exit { status, .. } => expression(status),
         crate::ir::Operation::Exec {
             argv,
             environment,
@@ -5149,6 +5189,12 @@ fn generate_go(plan: &crate::ir::Plan) -> Result<Vec<u8>, String> {
         .tasks
         .iter()
         .any(|task| node_captures_stdout(&task.body));
+    // A run-time exit status is parsed and trimmed, which is the only place the
+    // generated Go needs `strconv`.
+    let go_parses_status = plan
+        .tasks
+        .iter()
+        .any(|task| go_node_checks_exit_status(&task.body));
     let (pattern_strings, pattern_utf8) =
         plan.tasks
             .iter()
@@ -5156,13 +5202,28 @@ fn generate_go(plan: &crate::ir::Plan) -> Result<Vec<u8>, String> {
                 let (task_strings, task_utf8) = go_pattern_packages(&task.body);
                 (strings || task_strings, utf8 || task_utf8)
             });
-    let imports = match (go_captures || pattern_strings, pattern_utf8) {
-        (true, true) => concat!(
-            "import (\n\t\"fmt\"\n\t\"os\"\n\t\"os/exec\"\n\t\"strings\"\n",
-            "\t\"unicode/utf8\"\n)\n\n"
-        ),
-        (true, false) => "import (\n\t\"fmt\"\n\t\"os\"\n\t\"os/exec\"\n\t\"strings\"\n)\n\n",
-        (false, _) => "import (\n\t\"fmt\"\n\t\"os\"\n\t\"os/exec\"\n)\n\n",
+    // Go rejects an unused import and a missing one alike, so the list is built
+    // from what the body needs rather than chosen from a few shapes.
+    let imports = {
+        let mut names = vec!["fmt", "os", "os/exec"];
+        if go_parses_status {
+            names.push("strconv");
+        }
+        if go_captures || pattern_strings || go_parses_status {
+            names.push("strings");
+        }
+        if pattern_utf8 {
+            names.push("unicode/utf8");
+        }
+        names.sort_unstable();
+        format!(
+            "import (\n{}\n)\n\n",
+            names
+                .into_iter()
+                .map(|name| format!("\t\"{name}\""))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
     };
     let source = format!(
         concat!(
@@ -5197,6 +5258,18 @@ fn generate_go(plan: &crate::ir::Plan) -> Result<Vec<u8>, String> {
         body = body,
     );
     Ok(source.into_bytes())
+}
+
+/// Whether any `exit` under this node reads its status at run time.
+fn go_node_checks_exit_status(node: &crate::ir::Node) -> bool {
+    if let crate::ir::Operation::Exit { non_numeric, .. } = &node.operation
+        && *non_numeric == crate::ir::NonNumericStatus::Refuse
+    {
+        return true;
+    }
+    let mut found = false;
+    visit_node(node, |child| found |= go_node_checks_exit_status(child));
+    found
 }
 
 /// The shell-local map a Go function body needs, if it needs one.
@@ -5349,9 +5422,34 @@ fn emit_go_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> Re
             }
             output.push_str(&format!("{indent}}}\n"));
         }
-        crate::ir::Operation::Exit { status } => {
-            output.push_str(&format!("{indent}os.Exit({})\n", rust_exit_status(status)?));
-        }
+        crate::ir::Operation::Exit {
+            status,
+            non_numeric,
+        } => match non_numeric {
+            crate::ir::NonNumericStatus::Unreachable => {
+                output.push_str(&format!("{indent}os.Exit({})\n", rust_exit_status(status)?))
+            }
+            crate::ir::NonNumericStatus::Refuse => output.push_str(&format!(
+                concat!(
+                    "{indent}{{\n",
+                    "{indent}\tdeshellStatus := {status}\n",
+                    "{indent}\tdeshellCode, deshellErr := strconv.ParseInt(",
+                    "strings.TrimSpace(deshellStatus), 10, 64)\n",
+                    "{indent}\tif deshellErr != nil {{\n",
+                    "{indent}\t\tfmt.Fprintf(os.Stderr,\n",
+                    "{indent}\t\t\t\"exit status %q is not a number; \"+\n",
+                    "{indent}\t\t\t\t\"the shells do not agree on what that means\\n\",\n",
+                    "{indent}\t\t\tdeshellStatus)\n",
+                    "{indent}\t\tos.Exit(70)\n",
+                    "{indent}\t}}\n",
+                    "{indent}\tdeshellCode = ((deshellCode % 256) + 256) % 256\n",
+                    "{indent}\tos.Exit(int(deshellCode))\n",
+                    "{indent}}}\n"
+                ),
+                indent = indent,
+                status = go_expression(status)?
+            )),
+        },
         crate::ir::Operation::TaskCall {
             task,
             arguments,
@@ -10196,6 +10294,109 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
         );
     }
 
+    /// A status read at run time ends where the shells end, and stops where
+    /// they part.
+    ///
+    /// `exit "${CODE}"` is the last thing standing between a real workflow and
+    /// a migration, and it is the one model that claims less than the whole of
+    /// its operation. Every measured shell reduces a decimal status modulo 256
+    /// and agrees; outside that bash ends with 255 and zsh with 0, so there is
+    /// nothing to reproduce. The generated programs match the shells inside the
+    /// domain and stop loudly outside it.
+    #[test]
+    fn a_run_time_exit_status_matches_the_shells_and_stops_where_they_part() {
+        let script = "exit \"${DESHELL_TEST_CODE}\"\n";
+        let plan = crate::frontend::lower(
+            "end.sh",
+            format!("#!/bin/bash\n{script}").as_bytes(),
+            crate::config::UnknownInterpreter::TraceOnly,
+        )
+        .unwrap();
+        let crate::ir::Operation::Exit {
+            status,
+            non_numeric,
+        } = &plan.tasks[0].body.operation
+        else {
+            panic!("expected an exit: {plan:#?}")
+        };
+        assert_eq!(*non_numeric, crate::ir::NonNumericStatus::Refuse);
+        assert_eq!(
+            status.parts,
+            [crate::ir::TextPart::Variable {
+                name: "DESHELL_TEST_CODE".into()
+            }]
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("end.sh"), script).unwrap();
+        std::fs::write(
+            directory.path().join("end.rs"),
+            generate_rust(&plan).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(directory.path().join("end.go"), generate_go(&plan).unwrap()).unwrap();
+        let built = std::process::Command::new("rustc")
+            .arg("end.rs")
+            .args(["--edition=2024", "-D", "warnings", "-o", "end-rust"])
+            .current_dir(directory.path())
+            .output()
+            .unwrap();
+        assert!(
+            built.status.success(),
+            "rustc rejected generated source:\n{}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        let built = std::process::Command::new("go")
+            .args(["build", "-o", "end-go", "end.go"])
+            .current_dir(directory.path())
+            .output()
+            .unwrap();
+        assert!(
+            built.status.success(),
+            "go build rejected generated source:\n{}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+
+        // Inside the domain: the same status bash ends with, measured rather
+        // than assumed, including the values that wrap.
+        for code in ["0", "1", "2", "255", "256", "300", "-1", " 7 "] {
+            let shell = std::process::Command::new("bash")
+                .arg("end.sh")
+                .env("DESHELL_TEST_CODE", code)
+                .current_dir(directory.path())
+                .status()
+                .unwrap();
+            for program in ["./end-rust", "./end-go"] {
+                let ran = std::process::Command::new(program)
+                    .env("DESHELL_TEST_CODE", code)
+                    .current_dir(directory.path())
+                    .status()
+                    .unwrap();
+                assert_eq!(
+                    ran.code(),
+                    shell.code(),
+                    "{program} ended differently for {code:?}"
+                );
+            }
+        }
+
+        // Outside it: the shells part, so the programs stop and name the value
+        // rather than picking one of them to imitate.
+        for program in ["./end-rust", "./end-go"] {
+            let ran = std::process::Command::new(program)
+                .env("DESHELL_TEST_CODE", "not-a-number")
+                .current_dir(directory.path())
+                .output()
+                .unwrap();
+            assert_eq!(ran.status.code(), Some(70), "{program}");
+            let stderr = String::from_utf8_lossy(&ran.stderr);
+            assert!(
+                stderr.contains("not-a-number") && stderr.contains("do not agree"),
+                "{program}: {stderr}"
+            );
+        }
+    }
+
     /// A redirection target is expanded, and the generated programs write where
     /// the shell writes.
     ///
@@ -10726,6 +10927,7 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
                             }),
                             node(crate::ir::Operation::Exit {
                                 status: crate::ir::TextExpression::literal("3"),
+                                non_numeric: crate::ir::NonNumericStatus::Unreachable,
                             }),
                             node(crate::ir::Operation::WriteStdout {
                                 contents: crate::ir::TextExpression::literal("after\n"),
