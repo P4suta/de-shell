@@ -208,6 +208,12 @@ enum Command {
 enum OutputFormat {
     Human,
     Json,
+    /// For a reader that cannot ask a follow-up question.
+    ///
+    /// The JSON values, plus the source each anchored message points at and a
+    /// description of the shape. A consumer holding this needs no second read
+    /// of the repository to see what a blocker is about.
+    Agent,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -489,6 +495,9 @@ enum SchemaName {
 struct ReportSpec {
     command: &'static str,
     format: OutputFormat,
+    /// Where an anchored message's path is relative to. The agent format reads
+    /// the source it points at, and a path alone does not say from where.
+    root: PathBuf,
     next_actions: Vec<crate::report::Action>,
 }
 
@@ -560,6 +569,7 @@ impl Command {
         let spec = match self {
             Self::Init { root, format, .. } => ReportSpec {
                 command: "init",
+                root: root.clone(),
                 format: *format,
                 next_actions: vec![
                     action(vec![
@@ -578,19 +588,22 @@ impl Command {
                     ]),
                 ],
             },
-            Self::Scan { format, .. } => ReportSpec {
+            Self::Scan { root, format, .. } => ReportSpec {
                 command: "scan",
+                root: root.clone(),
                 format: *format,
                 next_actions: Vec::new(),
             },
-            Self::Audit { format, .. } => match format {
+            Self::Audit { root, format, .. } => match format {
                 AuditOutputFormat::Human => ReportSpec {
                     command: "audit",
+                    root: root.clone(),
                     format: OutputFormat::Human,
                     next_actions: Vec::new(),
                 },
                 AuditOutputFormat::Json => ReportSpec {
                     command: "audit",
+                    root: root.clone(),
                     format: OutputFormat::Json,
                     next_actions: Vec::new(),
                 },
@@ -607,6 +620,7 @@ impl Command {
                 };
                 ReportSpec {
                     command: "scenario",
+                    root: root.clone(),
                     format,
                     next_actions: vec![action(vec![
                         "deshell".into(),
@@ -624,6 +638,7 @@ impl Command {
                 };
                 ReportSpec {
                     command: "matrix",
+                    root: root.clone(),
                     format,
                     next_actions: vec![action(vec![
                         "deshell".into(),
@@ -636,6 +651,7 @@ impl Command {
             }
             Self::Analyze { root, format, .. } => ReportSpec {
                 command: "analyze",
+                root: root.clone(),
                 format: *format,
                 next_actions: vec![action(vec![
                     "deshell".into(),
@@ -644,24 +660,27 @@ impl Command {
                     root_value(root),
                 ])],
             },
-            Self::Rewrite { format, .. } => ReportSpec {
+            Self::Rewrite { root, format, .. } => ReportSpec {
                 command: "rewrite",
+                root: root.clone(),
                 format: *format,
                 next_actions: Vec::new(),
             },
-            Self::Modernize { format, .. } => ReportSpec {
+            Self::Modernize { root, format, .. } => ReportSpec {
                 command: "modernize",
+                root: root.clone(),
                 format: *format,
                 next_actions: Vec::new(),
             },
             Self::Harden { command } => {
-                let format = match command {
-                    HardenCommand::Plan { format, .. }
-                    | HardenCommand::Verify { format, .. }
-                    | HardenCommand::Apply { format, .. } => *format,
+                let (root, format) = match command {
+                    HardenCommand::Plan { root, format, .. }
+                    | HardenCommand::Verify { root, format, .. }
+                    | HardenCommand::Apply { root, format, .. } => (root, *format),
                 };
                 ReportSpec {
                     command: "harden",
+                    root: root.clone(),
                     format,
                     next_actions: Vec::new(),
                 }
@@ -678,6 +697,7 @@ impl Command {
                 };
                 ReportSpec {
                     command: "migrate",
+                    root: root.clone(),
                     format,
                     next_actions: vec![action(vec![
                         "deshell".into(),
@@ -690,6 +710,7 @@ impl Command {
             }
             Self::Verify { root, format, .. } => ReportSpec {
                 command: "verify",
+                root: root.clone(),
                 format: *format,
                 next_actions: vec![action(vec![
                     "deshell".into(),
@@ -700,6 +721,7 @@ impl Command {
             },
             Self::Observe { root, format, .. } => ReportSpec {
                 command: "observe",
+                root: root.clone(),
                 format: *format,
                 next_actions: vec![action(vec![
                     "deshell".into(),
@@ -708,13 +730,15 @@ impl Command {
                     root_value(root),
                 ])],
             },
-            Self::Doctor { format, .. } => ReportSpec {
+            Self::Doctor { root, format, .. } => ReportSpec {
                 command: "doctor",
+                root: root.clone(),
                 format: *format,
                 next_actions: Vec::new(),
             },
             Self::Check { root, format } => ReportSpec {
                 command: "check",
+                root: root.clone(),
                 format: *format,
                 next_actions: vec![
                     action(vec![
@@ -733,8 +757,9 @@ impl Command {
                     ]),
                 ],
             },
-            Self::Explain { format, .. } => ReportSpec {
+            Self::Explain { root, format, .. } => ReportSpec {
                 command: "explain",
+                root: root.clone(),
                 format: *format,
                 next_actions: Vec::new(),
             },
@@ -991,6 +1016,7 @@ where
         let emitted = match spec.format {
             OutputFormat::Human => report.emit_human(stdout).map_err(|error| error.to_string()),
             OutputFormat::Json => report.emit_json(stdout),
+            OutputFormat::Agent => report.emit_agent(&spec.root, stdout),
         };
         if let Err(message) = emitted {
             let diagnostic = crate::diagnostics::Diagnostic::error(
@@ -1398,7 +1424,10 @@ fn dispatch(
                         &crate::canonical_json::pretty_bytes(&value).map_err(Failure::internal)?,
                     )?;
                 }
-                OutputFormat::Human => {
+                // `Agent` is collected from the human output by `command_report`,
+                // which sets the format to `Human` before dispatch runs, so it cannot
+                // arrive here. Listing it says that rather than leaving a wildcard.
+                OutputFormat::Agent | OutputFormat::Human => {
                     for finding in &inventory.findings {
                         writeln_io(
                             stdout,
@@ -1531,7 +1560,10 @@ fn dispatch(
                     stdout,
                     format_args!("{}: project artifacts are ready", root.display()),
                 )?,
-                OutputFormat::Human => {
+                // `Agent` is collected from the human output by `command_report`,
+                // which sets the format to `Human` before dispatch runs, so it cannot
+                // arrive here. Listing it says that rather than leaving a wildcard.
+                OutputFormat::Agent | OutputFormat::Human => {
                     writeln_io(
                         stdout,
                         format_args!("{}: project is valid but not ready", root.display()),
@@ -2249,7 +2281,10 @@ fn scenario_review_command(
                 &crate::canonical_json::pretty_bytes(&value).map_err(Failure::internal)?,
             )?;
         }
-        OutputFormat::Human => {
+        // `Agent` is collected from the human output by `command_report`,
+        // which sets the format to `Human` before dispatch runs, so it cannot
+        // arrive here. Listing it says that rather than leaving a wildcard.
+        OutputFormat::Agent | OutputFormat::Human => {
             for review in &reviews {
                 writeln_io(
                     stdout,
@@ -2327,7 +2362,10 @@ fn scenario_approve_command(parts: ScenarioApproveCommandArgs<'_>) -> Result<i32
                 &crate::canonical_json::pretty_bytes(&value).map_err(Failure::internal)?,
             )?;
         }
-        OutputFormat::Human => writeln_io(
+        // `Agent` is collected from the human output by `command_report`,
+        // which sets the format to `Human` before dispatch runs, so it cannot
+        // arrive here. Listing it says that rather than leaving a wildcard.
+        OutputFormat::Agent | OutputFormat::Human => writeln_io(
             stdout,
             format_args!("approved scenario {name} as {}", approval.approval_digest),
         )?,
@@ -2350,7 +2388,10 @@ fn matrix_review_command(
                 &crate::canonical_json::pretty_bytes(&value).map_err(Failure::internal)?,
             )?;
         }
-        OutputFormat::Human => {
+        // `Agent` is collected from the human output by `command_report`,
+        // which sets the format to `Human` before dispatch runs, so it cannot
+        // arrive here. Listing it says that rather than leaving a wildcard.
+        OutputFormat::Agent | OutputFormat::Human => {
             for review in &reviews {
                 writeln_io(
                     stdout,
@@ -2427,7 +2468,10 @@ fn matrix_approve_command(parts: MatrixApproveCommandArgs<'_>) -> Result<i32, Fa
                 &crate::canonical_json::pretty_bytes(&value).map_err(Failure::internal)?,
             )?;
         }
-        OutputFormat::Human => writeln_io(
+        // `Agent` is collected from the human output by `command_report`,
+        // which sets the format to `Human` before dispatch runs, so it cannot
+        // arrive here. Listing it says that rather than leaving a wildcard.
+        OutputFormat::Agent | OutputFormat::Human => writeln_io(
             stdout,
             format_args!(
                 "approved matrix cell {cell} as {}",
@@ -3095,7 +3139,10 @@ fn doctor_command(
                 &crate::canonical_json::pretty_bytes(&value).map_err(Failure::internal)?,
             )?;
         }
-        OutputFormat::Human => {
+        // `Agent` is collected from the human output by `command_report`,
+        // which sets the format to `Human` before dispatch runs, so it cannot
+        // arrive here. Listing it says that rather than leaving a wildcard.
+        OutputFormat::Agent | OutputFormat::Human => {
             writeln_io(
                 stdout,
                 format_args!("binary: {}", if binary_ok { "ok" } else { "invalid" }),
@@ -4418,7 +4465,10 @@ fn migrate_status_command(
             )
             .map_err(Failure::internal)?,
         )?,
-        OutputFormat::Human => {
+        // `Agent` is collected from the human output by `command_report`,
+        // which sets the format to `Human` before dispatch runs, so it cannot
+        // arrive here. Listing it says that rather than leaving a wildcard.
+        OutputFormat::Agent | OutputFormat::Human => {
             writeln_io(
                 stdout,
                 format_args!(

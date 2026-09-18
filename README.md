@@ -69,12 +69,21 @@ capability report.
 
 ## Advanced contracts
 
-Reporting commands accept `--format human|json`. Both forms are rendered from
-the same strict `*-report-v1` value with `schema_version`, `command`, `status`,
-`summary`, and typed `next_actions`. Command actions contain exact argv arrays;
-review actions contain project paths. A blocked or not-ready completed command
-writes its report to stdout and leaves stderr empty. Syntax, I/O, invalid
-contract, and internal failures write Diagnostic v1 to stderr instead.
+Reporting commands accept `--format human|json|agent`. All three are rendered
+from the same strict `*-report-v1` value with `schema_version`, `command`,
+`status`, `summary`, and typed `next_actions`. Command actions contain exact
+argv arrays; review actions contain project paths. A blocked or not-ready
+completed command writes its report to stdout and leaves stderr empty. Syntax,
+I/O, invalid contract, and internal failures write Diagnostic v1 to stderr
+instead.
+
+`agent` is for a reader that cannot ask a follow-up question. It carries the
+JSON values unchanged and adds two things a consumer would otherwise spend a
+second read of the repository on: the source each anchored message points at,
+resolved from `path@start..end` into the file, the line range and the text; and
+a `schema` block saying what each field means, so the shape does not have to be
+learned from an example. Nothing is removed, so a consumer that already knows
+the shape reads the same fields it always did.
 
 `audit` additionally supports Finding-only JSONL, SARIF, and GitHub annotation
 streams. With no findings, human and JSON still return a summary while JSONL is
