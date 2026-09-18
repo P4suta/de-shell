@@ -69,6 +69,28 @@ Nushell), with both official Rust and Go generators where applicable.
 - [ ] Run every fast, contract, platform, differential, security, package,
   official-exporter, and workflow gate from `v0.1.0-rc.1`, including the
   required three-operating-system matrix.
+
+  Run on macOS aarch64, one at a time, with what each one said:
+
+  | gate | |
+  | --- | --- |
+  | `test:fast`, `test:contract`, `test:adapters` | pass |
+  | `test:platform`, `test:differential`, `test:security` | pass |
+  | `test:builtin-semantics`, `test:schema-validator` | pass |
+  | `package` | pass |
+  | `performance` | pass |
+  | `test:supply-chain` | advisories, bans, licenses, sources ok |
+  | `test:official-exporters` | needs Docker, absent here |
+  | `lint` | pass |
+
+  Two of them failed until this round and both were real: the Effect IR schema
+  did not describe six operations the IR produces, and the performance fixture
+  measured a run that could not start. `test:supply-chain` needs `--offline`
+  on this machine, because `cargo deny` refreshes its advisory database with
+  `git reset --hard` and the shell here refuses that; the check itself passes.
+
+  What is left for the release runner is the three-operating-system matrix and
+  the exporter gate, neither of which this machine can stand in for.
 - [x] Enforce measured line coverage at 90% overall and at least 90% in scanner,
   frontend, runner, protocol, lab, and patch as a 0.1.0 release gate.
 - [ ] Run the fixed 2026-08-25 48-repository audit selection through both
