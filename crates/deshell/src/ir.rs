@@ -139,10 +139,11 @@ pub(crate) enum UnsetPolicy {
 /// next one runs anyway. `Stop` is what `set -e` selects.
 ///
 /// The choice belongs to the sequence rather than to each statement because
-/// `set -e` stops only on commands that are *not tested*, and which commands
-/// those are is already the shape of the tree: the left of `&&`/`||`, an `if`
-/// condition and the operand of `!` each lower into their own node, so the only
-/// untested position is a statement of a sequence. Shell function definitions,
+/// `set -e` stops only on commands that are *not tested*. Of the tested
+/// positions, `&&` and `||` lower into their own node and so never reach a
+/// sequence's statement list; `if`, `while`, `until` and `!` are not in the
+/// native subset at all and are delegated whole. Either way the only untested
+/// position that reaches this loop is a statement of a sequence. Shell function definitions,
 /// where the option's meaning would depend on the call site, are delegated
 /// before they reach the lowering.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

@@ -1217,10 +1217,11 @@ struct ShellOptions {
 /// the script does, so an unmodelled option disqualifies the whole statement
 /// rather than only itself.
 ///
-/// `-e` is modelled because which commands it stops on is decided by the shape of
-/// the tree rather than by the caller: the left of `&&`/`||`, an `if` condition
-/// and the operand of `!` each lower into their own node, so the only untested
-/// position is a statement of a sequence. The case where the option's meaning
+/// `-e` is modelled because which commands it stops on is decided statically
+/// rather than by the caller. `&&` and `||` lower into their own node, and the
+/// other tested positions — `if`, `while`, `until`, `!` — are not in the native
+/// subset and are delegated whole, so the only untested position that reaches a
+/// sequence is a plain statement. The case where the option's meaning
 /// *would* depend on the call site — a shell function, whose body runs to
 /// completion when the call is tested — is delegated before reaching here,
 /// because function definitions are not in the native subset.
