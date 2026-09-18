@@ -64,132 +64,132 @@ struct Rule {
 
 static RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
     vec![
-        rule(
-            "shell.dynamic-eval",
-            Category::Injection,
-            AuditSeverity::High,
-            r"\beval\b",
-            "Dynamic evaluation can reinterpret untrusted text as commands.",
-        ),
-        rule(
-            "supply-chain.download-execute",
-            Category::SupplyChain,
-            AuditSeverity::Critical,
-            r"(?m)\b(?:curl|wget)\b[^\r\n|]*\|[ \t]*(?:sh|bash|zsh|pwsh|powershell)\b",
-            "Downloaded bytes are executed without an independently verified artifact digest.",
-        ),
-        rule(
-            "supply-chain.unpinned-reference",
-            Category::SupplyChain,
-            AuditSeverity::Medium,
-            r#"(?i):latest\b|https?://[^[:space:]'"]+\.(?:sh|ps1)\b"#,
-            "Artifact or image reference is mutable or lacks an immutable digest.",
-        ),
-        rule(
-            "filesystem.dangerous-delete",
-            Category::Filesystem,
-            AuditSeverity::High,
-            r"(?m)\brm[ \t]+-[A-Za-z]*r[A-Za-z]*[ \t]+[^\r\n;]+",
-            "Recursive deletion depends on a path whose boundary must be proven.",
-        ),
-        rule(
-            "filesystem.unquoted-expansion",
-            Category::Filesystem,
-            AuditSeverity::High,
-            r"(?m)\b(?:rm|cp|mv|chmod|chown|install|tar)\b[^\r\n#]*?[ \t](?P<risk>\$\{?[A-Za-z_][A-Za-z0-9_]*\}?)(?:/|[ \t;&|]|$)",
-            "An unquoted path expansion can split into multiple arguments.",
-        ),
-        rule(
-            "filesystem.unbounded-glob",
-            Category::Filesystem,
-            AuditSeverity::High,
-            r"(?m)\b(?:rm|cp|mv|chmod|chown|install|tar)\b[^\r\n#]*?[ \t](?P<risk>[^ \t\r\n;|&]*[*?][^ \t\r\n;|&]*)",
-            "A filesystem mutation depends on ambient glob expansion and no-match policy.",
-        ),
-        rule(
-            "filesystem.symlink-race",
-            Category::Race,
-            AuditSeverity::High,
-            r"(?m)(?P<risk>\bln[ \t]+-[A-Za-z]*s[A-Za-z]*\b)",
-            "Symlink creation requires a reviewed boundary against path substitution races.",
-        ),
-        rule(
-            "filesystem.toctou-check",
-            Category::Race,
-            AuditSeverity::High,
-            r"(?m)(?P<risk>\btest[ \t]+-[efL]\b|\[[ \t]+-[efL]\b)",
-            "A path existence or type check can race with a later filesystem operation.",
-        ),
-        rule(
-            "filesystem.world-writable",
-            Category::Filesystem,
-            AuditSeverity::High,
-            r"(?m)\bchmod[ \t]+(?:0?777|a\+w)\b",
-            "World-writable permissions exceed least privilege.",
-        ),
-        rule(
-            "privilege.escalation",
-            Category::Filesystem,
-            AuditSeverity::High,
-            r"(?m)(?:^|[;&|][ \t]*)sudo\b",
-            "Privileged execution requires an explicit reviewed capability boundary.",
-        ),
-        rule(
-            "secret.argv-exposure",
-            Category::Secret,
-            AuditSeverity::High,
-            r"(?i)\$(?:\{)?[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|PRIVATE_KEY)[A-Z0-9_]*(?:\})?",
-            "A secret-like environment value is exposed through process arguments or output.",
-        ),
-        rule(
-            "filesystem.temp-race",
-            Category::Race,
-            AuditSeverity::High,
-            r#"(?m)\bmktemp[ \t]+-u\b|(?:^|[[:space:]'"])/tmp/[^[:space:]'"]+"#,
-            "Predictable or non-atomically reserved temporary paths permit TOCTOU or symlink races.",
-        ),
-        rule(
-            "status.unchecked-cwd",
-            Category::Status,
-            AuditSeverity::Medium,
-            r"(?m)^[ \t]*cd[ \t]+[^\r\n;&|]+$",
-            "Working-directory changes must have explicit failure behavior.",
-        ),
-        rule(
-            "status.pipeline",
-            Category::Status,
-            AuditSeverity::Medium,
-            r"(?m)^[^#\r\n]*[^|]\|[^|][^\r\n]*$",
-            "Pipeline status semantics must be explicit and checked.",
-        ),
-        rule(
-            "nondeterminism.clock",
-            Category::Nondeterminism,
-            AuditSeverity::Low,
-            r"\bdate\b|\bGet-Date\b",
-            "Wall-clock input makes behavior dependent on execution time.",
-        ),
-        rule(
-            "nondeterminism.random",
-            Category::Nondeterminism,
-            AuditSeverity::Medium,
-            r"\$RANDOM\b|\b(?:openssl[ \t]+rand|uuidgen)\b",
-            "Unseeded randomness makes repeated verification unstable.",
-        ),
-        rule(
-            "nondeterminism.ambient-environment",
-            Category::Nondeterminism,
-            AuditSeverity::Low,
-            r"\$(?:\{)?(?:PATH|LANG|LC_ALL|TZ|HOME)(?:\})?\b",
-            "Ambient environment state is not declared as an input.",
-        ),
-        rule(
-            "portability.bashism",
-            Category::Portability,
-            AuditSeverity::Medium,
-            r"\[\[|\]\]",
-            "Interpreter-specific syntax conflicts with a portable shell contract.",
-        ),
+        rule(RuleArgs {
+                id: "shell.dynamic-eval",
+                category: Category::Injection,
+                severity: AuditSeverity::High,
+                expression: r"\beval\b",
+                message: "Dynamic evaluation can reinterpret untrusted text as commands.",
+            }),
+        rule(RuleArgs {
+                id: "supply-chain.download-execute",
+                category: Category::SupplyChain,
+                severity: AuditSeverity::Critical,
+                expression: r"(?m)\b(?:curl|wget)\b[^\r\n|]*\|[ \t]*(?:sh|bash|zsh|pwsh|powershell)\b",
+                message: "Downloaded bytes are executed without an independently verified artifact digest.",
+            }),
+        rule(RuleArgs {
+                id: "supply-chain.unpinned-reference",
+                category: Category::SupplyChain,
+                severity: AuditSeverity::Medium,
+                expression: r#"(?i):latest\b|https?://[^[:space:]'"]+\.(?:sh|ps1)\b"#,
+                message: "Artifact or image reference is mutable or lacks an immutable digest.",
+            }),
+        rule(RuleArgs {
+                id: "filesystem.dangerous-delete",
+                category: Category::Filesystem,
+                severity: AuditSeverity::High,
+                expression: r"(?m)\brm[ \t]+-[A-Za-z]*r[A-Za-z]*[ \t]+[^\r\n;]+",
+                message: "Recursive deletion depends on a path whose boundary must be proven.",
+            }),
+        rule(RuleArgs {
+                id: "filesystem.unquoted-expansion",
+                category: Category::Filesystem,
+                severity: AuditSeverity::High,
+                expression: r"(?m)\b(?:rm|cp|mv|chmod|chown|install|tar)\b[^\r\n#]*?[ \t](?P<risk>\$\{?[A-Za-z_][A-Za-z0-9_]*\}?)(?:/|[ \t;&|]|$)",
+                message: "An unquoted path expansion can split into multiple arguments.",
+            }),
+        rule(RuleArgs {
+                id: "filesystem.unbounded-glob",
+                category: Category::Filesystem,
+                severity: AuditSeverity::High,
+                expression: r"(?m)\b(?:rm|cp|mv|chmod|chown|install|tar)\b[^\r\n#]*?[ \t](?P<risk>[^ \t\r\n;|&]*[*?][^ \t\r\n;|&]*)",
+                message: "A filesystem mutation depends on ambient glob expansion and no-match policy.",
+            }),
+        rule(RuleArgs {
+                id: "filesystem.symlink-race",
+                category: Category::Race,
+                severity: AuditSeverity::High,
+                expression: r"(?m)(?P<risk>\bln[ \t]+-[A-Za-z]*s[A-Za-z]*\b)",
+                message: "Symlink creation requires a reviewed boundary against path substitution races.",
+            }),
+        rule(RuleArgs {
+                id: "filesystem.toctou-check",
+                category: Category::Race,
+                severity: AuditSeverity::High,
+                expression: r"(?m)(?P<risk>\btest[ \t]+-[efL]\b|\[[ \t]+-[efL]\b)",
+                message: "A path existence or type check can race with a later filesystem operation.",
+            }),
+        rule(RuleArgs {
+                id: "filesystem.world-writable",
+                category: Category::Filesystem,
+                severity: AuditSeverity::High,
+                expression: r"(?m)\bchmod[ \t]+(?:0?777|a\+w)\b",
+                message: "World-writable permissions exceed least privilege.",
+            }),
+        rule(RuleArgs {
+                id: "privilege.escalation",
+                category: Category::Filesystem,
+                severity: AuditSeverity::High,
+                expression: r"(?m)(?:^|[;&|][ \t]*)sudo\b",
+                message: "Privileged execution requires an explicit reviewed capability boundary.",
+            }),
+        rule(RuleArgs {
+                id: "secret.argv-exposure",
+                category: Category::Secret,
+                severity: AuditSeverity::High,
+                expression: r"(?i)\$(?:\{)?[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|PRIVATE_KEY)[A-Z0-9_]*(?:\})?",
+                message: "A secret-like environment value is exposed through process arguments or output.",
+            }),
+        rule(RuleArgs {
+                id: "filesystem.temp-race",
+                category: Category::Race,
+                severity: AuditSeverity::High,
+                expression: r#"(?m)\bmktemp[ \t]+-u\b|(?:^|[[:space:]'"])/tmp/[^[:space:]'"]+"#,
+                message: "Predictable or non-atomically reserved temporary paths permit TOCTOU or symlink races.",
+            }),
+        rule(RuleArgs {
+                id: "status.unchecked-cwd",
+                category: Category::Status,
+                severity: AuditSeverity::Medium,
+                expression: r"(?m)^[ \t]*cd[ \t]+[^\r\n;&|]+$",
+                message: "Working-directory changes must have explicit failure behavior.",
+            }),
+        rule(RuleArgs {
+                id: "status.pipeline",
+                category: Category::Status,
+                severity: AuditSeverity::Medium,
+                expression: r"(?m)^[^#\r\n]*[^|]\|[^|][^\r\n]*$",
+                message: "Pipeline status semantics must be explicit and checked.",
+            }),
+        rule(RuleArgs {
+                id: "nondeterminism.clock",
+                category: Category::Nondeterminism,
+                severity: AuditSeverity::Low,
+                expression: r"\bdate\b|\bGet-Date\b",
+                message: "Wall-clock input makes behavior dependent on execution time.",
+            }),
+        rule(RuleArgs {
+                id: "nondeterminism.random",
+                category: Category::Nondeterminism,
+                severity: AuditSeverity::Medium,
+                expression: r"\$RANDOM\b|\b(?:openssl[ \t]+rand|uuidgen)\b",
+                message: "Unseeded randomness makes repeated verification unstable.",
+            }),
+        rule(RuleArgs {
+                id: "nondeterminism.ambient-environment",
+                category: Category::Nondeterminism,
+                severity: AuditSeverity::Low,
+                expression: r"\$(?:\{)?(?:PATH|LANG|LC_ALL|TZ|HOME)(?:\})?\b",
+                message: "Ambient environment state is not declared as an input.",
+            }),
+        rule(RuleArgs {
+                id: "portability.bashism",
+                category: Category::Portability,
+                severity: AuditSeverity::Medium,
+                expression: r"\[\[|\]\]",
+                message: "Interpreter-specific syntax conflicts with a portable shell contract.",
+            }),
     ]
 });
 
@@ -205,13 +205,29 @@ static POWERSHELL_DOUBLE_HERE_STRING: LazyLock<regex::Regex> = LazyLock::new(|| 
         .expect("static PowerShell double here-string regex")
 });
 
-fn rule(
+/// The inputs of [`rule`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`rule`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct RuleArgs {
     id: &'static str,
     category: Category,
     severity: AuditSeverity,
     expression: &'static str,
     message: &'static str,
-) -> Rule {
+}
+
+fn rule(parts: RuleArgs) -> Rule {
+    // Destructured without `..`: see `RuleArgs`.
+    let RuleArgs {
+        id,
+        category,
+        severity,
+        expression,
+        message,
+    } = parts;
     Rule {
         id,
         category,
