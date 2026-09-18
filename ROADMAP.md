@@ -141,10 +141,19 @@ blocker DESHELL_BLOCKER_UNIMPLEMENTED_SEMANTIC action.yml@3963..6698:
 
     Being stricter than the source is safer than being looser, but it is still a
     difference, and a tool that reports observed differences should not be one of
-    them. The work is to make the default substitute an empty string and let
-    `set -u` select the current behaviour, which needs the flag on the task
-    rather than on the statement list — unlike `-e`, this changes what an
-    expansion does rather than when a sequence stops.
+    them. The default now substitutes an empty string and `Task::nounset` selects
+    the refusing behaviour, carried to the expansion through the run context
+    because an expansion is evaluated far from the task that set the option —
+    unlike `-e`, which is a property of the statement list and belongs to the
+    sequence.
+
+    With `-e`, `-u` and `-o pipefail` all modelled, `set -euo pipefail` is
+    accepted whole and no longer blocks anything. Measured against OComment's
+    composite action, its five blockers changed from five copies of
+    `shell builtin set` to three `dynamic expansion or control syntax` and two
+    `shell compound syntax`: the wall that stopped every CI step is gone, and
+    what is behind it is ordinary missing frontend coverage rather than
+    unsettled semantics.
 - [ ] `-e` needs one new IR value, not a call-graph analysis. Which commands
   `set -e` stops on is already the shape of the tree: the left of `&&`/`||`, an
   `if` condition and the operand of `!` each lower into their own node, so the
