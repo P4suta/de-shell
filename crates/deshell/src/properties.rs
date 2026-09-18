@@ -77,7 +77,7 @@ fn generated_expressions_never_reparse_expanded_dollar_text() {
         let variables = BTreeMap::from([(variable_name, variable_value.clone())]);
         let arguments = BTreeMap::from([(argument_name, argument_value.clone())]);
         assert_eq!(
-            expression.evaluate(&variables, &arguments).unwrap(),
+            expression.evaluate(&variables, &arguments, crate::ir::UnsetPolicy::Empty).unwrap(),
             literal + &variable_value + &argument_value
         );
     }

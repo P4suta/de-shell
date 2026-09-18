@@ -196,6 +196,9 @@ struct Context {
     process_environment: BTreeMap<String, String>,
     secret_names: BTreeSet<String>,
     secret_values: Vec<String>,
+    /// From the task's `nounset`. Travels in the context because an expansion is
+    /// evaluated far from the task that set the option.
+    unset: crate::ir::UnsetPolicy,
 }
 
 struct Executor<'a> {
@@ -316,6 +319,11 @@ impl Executor<'_> {
             process_environment,
             secret_names,
             secret_values,
+            unset: if task.nounset {
+                crate::ir::UnsetPolicy::Refuse
+            } else {
+                crate::ir::UnsetPolicy::Empty
+            },
         };
         let mut next_stack = stack.to_vec();
         next_stack.push(name.to_owned());
@@ -965,7 +973,7 @@ fn combine(mut left: RunResult, right: RunResult) -> RunResult {
 
 fn evaluate(expression: &TextExpression, context: &Context) -> Result<String, RunError> {
     expression
-        .evaluate(&context.variables, &context.arguments)
+        .evaluate(&context.variables, &context.arguments, context.unset)
         .map_err(invalid)
 }
 
@@ -1135,7 +1143,7 @@ fn bind_powershell_arguments(
             }
             let value = if let Some(default) = &parameter.default {
                 default
-                    .evaluate(&BTreeMap::new(), &BTreeMap::new())
+                    .evaluate(&BTreeMap::new(), &BTreeMap::new(), crate::ir::UnsetPolicy::Empty)
                     .map_err(invalid)?
             } else if parameter.is_switch {
                 "false".into()
@@ -1469,6 +1477,7 @@ mod tests {
                 secrets: vec![],
                 platform_capabilities: vec![],
                 cacheable: false,
+                nounset: false,
                 invocation: None,
                 body,
             }],
@@ -1837,6 +1846,7 @@ mod tests {
             secrets: vec![],
             platform_capabilities: vec![],
             cacheable: false,
+            nounset: false,
             invocation: None,
             body: node(Operation::Exec {
                 argv: vec![
@@ -2136,6 +2146,7 @@ mod tests {
             secrets: vec![],
             platform_capabilities: vec![],
             cacheable: false,
+            nounset: false,
             invocation: Some(Invocation {
                 style: InvocationStyle::Powershell,
                 accepts_common_parameters: false,

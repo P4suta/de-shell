@@ -45,17 +45,20 @@ impl TextExpression {
         &self,
         variables: &BTreeMap<String, String>,
         arguments: &BTreeMap<String, String>,
+        unset: UnsetPolicy,
     ) -> Result<String, String> {
         validate_expression(self, None)?;
         let mut output = String::new();
         for part in &self.parts {
             match part {
                 TextPart::Literal { value } => output.push_str(value),
-                TextPart::Variable { name } => output.push_str(
-                    variables
-                        .get(name)
-                        .ok_or_else(|| format!("runtime variable is not defined: {name}"))?,
-                ),
+                TextPart::Variable { name } => match (variables.get(name), unset) {
+                    (Some(value), _) => output.push_str(value),
+                    (None, UnsetPolicy::Empty) => {}
+                    (None, UnsetPolicy::Refuse) => {
+                        return Err(format!("runtime variable is not defined: {name}"));
+                    }
+                },
                 TextPart::DefaultValue {
                     name,
                     fallback,
@@ -109,6 +112,25 @@ pub(crate) enum PrimitiveType {
 pub(crate) enum PipelineStatus {
     Last,
     Pipefail,
+}
+
+/// What an expansion of a name with no value produces.
+///
+/// The shell substitutes an empty string and carries on; `set -u` makes it an
+/// error instead, and the measured exit status for that is 127 rather than 1.
+///
+/// de-shell used to refuse unconditionally, which is stricter than the source it
+/// claims equivalence with. Stricter is safer than looser, but a tool whose
+/// output is a report of observed differences should not be one of them.
+///
+/// `${name:-fallback}` and `${name-fallback}` are unaffected: substituting is
+/// what they are for, and they are exactly what `set -u` excepts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UnsetPolicy {
+    /// The shell's default: an unset name expands to nothing.
+    Empty,
+    /// `set -u`: an unset name is an error.
+    Refuse,
 }
 
 /// What a sequence does when one of its statements fails.
@@ -502,6 +524,9 @@ pub(crate) struct Task {
     pub secrets: Vec<String>,
     pub platform_capabilities: Vec<String>,
     pub cacheable: bool,
+    /// Whether `set -u` is in effect: an expansion of a name with no value is an
+    /// error rather than an empty string. See [`UnsetPolicy`].
+    pub nounset: bool,
     pub invocation: Option<Invocation>,
     pub body: Node,
 }
@@ -1620,6 +1645,7 @@ mod tests {
                 secrets: vec![],
                 platform_capabilities: vec![],
                 cacheable: false,
+                nounset: false,
                 invocation: None,
                 body: Node {
                     id: String::new(),
@@ -1716,7 +1742,7 @@ mod tests {
         ]);
         let arguments = BTreeMap::from([("name".into(), "-${SECOND}".into())]);
         assert_eq!(
-            expression.evaluate(&variables, &arguments).unwrap(),
+            expression.evaluate(&variables, &arguments, UnsetPolicy::Empty).unwrap(),
             "$SECOND-${SECOND}"
         );
     }
@@ -2057,19 +2083,42 @@ mod tests {
             literal_value(&expression(vec![TextPart::Variable { name: "A".into() }])),
             None
         );
+        // An undefined expansion is an empty string in the shell and an error only
+        // under `set -u`. de-shell used to fail either way, which made it stricter
+        // than the source it claims equivalence with.
+        assert_eq!(
+            expression(vec![TextPart::Variable {
+                name: "MISSING".into()
+            }])
+            .evaluate(&BTreeMap::new(), &BTreeMap::new(), UnsetPolicy::Empty)
+            .unwrap(),
+            ""
+        );
         assert!(
             expression(vec![TextPart::Variable {
                 name: "MISSING".into()
             }])
-            .evaluate(&BTreeMap::new(), &BTreeMap::new())
+            .evaluate(&BTreeMap::new(), &BTreeMap::new(), UnsetPolicy::Refuse)
             .unwrap_err()
             .contains("runtime variable")
+        );
+        // `${MISSING:-fallback}` is what `set -u` excepts, so it stays defined
+        // under either policy.
+        assert_eq!(
+            expression(vec![TextPart::DefaultValue {
+                name: "MISSING".into(),
+                fallback: "fallback".into(),
+                empty_is_unset: true,
+            }])
+            .evaluate(&BTreeMap::new(), &BTreeMap::new(), UnsetPolicy::Refuse)
+            .unwrap(),
+            "fallback"
         );
         assert!(
             expression(vec![TextPart::Argument {
                 name: "missing".into()
             }])
-            .evaluate(&BTreeMap::new(), &BTreeMap::new())
+            .evaluate(&BTreeMap::new(), &BTreeMap::new(), UnsetPolicy::Empty)
             .unwrap_err()
             .contains("task argument")
         );
@@ -2545,6 +2594,7 @@ mod tests {
             secrets: vec![],
             platform_capabilities: vec![],
             cacheable: false,
+            nounset: false,
             invocation: None,
             body: exec(),
         };

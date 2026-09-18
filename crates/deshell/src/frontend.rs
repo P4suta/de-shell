@@ -197,13 +197,14 @@ pub(crate) fn lower(
         },
     };
 
-    let (body, inputs, environment, invocation, platform_capabilities) = match lowered {
+    let (body, inputs, environment, invocation, platform_capabilities, nounset) = match lowered {
         Ok(lowered) => (
             lowered.body,
             lowered.inputs,
             lowered.environment,
             None,
             Vec::new(),
+            lowered.nounset,
         ),
         Err(reason) => {
             let analysis = conservative_source_analysis(source, &interpreter, &reason);
@@ -224,6 +225,9 @@ pub(crate) fn lower(
                 analysis.environment,
                 None,
                 Vec::new(),
+                // A delegated body runs under its own interpreter, which reads
+                // the option from the source it was handed.
+                false,
             )
         }
     };
@@ -251,6 +255,7 @@ pub(crate) fn lower(
             secrets,
             platform_capabilities,
             cacheable: false,
+            nounset,
             invocation,
             body,
         }],
@@ -384,6 +389,9 @@ struct Lowered {
     body: Node,
     inputs: BTreeSet<String>,
     environment: BTreeSet<String>,
+    /// Whether `set -u` was in effect. Only the POSIX family reads it; the other
+    /// frontends report `false` because they do not model the option.
+    nounset: bool,
 }
 
 impl Default for Node {
@@ -1197,6 +1205,7 @@ struct Range {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct ShellOptions {
     errexit: bool,
+    nounset: bool,
     pipefail: bool,
 }
 
@@ -1242,6 +1251,7 @@ fn set_statement(statement: &str, current: ShellOptions) -> Option<ShellOptions>
         while let Some(flag) = flags.next() {
             match flag {
                 'e' => options.errexit = enable,
+                'u' => options.nounset = enable,
                 'o' if flags.peek().is_none() => match words.next()? {
                     "pipefail" => options.pipefail = enable,
                     _ => return None,
@@ -1318,6 +1328,7 @@ fn lower_posix(path: &str, source: &str, interpreter: &Interpreter) -> Result<Lo
         body,
         inputs,
         environment,
+        nounset: options.nounset,
     })
 }
 
@@ -1847,6 +1858,7 @@ fn lower_fish(path: &str, source: &str) -> Result<Lowered, String> {
         body,
         inputs,
         environment,
+        nounset: false,
     })
 }
 
@@ -2168,6 +2180,7 @@ fn lower_cmd(path: &str, source: &str) -> Result<Lowered, String> {
         body,
         inputs,
         environment,
+        nounset: false,
     })
 }
 
@@ -2466,6 +2479,7 @@ fn lower_powershell(path: &str, source: &str) -> Result<Lowered, String> {
         body,
         inputs,
         environment,
+        nounset: false,
     })
 }
 
@@ -2788,6 +2802,7 @@ fn lower_nushell(path: &str, source: &str, interpreter: &Interpreter) -> Result<
         condition.source.clone().unwrap(),
     );
     Ok(Lowered {
+        nounset: false,
         body: native_node(
             Operation::Sequence {
                 nodes: vec![first, condition],
@@ -3394,6 +3409,7 @@ fn lower_literal_family(
         body,
         inputs: BTreeSet::new(),
         environment: BTreeSet::new(),
+        nounset: false,
     })
 }
 
@@ -3742,20 +3758,28 @@ mod tests {
 
         // `-u` is not modelled, so the whole statement is refused rather than
         // having its `-e` and `pipefail` taken and its `-u` dropped.
+        // `-e`, `-u` and `-o pipefail` are all modelled now, so the combined form
+        // that opens nearly every CI step is accepted whole.
         assert_eq!(
             set_statement("set -euo pipefail", ShellOptions::default()),
-            None
+            Some(ShellOptions {
+                errexit: true,
+                nounset: true,
+                pipefail: true
+            })
         );
         assert_eq!(
             set_statement("set -eo pipefail", ShellOptions::default()),
             Some(ShellOptions {
                 errexit: true,
+                nounset: false,
                 pipefail: true
             })
         );
         assert_eq!(
             set_statement("set +e", ShellOptions {
                 errexit: true,
+                nounset: false,
                 pipefail: false
             }),
             Some(ShellOptions::default())

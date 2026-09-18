@@ -1538,6 +1538,7 @@ mod tests {
                 secrets: vec![],
                 platform_capabilities: vec![],
                 cacheable: false,
+                nounset: false,
                 invocation: None,
                 body: native(Operation::Condition {
                     predicate: Box::new(emit("predicate")),

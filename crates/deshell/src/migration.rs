@@ -5404,18 +5404,18 @@ fn execute_ir_node(
         } => {
             let argv = argv
                 .iter()
-                .map(|value| value.evaluate(variables, arguments))
+                .map(|value| value.evaluate(variables, arguments, crate::ir::UnsetPolicy::Empty))
                 .collect::<Result<Vec<_>, _>>()?;
             let mut process_environment = variables.clone();
             for value in environment {
                 process_environment.insert(
                     value.name.clone(),
-                    value.value.evaluate(variables, arguments)?,
+                    value.value.evaluate(variables, arguments, crate::ir::UnsetPolicy::Empty)?,
                 );
             }
             let working_directory = working_directory
                 .as_ref()
-                .map(|value| value.evaluate(variables, arguments))
+                .map(|value| value.evaluate(variables, arguments, crate::ir::UnsetPolicy::Empty))
                 .transpose()?
                 .or_else(|| default_cwd.map(str::to_owned));
             let _ = positional;
@@ -5587,18 +5587,18 @@ fn ir_exec_request(parts: IrExecRequestArgs<'_>) -> Result<crate::agent_process:
     };
     let argv = argv
         .iter()
-        .map(|value| value.evaluate(variables, arguments))
+        .map(|value| value.evaluate(variables, arguments, crate::ir::UnsetPolicy::Empty))
         .collect::<Result<Vec<_>, _>>()?;
     let mut process_environment = variables.clone();
     for value in environment {
         process_environment.insert(
             value.name.clone(),
-            value.value.evaluate(variables, arguments)?,
+            value.value.evaluate(variables, arguments, crate::ir::UnsetPolicy::Empty)?,
         );
     }
     let working_directory = working_directory
         .as_ref()
-        .map(|value| value.evaluate(variables, arguments))
+        .map(|value| value.evaluate(variables, arguments, crate::ir::UnsetPolicy::Empty))
         .transpose()?
         .or_else(|| default_cwd.map(str::to_owned));
     Ok(crate::agent_process::Request {
