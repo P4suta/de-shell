@@ -3473,8 +3473,10 @@ fn generate_rust(plan: &crate::ir::Plan) -> Result<Vec<u8>, String> {
     emit_rust_node(&task.body, &mut body, 2)?;
     let import = if pipeline {
         "use std::process::{Command, Stdio};\n\n"
-    } else {
+    } else if rust_node_starts_a_process(&task.body) {
         "use std::process::Command;\n\n"
+    } else {
+        ""
     };
     let pipeline_helper = if pipeline {
         concat!(
@@ -3587,6 +3589,25 @@ fn emit_rust_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> 
                 indent = indent
             ));
         }
+        crate::ir::Operation::Test { predicate } => {
+            // `test` succeeds with 0 and fails with 1, so the predicate becomes a
+            // bool and the node becomes its exit status.
+            let condition = match predicate {
+                crate::ir::TestPredicate::NonEmpty { value } => {
+                    format!("!{}.is_empty()", rust_expression(value)?)
+                }
+                crate::ir::TestPredicate::Empty { value } => {
+                    format!("{}.is_empty()", rust_expression(value)?)
+                }
+                crate::ir::TestPredicate::StringEqual { left, right } => {
+                    format!("{} == {}", rust_expression(left)?, rust_expression(right)?)
+                }
+                crate::ir::TestPredicate::StringNotEqual { left, right } => {
+                    format!("{} != {}", rust_expression(left)?, rust_expression(right)?)
+                }
+            };
+            output.push_str(&format!("{indent}i32::from(!({condition}))"));
+        }
         crate::ir::Operation::Sequence { nodes, .. } => {
             let Some((last, preceding)) = nodes.split_last() else {
                 return Err("generator received an empty sequence".into());
@@ -3663,6 +3684,48 @@ fn emit_rust_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> 
         }
     }
     Ok(())
+}
+
+/// Whether the generated program will name `Command` at all.
+///
+/// A plan made only of `Test` nodes starts no process, and an unused import is a
+/// hard error under the `-D warnings` gate the generated Rust is checked with —
+/// so emitting the import unconditionally made such a plan ungeneratable.
+fn rust_node_starts_a_process(node: &crate::ir::Node) -> bool {
+    match &node.operation {
+        crate::ir::Operation::Exec { .. }
+        | crate::ir::Operation::Pipeline { .. }
+        | crate::ir::Operation::InterpreterCall { .. } => true,
+        crate::ir::Operation::Sequence { nodes, .. } | crate::ir::Operation::Parallel { nodes } => {
+            nodes.iter().any(rust_node_starts_a_process)
+        }
+        crate::ir::Operation::Condition {
+            predicate,
+            if_true,
+            if_false,
+        } => {
+            rust_node_starts_a_process(predicate)
+                || rust_node_starts_a_process(if_true)
+                || if_false
+                    .as_ref()
+                    .is_some_and(|node| rust_node_starts_a_process(node))
+        }
+        crate::ir::Operation::Match { cases, default, .. } => {
+            cases
+                .iter()
+                .any(|case| rust_node_starts_a_process(&case.body))
+                || default
+                    .as_ref()
+                    .is_some_and(|node| rust_node_starts_a_process(node))
+        }
+        crate::ir::Operation::Redirect { body, .. }
+        | crate::ir::Operation::Foreach { body, .. }
+        | crate::ir::Operation::Scope { body, .. } => rust_node_starts_a_process(body),
+        crate::ir::Operation::TryFinally { body, finalizer } => {
+            rust_node_starts_a_process(body) || rust_node_starts_a_process(finalizer)
+        }
+        _ => false,
+    }
 }
 
 fn rust_node_uses_pipeline(node: &crate::ir::Node) -> bool {
@@ -3966,6 +4029,35 @@ fn emit_go_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> Re
                     "{indent}}}\n"
                 ),
                 indent = indent
+            ));
+        }
+        crate::ir::Operation::Test { predicate } => {
+            // `test` succeeds with 0 and fails with 1, so the predicate becomes a
+            // bool and the node sets the running status from it.
+            let condition = match predicate {
+                crate::ir::TestPredicate::NonEmpty { value } => {
+                    format!("{} != \"\"", go_expression(value)?)
+                }
+                crate::ir::TestPredicate::Empty { value } => {
+                    format!("{} == \"\"", go_expression(value)?)
+                }
+                crate::ir::TestPredicate::StringEqual { left, right } => {
+                    format!("{} == {}", go_expression(left)?, go_expression(right)?)
+                }
+                crate::ir::TestPredicate::StringNotEqual { left, right } => {
+                    format!("{} != {}", go_expression(left)?, go_expression(right)?)
+                }
+            };
+            output.push_str(&format!(
+                concat!(
+                    "{indent}if {condition} {{\n",
+                    "{indent}\tdeshellLast = 0\n",
+                    "{indent}}} else {{\n",
+                    "{indent}\tdeshellLast = 1\n",
+                    "{indent}}}\n"
+                ),
+                indent = indent,
+                condition = condition
             ));
         }
         crate::ir::Operation::Sequence { nodes, .. } => {

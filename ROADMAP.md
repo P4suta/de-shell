@@ -190,9 +190,16 @@ blocker DESHELL_BLOCKER_UNIMPLEMENTED_SEMANTIC action.yml@3963..6698:
   3.2 and Linux runners ship 5.x; the CI matrix spans both. A tool that claims
   equivalence has to say which interpreter it is equivalent to, and the `set -e`
   rules above were only measured on 3.2.
-- [ ] Generate a `Test`. The operators lower natively now, but no generator
-  emits them, so a conditional reaches the plan and then blocks there. Rust wants
-  `!value.is_empty()` and Go `value != ""`; neither needs a helper.
+- [x] Generate a `Test`. Rust emits `i32::from(!(...))` and Go sets the running
+  status from the condition; neither needs a helper. Verified end to end: a
+  script that is only `[ -n "$VALUE" ]` lowers with zero delegated bytes,
+  generates Rust that passes `clippy -D warnings`, and agrees with the shell on
+  set, empty and unset.
+
+  Emitting the import unconditionally was a defect this found: a plan made only
+  of `Test` nodes starts no process, and `use std::process::Command` is then an
+  unused import — a hard error under the very gate the generated Rust is checked
+  with. The generator could produce code it could not itself accept.
 - [ ] The end-to-end generator tests take 16s each and time out at 30s under
   parallel load, reporting `replacement build failed with exit 124`. A timeout
   that surfaces as a build failure is the same defect as a timeout that surfaces
