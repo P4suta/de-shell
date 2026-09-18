@@ -3627,6 +3627,24 @@ fn generate_rust(plan: &crate::ir::Plan) -> Result<Vec<u8>, String> {
     } else {
         ""
     };
+    // `echo` and `printf` both write to standard output, and both report 1 if
+    // the write fails, which is what the shell's builtins do. One helper rather
+    // than ten lines at each site, for the same reason a shell function stays a
+    // function.
+    let write_helper = if body.contains("deshell_write(") || functions.contains("deshell_write(") {
+        concat!(
+            "/// Write to standard output, reporting 1 if the write fails.\n",
+            "///\n",
+            "/// The shell's `echo` and `printf` both do, which is why a script\n",
+            "/// whose reader has closed ends the way it does.\n",
+            "fn deshell_write(text: &str) -> i32 {\n",
+            "    use std::io::Write as _;\n",
+            "    i32::from(std::io::stdout().write_all(text.as_bytes()).is_err())\n",
+            "}\n\n"
+        )
+    } else {
+        ""
+    };
     let argument_binding = if arguments {
         "    let deshell_args: &[String] = &std::env::args().skip(1).collect::<Vec<_>>();\n"
     } else {
@@ -3744,6 +3762,7 @@ fn generate_rust(plan: &crate::ir::Plan) -> Result<Vec<u8>, String> {
             "//! refers back to the tool that wrote it.\n\n",
             "{import}",
             "{pipeline_helper}",
+            "{write_helper}",
             "{argument_helper}",
             "{lookup_helper}",
             "{functions}",
@@ -3763,6 +3782,7 @@ fn generate_rust(plan: &crate::ir::Plan) -> Result<Vec<u8>, String> {
         ),
         import = import,
         pipeline_helper = pipeline_helper,
+        write_helper = write_helper,
         argument_helper = argument_helper,
         lookup_helper = lookup_helper,
         functions = functions,
@@ -3799,11 +3819,14 @@ fn rust_variable_binding(body: &crate::ir::Node) -> String {
             crate::ir::TextPart::Variable { .. } | crate::ir::TextPart::DefaultValue { .. }
         )
     });
-    let writes = rust_node_sets_variables(body);
-    match (writes, reads) {
-        (false, false) => String::new(),
-        (true, _) => "    let mut deshell_vars: std::collections::BTreeMap<String, String> =\n        std::collections::BTreeMap::new();\n".to_owned(),
-        (false, true) => "    let deshell_vars: std::collections::BTreeMap<String, String> =\n        std::collections::BTreeMap::new();\n".to_owned(),
+    if rust_node_sets_variables(body) {
+        "    let mut deshell_vars: std::collections::BTreeMap<String, String> =\n        std::collections::BTreeMap::new();\n".to_owned()
+    } else if reads {
+        // Read-only: `mut` would be an unused-mut warning under the gate the
+        // generated Rust is checked with.
+        "    let deshell_vars: std::collections::BTreeMap<String, String> =\n        std::collections::BTreeMap::new();\n".to_owned()
+    } else {
+        String::new()
     }
 }
 
@@ -4081,25 +4104,13 @@ fn emit_rust_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> 
                 status = rust_expression(status)?
             )),
         },
-        // `echo` returns 1 when the write fails, so the status is the write's.
-        // The `use` is local to the block: the import list is decided before the
-        // body is walked, and an unconditional `std::io::Write` would be unused
-        // in every plan that prints nothing.
+        // One helper rather than eight lines at each site, for the same reason
+        // a shell function stays a function: three copies of a write are three
+        // things for the reader of the migration to read where one would do.
         crate::ir::Operation::WriteStdout { contents } => {
             output.push_str(&format!(
-                concat!(
-                    "{indent}{{\n",
-                    "{indent}    use std::io::Write as _;\n",
-                    "{indent}    let deshell_bytes = {contents};\n",
-                    "{indent}    i32::from(\n",
-                    "{indent}        std::io::stdout()\n",
-                    "{indent}            .write_all(deshell_bytes.as_bytes())\n",
-                    "{indent}            .is_err(),\n",
-                    "{indent}    )\n",
-                    "{indent}}}"
-                ),
-                indent = indent,
-                contents = rust_expression(contents)?
+                "{indent}deshell_write({})",
+                rust_expression_as_str(contents)?
             ));
         }
         // Destructured without `..`: `on_failure` is `set -e`, and discarding
@@ -5098,6 +5109,18 @@ fn emit_rust_command(parts: EmitRustCommandArgs<'_>) -> Result<(), String> {
 /// `Command::new` and its friends take `impl AsRef<_>`, so a literal needs no
 /// `to_owned` — and `clippy` says so. Everywhere a `String` is required,
 /// [`rust_expression`] is the one to call.
+/// The expression as something of type `&str`.
+///
+/// Decided by how the expression was built rather than by reading the text it
+/// produced: a single literal is already a `&str`, and anything else is a
+/// `String` that needs borrowing.
+fn rust_expression_as_str(expression: &crate::ir::TextExpression) -> Result<String, String> {
+    if let [crate::ir::TextPart::Literal { value }] = expression.parts.as_slice() {
+        return Ok(format!("{value:?}"));
+    }
+    Ok(format!("&{}", rust_expression(expression)?))
+}
+
 fn rust_expression_borrowed(expression: &crate::ir::TextExpression) -> Result<String, String> {
     // An owning expression of one part ends in `.to_owned()`, which a caller
     // taking `impl AsRef<_>` does not need and `clippy::pedantic` names.
@@ -5123,36 +5146,34 @@ fn rust_expression(expression: &crate::ir::TextExpression) -> Result<String, Str
             return Ok(format!("deshell_lookup({name:?}, &deshell_vars)"));
         }
         [crate::ir::TextPart::Argument { name }] => {
-            let index = name
-                .parse::<usize>()
-                .ok()
-                .and_then(|position| position.checked_sub(1))
-                .ok_or_else(|| format!("generator cannot bind named argument {name}"))?;
-            return Ok(format!("deshell_argument(deshell_args, {index})"));
+            return Ok(format!(
+                "deshell_argument(deshell_args, {})",
+                positional_index(name)?
+            ));
         }
         _ => {}
     }
-    let mut output = "{ let mut deshell_value = String::new();".to_owned();
+    // Several parts become one `format!`, which reads like the word the script
+    // wrote: `"::error::input {} does not match tag {}"` beside the two values,
+    // rather than six statements appending to a buffer.
+    let mut template = String::new();
+    let mut values = Vec::new();
     for part in &expression.parts {
         match part {
             crate::ir::TextPart::Literal { value } => {
-                // `push_str` with a one-character literal is a hard error under
-                // the `-D warnings` gate the generated Rust is checked with, so
-                // the single-character case uses `push`. Only a literal that is
-                // one *char* qualifies: `"é"` is two bytes and one char, and
-                // `push` takes a char.
-                let mut chars = value.chars();
-                output.push_str(&match (chars.next(), chars.next()) {
-                    (Some(single), None) => format!(" deshell_value.push({single:?});"),
-                    _ => format!(" deshell_value.push_str({value:?});"),
-                });
+                // Braces are the template's own syntax, so a literal one is
+                // written twice.
+                template.push_str(&value.replace('{', "{{").replace('}', "}}"));
             }
             crate::ir::TextPart::Variable { name } => {
-                // Locals shadow the environment, the way the shell resolves a
-                // name. `deshell_vars` exists only when the tree assigns to
-                // something, so the lookup is written to compile either way.
-                output.push_str(&format!(
-                    " deshell_value.push_str(&deshell_lookup({name:?}, &deshell_vars));"
+                template.push_str("{}");
+                values.push(format!("deshell_lookup({name:?}, &deshell_vars)"));
+            }
+            crate::ir::TextPart::Argument { name } => {
+                template.push_str("{}");
+                values.push(format!(
+                    "deshell_argument(deshell_args, {})",
+                    positional_index(name)?
                 ));
             }
             crate::ir::TextPart::DefaultValue {
@@ -5160,36 +5181,43 @@ fn rust_expression(expression: &crate::ir::TextExpression) -> Result<String, Str
                 fallback,
                 empty_is_unset,
             } => {
-                // `:-` substitutes an empty value as well as an unset one, so the
-                // two forms cannot share a lookup: `unwrap_or_default` would turn
-                // `${x-d}` with `x=""` into `d`, which the shell does not.
-                // Locals shadow the environment here too: `${x:-d}` after `x=v`
-                // is `v`, and reading only the environment would give `d`.
-                let lookup = if *empty_is_unset {
-                    format!(
-                        "deshell_lookup_opt({name:?}, &deshell_vars).filter(|deshell_set| !deshell_set.is_empty()).unwrap_or_else(|| {fallback:?}.to_owned())"
-                    )
-                } else {
-                    format!(
-                        "deshell_lookup_opt({name:?}, &deshell_vars).unwrap_or_else(|| {fallback:?}.to_owned())"
-                    )
-                };
-                output.push_str(&format!(" deshell_value.push_str(&{lookup});"));
-            }
-            crate::ir::TextPart::Argument { name } => {
-                let index = name
-                    .parse::<usize>()
-                    .ok()
-                    .and_then(|index| index.checked_sub(1))
-                    .ok_or_else(|| format!("generator cannot bind named argument {name}"))?;
-                output.push_str(&format!(
-                    " deshell_value.push_str(&deshell_argument(deshell_args, {index}));"
-                ));
+                template.push_str("{}");
+                values.push(rust_default_value(name, fallback, *empty_is_unset));
             }
         }
     }
-    output.push_str(" deshell_value }");
-    Ok(output)
+    Ok(format!(
+        "format!({template:?}{}{})",
+        if values.is_empty() { "" } else { ", " },
+        values.join(", ")
+    ))
+}
+
+/// The Rust expression a `${name-fallback}` is.
+///
+/// `:-` substitutes an empty value as well as an unset one, so the two forms
+/// cannot share a lookup: `unwrap_or_default` would turn `${x-d}` with `x=""`
+/// into `d`, which the shell does not. Locals shadow the environment here too —
+/// `${x:-d}` after `x=v` is `v`, and reading only the environment would give
+/// `d`.
+fn rust_default_value(name: &str, fallback: &str, empty_is_unset: bool) -> String {
+    if empty_is_unset {
+        format!(
+            "deshell_lookup_opt({name:?}, &deshell_vars).filter(|deshell_set| !deshell_set.is_empty()).unwrap_or_else(|| {fallback:?}.to_owned())"
+        )
+    } else {
+        format!(
+            "deshell_lookup_opt({name:?}, &deshell_vars).unwrap_or_else(|| {fallback:?}.to_owned())"
+        )
+    }
+}
+
+/// The zero-based index a `$N` reads.
+fn positional_index(name: &str) -> Result<usize, String> {
+    name.parse::<usize>()
+        .ok()
+        .and_then(|position| position.checked_sub(1))
+        .ok_or_else(|| format!("generator cannot bind named argument {name}"))
 }
 
 fn generate_go(plan: &crate::ir::Plan) -> Result<Vec<u8>, String> {
@@ -5277,6 +5305,21 @@ fn generate_go(plan: &crate::ir::Plan) -> Result<Vec<u8>, String> {
     // `set -u` says an unset name and an empty one are different, so a helper
     // that answers an empty string for both is a program with the option
     // silently off.
+    // `echo` and `printf` both write to standard output, and both report 1 if
+    // the write fails, which is what the shell's builtins do.
+    let write_helper = if body.contains("deshellWrite(") || functions.contains("deshellWrite(") {
+        concat!(
+            "// deshellWrite writes to standard output, reporting 1 if the write\n",
+            "// fails. The shell's `echo` and `printf` both do, which is why a\n",
+            "// script whose reader has closed ends the way it does.\n",
+            "func deshellWrite(text string) int {\n",
+            "\tif _, err := os.Stdout.WriteString(text); err != nil {\n\t\treturn 1\n\t}\n",
+            "\treturn 0\n",
+            "}\n\n"
+        )
+    } else {
+        ""
+    };
     let argument_helper = if uses_arguments && task.nounset {
         concat!(
             "// deshellArgument reads a positional argument the script requires\n",
@@ -5430,6 +5473,7 @@ fn generate_go(plan: &crate::ir::Plan) -> Result<Vec<u8>, String> {
             "\treturn 127\n",
             "}}\n\n",
             "{pipeline_helper}",
+            "{write_helper}",
             "{argument_helper}{lookup_helper}{default_helper}",
             "{functions}",
             "// deshellMain holds the retired script's own statements.\n",
@@ -5449,6 +5493,7 @@ fn generate_go(plan: &crate::ir::Plan) -> Result<Vec<u8>, String> {
         ),
         imports = imports,
         pipeline_helper = pipeline_helper,
+        write_helper = write_helper,
         argument_helper = argument_helper,
         lookup_helper = lookup_helper,
         default_helper = default_helper,
@@ -5741,20 +5786,12 @@ fn emit_go_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> Re
                 "{indent}\tdeshellLast = deshellExitCode(deshellCommand.Run())\n{indent}}}\n"
             ));
         }
-        // `echo` returns 1 when the write fails, so the status is the write's.
+        // One helper rather than five lines at each site, for the same reason a
+        // shell function stays a function.
         crate::ir::Operation::WriteStdout { contents } => {
             output.push_str(&format!(
-                concat!(
-                    "{indent}{{\n",
-                    "{indent}\tdeshellLast = 0\n",
-                    "{indent}\tif _, deshellWriteErr := os.Stdout.WriteString({contents}); ",
-                    "deshellWriteErr != nil {{\n",
-                    "{indent}\t\tdeshellLast = 1\n",
-                    "{indent}\t}}\n",
-                    "{indent}}}\n"
-                ),
-                indent = indent,
-                contents = go_expression(contents)?
+                "{indent}deshellLast = deshellWrite({})\n",
+                go_expression(contents)?
             ));
         }
         crate::ir::Operation::Sequence { nodes, on_failure } => {
