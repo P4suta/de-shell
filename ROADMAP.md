@@ -262,15 +262,21 @@ blocker DESHELL_BLOCKER_UNIMPLEMENTED_SEMANTIC action.yml@3963..6698:
   if ! "${binary}" --version >"${version_file}"    — implemented (`!`)
   while [ "$2" = "${delimiter}" ]; do              — implemented
   if [ ... ] && [[ "${ACTION_REF}" == v* ]]        — `[[` is a bash extension
-  expected="$(awk ...)"                            — command substitution
+  expected="$(awk ...)"                            — lowers; the generator cannot
+                                                     emit it
   ```
 
-  `[` is the one to weigh first: it is a builtin, so it is refused by name, and
-  nearly every shell conditional goes through it. Treating it as `/bin/test`
-  would make these branches lower, but a builtin `[` and the external one are not
-  the same program, and the difference is exactly the kind this tool exists to
-  report. Modelling its operators (`-n`, `-z`, `-f`, `-e`, `=`, `-ne`) is the
-  honest version and is a table, not a parser. These blocked three of six
+  The substitution case is a different kind of gap from the rest. `x=$(cmd)`
+  lowers to `CaptureStdout` now — the assignment parser was rejecting it only
+  because its right-hand side contains spaces — but no generator emits it, and
+  neither does any generator emit `SetVariable`. **The generated programs have no
+  notion of a shell-local variable at all**: an expansion becomes
+  `std::env::var(...)`, so a name the script assigns to itself has nowhere to
+  live. That is the work, and it is larger than the substitution.
+
+  `[` was the one that gated the most and is done: its string operators are
+  modelled, measured against the builtin and the external utility, and recorded
+  in `contracts/golden/test-builtin-semantics-v1.json`. These blocked three of six
   steps in a corpus with no `set` in it, and unlike the above they are missing
   implementation rather than unsettled semantics.
 - [ ] Carry the thirteen `set` semantics cases into the golden corpus. The corpus

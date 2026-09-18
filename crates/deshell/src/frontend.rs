@@ -2279,13 +2279,45 @@ fn standalone_assignment(value: &str) -> Option<(&str, &str)> {
         return None;
     }
     let rhs = &value[separator + 1..];
-    if rhs.is_empty()
-        || rhs.bytes().any(|byte| byte.is_ascii_whitespace())
-            && !(rhs.starts_with('"') && rhs.ends_with('"'))
-    {
+    if rhs.is_empty() {
+        return None;
+    }
+    // Whitespace on the right normally means the statement is a command with a
+    // leading assignment (`X=1 cmd`), which is a different operation. It does not
+    // when the value is quoted, or when it is a single command substitution —
+    // `x=$(cmd with args)` is one assignment, and its spaces belong to the
+    // command being substituted.
+    let quoted = rhs.starts_with('"') && rhs.ends_with('"');
+    let whole_substitution = rhs.starts_with("$(")
+        && rhs.ends_with(')')
+        && matching_paren(rhs, 1) == Some(rhs.len() - 1);
+    if rhs.bytes().any(|byte| byte.is_ascii_whitespace()) && !quoted && !whole_substitution {
         return None;
     }
     Some((name, rhs))
+}
+
+/// The index of the `)` closing the `(` at `open`, or `None` if it is unbalanced.
+///
+/// Counting is needed because `x=$(a) $(b)` is two substitutions and a space, not
+/// one substitution containing a space — the first would otherwise look like it
+/// spans to the end.
+fn matching_paren(value: &str, open: usize) -> Option<usize> {
+    let bytes = value.as_bytes();
+    let mut depth = 0_usize;
+    for (index, byte) in bytes.iter().enumerate().skip(open) {
+        match byte {
+            b'(' => depth += 1,
+            b')' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn infer_value_type(expression: &TextExpression) -> ValueType {
@@ -4352,6 +4384,27 @@ mod tests {
                 fallback: String::new(),
                 empty_is_unset: true,
             }]
+        );
+    }
+
+    #[test]
+    fn an_assigning_command_substitution_lowers_to_a_capture() {
+        // `NAME=$(COMMAND)` is the form `Operation::CaptureStdout` represents: a
+        // name, and the command whose stdout becomes its value.
+        let node = body("build.sh", b"value=$(/bin/echo hello)\n");
+        let Operation::CaptureStdout { name, body: inner, .. } = &node.operation else {
+            panic!("expected capture: {node:#?}")
+        };
+        assert_eq!(name, "value");
+        assert!(matches!(inner.operation, Operation::Exec { .. }));
+
+        // A substitution used as an argument has nowhere to go: `TextPart` has no
+        // variant for "the output of a command", so it stays delegated rather than
+        // being approximated by a capture into a name nobody wrote.
+        let node = body("build.sh", b"/bin/echo \"$(/bin/echo hello)\"\n");
+        assert!(
+            matches!(node.operation, Operation::InterpreterCall { .. }),
+            "an argument substitution must delegate: {node:#?}"
         );
     }
 
