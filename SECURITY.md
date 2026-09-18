@@ -43,6 +43,10 @@ only, not a proof of behavior for other inputs. Host materialization and host
 execution remain outside the default trust boundary.
 
 The repository build directly executes only supervised rootless OCI providers.
-Windows and macOS launch contracts remain unavailable until their signed helper
-transport is connected; provider discovery alone is never reported as execution
-readiness.
+macOS reaches the same supervised rootless OCI providers as Linux: a
+`podman machine` is a Linux VM running rootless containers, and it is selected
+the same way. The signed Virtualization.framework helper is still preferred
+where it is installed, because it observes macOS as macOS where a container
+observes Linux. Windows launch contracts remain unavailable until their signed
+helper transport is connected; provider discovery alone is never reported as
+execution readiness.

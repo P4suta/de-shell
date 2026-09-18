@@ -250,7 +250,9 @@ caller also supplies `--backend local`. Residual nodes never execute, and
 delegation is available only inside a pinned disposable runtime.
 
 This source tree directly connects the supervised Podman and rootless-Docker
-process transports. Windows Sandbox/Hyper-V and Virtualization.framework have
+process transports on Linux and on macOS, where a `podman machine` is a Linux
+VM running rootless containers. Windows Sandbox/Hyper-V and
+Virtualization.framework have
 validated launch contracts, but `doctor` reports them unavailable until their
 signed helper transport is installed and connected; they never fall back to a
 host shell.

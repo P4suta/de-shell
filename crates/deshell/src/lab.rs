@@ -99,11 +99,23 @@ pub(crate) fn execution_connected(provider: Provider) -> bool {
 
 pub(crate) fn select(platform: Platform, probe: &dyn Probe) -> Result<Provider, String> {
     match platform {
-        Platform::Linux if probe.command_exists("podman") => Ok(Provider::Podman),
-        Platform::Linux if probe.command_exists("docker") && probe.docker_rootless() => {
+        // The signed helper is preferred on macOS because it observes macOS as
+        // macOS. A container observes Linux, which is the right answer for a step
+        // that will run on a Linux runner and the wrong one for a script whose
+        // `/bin/sh` is bash 3.2 and whose `sed` is BSD.
+        Platform::Macos if probe.command_exists("deshell-vz-agent") => {
+            Ok(Provider::VirtualizationFramework)
+        }
+        // A `podman machine` is a Linux VM running rootless containers: the same
+        // isolation the Linux path relies on, reached the same way. Refusing it
+        // left macOS with only a helper this source tree does not contain.
+        Platform::Linux | Platform::Macos if probe.command_exists("podman") => Ok(Provider::Podman),
+        Platform::Linux | Platform::Macos
+            if probe.command_exists("docker") && probe.docker_rootless() =>
+        {
             Ok(Provider::DockerRootless)
         }
-        Platform::Linux => Err(
+        Platform::Linux | Platform::Macos => Err(
             "no supported rootless OCI runtime is available (install Podman or enable rootless Docker)"
                 .into(),
         ),
@@ -116,13 +128,6 @@ pub(crate) fn select(platform: Platform, probe: &dyn Probe) -> Result<Provider, 
         Platform::Windows => {
             Err("Windows Sandbox or Hyper-V is required for disposable observation".into())
         }
-        Platform::Macos if probe.command_exists("deshell-vz-agent") => {
-            Ok(Provider::VirtualizationFramework)
-        }
-        Platform::Macos => Err(
-            "the signed deshell-vz-agent is required for Virtualization.framework observation"
-                .into(),
-        ),
     }
 }
 
@@ -132,17 +137,23 @@ pub(crate) fn validate_provider(
     provider: Provider,
 ) -> Result<(), String> {
     match (platform, provider) {
-        (Platform::Linux, Provider::Podman) if probe.command_exists("podman") => Ok(()),
-        (Platform::Linux, Provider::Podman) => {
+        (Platform::Linux | Platform::Macos, Provider::Podman) if probe.command_exists("podman") => {
+            Ok(())
+        }
+        (Platform::Linux | Platform::Macos, Provider::Podman) => {
             Err("the requested Podman executable is unavailable".into())
         }
-        (Platform::Linux, Provider::DockerRootless) if !probe.command_exists("docker") => {
+        (Platform::Linux | Platform::Macos, Provider::DockerRootless)
+            if !probe.command_exists("docker") =>
+        {
             Err("the requested Docker executable is unavailable".into())
         }
-        (Platform::Linux, Provider::DockerRootless) if !probe.docker_rootless() => {
+        (Platform::Linux | Platform::Macos, Provider::DockerRootless)
+            if !probe.docker_rootless() =>
+        {
             Err("the requested Docker daemon is not running in rootless mode".into())
         }
-        (Platform::Linux, Provider::DockerRootless) => Ok(()),
+        (Platform::Linux | Platform::Macos, Provider::DockerRootless) => Ok(()),
         (Platform::Windows, Provider::WindowsSandbox)
             if probe.feature_enabled("Containers-DisposableClientVM") =>
         {
@@ -166,7 +177,7 @@ pub(crate) fn validate_provider(
             Err("the signed deshell-vz-agent is unavailable".into())
         }
         (_, Provider::Podman | Provider::DockerRootless) => {
-            Err("the requested OCI provider is supported only on Linux".into())
+            Err("the requested OCI provider is supported only on Linux and macOS".into())
         }
         (_, Provider::WindowsSandbox | Provider::HyperV) => {
             Err("the requested provider is supported only on Windows".into())
@@ -920,6 +931,41 @@ mod tests {
         assert!(!execution_connected(Provider::WindowsSandbox));
         assert!(!execution_connected(Provider::HyperV));
         assert!(!execution_connected(Provider::VirtualizationFramework));
+    }
+
+    #[test]
+    fn macos_uses_the_rootless_oci_runtimes_it_actually_has() {
+        // A `podman machine` is a Linux VM running rootless containers, which is
+        // the same isolation the Linux path already relies on. Refusing it here
+        // left macOS with only `deshell-vz-agent`, which this source tree does not
+        // contain, so `run` and `observe` could not succeed on the platform at all.
+        assert_eq!(
+            select(Platform::Macos, &probe(&["podman"], &[], false)).unwrap(),
+            Provider::Podman
+        );
+        assert_eq!(
+            select(Platform::Macos, &probe(&["docker"], &[], true)).unwrap(),
+            Provider::DockerRootless
+        );
+        // The signed helper still wins when it is present: it observes macOS as
+        // macOS, where a Linux container observes Linux.
+        assert_eq!(
+            select(
+                Platform::Macos,
+                &probe(&["podman", "deshell-vz-agent"], &[], false)
+            )
+            .unwrap(),
+            Provider::VirtualizationFramework
+        );
+        // Fail-closed is unchanged: nothing present is still an error, and a
+        // Docker that is not rootless is still refused.
+        assert!(select(Platform::Macos, &probe(&[], &[], false)).is_err());
+        assert!(
+            select(Platform::Macos, &probe(&["docker"], &[], false))
+                .unwrap_err()
+                .contains("rootless")
+        );
+        assert!(validate_provider(Platform::Macos, &probe(&["podman"], &[], false), Provider::Podman).is_ok());
     }
 
     #[test]
