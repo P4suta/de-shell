@@ -2855,6 +2855,39 @@ fn path_string(path: &Path, label: &str) -> Result<String, Failure> {
         .ok_or_else(|| Failure::invalid(format!("{label} is not valid UTF-8: {}", path.display())))
 }
 
+/// The version string each supported interpreter reports on this host.
+///
+/// Absent entries mean the interpreter is not installed, which is not itself an
+/// error: a project that lowers no PowerShell does not need `pwsh`.
+fn observed_interpreter_builds() -> serde_json::Value {
+    let mut builds = serde_json::Map::new();
+    for (name, program, argument) in [
+        ("bash", "bash", "--version"),
+        ("zsh", "zsh", "--version"),
+        ("fish", "fish", "--version"),
+        ("powershell", "pwsh", "--version"),
+        ("nushell", "nu", "--version"),
+    ] {
+        let Ok(output) = std::process::Command::new(program).arg(argument).output() else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        let Ok(text) = String::from_utf8(output.stdout) else {
+            continue;
+        };
+        let Some(first) = text.lines().next() else {
+            continue;
+        };
+        builds.insert(
+            name.to_owned(),
+            serde_json::Value::String(first.trim().to_owned()),
+        );
+    }
+    serde_json::Value::Object(builds)
+}
+
 fn doctor_command(
     root: &Path,
     format: OutputFormat,
@@ -2982,6 +3015,23 @@ fn doctor_command(
                 stdout,
                 format_args!("lock: {}", if lock.is_ok() { "ok" } else { "invalid" }),
             )?;
+            // The pins in the lock identify de-shell's own runtime contract, not the
+            // build of the interpreter that will run a delegated node. `nu` is
+            // version-matched exactly at parse time while `bash` is not pinned at
+            // all, and macOS ships 3.2 where Linux runners ship 5.x — the `set -e`
+            // rules differ between them, so a claim of equivalence has to name
+            // which build it means. Reporting the measurement is the first half of
+            // that; carrying it in the lock is tracked in ROADMAP.
+            if let serde_json::Value::Object(builds) = observed_interpreter_builds()
+                && !builds.is_empty()
+            {
+                let mut line = String::from("interpreter builds:");
+                for (name, value) in &builds {
+                    let version = value.as_str().unwrap_or("unknown");
+                    line.push_str(&format!(" {name}={version};"));
+                }
+                writeln_io(stdout, format_args!("{}", line.trim_end_matches(';')))?;
+            }
             writeln_io(
                 stdout,
                 format_args!(

@@ -175,7 +175,18 @@ blocker DESHELL_BLOCKER_UNIMPLEMENTED_SEMANTIC action.yml@3963..6698:
   directly runs to completion when called as `f || true`. Lowering it to `?` per
   statement is observably wrong, and `set +e` … `set -e` pairs are how callers
   express "a non-zero exit is not a failure here".
-- [ ] Pin the bash version in `deshell.lock` the way `nu` already is. macOS ships
+- [ ] Pin the bash version in `deshell.lock` the way `nu` already is. `doctor`
+  now reports the build each interpreter announces on the host, so the difference
+  is at least observable:
+
+  ```
+  interpreter builds: bash=GNU bash, version 3.2.57(1)-release (arm64-apple-darwin26);
+                      nushell=0.115.1; zsh=zsh 5.9 (arm64-apple-darwin26.0)
+  ```
+
+  Carrying it in the lock is the remaining half, and the open question is what to
+  record: baking the init-time version makes the lock host-specific, while
+  recording nothing leaves a delegated node pinned to `bash` with no build. macOS ships
   3.2 and Linux runners ship 5.x; the CI matrix spans both. A tool that claims
   equivalence has to say which interpreter it is equivalent to, and the `set -e`
   rules above were only measured on 3.2.
