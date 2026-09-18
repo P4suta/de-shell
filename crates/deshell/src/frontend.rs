@@ -1493,6 +1493,53 @@ fn case_end(source: &str, statements: &[Range], start: usize) -> Option<usize> {
     None
 }
 
+/// Names a shell answers from itself rather than from the environment.
+///
+/// A generated program resolves a name through the process environment, which
+/// is right for `PATH` and wrong for `RANDOM`: every measured shell supplies a
+/// value no environment carries, so the generated program reads nothing and
+/// writes an empty string where the script wrote a number. Lowering one of
+/// these as an ordinary expansion is a silent substitution, and it was being
+/// claimed as native.
+///
+/// The union across bash, `/bin/sh`, zsh and dash, for the same reason the
+/// builtin table is a union: delegating a name this shell does not supply costs
+/// a delegation, while lowering one it does supply reads the wrong thing.
+/// `contracts/golden/shell-variable-inventory-v1.json` holds the measurement
+/// and `cargo xtask shell-variables` re-runs it.
+const SHELL_SUPPLIED_VARIABLES: &[&str] = &[
+    "BASH",
+    "BASH_COMMAND",
+    "BASH_SUBSHELL",
+    "BASH_VERSION",
+    "COLUMNS",
+    "DIRSTACK",
+    "EUID",
+    "GROUPS",
+    "HOSTNAME",
+    "HOSTTYPE",
+    "IFS",
+    "LINENO",
+    "LINES",
+    "MACHTYPE",
+    "OPTARG",
+    "OPTIND",
+    "OSTYPE",
+    "PIPESTATUS",
+    "PPID",
+    "PS1",
+    "PS2",
+    "PS4",
+    "RANDOM",
+    "SECONDS",
+    "UID",
+];
+
+/// Whether the shell answers this name itself.
+fn shell_supplied_variable(name: &str) -> bool {
+    SHELL_SUPPLIED_VARIABLES.contains(&name)
+}
+
 /// The name of the function a statement defines, if it defines one.
 ///
 /// Only `name() {`, which is the form POSIX defines. `function name {` is a
@@ -4950,7 +4997,11 @@ fn parse_expansion(parts: ParseExpansionArgs<'_>) -> Result<(TextPart, usize), S
             .or_else(|| inner.split_once('-').map(|(n, f)| ((n, false), f)))
         {
             let ((name, empty_is_unset), fallback) = (name, fallback);
-            if valid_identifier(name) && !fallback.contains('$') && !fallback.contains('`') {
+            if valid_identifier(name)
+                && !shell_supplied_variable(name)
+                && !fallback.contains('$')
+                && !fallback.contains('`')
+            {
                 if !locals.contains(name) {
                     environment.insert(name.to_owned());
                 }
@@ -4991,6 +5042,15 @@ fn parse_expansion(parts: ParseExpansionArgs<'_>) -> Result<(TextPart, usize), S
             end,
         ))
     } else if valid_identifier(name) {
+        // A name the shell answers from itself is not an environment variable,
+        // and lowering it as one reads nothing: `${RANDOM}` becomes an empty
+        // string where the script had a number. A local of the same name shadows
+        // the shell's, which is why the check comes first.
+        if !locals.contains(name) && shell_supplied_variable(name) {
+            return Err(format!(
+                "{name} is supplied by the shell rather than the environment and requires pinned interpreter delegation"
+            ));
+        }
         if !locals.contains(name) {
             environment.insert(name.to_owned());
         }
@@ -5676,6 +5736,78 @@ mod tests {
         );
         assert!(
             matches!(node.operation, Operation::InterpreterCall { .. }),
+            "{node:#?}"
+        );
+    }
+
+    /// A name the shell answers itself is not lowered as an environment read.
+    ///
+    /// `d="x${RANDOM}"` lowered to a variable expansion and was claimed native.
+    /// A generated program resolves a name through the process environment, and
+    /// no environment carries `RANDOM` — so the program wrote `x` where the
+    /// script wrote `x15226`, silently, with a guarantee saying the two agreed.
+    #[test]
+    fn a_name_the_shell_supplies_is_not_lowered_as_an_environment_read() {
+        let raw = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/contracts/golden/shell-variable-inventory-v1.json"
+        ))
+        .expect("corpus is readable");
+        let corpus: serde_json::Value = serde_json::from_str(&raw).expect("corpus is JSON");
+        let shells: Vec<&str> = corpus["shells"]
+            .as_array()
+            .expect("corpus lists shells")
+            .iter()
+            .map(|value| value.as_str().expect("shell is a string"))
+            .collect();
+        let names = corpus["names"].as_object().expect("corpus records names");
+        assert!(!names.is_empty());
+
+        let mut supplied = 0_usize;
+        for (name, states) in names {
+            let shell_supplies = shells
+                .iter()
+                .any(|shell| states[*shell].as_str() == Some("SHELL"));
+            assert_eq!(
+                shell_supplied_variable(name),
+                shell_supplies,
+                "the table and the recording disagree about {name}"
+            );
+            if !shell_supplies {
+                continue;
+            }
+            supplied += 1;
+            // Both spellings: a plain expansion and one with a default.
+            for source in [
+                format!("#!/bin/bash\n/bin/echo \"${{{name}}}\"\n"),
+                format!("#!/bin/bash\n/bin/echo \"${{{name}:-x}}\"\n"),
+            ] {
+                let node = body("build.sh", source.as_bytes());
+                assert!(
+                    matches!(node.operation, Operation::InterpreterCall { .. }),
+                    "{name} lowered rather than delegating: {node:#?}"
+                );
+            }
+        }
+        assert!(supplied > 10, "{supplied} names");
+
+        // A local of the same name is the script's own, and shadows the shell's.
+        let node = body(
+            "build.sh",
+            b"#!/bin/bash\nRANDOM=fixed\n/bin/echo \"${RANDOM}\"\n",
+        );
+        assert!(
+            !matches!(node.operation, Operation::InterpreterCall { .. }),
+            "an assigned name is the script's own: {node:#?}"
+        );
+
+        // An ordinary environment name still lowers.
+        let node = body("build.sh", b"#!/bin/bash\n/bin/echo \"${GITHUB_OUTPUT}\"\n");
+        assert!(
+            matches!(
+                node.operation,
+                Operation::WriteStdout { .. } | Operation::Exec { .. }
+            ),
             "{node:#?}"
         );
     }

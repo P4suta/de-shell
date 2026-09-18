@@ -1,0 +1,272 @@
+{
+ "schema_version": 1,
+ "contract": "shell-variable-inventory-v1",
+ "purpose": "Record which names a shell answers from itself rather than from the environment, so an expansion of one is not lowered into a program that reads an environment variable nobody set.",
+ "note": "A generated program resolves a name through the process environment. That is right for `PATH` and wrong for `RANDOM`, which every shell here answers from itself and no environment carries: the generated program reads nothing and produces an empty string where the script produced a number. INHERITED means the name was in the environment this was measured in; SHELL means the shell supplied a value the environment did not; ABSENT means neither. A name marked SHELL anywhere is one the frontend must not lower as an ordinary expansion, whatever it is in the shell being lowered.",
+ "shells": [
+  "bash",
+  "sh",
+  "zsh",
+  "dash"
+ ],
+ "names": {
+  "BASH": {
+   "bash": "SHELL",
+   "sh": "SHELL",
+   "zsh": "ABSENT",
+   "dash": "ABSENT"
+  },
+  "BASHPID": {
+   "bash": "ABSENT",
+   "sh": "ABSENT",
+   "zsh": "ABSENT",
+   "dash": "ABSENT"
+  },
+  "BASH_COMMAND": {
+   "bash": "SHELL",
+   "sh": "SHELL",
+   "zsh": "ABSENT",
+   "dash": "ABSENT"
+  },
+  "BASH_LINENO": {
+   "bash": "ABSENT",
+   "sh": "ABSENT",
+   "zsh": "ABSENT",
+   "dash": "ABSENT"
+  },
+  "BASH_SOURCE": {
+   "bash": "ABSENT",
+   "sh": "ABSENT",
+   "zsh": "ABSENT",
+   "dash": "ABSENT"
+  },
+  "BASH_SUBSHELL": {
+   "bash": "SHELL",
+   "sh": "SHELL",
+   "zsh": "ABSENT",
+   "dash": "ABSENT"
+  },
+  "BASH_VERSION": {
+   "bash": "SHELL",
+   "sh": "SHELL",
+   "zsh": "ABSENT",
+   "dash": "ABSENT"
+  },
+  "COLUMNS": {
+   "bash": "ABSENT",
+   "sh": "ABSENT",
+   "zsh": "SHELL",
+   "dash": "ABSENT"
+  },
+  "COMP_WORDS": {
+   "bash": "ABSENT",
+   "sh": "ABSENT",
+   "zsh": "ABSENT",
+   "dash": "ABSENT"
+  },
+  "DIRSTACK": {
+   "bash": "SHELL",
+   "sh": "SHELL",
+   "zsh": "ABSENT",
+   "dash": "ABSENT"
+  },
+  "EPOCHREALTIME": {
+   "bash": "ABSENT",
+   "sh": "ABSENT",
+   "zsh": "ABSENT",
+   "dash": "ABSENT"
+  },
+  "EPOCHSECONDS": {
+   "bash": "ABSENT",
+   "sh": "ABSENT",
+   "zsh": "ABSENT",
+   "dash": "ABSENT"
+  },
+  "EUID": {
+   "bash": "SHELL",
+   "sh": "SHELL",
+   "zsh": "SHELL",
+   "dash": "ABSENT"
+  },
+  "FUNCNAME": {
+   "bash": "ABSENT",
+   "sh": "ABSENT",
+   "zsh": "ABSENT",
+   "dash": "ABSENT"
+  },
+  "GROUPS": {
+   "bash": "SHELL",
+   "sh": "SHELL",
+   "zsh": "ABSENT",
+   "dash": "ABSENT"
+  },
+  "HISTFILE": {
+   "bash": "ABSENT",
+   "sh": "ABSENT",
+   "zsh": "ABSENT",
+   "dash": "ABSENT"
+  },
+  "HOME": {
+   "bash": "INHERITED",
+   "sh": "INHERITED",
+   "zsh": "INHERITED",
+   "dash": "INHERITED"
+  },
+  "HOSTNAME": {
+   "bash": "SHELL",
+   "sh": "SHELL",
+   "zsh": "ABSENT",
+   "dash": "ABSENT"
+  },
+  "HOSTTYPE": {
+   "bash": "SHELL",
+   "sh": "SHELL",
+   "zsh": "ABSENT",
+   "dash": "ABSENT"
+  },
+  "IFS": {
+   "bash": "SHELL",
+   "sh": "SHELL",
+   "zsh": "SHELL",
+   "dash": "SHELL"
+  },
+  "LINENO": {
+   "bash": "SHELL",
+   "sh": "SHELL",
+   "zsh": "SHELL",
+   "dash": "SHELL"
+  },
+  "LINES": {
+   "bash": "ABSENT",
+   "sh": "ABSENT",
+   "zsh": "SHELL",
+   "dash": "ABSENT"
+  },
+  "LOGNAME": {
+   "bash": "INHERITED",
+   "sh": "INHERITED",
+   "zsh": "INHERITED",
+   "dash": "INHERITED"
+  },
+  "MACHTYPE": {
+   "bash": "SHELL",
+   "sh": "SHELL",
+   "zsh": "SHELL",
+   "dash": "ABSENT"
+  },
+  "OLDPWD": {
+   "bash": "ABSENT",
+   "sh": "ABSENT",
+   "zsh": "INHERITED",
+   "dash": "INHERITED"
+  },
+  "OPTARG": {
+   "bash": "ABSENT",
+   "sh": "ABSENT",
+   "zsh": "SHELL",
+   "dash": "ABSENT"
+  },
+  "OPTIND": {
+   "bash": "SHELL",
+   "sh": "SHELL",
+   "zsh": "SHELL",
+   "dash": "SHELL"
+  },
+  "OSTYPE": {
+   "bash": "SHELL",
+   "sh": "SHELL",
+   "zsh": "SHELL",
+   "dash": "ABSENT"
+  },
+  "PATH": {
+   "bash": "INHERITED",
+   "sh": "INHERITED",
+   "zsh": "INHERITED",
+   "dash": "INHERITED"
+  },
+  "PIPESTATUS": {
+   "bash": "SHELL",
+   "sh": "SHELL",
+   "zsh": "ABSENT",
+   "dash": "ABSENT"
+  },
+  "PPID": {
+   "bash": "SHELL",
+   "sh": "SHELL",
+   "zsh": "SHELL",
+   "dash": "SHELL"
+  },
+  "PS1": {
+   "bash": "ABSENT",
+   "sh": "ABSENT",
+   "zsh": "SHELL",
+   "dash": "SHELL"
+  },
+  "PS2": {
+   "bash": "ABSENT",
+   "sh": "ABSENT",
+   "zsh": "SHELL",
+   "dash": "SHELL"
+  },
+  "PS4": {
+   "bash": "SHELL",
+   "sh": "SHELL",
+   "zsh": "SHELL",
+   "dash": "SHELL"
+  },
+  "PWD": {
+   "bash": "INHERITED",
+   "sh": "INHERITED",
+   "zsh": "INHERITED",
+   "dash": "INHERITED"
+  },
+  "RANDOM": {
+   "bash": "SHELL",
+   "sh": "SHELL",
+   "zsh": "SHELL",
+   "dash": "ABSENT"
+  },
+  "REPLY": {
+   "bash": "ABSENT",
+   "sh": "ABSENT",
+   "zsh": "ABSENT",
+   "dash": "ABSENT"
+  },
+  "SECONDS": {
+   "bash": "SHELL",
+   "sh": "SHELL",
+   "zsh": "SHELL",
+   "dash": "ABSENT"
+  },
+  "SHELL": {
+   "bash": "INHERITED",
+   "sh": "INHERITED",
+   "zsh": "INHERITED",
+   "dash": "INHERITED"
+  },
+  "SHLVL": {
+   "bash": "INHERITED",
+   "sh": "INHERITED",
+   "zsh": "INHERITED",
+   "dash": "INHERITED"
+  },
+  "SRANDOM": {
+   "bash": "ABSENT",
+   "sh": "ABSENT",
+   "zsh": "ABSENT",
+   "dash": "ABSENT"
+  },
+  "UID": {
+   "bash": "SHELL",
+   "sh": "SHELL",
+   "zsh": "SHELL",
+   "dash": "ABSENT"
+  },
+  "USER": {
+   "bash": "INHERITED",
+   "sh": "INHERITED",
+   "zsh": "INHERITED",
+   "dash": "INHERITED"
+  }
+ }
+}

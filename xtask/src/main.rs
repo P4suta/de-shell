@@ -769,6 +769,79 @@ fn decode_base64(encoded: &str) -> Option<Vec<u8>> {
     Some(output)
 }
 
+/// Re-measure which names a shell answers from itself.
+///
+/// A generated program resolves a name through the process environment, so a
+/// name the shell supplies is one the program would read as empty. The
+/// measurement is what the frontend's table has to keep up with: a shell that
+/// starts supplying a name the recording calls absent is a name that has
+/// quietly become unlowerable.
+fn run_shell_variables(root: &Path) -> Result<(), Vec<String>> {
+    let path = root.join("contracts/golden/shell-variable-inventory-v1.json");
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|error| vec![format!("cannot read {}: {error}", path.display())])?;
+    let corpus: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|error| vec![format!("malformed corpus: {error}")])?;
+    let shells: Vec<&str> = corpus["shells"]
+        .as_array()
+        .ok_or_else(|| vec!["corpus has no shells array".to_owned()])?
+        .iter()
+        .filter_map(|value| value.as_str())
+        .collect();
+    let names = corpus["names"]
+        .as_object()
+        .ok_or_else(|| vec!["corpus has no names object".to_owned()])?;
+    if names.is_empty() || shells.is_empty() {
+        return Err(vec!["corpus is empty".to_owned()]);
+    }
+    let mut errors = Vec::new();
+    let mut checked = 0_usize;
+    for (name, recorded) in names {
+        for shell in &shells {
+            let Some(expected) = recorded[*shell].as_str() else {
+                errors.push(format!("{name} has no {shell} column"));
+                continue;
+            };
+            let script = format!(
+                "if env | grep -q \"^{name}=\"; then printf INHERITED; \
+                 elif [ -n \"${{{name}+x}}\" ]; then printf SHELL; else printf ABSENT; fi"
+            );
+            let Ok(output) = std::process::Command::new(shell)
+                .arg("-c")
+                .arg(&script)
+                .output()
+            else {
+                println!("skipped  {name}/{shell}: not on this runner");
+                continue;
+            };
+            let observed = String::from_utf8_lossy(&output.stdout).into_owned();
+            let observed = if observed.is_empty() {
+                "ABSENT".to_owned()
+            } else {
+                observed
+            };
+            checked += 1;
+            // `INHERITED` says the environment this ran in carried the name,
+            // which is a property of the runner and not of the shell. Only a
+            // move into or out of `SHELL` is a change the frontend cares about.
+            let supplied = |state: &str| state == "SHELL";
+            if supplied(&observed) != supplied(expected) {
+                errors.push(format!(
+                    "{name}/{shell}: recorded {expected}, observed {observed}"
+                ));
+            }
+        }
+    }
+    if errors.is_empty() {
+        println!(
+            "{} variable name(s) match the recording across {checked} shell observation(s)",
+            names.len()
+        );
+        return Ok(());
+    }
+    Err(errors)
+}
+
 fn run_test_semantics(root: &Path) -> Result<(), Vec<String>> {
     let path = root.join("contracts/golden/test-builtin-semantics-v1.json");
     let raw = std::fs::read_to_string(&path)
@@ -1848,6 +1921,7 @@ fn dispatch(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Vec<Str
         Some("posix-divergence") => run_posix_divergence(root),
         Some("printf-semantics") => run_printf_semantics(root),
         Some("case-patterns") => run_case_patterns(root),
+        Some("shell-variables") => run_shell_variables(root),
         Some("validate-contracts") => validate_contract_tree(root).map(|_| ()),
         Some("performance") => {
             let binary = arguments

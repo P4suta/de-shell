@@ -86,6 +86,7 @@ jobs:
           cargo run --locked -p xtask -- posix-divergence
           cargo run --locked -p xtask -- printf-semantics
           cargo run --locked -p xtask -- case-patterns
+          cargo run --locked -p xtask -- shell-variables
 
       - name: Run shared CLI, schema, golden, and agent conformance
         run: |
