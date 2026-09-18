@@ -11,14 +11,41 @@ pub(crate) enum Mode {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
-#[expect(
-    dead_code,
-    reason = "constructed by contract paths that are exercised only under specific platforms or feature gates"
+/// The severity vocabulary of `contracts/schema/diagnostic-v1.schema.json`.
+///
+/// `Note` is in the contract and nothing in de-shell emits one yet. That is the
+/// whole reason it is unconstructed, and the `expect` used to give a different
+/// one — "exercised only under specific platforms or feature gates", which was
+/// not true of any of the three and so could have covered a variant that was
+/// genuinely left over. An `expect` whose reason is false costs what an `allow`
+/// costs.
+///
+/// The variant stays because the schema is the vocabulary a reader of the JSONL
+/// stream decodes against, not because something might construct it later.
+/// [`tests::severity_vocabulary_matches_the_diagnostic_schema`] is what holds
+/// the two lists equal in both directions.
+// `not(test)` because the schema comparison below does construct all three, so
+// outside a test build is exactly where `Note` is unconstructed.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "`Note` is declared by contracts/schema/diagnostic-v1.schema.json and nothing emits one yet; the schema comparison in tests is what keeps the vocabularies equal"
+    )
 )]
 pub(crate) enum Severity {
     Error,
     Warning,
     Note,
+}
+
+impl Severity {
+    /// Every severity, in the order the schema lists them.
+    ///
+    /// Beside the enum so the two are read together, and `#[cfg(test)]` because
+    /// the comparison with the schema is the only thing that needs it.
+    #[cfg(test)]
+    const ALL: &'static [Self] = &[Self::Error, Self::Warning, Self::Note];
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -127,6 +154,39 @@ pub(crate) fn emit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The severity vocabulary and the diagnostic schema say the same thing.
+    ///
+    /// In both directions: a variant added here without a line in the schema
+    /// writes a `severity` no reader can decode, and a value added to the schema
+    /// without a variant here is a promise nothing can keep. `Severity::Note` is
+    /// the second case standing still — it is in the contract and nothing emits
+    /// one — which is why it is unconstructed and why that has to be checked
+    /// rather than asserted in an `expect` reason.
+    #[test]
+    fn severity_vocabulary_matches_the_diagnostic_schema() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("contracts/schema/diagnostic-v1.schema.json");
+        let schema: serde_json::Value =
+            crate::strict_json::parse(&std::fs::read(&path).unwrap()).unwrap();
+        let recorded = schema["properties"]["severity"]["enum"]
+            .as_array()
+            .expect("the diagnostic schema declares a severity enum")
+            .iter()
+            .map(|value| value.as_str().expect("a severity is a string").to_owned())
+            .collect::<Vec<_>>();
+        let declared = Severity::ALL
+            .iter()
+            .map(|severity| {
+                serde_json::to_value(severity)
+                    .unwrap()
+                    .as_str()
+                    .expect("a severity serialises as a string")
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(declared, recorded);
+    }
 
     #[test]
     fn jsonl_is_one_compact_strict_line_with_stable_keys() {

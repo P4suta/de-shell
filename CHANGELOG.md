@@ -65,6 +65,16 @@ All notable changes are documented here. No compatibility contract predates
   argument two different values through `argv` and `arguments` is now refused
   by name instead of surfacing as an observed difference.
 
+- `cargo xtask lint-expectations`, wired into `mise run lint`: `allow` is
+  rejected outright, a `dead_code` expectation must be
+  `cfg_attr(not(test), ...)`, and it may not sit on a `mod` declaration.
+- Narrowed the blanket `dead_code` expectation on `mod lab` to the one item that
+  was actually dead, and corrected the reason on `Severity`, which claimed a
+  platform gate that applies to none of its variants.
+- `severity_vocabulary_matches_the_diagnostic_schema`, which holds the
+  `Severity` variants and `contracts/schema/diagnostic-v1.schema.json` equal in
+  both directions.
+
 ### Removed
 
 - Pre-v1 Effect IR and lock migration promises.

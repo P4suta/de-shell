@@ -131,6 +131,26 @@ pub(crate) fn select(platform: Platform, probe: &dyn Probe) -> Result<Provider, 
     }
 }
 
+/// Whether a *named* provider can run here.
+///
+/// Nothing names one yet: every command calls [`select`], which picks the
+/// provider from what the host has. So this validates a request that no command
+/// makes, which is the whole reason it is unconstructed outside tests — the
+/// module used to carry a blanket `expect(dead_code)` saying the code was
+/// "exercised only under specific platforms or feature gates", and that reason
+/// was false for every other item in the file and hid that exactly one thing
+/// here was dead.
+///
+/// It is kept, and tested against the same `Probe`, because the day a command
+/// takes `--provider` the check it needs must already agree with [`select`]
+/// about what each platform supports.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no command names a provider — `select` picks one — so this validates a request nothing makes yet; the tests keep it from drifting away from `select`"
+    )
+)]
 pub(crate) fn validate_provider(
     platform: Platform,
     probe: &dyn Probe,

@@ -975,6 +975,113 @@ fn run_enum_equality(root: &Path) -> Result<(), Vec<String>> {
 }
 
 /// Every `.rs` file this repository owns.
+/// Every lint suppression is narrow, conditional on not being a test, and
+/// attached to the item it is about.
+///
+/// Three rules, each from something that actually happened in this repository.
+///
+/// `allow` is banned outright. It silences without recording why, and an
+/// `expect` at least fails when the lint stops firing — a suppression that has
+/// outlived its reason is a suppression that is now hiding something else.
+///
+/// A `dead_code` expectation must be `cfg_attr(not(test), ...)`. Code that not
+/// even a test constructs is code nobody has looked at; the conditional form
+/// says "the tests reach this and the release build does not", which is a fact
+/// the compiler then checks in both directions.
+///
+/// A `dead_code` expectation must not sit on a `mod` declaration. `mod lab`
+/// carried one reading "constructed by contract paths that are exercised only
+/// under specific platforms or feature gates". Exactly one item in that
+/// nine-hundred-line module was dead — `validate_provider`, a fail-closed
+/// provider check with no caller — and the blanket covered it along with
+/// everything else, so nothing could say how much it was hiding or when that
+/// grew.
+fn run_lint_expectations(root: &Path) -> Result<(), Vec<String>> {
+    let mut failures = Vec::new();
+    for entry in walk_rust_sources(root)? {
+        let text = std::fs::read_to_string(&entry)
+            .map_err(|error| vec![format!("cannot read {}: {error}", entry.display())])?;
+        let display = entry
+            .strip_prefix(root)
+            .unwrap_or(&entry)
+            .display()
+            .to_string();
+        let lines: Vec<&str> = text.lines().collect();
+        let mut index = 0;
+        while index < lines.len() {
+            let trimmed = lines[index].trim_start();
+            if !(trimmed.starts_with("#[") || trimmed.starts_with("#![")) {
+                index += 1;
+                continue;
+            }
+            // Accumulate the attribute until its brackets balance, so that a
+            // multi-line `cfg_attr(not(test), expect(...))` is read whole.
+            let start = index;
+            let mut attribute = String::new();
+            let mut depth = 0i32;
+            loop {
+                let line = lines[index];
+                attribute.push_str(line);
+                attribute.push('\n');
+                for character in line.chars() {
+                    match character {
+                        '[' | '(' => depth += 1,
+                        ']' | ')' => depth -= 1,
+                        _ => {}
+                    }
+                }
+                index += 1;
+                if depth <= 0 || index >= lines.len() {
+                    break;
+                }
+            }
+            if attribute.contains("#[allow(") || attribute.contains("#![allow(") {
+                failures.push(format!(
+                    "{display}:{}: `allow` is banned; use `expect` so the suppression fails when the lint stops firing",
+                    start + 1
+                ));
+            }
+            if !attribute.contains("dead_code") {
+                continue;
+            }
+            if !attribute.contains("not(test)") {
+                failures.push(format!(
+                    "{display}:{}: a `dead_code` expectation must be `cfg_attr(not(test), ...)`; code no test constructs is code nobody has looked at",
+                    start + 1
+                ));
+            }
+            // The item the attribute is about is the next line that is not
+            // another attribute, a comment, or blank.
+            let subject = lines[index..]
+                .iter()
+                .map(|line| line.trim_start())
+                .find(|line| {
+                    !line.is_empty()
+                        && !line.starts_with("#[")
+                        && !line.starts_with("#![")
+                        && !line.starts_with("//")
+                });
+            if subject.is_some_and(|line| {
+                line.starts_with("mod ")
+                    || line.starts_with("pub mod ")
+                    || line.starts_with("pub(crate) mod ")
+            }) {
+                failures.push(format!(
+                    "{display}:{}: a `dead_code` expectation on a `mod` covers every item in it; put it on the item that is actually dead",
+                    start + 1
+                ));
+            }
+        }
+    }
+    if failures.is_empty() {
+        println!(
+            "lint suppressions are narrow, conditional on not(test), and attached to an item, not a module"
+        );
+        return Ok(());
+    }
+    Err(failures)
+}
+
 fn walk_rust_sources(root: &Path) -> Result<Vec<std::path::PathBuf>, Vec<String>> {
     let mut sources = Vec::new();
     for directory in ["crates", "xtask"] {
@@ -2092,6 +2199,7 @@ fn dispatch(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Vec<Str
         Some("case-patterns") => run_case_patterns(root),
         Some("shell-variables") => run_shell_variables(root),
         Some("enum-equality") => run_enum_equality(root),
+        Some("lint-expectations") => run_lint_expectations(root),
         Some("validate-contracts") => validate_contract_tree(root).map(|_| ()),
         Some("performance") => {
             let binary = arguments
