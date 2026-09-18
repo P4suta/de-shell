@@ -211,6 +211,21 @@ blocker DESHELL_BLOCKER_UNIMPLEMENTED_SEMANTIC action.yml@3963..6698:
   honest lowering. It currently delegates on that shape, which is correct but
   coarse: the statements above the change were lowerable.
 
+  Splitting the sequence at each change is not enough on its own. Measured:
+
+  ```
+  A: set +e / false / set -e / true            shell: exit 0
+  B: set +e / false / set -e / false / echo    shell: exit 1, no output
+  C: set -e / false / set +e / echo after      shell: exit 1, no output
+  ```
+
+  With one outer sequence around the regions, `on_failure: continue` passes A and
+  B and fails C — the first region stopped, and the outer one runs the next
+  anyway. `on_failure: stop` fails A, since the first region's last statement
+  exits 1 and that is indistinguishable from having been cut short. `combine`
+  keeps the last statement's status and nothing else, so "this region ended" and
+  "this region was stopped" arrive as the same value.
+
   The same question applies to subshells and `&&` chains, where the option's
   reach differs again. A bool records that an option was set; it cannot record
   where it applied, and anything downstream of a rangeless record has to guess.
