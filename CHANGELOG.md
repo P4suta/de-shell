@@ -79,6 +79,15 @@ All notable changes are documented here. No compatibility contract predates
   `Severity` variants and `contracts/schema/diagnostic-v1.schema.json` equal in
   both directions.
 
+- Gave every location in a file its own byte span. The span came from searching
+  the whole file for the command text, which returns the first occurrence, so
+  repeated identical `run:` lines in one workflow all reported the first one's
+  bytes. `deshell init` refused its own inventory as duplicate location
+  overrides — correctly — which is why de-shell could not be run on its own
+  repository.
+- Stopped a value the scanner cannot locate from claiming the whole file as its
+  span; it gets the line it was found on.
+
 ### Removed
 
 - Pre-v1 Effect IR and lock migration promises.

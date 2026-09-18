@@ -1034,14 +1034,36 @@ fn finding(parts: FindingParts<'_>) -> Finding {
     }
 }
 
-fn span_of(source: &str, value: &str) -> ByteSpan {
-    source.find(value).map_or_else(
-        || ByteSpan::whole(source.as_bytes()),
-        |start| ByteSpan {
-            start_byte: start as u64,
-            end_byte: (start + value.len()) as u64,
+/// Where `value` sits in `source`, searched from `from`.
+///
+/// `from` is what makes this exact rather than a guess. Searching the whole
+/// file returns the *first* occurrence, so four identical `run:` lines in one
+/// workflow all reported the same byte span — the line numbers were right and
+/// the spans named one line four times. `deshell init` then refused its own
+/// output as duplicate location overrides, which was the correct refusal of an
+/// incorrect inventory; had it not refused, a migration would have rewritten
+/// one occurrence four times.
+///
+/// The fallback is the span of the line at `from` rather than the whole file.
+/// A span covering every byte of a file is not a location, and a rewrite
+/// reading one would replace the file with a single block.
+fn span_of(source: &str, from: usize, value: &str) -> ByteSpan {
+    let from = from.min(source.len());
+    match source.get(from..).and_then(|rest| rest.find(value)) {
+        Some(offset) => ByteSpan {
+            start_byte: (from + offset) as u64,
+            end_byte: (from + offset + value.len()) as u64,
         },
-    )
+        None => {
+            let end = source[from..]
+                .find('\n')
+                .map_or(source.len(), |offset| from + offset);
+            ByteSpan {
+                start_byte: from as u64,
+                end_byte: end as u64,
+            }
+        }
+    }
 }
 
 fn line_offsets(source: &str) -> Vec<usize> {
@@ -1067,13 +1089,18 @@ fn package_findings(path: &str, source: &str) -> Result<Vec<Finding>, String> {
                 .as_str()
                 .filter(|script| !script.is_empty())
                 .map(|script| {
+                    // Anchored on the key, which is unique within the object,
+                    // so two scripts running the same command get their own
+                    // spans instead of both getting the first one's.
+                    let key = format!("\"{name}\"");
+                    let after_key = source.find(&key).map_or(0, |offset| offset + key.len());
                     finding(FindingParts {
                         path,
                         kind: FindingKind::EmbeddedShell,
                         interpreter: Some("package-shell".into()),
                         interpreter_confidence: InterpreterConfidence::Medium,
                         locator: Some(format!("scripts.{name}")),
-                        span: span_of(source, script),
+                        span: span_of(source, after_key, script),
                         source: script.as_bytes().to_vec(),
                     })
                 })
@@ -1271,7 +1298,10 @@ fn yaml_findings(path: &str, source: &str, lower: &str) -> Result<Vec<Finding>, 
                     InterpreterConfidence::Low
                 },
                 locator: Some(format!("{key}:{line}")),
-                span: span_of(source, &value),
+                // Anchored at the line the key is on, the same way the block
+                // form above uses `offsets[line - 1]`. Searching the whole file
+                // gave every repeat of a one-line `run:` the first one's span.
+                span: span_of(source, offsets[line - 1], &value),
                 source: value.into_bytes(),
             }));
         }
@@ -1631,7 +1661,7 @@ fn collect_json_candidates(parts: CollectJsonCandidatesArgs<'_>) {
                 interpreter: None,
                 interpreter_confidence: InterpreterConfidence::Low,
                 locator: Some(locator.into()),
-                span: span_of(source, command),
+                span: span_of(source, 0, command),
                 source: command.as_bytes().to_vec(),
             })),
         _ => {}
@@ -1710,7 +1740,7 @@ fn collect_toml_candidates(parts: CollectTomlCandidatesArgs<'_>) {
                 interpreter: None,
                 interpreter_confidence: InterpreterConfidence::Low,
                 locator: Some(locator.into()),
-                span: span_of(source, command),
+                span: span_of(source, 0, command),
                 source: command.as_bytes().to_vec(),
             }));
         }
@@ -2840,6 +2870,75 @@ spawn(dynamicProgram, dynamicArguments);
         assert_eq!(inventory.skipped.len(), 1);
         assert_eq!(inventory.skipped[0].path, "build.py");
         assert_eq!(inventory.skipped[0].reason, "unsupported_encoding");
+    }
+
+    /// Two locations holding the same text get their own byte spans.
+    ///
+    /// They did not. The span came from searching the whole file for the text,
+    /// which returns the first occurrence, so four identical
+    /// `run: ./scripts/install-nushell.ps1` lines in de-shell's own CI workflow
+    /// all reported bytes 1036..1065. The line numbers beside them were right,
+    /// which is what made it look fine.
+    ///
+    /// It surfaced as `deshell init` refusing its own inventory —
+    /// "duplicate exact location override" — and that refusal was correct: two
+    /// locations cannot occupy one span. Had the validator not caught it, a
+    /// migration would have rewritten one of the four occurrences four times.
+    #[test]
+    fn repeated_identical_commands_in_one_file_each_get_their_own_span() {
+        let directory = tempfile::tempdir().unwrap();
+        let workflow = b"name: ci\non:\n  push:\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - name: one\n        run: ./tools/setup.sh\n      - name: two\n        run: ./tools/setup.sh\n      - name: three\n        run: |\n          ./tools/setup.sh\n";
+        write(directory.path(), ".github/workflows/ci.yml", workflow);
+        // Two scripts whose bodies are byte-identical, in a format whose keys
+        // are unique so each body can still be placed exactly.
+        let package = br#"{"scripts": {"a": "node build.js", "b": "node build.js"}}"#;
+        write(directory.path(), "package.json", package);
+
+        let inventory = scan(directory.path()).unwrap();
+        assert!(inventory.errors.is_empty(), "{:#?}", inventory.errors);
+
+        for (path, source) in [
+            (".github/workflows/ci.yml", workflow.as_slice()),
+            ("package.json", package.as_slice()),
+        ] {
+            let spans: Vec<_> = inventory
+                .findings
+                .iter()
+                .filter(|finding| finding.path == path)
+                .map(|finding| (finding.span.start_byte, finding.span.end_byte))
+                .collect();
+            assert!(spans.len() >= 2, "{path} produced {} findings", spans.len());
+            let unique: std::collections::BTreeSet<_> = spans.iter().collect();
+            assert_eq!(unique.len(), spans.len(), "{path} reused a span: {spans:?}");
+            for (start, end) in spans {
+                let start = start as usize;
+                let end = end as usize;
+                assert!(start < end && end <= source.len(), "{path} {start}..{end}");
+                assert!(
+                    source[start..end]
+                        .windows(9)
+                        .any(|window| window == b"setup.sh\n" || window == b"build.js\"")
+                        || source[start..end].ends_with(b"setup.sh")
+                        || source[start..end].ends_with(b"build.js"),
+                    "{path} {start}..{end} is {:?}",
+                    String::from_utf8_lossy(&source[start..end])
+                );
+            }
+        }
+    }
+
+    /// A value the scanner cannot find in the source gets the line it was on,
+    /// not the whole file.
+    ///
+    /// `span_of` used to fall back to every byte of the file. A span that wide
+    /// is not a location: a rewrite reading one would replace the file with a
+    /// single block.
+    #[test]
+    fn an_unlocatable_value_falls_back_to_its_line_and_not_the_file() {
+        let source = "first line\nsecond line\nthird line\n";
+        let span = span_of(source, 11, "not in the file");
+        assert_eq!((span.start_byte, span.end_byte), (11, 22));
+        assert_eq!(&source[11..22], "second line");
     }
 
     #[test]
