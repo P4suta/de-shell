@@ -3245,6 +3245,7 @@ fn visit_node(node: &crate::ir::Node, mut visit: impl FnMut(&crate::ir::Node)) {
         | crate::ir::Operation::RandomBytes { .. }
         | crate::ir::Operation::TaskCall { .. }
         | crate::ir::Operation::InterpreterCall { .. }
+        | crate::ir::Operation::Exit { .. }
         | crate::ir::Operation::OpaqueCapsule { .. } => {}
     }
 }
@@ -3762,6 +3763,15 @@ fn emit_rust_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> 
             }
             output.push_str(&format!("\n{indent}    }}\n{indent}}}"));
         }
+        // The frontend lowers only a literal integer status, so this is a
+        // constant. `process::exit` returns `!`, which is why it stands where
+        // the surrounding expression wants an `i32`.
+        crate::ir::Operation::Exit { status } => {
+            output.push_str(&format!(
+                "{indent}std::process::exit({})",
+                rust_exit_status(status)?
+            ));
+        }
         // `echo` returns 1 when the write fails, so the status is the write's.
         // The `use` is local to the block: the import list is decided before the
         // body is walked, and an unconditional `std::io::Write` would be unused
@@ -3784,7 +3794,7 @@ fn emit_rust_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> 
             ));
         }
         crate::ir::Operation::Sequence { nodes, .. } => {
-            let Some((last, preceding)) = nodes.split_last() else {
+            let Some((last, preceding)) = reachable_nodes(nodes).split_last() else {
                 return Err("generator received an empty sequence".into());
             };
             output.push_str(&format!("{indent}{{\n"));
@@ -3933,7 +3943,9 @@ fn node_captures_stdout(node: &crate::ir::Node) -> bool {
         return true;
     }
     match &node.operation {
-        crate::ir::Operation::NoOp | crate::ir::Operation::WriteStdout { .. } => false,
+        crate::ir::Operation::NoOp
+        | crate::ir::Operation::WriteStdout { .. }
+        | crate::ir::Operation::Exit { .. } => false,
         crate::ir::Operation::Sequence { nodes, .. }
         | crate::ir::Operation::Pipeline { nodes, .. }
         | crate::ir::Operation::Parallel { nodes } => nodes.iter().any(node_captures_stdout),
@@ -3993,7 +4005,9 @@ fn rust_node_sets_variables(node: &crate::ir::Node) -> bool {
         return true;
     }
     match &node.operation {
-        crate::ir::Operation::NoOp | crate::ir::Operation::WriteStdout { .. } => false,
+        crate::ir::Operation::NoOp
+        | crate::ir::Operation::WriteStdout { .. }
+        | crate::ir::Operation::Exit { .. } => false,
         crate::ir::Operation::Sequence { nodes, .. }
         | crate::ir::Operation::Pipeline { nodes, .. }
         | crate::ir::Operation::Parallel { nodes } => nodes.iter().any(rust_node_sets_variables),
@@ -4046,6 +4060,97 @@ fn rust_node_sets_variables(node: &crate::ir::Node) -> bool {
     }
 }
 
+/// Whether every path through this node ends the task.
+///
+/// A statement after one cannot run, and emitting it anyway produces code the
+/// generator's own `-D warnings` gate rejects as unreachable. Suppressing the
+/// warning would keep the dead statement in the output; dropping it is what the
+/// shell does at run time, so the two programs still agree.
+///
+/// Conservative in the safe direction: `false` for anything this cannot prove,
+/// which at worst emits a statement that does run.
+fn node_always_exits(node: &crate::ir::Node) -> bool {
+    match &node.operation {
+        crate::ir::Operation::Exit { .. } => true,
+        // A sequence ends the task if any of its statements does, whatever
+        // `on_failure` says: the ones after it are the unreachable part.
+        crate::ir::Operation::Sequence { nodes, .. } => nodes.iter().any(node_always_exits),
+        // Every arm has to end it, and an absent default is an arm that runs
+        // nothing and returns.
+        crate::ir::Operation::Match { cases, default, .. } => {
+            default.as_deref().is_some_and(node_always_exits)
+                && cases.iter().all(|case| node_always_exits(&case.body))
+        }
+        // Without an `else` the false branch returns.
+        crate::ir::Operation::Condition {
+            if_true, if_false, ..
+        } => node_always_exits(if_true) && if_false.as_deref().is_some_and(node_always_exits),
+        crate::ir::Operation::Not { body }
+        | crate::ir::Operation::Redirect { body, .. }
+        | crate::ir::Operation::Scope { body, .. } => node_always_exits(body),
+        // A loop may run its body no times, a substitution and a pipeline stage
+        // run in their own process, and the rest start no task to end.
+        crate::ir::Operation::While { .. }
+        | crate::ir::Operation::Foreach { .. }
+        | crate::ir::Operation::Pipeline { .. }
+        | crate::ir::Operation::Parallel { .. }
+        | crate::ir::Operation::CaptureStdout { .. }
+        | crate::ir::Operation::Spawn { .. }
+        | crate::ir::Operation::TryFinally { .. }
+        | crate::ir::Operation::Exec { .. }
+        | crate::ir::Operation::ExpandWords { .. }
+        | crate::ir::Operation::NoOp
+        | crate::ir::Operation::WriteStdout { .. }
+        | crate::ir::Operation::Test { .. }
+        | crate::ir::Operation::SetVariable { .. }
+        | crate::ir::Operation::SetEnvironment { .. }
+        | crate::ir::Operation::SetWorkingDirectory { .. }
+        | crate::ir::Operation::Wait { .. }
+        | crate::ir::Operation::SendSignal { .. }
+        | crate::ir::Operation::FileRead { .. }
+        | crate::ir::Operation::FileWrite { .. }
+        | crate::ir::Operation::FileRemove { .. }
+        | crate::ir::Operation::FileMetadata { .. }
+        | crate::ir::Operation::FileSetMetadata { .. }
+        | crate::ir::Operation::NetworkRequest { .. }
+        | crate::ir::Operation::ClockRead { .. }
+        | crate::ir::Operation::RandomBytes { .. }
+        | crate::ir::Operation::TaskCall { .. }
+        | crate::ir::Operation::InterpreterCall { .. }
+        | crate::ir::Operation::OpaqueCapsule { .. } => false,
+    }
+}
+
+/// The statements of a sequence that can run.
+///
+/// Everything after the first one that always ends the task is unreachable.
+fn reachable_nodes(nodes: &[crate::ir::Node]) -> &[crate::ir::Node] {
+    match nodes.iter().position(node_always_exits) {
+        Some(index) => &nodes[..=index],
+        None => nodes,
+    }
+}
+
+/// The literal status an `Operation::Exit` ends with.
+///
+/// The frontend refuses a status it cannot read, so a plan that reaches a
+/// generator carries a decimal integer. Reducing it here rather than in the
+/// generated program keeps the arithmetic in one place, and every measured
+/// shell reduces modulo 256.
+fn rust_exit_status(status: &crate::ir::TextExpression) -> Result<i32, String> {
+    let [crate::ir::TextPart::Literal { value }] = status.parts.as_slice() else {
+        return Err(
+            "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: exit status must be a literal integer".into(),
+        );
+    };
+    let parsed: i64 = value
+        .trim()
+        .parse()
+        .map_err(|error| format!("DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: exit status: {error}"))?;
+    i32::try_from(parsed.rem_euclid(256))
+        .map_err(|error| format!("DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: exit status: {error}"))
+}
+
 /// Whether the generated program will name `Command` at all.
 ///
 /// A plan made only of `Test` nodes starts no process, and an unused import is a
@@ -4053,7 +4158,9 @@ fn rust_node_sets_variables(node: &crate::ir::Node) -> bool {
 /// so emitting the import unconditionally made such a plan ungeneratable.
 fn rust_node_starts_a_process(node: &crate::ir::Node) -> bool {
     match &node.operation {
-        crate::ir::Operation::NoOp | crate::ir::Operation::WriteStdout { .. } => false,
+        crate::ir::Operation::NoOp
+        | crate::ir::Operation::WriteStdout { .. }
+        | crate::ir::Operation::Exit { .. } => false,
         crate::ir::Operation::Exec { .. }
         | crate::ir::Operation::Pipeline { .. }
         | crate::ir::Operation::InterpreterCall { .. } => true,
@@ -4149,6 +4256,7 @@ fn node_has_expression_part(
     match &node.operation {
         crate::ir::Operation::NoOp => false,
         crate::ir::Operation::WriteStdout { contents } => expression(contents),
+        crate::ir::Operation::Exit { status } => expression(status),
         crate::ir::Operation::Exec {
             argv,
             environment,
@@ -4625,6 +4733,9 @@ fn emit_go_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> Re
             }
             output.push_str(&format!("{indent}}}\n"));
         }
+        crate::ir::Operation::Exit { status } => {
+            output.push_str(&format!("{indent}os.Exit({})\n", rust_exit_status(status)?));
+        }
         // `echo` returns 1 when the write fails, so the status is the write's.
         crate::ir::Operation::WriteStdout { contents } => {
             output.push_str(&format!(
@@ -4642,7 +4753,7 @@ fn emit_go_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> Re
             ));
         }
         crate::ir::Operation::Sequence { nodes, .. } => {
-            for child in nodes {
+            for child in reachable_nodes(nodes) {
                 emit_go_node(child, output, depth)?;
             }
         }
@@ -9334,6 +9445,112 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
             "go vet rejected generated source:\n{}",
             String::from_utf8_lossy(&vet.stderr)
         );
+    }
+
+    /// The generated programs end where the shell ends, with the same bytes and
+    /// the same status.
+    ///
+    /// Compiling is not enough for `exit`: a generator that emitted it as a
+    /// status rather than as a jump would produce a program that compiles and
+    /// keeps running. So both are built and run, and their output is compared
+    /// against bash running the script they replaced.
+    #[test]
+    fn generated_programs_stop_at_exit_exactly_where_bash_does() {
+        let plan = plan_with_body(node(crate::ir::Operation::Match {
+            value: crate::ir::TextExpression::literal("1"),
+            cases: vec![
+                crate::ir::MatchCase {
+                    pattern: crate::ir::TextExpression::literal("0"),
+                    body: node(crate::ir::Operation::NoOp),
+                },
+                crate::ir::MatchCase {
+                    pattern: crate::ir::TextExpression::literal("1"),
+                    body: node(crate::ir::Operation::Sequence {
+                        nodes: vec![
+                            node(crate::ir::Operation::WriteStdout {
+                                contents: crate::ir::TextExpression::literal("before\n"),
+                            }),
+                            node(crate::ir::Operation::Exit {
+                                status: crate::ir::TextExpression::literal("3"),
+                            }),
+                            node(crate::ir::Operation::WriteStdout {
+                                contents: crate::ir::TextExpression::literal("after\n"),
+                            }),
+                        ],
+                        on_failure: crate::ir::SequenceFailure::Continue,
+                    }),
+                },
+            ],
+            default: None,
+        }));
+        let directory = tempfile::tempdir().unwrap();
+
+        // What the script this replaces does, measured rather than assumed.
+        std::fs::write(
+            directory.path().join("original.sh"),
+            "case '1' in\n  0) ;;\n  1)\n    echo before\n    exit 3\n    echo after\n    ;;\nesac\n",
+        )
+        .unwrap();
+        let shell = std::process::Command::new("bash")
+            .arg("original.sh")
+            .current_dir(directory.path())
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&shell.stdout), "before\n");
+        assert_eq!(shell.status.code(), Some(3));
+
+        let rust = directory.path().join("exiting.rs");
+        std::fs::write(&rust, generate_rust(&plan).unwrap()).unwrap();
+        let built = std::process::Command::new("rustc")
+            .arg(&rust)
+            .args(["--edition=2024", "-D", "warnings", "-o"])
+            .arg(directory.path().join("exiting-rust"))
+            .output()
+            .unwrap();
+        assert!(
+            built.status.success(),
+            "rustc rejected generated source:\n{}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        let ran = std::process::Command::new(directory.path().join("exiting-rust"))
+            .output()
+            .unwrap();
+        assert_eq!(ran.stdout, shell.stdout, "generated Rust wrote other bytes");
+        assert_eq!(ran.status.code(), shell.status.code());
+
+        std::fs::write(
+            directory.path().join("exiting.go"),
+            generate_go(&plan).unwrap(),
+        )
+        .unwrap();
+        let vet = std::process::Command::new("go")
+            .args(["vet", "exiting.go"])
+            .current_dir(directory.path())
+            .output()
+            .unwrap();
+        assert!(
+            vet.status.success(),
+            "go vet rejected generated source:\n{}",
+            String::from_utf8_lossy(&vet.stderr)
+        );
+        // Built rather than `go run`: `go run` reports 1 for any non-zero exit
+        // and prints the real status to its own stderr, which would hide exactly
+        // what this checks.
+        let built = std::process::Command::new("go")
+            .args(["build", "-o", "exiting-go", "exiting.go"])
+            .current_dir(directory.path())
+            .output()
+            .unwrap();
+        assert!(
+            built.status.success(),
+            "go build rejected generated source:\n{}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        let ran = std::process::Command::new(directory.path().join("exiting-go"))
+            .output()
+            .unwrap();
+        assert_eq!(ran.stdout, shell.stdout, "generated Go wrote other bytes");
+        assert_eq!(ran.status.code(), shell.status.code());
     }
 
     #[test]

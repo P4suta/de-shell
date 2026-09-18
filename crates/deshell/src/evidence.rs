@@ -229,7 +229,9 @@ fn collect_nodes(node: &crate::ir::Node, output: &mut Vec<NodeEvidence>) {
         guarantee: node.guarantee.clone(),
     });
     match &node.operation {
-        crate::ir::Operation::NoOp | crate::ir::Operation::WriteStdout { .. } => {}
+        crate::ir::Operation::NoOp
+        | crate::ir::Operation::WriteStdout { .. }
+        | crate::ir::Operation::Exit { .. } => {}
         crate::ir::Operation::Test { .. } => {}
         crate::ir::Operation::Pipeline { nodes, .. }
         | crate::ir::Operation::Sequence { nodes, .. }

@@ -284,6 +284,93 @@ fn run_echo_semantics(root: &Path) -> Result<(), Vec<String>> {
     Err(errors)
 }
 
+/// Check each shell's `exit` builtin against the recording, and check the
+/// frontend's native rule against all three.
+///
+/// A modelled status is one every shell reduces the same way, so unlike the
+/// `echo` gate this one requires the three columns to agree — and to agree with
+/// the reduction the runner and the generators perform.
+fn run_exit_semantics(root: &Path) -> Result<(), Vec<String>> {
+    let path = root.join("contracts/golden/exit-builtin-semantics-v1.json");
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|error| vec![format!("cannot read {}: {error}", path.display())])?;
+    let corpus: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|error| vec![format!("malformed corpus: {error}")])?;
+    let cases = corpus["cases"]
+        .as_array()
+        .ok_or_else(|| vec!["corpus has no cases array".to_owned()])?;
+    if cases.is_empty() {
+        return Err(vec!["corpus is empty".to_owned()]);
+    }
+    let mut errors = Vec::new();
+    let mut checked = 0_usize;
+    for case in cases {
+        let name = case["name"].as_str().unwrap_or("<unnamed>");
+        let Some(status) = case["status"].as_str() else {
+            errors.push(format!("{name} has no status"));
+            continue;
+        };
+        for shell in ["bash", "sh", "zsh"] {
+            let Some(recorded) = case[shell].as_i64() else {
+                errors.push(format!("{name} has no {shell} column"));
+                continue;
+            };
+            let observed = std::process::Command::new(shell)
+                .arg("-c")
+                .arg(format!("exit {status}"))
+                .status();
+            let observed = match observed {
+                Ok(observed) => observed,
+                Err(error) if shell != "bash" => {
+                    println!("skipped  {name}/{shell}: {error}");
+                    continue;
+                }
+                Err(error) => {
+                    errors.push(format!("cannot run {shell} for {name}: {error}"));
+                    continue;
+                }
+            };
+            let code = i64::from(observed.code().unwrap_or(-1));
+            checked += 1;
+            if code != recorded {
+                errors.push(format!(
+                    "{name}/{shell}: recorded {recorded}, observed {code}"
+                ));
+            }
+        }
+        let Some(modelled) = case["modelled"].as_bool() else {
+            errors.push(format!("{name} does not say whether it is modelled"));
+            continue;
+        };
+        if !modelled {
+            continue;
+        }
+        let Ok(parsed) = status.trim().parse::<i64>() else {
+            errors.push(format!(
+                "{name} is modelled, but {status:?} is not a decimal integer"
+            ));
+            continue;
+        };
+        let reduced = parsed.rem_euclid(256);
+        for shell in ["bash", "sh", "zsh"] {
+            let recorded = case[shell].as_i64().unwrap_or(-1);
+            if recorded != reduced {
+                errors.push(format!(
+                    "{name} is modelled, but {shell} ends with {recorded} where the reduction gives {reduced}"
+                ));
+            }
+        }
+    }
+    if errors.is_empty() {
+        println!(
+            "{} exit case(s) match the recording across {checked} shell observation(s)",
+            cases.len()
+        );
+        return Ok(());
+    }
+    Err(errors)
+}
+
 fn run_test_semantics(root: &Path) -> Result<(), Vec<String>> {
     let path = root.join("contracts/golden/test-builtin-semantics-v1.json");
     let raw = std::fs::read_to_string(&path)
@@ -1358,6 +1445,7 @@ fn dispatch(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Vec<Str
         Some("bash-semantics") => run_bash_semantics(root),
         Some("test-semantics") => run_test_semantics(root),
         Some("echo-semantics") => run_echo_semantics(root),
+        Some("exit-semantics") => run_exit_semantics(root),
         Some("validate-contracts") => validate_contract_tree(root).map(|_| ()),
         Some("performance") => {
             let binary = arguments

@@ -72,7 +72,7 @@ jobs:
         shell: bash
         run: cargo run --locked -p xtask -- bash-semantics
 
-      - name: Measure the test and echo builtins against their recordings
+      - name: Measure the test, echo and exit builtins against their recordings
         # Unlike the `set` corpus above this one fails on disagreement: the
         # frontend lowers `[` and `echo` to modelled operations, so a runner
         # whose builtin writes different bytes makes that lowering wrong rather
@@ -81,6 +81,7 @@ jobs:
         run: |
           cargo run --locked -p xtask -- test-semantics
           cargo run --locked -p xtask -- echo-semantics
+          cargo run --locked -p xtask -- exit-semantics
 
       - name: Run shared CLI, schema, golden, and agent conformance
         run: |

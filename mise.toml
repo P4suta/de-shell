@@ -116,10 +116,11 @@ run = [
 ]
 
 [tasks."test:builtin-semantics"]
-description = "Measure the `test` and `echo` builtins against their recordings"
+description = "Measure the `test`, `echo` and `exit` builtins against their recordings"
 run = [
   "cargo run --locked -p xtask -- test-semantics",
   "cargo run --locked -p xtask -- echo-semantics",
+  "cargo run --locked -p xtask -- exit-semantics",
 ]
 
 [tasks.test]
@@ -130,6 +131,7 @@ run = [
   "cargo run --locked -p xtask -- conformance target/debug/deshell",
   "cargo run --locked -p xtask -- test-semantics",
   "cargo run --locked -p xtask -- echo-semantics",
+  "cargo run --locked -p xtask -- exit-semantics",
 ]
 
 [tasks.performance]

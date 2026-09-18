@@ -152,6 +152,7 @@ mod tests {
             "contracts/golden/bash-set-semantics-v1.json",
             "contracts/golden/test-builtin-semantics-v1.json",
             "contracts/golden/echo-builtin-semantics-v1.json",
+            "contracts/golden/exit-builtin-semantics-v1.json",
         ] {
             assert!(root().join(relative).is_file(), "missing {relative}");
         }

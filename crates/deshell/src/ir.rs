@@ -383,6 +383,25 @@ pub(crate) enum Operation {
     WriteStdout {
         contents: TextExpression,
     },
+    /// End the task with a status.
+    ///
+    /// A bare `exit` ends with the last command's status, which this cannot say:
+    /// the IR has no term for `$?`, and a node that reported 0 would overwrite
+    /// the status it was meant to carry. So the status is required and the
+    /// frontend delegates a bare `exit` rather than inventing one.
+    ///
+    /// The status is a decimal integer reduced modulo 256, which every measured
+    /// shell agrees on — including a negative one and one above 255. They do not
+    /// agree on anything else: measured on macOS, bash and `/bin/sh` exit 255
+    /// and write a message naming the interpreter's own path and a line number,
+    /// while zsh exits 0 in silence. Nothing native can reproduce a message that
+    /// names the interpreter, so the frontend lowers a literal integer only and
+    /// delegates a status it cannot read.
+    /// `contracts/golden/exit-builtin-semantics-v1.json` records the
+    /// measurement.
+    Exit {
+        status: TextExpression,
+    },
     /// Runs nothing and succeeds.
     ///
     /// Distinct from an empty [`Operation::Sequence`], which the validator
@@ -529,6 +548,7 @@ impl Operation {
             Self::Pipeline { .. } => "pipeline",
             Self::Sequence { .. } => "sequence",
             Self::NoOp => "no_op",
+            Self::Exit { .. } => "exit",
             Self::WriteStdout { .. } => "write_stdout",
             Self::Test { .. } => "test",
             Self::Not { .. } => "not",
@@ -827,7 +847,7 @@ fn visit_children_mut<E>(
     mut visit: impl FnMut(&mut Node) -> Result<(), E>,
 ) -> Result<(), E> {
     match operation {
-        Operation::NoOp | Operation::WriteStdout { .. } => {}
+        Operation::NoOp | Operation::WriteStdout { .. } | Operation::Exit { .. } => {}
         Operation::Pipeline { nodes, .. }
         | Operation::Sequence { nodes, .. }
         | Operation::Parallel { nodes } => {
@@ -1111,6 +1131,7 @@ fn validate_node(parts: ValidateNodeArgs<'_>) {
         // Children are validated by the walk over them; nothing here is its own.
         Operation::NoOp | Operation::Not { .. } | Operation::While { .. } => {}
         Operation::WriteStdout { contents } => expression(contents, errors),
+        Operation::Exit { status } => expression(status, errors),
         Operation::Test { predicate } => match predicate {
             TestPredicate::NonEmpty { value } | TestPredicate::Empty { value } => {
                 expression(value, errors);
@@ -1588,7 +1609,7 @@ fn validate_node(parts: ValidateNodeArgs<'_>) {
 fn contains_state_mutation(node: &Node) -> bool {
     match &node.operation {
         Operation::NoOp => false,
-        Operation::WriteStdout { .. } => true,
+        Operation::WriteStdout { .. } | Operation::Exit { .. } => true,
         Operation::Not { body } => contains_state_mutation(body),
         Operation::While { condition, body } => {
             contains_state_mutation(condition) || contains_state_mutation(body)

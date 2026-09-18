@@ -322,7 +322,7 @@ fn rebind_source_path(plan: &mut Plan, from: &str, to: &str) -> Result<(), Strin
             *path = to.into();
         }
         match &mut node.operation {
-            Operation::NoOp | Operation::WriteStdout { .. } => {}
+            Operation::NoOp | Operation::WriteStdout { .. } | Operation::Exit { .. } => {}
             Operation::While { condition, body } => {
                 visit(condition, from, to);
                 visit(body, from, to);
@@ -757,7 +757,7 @@ pub(crate) fn bind_interpreter_pins(
 
 fn bind_node_pin(node: &mut Node, pins: &crate::config::InterpreterPins) -> Result<(), String> {
     match &mut node.operation {
-        Operation::NoOp | Operation::WriteStdout { .. } => {}
+        Operation::NoOp | Operation::WriteStdout { .. } | Operation::Exit { .. } => {}
         Operation::While { condition, body } => {
             bind_node_pin(condition, pins)?;
             bind_node_pin(body, pins)?;
@@ -2316,6 +2316,31 @@ fn lower_posix_simple(parts: LowerPosixSimpleArgs<'_>) -> Result<Node, String> {
             ));
         }
         return Err("echo argument requires pinned interpreter delegation".into());
+    }
+    if executable == "exit" {
+        // Measured on macOS: every shell reduces the status modulo 256, negatives
+        // and values above 255 alike. They agree on nothing else — bash and
+        // `/bin/sh` exit 255 and write a message naming the interpreter's own
+        // path and a line number, while zsh exits 0 in silence — so a status this
+        // cannot read statically has no lowering that is not one shell
+        // impersonating another. `contracts/golden/exit-builtin-semantics-v1.json`
+        // records the measurement.
+        //
+        // A bare `exit` ends with the last command's status, which the IR has no
+        // term for, so it is delegated rather than reported as 0.
+        if let [status] = &words[1..]
+            && let Some(literal) = literal_expression(status)
+            && literal.trim().parse::<i64>().is_ok()
+        {
+            return Ok(native_node(
+                Operation::Exit {
+                    status: crate::ir::TextExpression::literal(literal.trim()),
+                },
+                &format!("{}-static-exit-v1", interpreter.name()),
+                span_for_range(path, source, range.start, range.end)?,
+            ));
+        }
+        return Err("exit status requires pinned interpreter delegation".into());
     }
     if shell_builtin(&executable) {
         return Err(format!(
@@ -4606,6 +4631,62 @@ mod tests {
                 written,
                 case["bash"].as_str().expect("case records bash"),
                 "{name} writes different bytes than bash"
+            );
+        }
+    }
+
+    /// The `exit` lowering ends with the status the shells end with.
+    ///
+    /// Reads the same file `cargo xtask exit-semantics` measures, so widening
+    /// the lowering without widening the recording fails here.
+    #[test]
+    fn the_exit_lowering_ends_with_what_the_shells_end_with() {
+        let raw = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/contracts/golden/exit-builtin-semantics-v1.json"
+        ))
+        .expect("corpus is readable");
+        let corpus: serde_json::Value = serde_json::from_str(&raw).expect("corpus is JSON");
+        let cases = corpus["cases"].as_array().expect("corpus has cases");
+        assert!(!cases.is_empty());
+        for case in cases {
+            let name = case["name"].as_str().expect("case has a name");
+            let status = case["status"].as_str().expect("case has a status");
+            let modelled = case["modelled"].as_bool().expect("case says modelled");
+            let node = body(
+                "build.sh",
+                format!("#!/bin/bash\nexit '{}'\n", status.replace('\'', "'\\''")).as_bytes(),
+            );
+            let Operation::Exit { status: lowered } = &node.operation else {
+                assert!(!modelled, "{name} is modelled but delegated: {node:#?}");
+                continue;
+            };
+            assert!(modelled, "{name} is not modelled but lowered: {node:#?}");
+            let [TextPart::Literal { value }] = lowered.parts.as_slice() else {
+                panic!("{name} lowered to a status that is not a literal: {lowered:#?}")
+            };
+            let reduced = value.parse::<i64>().expect("status is an integer") % 256;
+            assert_eq!(
+                reduced.rem_euclid(256),
+                case["bash"].as_i64().expect("case records bash"),
+                "{name} ends with a different status than bash"
+            );
+        }
+    }
+
+    /// A bare `exit` ends with the last command's status, which the IR cannot
+    /// say — so it is delegated rather than reported as 0.
+    #[test]
+    fn a_bare_exit_and_a_dynamic_status_are_delegated() {
+        for source in [
+            "#!/bin/bash\nexit\n".as_bytes(),
+            "#!/bin/bash\nexit \"$1\"\n".as_bytes(),
+            "#!/bin/bash\nexit \"${CODE:-2}\"\n".as_bytes(),
+        ] {
+            let node = body("build.sh", source);
+            assert!(
+                matches!(node.operation, Operation::InterpreterCall { .. }),
+                "must delegate: {node:#?}"
             );
         }
     }

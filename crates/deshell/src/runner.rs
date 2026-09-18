@@ -103,6 +103,39 @@ pub(crate) enum TraceEvent {
     },
 }
 
+/// Whether the task continues after a node.
+///
+/// `exit` does not return to its caller, so a result alone cannot say whether
+/// the statement after it runs. Carrying this beside the result makes every
+/// place that runs a second node decide what to do about the first, instead of
+/// running the second because nothing stopped it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Flow {
+    Continue,
+    Exited,
+}
+
+/// What running one node produced.
+///
+/// Destructured without `..` at every consumer, so a field added here is a
+/// compile error everywhere it matters rather than a value quietly dropped.
+struct Step {
+    result: RunResult,
+    flow: Flow,
+    context: Context,
+}
+
+impl Step {
+    /// A node that finished and left the task running.
+    fn next(result: RunResult, context: Context) -> Self {
+        Self {
+            result,
+            flow: Flow::Continue,
+            context,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RunResult {
     pub exit_code: i32,
@@ -333,10 +366,19 @@ impl Executor<'_> {
             stdin,
             stack: &next_stack,
         })
-        .map(|(result, _)| result)
+        .map(|step| {
+            // Destructured without `..`: see `Step`. The task's result is the
+            // body's either way; `exit` ends the task, and the task is over.
+            let Step {
+                result,
+                flow: _,
+                context: _,
+            } = step;
+            result
+        })
     }
 
-    fn run_node(&self, parts: RunNodeArgs<'_>) -> Result<(RunResult, Context), RunError> {
+    fn run_node(&self, parts: RunNodeArgs<'_>) -> Result<Step, RunError> {
         // Destructured without `..`: see `RunNodeArgs`.
         let RunNodeArgs {
             node,
@@ -354,13 +396,27 @@ impl Executor<'_> {
                 let mut next = context;
                 let mut input = stdin;
                 loop {
-                    let (test, after_test) = self.run_node(RunNodeArgs {
+                    let Step {
+                        result: test,
+                        flow: test_flow,
+                        context: after_test,
+                    } = self.run_node(RunNodeArgs {
                         node: condition,
                         context: next,
                         stdin: Vec::new(),
                         stack,
                     })?;
                     let passed = test.exit_code == 0;
+                    // An `exit` in the condition ends the task with its own
+                    // status, so unlike a condition that merely failed, this one
+                    // does become the loop's status.
+                    if test_flow == Flow::Exited {
+                        return Ok(Step {
+                            result: combine(aggregate, test),
+                            flow: Flow::Exited,
+                            context: after_test,
+                        });
+                    }
                     // The condition's own status is not the loop's: a `while` that
                     // never enters its body reports 0, not the failing test.
                     let carried = aggregate.exit_code;
@@ -370,7 +426,11 @@ impl Executor<'_> {
                     if !passed {
                         break;
                     }
-                    let (result, after_body) = self.run_node(RunNodeArgs {
+                    let Step {
+                        result,
+                        flow: body_flow,
+                        context: after_body,
+                    } = self.run_node(RunNodeArgs {
                         node: body,
                         context: next,
                         stdin: input,
@@ -379,19 +439,40 @@ impl Executor<'_> {
                     input = Vec::new();
                     aggregate = combine(aggregate, result);
                     next = after_body;
+                    if body_flow == Flow::Exited {
+                        return Ok(Step {
+                            result: aggregate,
+                            flow: Flow::Exited,
+                            context: next,
+                        });
+                    }
                 }
-                Ok((aggregate, next))
+                Ok(Step::next(aggregate, next))
             }
             // `! cmd` inverts the status to a boolean: a body that exits 2 makes
             // this exit 0, the same as one that exits 1. Output passes through.
             Operation::Not { body } => {
-                let (result, next) = self.run_node(RunNodeArgs {
+                let Step {
+                    result,
+                    flow,
+                    context: next,
+                } = self.run_node(RunNodeArgs {
                     node: body,
                     context,
                     stdin,
                     stack,
                 })?;
-                Ok((
+                // `! exit 1` never reaches the inversion: the shell has already
+                // left. Inverting an exit status would report 0 for a task that
+                // ended with 1.
+                if flow == Flow::Exited {
+                    return Ok(Step {
+                        result,
+                        flow,
+                        context: next,
+                    });
+                }
+                Ok(Step::next(
                     RunResult {
                         exit_code: i32::from(result.exit_code == 0),
                         ..result
@@ -400,10 +481,35 @@ impl Executor<'_> {
                 ))
             }
             // `test` succeeds with 0 and fails with 1, and produces no output.
-            Operation::NoOp => Ok((RunResult::empty(), context)),
+            Operation::NoOp => Ok(Step::next(RunResult::empty(), context)),
+            Operation::Exit { status } => {
+                let text = evaluate(status, &context)?;
+                let parsed = text.trim().parse::<i64>().map_err(|_| {
+                    // The shells disagree here — bash exits 255 with a message
+                    // naming itself, zsh exits 0 in silence — so there is no
+                    // status to report that is not one shell impersonating
+                    // another. The frontend refuses a status it cannot read, so
+                    // reaching this means the plan was built by hand.
+                    invalid(format!("exit status is not an integer: {text}"))
+                })?;
+                // Measured: every shell reduces modulo 256, negatives and
+                // values above 255 alike.
+                let code = i32::try_from(parsed.rem_euclid(256))
+                    .map_err(|error| invalid(format!("exit status is out of range: {error}")))?;
+                Ok(Step {
+                    result: RunResult {
+                        exit_code: code,
+                        stdout: vec![],
+                        stderr: vec![],
+                        trace: vec![],
+                    },
+                    flow: Flow::Exited,
+                    context,
+                })
+            }
             Operation::WriteStdout { contents } => {
                 let text = evaluate(contents, &context)?;
-                Ok((
+                Ok(Step::next(
                     RunResult {
                         exit_code: 0,
                         stdout: text.into_bytes(),
@@ -437,7 +543,7 @@ impl Executor<'_> {
                         evaluate(value, &context)?.contains(infix.as_str())
                     }
                 };
-                Ok((
+                Ok(Step::next(
                     RunResult {
                         exit_code: i32::from(!truth),
                         stdout: vec![],
@@ -484,7 +590,7 @@ impl Executor<'_> {
                     .iter()
                     .map(|value| redact(value, &context.secret_values))
                     .collect();
-                Ok((
+                Ok(Step::next(
                     RunResult {
                         exit_code: process.exit_code,
                         stdout: process.stdout,
@@ -577,7 +683,7 @@ impl Executor<'_> {
                             exit_code: result.exit_code,
                         });
                     }
-                    return Ok((
+                    return Ok(Step::next(
                         RunResult {
                             exit_code: pipeline_exit,
                             stdout,
@@ -593,7 +699,15 @@ impl Executor<'_> {
                 let mut exit_code = 0;
                 let mut stdout = Vec::new();
                 for child in nodes {
-                    let (result, _) = self.run_node(RunNodeArgs {
+                    // A stage runs in its own process, so an `exit` inside one
+                    // ends that stage and not the shell that started it. The
+                    // status it leaves is the stage's, which the loop below
+                    // already reads.
+                    let Step {
+                        result,
+                        flow: _,
+                        context: _,
+                    } = self.run_node(RunNodeArgs {
                         node: child,
                         context: context.clone(),
                         stdin: input,
@@ -611,7 +725,7 @@ impl Executor<'_> {
                         crate::ir::PipelineStatus::Pipefail => exit_code,
                     };
                 }
-                Ok((
+                Ok(Step::next(
                     RunResult {
                         exit_code,
                         stdout,
@@ -626,7 +740,11 @@ impl Executor<'_> {
                 let mut next_context = context;
                 let mut input = stdin;
                 for child in nodes {
-                    let (result, child_context) = self.run_node(RunNodeArgs {
+                    let Step {
+                        result,
+                        flow,
+                        context: child_context,
+                    } = self.run_node(RunNodeArgs {
                         node: child,
                         context: next_context,
                         stdin: input,
@@ -636,6 +754,15 @@ impl Executor<'_> {
                     aggregate = combine(aggregate, result);
                     next_context = child_context;
                     input = Vec::new();
+                    // `exit` ends the task, so nothing later in the list runs —
+                    // whatever `on_failure` says, and whether or not it failed.
+                    if flow == Flow::Exited {
+                        return Ok(Step {
+                            result: aggregate,
+                            flow,
+                            context: next_context,
+                        });
+                    }
                     // `set -e`. The statements of a sequence are the only untested
                     // position, so stopping here is the whole of the option: a
                     // failure inside `&&`, an `if` condition or `!` belongs to
@@ -644,7 +771,7 @@ impl Executor<'_> {
                         break;
                     }
                 }
-                Ok((aggregate, next_context))
+                Ok(Step::next(aggregate, next_context))
             }
             Operation::Parallel { nodes } => self.run_parallel(RunParallelArgs {
                 nodes,
@@ -657,27 +784,48 @@ impl Executor<'_> {
                 if_true,
                 if_false,
             } => {
-                let (condition, predicate_context) = self.run_node(RunNodeArgs {
+                let Step {
+                    result: condition,
+                    flow: predicate_flow,
+                    context: predicate_context,
+                } = self.run_node(RunNodeArgs {
                     node: predicate,
                     context,
                     stdin,
                     stack,
                 })?;
+                // An `exit` in the condition ends the task; neither branch runs
+                // and the condition's status is not read as a branch selector.
+                if predicate_flow == Flow::Exited {
+                    return Ok(Step {
+                        result: condition,
+                        flow: predicate_flow,
+                        context: predicate_context,
+                    });
+                }
                 let branch = if condition.exit_code == 0 {
                     Some(if_true.as_ref())
                 } else {
                     if_false.as_deref()
                 };
                 if let Some(branch) = branch {
-                    let (result, branch_context) = self.run_node(RunNodeArgs {
+                    let Step {
+                        result,
+                        flow,
+                        context: branch_context,
+                    } = self.run_node(RunNodeArgs {
                         node: branch,
                         context: predicate_context,
                         stdin: Vec::new(),
                         stack,
                     })?;
-                    Ok((combine(condition, result), branch_context))
+                    Ok(Step {
+                        result: combine(condition, result),
+                        flow,
+                        context: branch_context,
+                    })
                 } else {
-                    Ok((condition, predicate_context))
+                    Ok(Step::next(condition, predicate_context))
                 }
             }
             Operation::Match {
@@ -701,7 +849,7 @@ impl Executor<'_> {
                         stack,
                     })
                 } else {
-                    Ok((RunResult::empty(), context))
+                    Ok(Step::next(RunResult::empty(), context))
                 }
             }
             Operation::Foreach {
@@ -713,9 +861,14 @@ impl Executor<'_> {
                 let previous = context.variables.get(variable).cloned();
                 let mut next_context = context;
                 let mut aggregate = RunResult::empty();
+                let mut exited = false;
                 for value in values {
                     next_context.variables.insert(variable.clone(), value);
-                    let (result, child_context) = self.run_node(RunNodeArgs {
+                    let Step {
+                        result,
+                        flow,
+                        context: child_context,
+                    } = self.run_node(RunNodeArgs {
                         node: body,
                         context: next_context,
                         stdin: stdin.clone(),
@@ -723,6 +876,13 @@ impl Executor<'_> {
                     })?;
                     aggregate = combine(aggregate, result);
                     next_context = child_context;
+                    // `exit` ends the task, so the remaining items do not run.
+                    // The loop variable is still restored below, because the
+                    // context travels on to whatever reads the result.
+                    if flow == Flow::Exited {
+                        exited = true;
+                        break;
+                    }
                 }
                 match previous {
                     Some(value) => {
@@ -732,7 +892,11 @@ impl Executor<'_> {
                         next_context.variables.remove(variable);
                     }
                 }
-                Ok((aggregate, next_context))
+                Ok(Step {
+                    result: aggregate,
+                    flow: if exited { Flow::Exited } else { Flow::Continue },
+                    context: next_context,
+                })
             }
             Operation::TryFinally { body, finalizer } => {
                 match self.run_node(RunNodeArgs {
@@ -756,8 +920,16 @@ impl Executor<'_> {
                             ),
                         }),
                     },
-                    Ok((body_result, body_context)) => {
-                        let (finalizer_result, finalizer_context) = self.run_node(RunNodeArgs {
+                    Ok(Step {
+                        result: body_result,
+                        flow: body_flow,
+                        context: body_context,
+                    }) => {
+                        let Step {
+                            result: finalizer_result,
+                            flow: finalizer_flow,
+                            context: finalizer_context,
+                        } = self.run_node(RunNodeArgs {
                             node: finalizer,
                             context: body_context,
                             stdin: Vec::new(),
@@ -770,7 +942,17 @@ impl Executor<'_> {
                         };
                         let mut result = combine(body_result, finalizer_result);
                         result.exit_code = exit_code;
-                        Ok((result, finalizer_context))
+                        // The finalizer runs even when the body exited — that is
+                        // what it is for — but the task still ends afterwards.
+                        let flow = match (body_flow, finalizer_flow) {
+                            (Flow::Continue, Flow::Continue) => Flow::Continue,
+                            (Flow::Exited, _) | (_, Flow::Exited) => Flow::Exited,
+                        };
+                        Ok(Step {
+                            result,
+                            flow,
+                            context: finalizer_context,
+                        })
                     }
                 }
             }
@@ -783,7 +965,7 @@ impl Executor<'_> {
                     stdin: Vec::new(),
                     stack,
                 })?;
-                Ok((result, context))
+                Ok(Step::next(result, context))
             }
             Operation::SetVariable {
                 name,
@@ -804,14 +986,21 @@ impl Executor<'_> {
                         context.secret_values.dedup();
                     }
                 }
-                Ok((RunResult::empty(), context))
+                Ok(Step::next(RunResult::empty(), context))
             }
             Operation::CaptureStdout {
                 name,
                 value_type,
                 body,
             } => {
-                let (mut captured, _) = self.run_node(RunNodeArgs {
+                // A substitution runs in its own process, so `$(exit 3)` ends
+                // that process and leaves 3 as its status; the shell reading it
+                // carries on.
+                let Step {
+                    result: mut captured,
+                    flow: _,
+                    context: _,
+                } = self.run_node(RunNodeArgs {
                     node: body,
                     context: context.clone(),
                     stdin,
@@ -828,7 +1017,7 @@ impl Executor<'_> {
                 let mut context = context;
                 context.variables.insert(name.clone(), normalized);
                 captured.stdout.clear();
-                Ok((captured, context))
+                Ok(Step::next(captured, context))
             }
             Operation::FileRead { path } => {
                 if !self.policy.allow_file_read {
@@ -840,7 +1029,7 @@ impl Executor<'_> {
                     .backend
                     .read_file(&path)
                     .map_err(|message| execution(redact(&message, &context.secret_values)))?;
-                Ok((
+                Ok(Step::next(
                     RunResult {
                         exit_code: 0,
                         stdout: contents,
@@ -866,7 +1055,7 @@ impl Executor<'_> {
                 self.backend
                     .write_file(&path, contents.as_bytes(), *append)
                     .map_err(|message| execution(redact(&message, &context.secret_values)))?;
-                Ok((
+                Ok(Step::next(
                     RunResult {
                         exit_code: 0,
                         stdout: vec![],
@@ -887,7 +1076,7 @@ impl Executor<'_> {
                 self.backend
                     .remove_file(&path)
                     .map_err(|message| execution(redact(&message, &context.secret_values)))?;
-                Ok((
+                Ok(Step::next(
                     RunResult {
                         exit_code: 0,
                         stdout: vec![],
@@ -909,7 +1098,7 @@ impl Executor<'_> {
                     .backend
                     .network_request(&method, &uri)
                     .map_err(|message| execution(redact(&message, &context.secret_values)))?;
-                Ok((
+                Ok(Step::next(
                     RunResult {
                         exit_code: 0,
                         stdout: response,
@@ -962,7 +1151,7 @@ impl Executor<'_> {
                         stdin,
                     })
                     .map_err(|message| execution(redact(&message, &context.secret_values)))?;
-                Ok((
+                Ok(Step::next(
                     RunResult {
                         exit_code: result.exit_code,
                         stdout: result.stdout,
@@ -989,7 +1178,7 @@ impl Executor<'_> {
         }
     }
 
-    fn run_parallel(&self, parts: RunParallelArgs<'_>) -> Result<(RunResult, Context), RunError> {
+    fn run_parallel(&self, parts: RunParallelArgs<'_>) -> Result<Step, RunError> {
         // Destructured without `..`: see `RunParallelArgs`.
         let RunParallelArgs {
             nodes,
@@ -998,7 +1187,7 @@ impl Executor<'_> {
             stack,
         } = parts;
         if nodes.is_empty() {
-            return Ok((RunResult::empty(), context));
+            return Ok(Step::next(RunResult::empty(), context));
         }
         let count = nodes.len();
         let workers = std::thread::available_parallelism()
@@ -1007,7 +1196,9 @@ impl Executor<'_> {
             .clamp(1, 8)
             .min(count);
         let next = std::sync::atomic::AtomicUsize::new(0);
-        let results = std::sync::Mutex::new(vec![None; count]);
+        let mut slots = Vec::new();
+        slots.resize_with(count, || None);
+        let results = std::sync::Mutex::new(slots);
         std::thread::scope(|scope| {
             for _ in 0..workers {
                 let next = &next;
@@ -1041,11 +1232,16 @@ impl Executor<'_> {
             .into_inner()
             .map_err(|_| execution("parallel result lock poisoned"))?
         {
-            let (result, _) =
-                result.ok_or_else(|| execution("parallel worker omitted a result"))??;
+            // Each branch runs in its own process, so an `exit` inside one
+            // ends that branch and leaves its status behind.
+            let Step {
+                result,
+                flow: _,
+                context: _,
+            } = result.ok_or_else(|| execution("parallel worker omitted a result"))??;
             aggregate = combine(aggregate, result);
         }
-        Ok((aggregate, context))
+        Ok(Step::next(aggregate, context))
     }
 }
 
@@ -1613,6 +1809,93 @@ mod tests {
             named_inputs: &BTreeMap::new(),
             arguments: &[],
         })
+    }
+
+    /// `exit` does not return to its caller, and every construct that runs a
+    /// second node has to know that.
+    ///
+    /// Before `Step` carried a `Flow`, a node's result said only what its
+    /// status was, so the statement after an `exit` ran: the result of `exit 3`
+    /// is indistinguishable from the result of a command that failed with 3.
+    #[test]
+    fn exit_ends_the_task_and_nothing_after_it_runs() {
+        let exit = |status: &str| {
+            node(Operation::Exit {
+                status: TextExpression::literal(status),
+            })
+        };
+        let backend = MockBackend::default();
+
+        // A sequence stops at the `exit`, whatever `on_failure` says — `exit 0`
+        // succeeds and still ends the task.
+        for (status, expected) in [("3", 3), ("0", 0)] {
+            for on_failure in [
+                crate::ir::SequenceFailure::Continue,
+                crate::ir::SequenceFailure::Stop,
+            ] {
+                let result = run(
+                    &backend,
+                    node(Operation::Sequence {
+                        nodes: vec![
+                            node(Operation::WriteStdout {
+                                contents: TextExpression::literal("before\n"),
+                            }),
+                            exit(status),
+                            node(Operation::WriteStdout {
+                                contents: TextExpression::literal("after\n"),
+                            }),
+                        ],
+                        on_failure,
+                    }),
+                )
+                .unwrap();
+                assert_eq!(result.stdout, b"before\n", "{status} {on_failure:?}");
+                assert_eq!(result.exit_code, expected, "{status} {on_failure:?}");
+            }
+        }
+
+        // A loop ends where the `exit` is, rather than running the rest of the
+        // body and testing the condition again.
+        let result = run(
+            &backend,
+            node(Operation::While {
+                condition: Box::new(node(Operation::Test {
+                    predicate: crate::ir::TestPredicate::Empty {
+                        value: TextExpression::literal(""),
+                    },
+                })),
+                body: Box::new(node(Operation::Sequence {
+                    nodes: vec![
+                        node(Operation::WriteStdout {
+                            contents: TextExpression::literal("once\n"),
+                        }),
+                        exit("4"),
+                    ],
+                    on_failure: crate::ir::SequenceFailure::Continue,
+                })),
+            }),
+        )
+        .unwrap();
+        assert_eq!(result.stdout, b"once\n");
+        assert_eq!(result.exit_code, 4);
+
+        // `! exit 1` is 1, not 0: the shell has already left by the time the
+        // inversion would happen.
+        let result = run(
+            &backend,
+            node(Operation::Not {
+                body: Box::new(exit("1")),
+            }),
+        )
+        .unwrap();
+        assert_eq!(result.exit_code, 1);
+
+        // Measured in `contracts/golden/exit-builtin-semantics-v1.json`: every
+        // shell reduces the status modulo 256.
+        for (status, expected) in [("256", 0), ("300", 44), ("-1", 255)] {
+            let result = run(&backend, exit(status)).unwrap();
+            assert_eq!(result.exit_code, expected, "exit {status}");
+        }
     }
 
     #[test]
