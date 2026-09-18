@@ -274,10 +274,130 @@ pub(crate) enum TestPredicate {
     },
 }
 
+/// One piece of a `case` pattern.
+///
+/// A pattern is a sequence of these rather than a string with a flag saying
+/// whether it is a glob, because quoting is resolved during word expansion,
+/// before any matching happens — so what decides is which character positions
+/// survived unquoted, not what the pattern as a whole looks like. Measured:
+/// `'a*c'` matches only `a*c`, `"a"*"c"` matches both `abc` and `a*c`, and a
+/// flag on the pattern gets the second one wrong whichever way it guesses.
+/// `contracts/golden/case-pattern-semantics-v1.json` records this.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case", tag = "kind")]
+pub(crate) enum PatternPiece {
+    /// Characters that have to appear as they are. An expansion that was
+    /// quoted contributes here, whatever it holds at run time.
+    Literal { value: TextExpression },
+    /// An unquoted `*`: any run of characters, including none. In a `case` this
+    /// crosses a `/`, unlike the same character in a filename glob.
+    AnyRun,
+    /// An unquoted `?`: exactly one character.
+    AnyCharacter,
+}
+
+/// A `case` pattern.
+///
+/// `[...]` is absent on purpose. Measured: `[^a]` negates the set in bash and
+/// is the two-member set `{^, a}` in dash, so the two answer the same for `^bc`
+/// by opposite rules and differently for `bac`. A bracket expression has no
+/// single meaning to lower.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub(crate) struct PatternExpression {
+    pub pieces: Vec<PatternPiece>,
+}
+
+impl PatternExpression {
+    /// A pattern that matches one exact string.
+    ///
+    /// The frontend reads pieces out of the source rather than building one
+    /// from a string, so this is here for the tests that need a fixture.
+    #[cfg(test)]
+    pub(crate) fn literal(value: &str) -> Self {
+        Self {
+            pieces: vec![PatternPiece::Literal {
+                value: TextExpression::literal(value),
+            }],
+        }
+    }
+
+    /// The one string this matches, if it matches exactly one.
+    ///
+    /// A pattern of literal pieces whose expansions are all literal text is an
+    /// equality test; anything with an `AnyRun` or an `AnyCharacter` is not.
+    pub(crate) fn exact(&self) -> Option<String> {
+        let mut exact = String::new();
+        for piece in &self.pieces {
+            match piece {
+                PatternPiece::Literal { value } => exact.push_str(&literal_text(value)?),
+                PatternPiece::AnyRun | PatternPiece::AnyCharacter => return None,
+            }
+        }
+        Some(exact)
+    }
+
+    /// Whether `subject` matches, given each literal piece's expanded text.
+    ///
+    /// Written here rather than in the runner so that the runner and the two
+    /// generators are checked against one definition. `*` is greedy-free: the
+    /// walk tries every split, which is what the shell's matcher does and what
+    /// a left-to-right scan would get wrong for `*a*a`.
+    pub(crate) fn matches(pieces: &[MatchPiece<'_>], subject: &str) -> bool {
+        let Some((first, rest)) = pieces.split_first() else {
+            return subject.is_empty();
+        };
+        match first {
+            MatchPiece::Literal(text) => match subject.strip_prefix(text.as_ref() as &str) {
+                Some(remainder) => Self::matches(rest, remainder),
+                None => false,
+            },
+            MatchPiece::AnyCharacter => match subject.chars().next() {
+                Some(character) => Self::matches(rest, &subject[character.len_utf8()..]),
+                None => false,
+            },
+            // Every split, shortest first, so `*` can cover nothing.
+            MatchPiece::AnyRun => std::iter::once(0)
+                .chain(
+                    subject
+                        .char_indices()
+                        .map(|(index, ch)| index + ch.len_utf8()),
+                )
+                .any(|split| Self::matches(rest, &subject[split..])),
+        }
+    }
+}
+
+/// A pattern piece with its literal text already expanded.
+///
+/// The IR carries expressions; matching needs the strings they became. Keeping
+/// the two apart is what lets the matcher be one function that the runner and
+/// the generators' tests both call.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum MatchPiece<'a> {
+    Literal(std::borrow::Cow<'a, str>),
+    AnyRun,
+    AnyCharacter,
+}
+
+/// The text of an expression whose parts are all literal, if they all are.
+fn literal_text(expression: &TextExpression) -> Option<String> {
+    let mut text = String::new();
+    for part in &expression.parts {
+        match part {
+            TextPart::Literal { value } => text.push_str(value),
+            TextPart::Variable { .. }
+            | TextPart::Argument { .. }
+            | TextPart::DefaultValue { .. } => return None,
+        }
+    }
+    Some(text)
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
 pub(crate) struct MatchCase {
-    pub pattern: TextExpression,
+    pub pattern: PatternExpression,
     pub body: Node,
 }
 
@@ -1299,8 +1419,15 @@ fn validate_node(parts: ValidateNodeArgs<'_>) {
             expression(value, errors);
             let mut patterns = BTreeSet::new();
             for case in cases {
-                expression(&case.pattern, errors);
-                if let Some(pattern) = literal_value(&case.pattern)
+                for piece in &case.pattern.pieces {
+                    if let PatternPiece::Literal { value } = piece {
+                        expression(value, errors);
+                    }
+                }
+                if case.pattern.pieces.is_empty() {
+                    errors.push("match case pattern has no pieces".into());
+                }
+                if let Some(pattern) = case.pattern.exact()
                     && !patterns.insert(pattern)
                 {
                     errors.push("duplicate literal match case".into());
@@ -1702,6 +1829,11 @@ fn validate_expression(
     Ok(())
 }
 
+/// The text of an expression that is one literal.
+///
+/// `PatternExpression::exact` replaced the use this had in validation; the
+/// tests below still measure it.
+#[cfg(test)]
 fn literal_value(expression: &TextExpression) -> Option<String> {
     match expression.parts.as_slice() {
         [TextPart::Literal { value }] => Some(value.clone()),
@@ -2590,11 +2722,11 @@ mod tests {
                     value: invalid_expression(),
                     cases: vec![
                         MatchCase {
-                            pattern: TextExpression::literal("same"),
+                            pattern: crate::ir::PatternExpression::literal("same"),
                             body: exec(),
                         },
                         MatchCase {
-                            pattern: TextExpression::literal("same"),
+                            pattern: crate::ir::PatternExpression::literal("same"),
                             body: exec(),
                         },
                     ],

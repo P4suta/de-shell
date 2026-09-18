@@ -647,7 +647,7 @@ mod tests {
                 native(Operation::Match {
                     value: TextExpression::literal("value"),
                     cases: vec![MatchCase {
-                        pattern: TextExpression::literal("value"),
+                        pattern: crate::ir::PatternExpression::literal("value"),
                         body: leaf(),
                     }],
                     default: Some(Box::new(leaf())),

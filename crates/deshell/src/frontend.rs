@@ -1489,16 +1489,90 @@ fn case_arm(text: &str) -> Option<(Vec<&str>, &str)> {
         return None;
     }
     let patterns: Vec<&str> = patterns.split('|').map(str::trim).collect();
-    if patterns.iter().any(|pattern| {
-        pattern.is_empty()
-            || pattern
-                .bytes()
-                .any(|byte| matches!(byte, b'$' | b'`' | b'"' | b'\'' | b'[' | b'?' | b'*'))
-                && *pattern != "*"
-    }) {
+    if patterns.iter().any(|pattern| pattern.is_empty()) {
         return None;
     }
     Some((patterns, body.trim()))
+}
+
+/// Read a `case` pattern into pieces, resolving quoting as the shell does.
+///
+/// Quoting is settled during word expansion, before anything is matched, so a
+/// `*` is a metacharacter exactly when it reaches the matcher unquoted.
+/// Measured: `'a*c'` matches only `a*c`, `a\*c` matches only `a*c`, and
+/// `"a"*"c"` matches both `abc` and `a*c` — so a flag saying whether the whole
+/// pattern is a glob gets the third one wrong whichever way it guesses.
+/// `contracts/golden/case-pattern-semantics-v1.json` records all three.
+///
+/// `None` for anything outside the model:
+///
+/// - `[...]`, because `[^a]` negates the set in bash and is the two-member set
+///   `{^, a}` in dash. The two agree for `^bc` by opposite rules and part for
+///   `bac`, so there is no single meaning to lower.
+/// - An expansion, because what a `$x` holds at run time decides whether the
+///   pattern has a metacharacter in it, and that is not knowable here.
+/// - A backslash at the end, which is a line continuation rather than a quote.
+/// - `(`, which opens an extglob list that three of the four shells refuse.
+fn case_pattern(pattern: &str) -> Option<crate::ir::PatternExpression> {
+    let mut pieces: Vec<crate::ir::PatternPiece> = Vec::new();
+    let mut literal = String::new();
+    let flush = |literal: &mut String, pieces: &mut Vec<crate::ir::PatternPiece>| {
+        if !literal.is_empty() {
+            pieces.push(crate::ir::PatternPiece::Literal {
+                value: crate::ir::TextExpression::literal(std::mem::take(literal).as_str()),
+            });
+        }
+    };
+    let mut rest = pattern.chars().peekable();
+    while let Some(character) = rest.next() {
+        match character {
+            // Quoted: every character up to the close is itself, including a
+            // `*`. A single quote also protects a backslash.
+            '\'' => loop {
+                match rest.next()? {
+                    '\'' => break,
+                    quoted => literal.push(quoted),
+                }
+            },
+            '"' => {
+                loop {
+                    match rest.next()? {
+                        '"' => break,
+                        // Inside double quotes a backslash quotes only a few
+                        // characters; the rest keep the backslash. Refusing is
+                        // narrower than modelling which is which.
+                        '\\' => return None,
+                        '$' | '`' => return None,
+                        quoted => literal.push(quoted),
+                    }
+                }
+            }
+            '\\' => literal.push(rest.next()?),
+            '*' => {
+                flush(&mut literal, &mut pieces);
+                pieces.push(crate::ir::PatternPiece::AnyRun);
+            }
+            '?' => {
+                flush(&mut literal, &mut pieces);
+                pieces.push(crate::ir::PatternPiece::AnyCharacter);
+            }
+            // `(` opens an extglob list — `@(a|b)`, which bash, `/bin/sh` and
+            // dash refuse outright and zsh reads as a literal that matches
+            // nothing. It is also where the arm splitter would cut: an arm
+            // written `@(a|b))` has its first `)` inside the pattern.
+            '[' | '$' | '`' | '(' | ')' => return None,
+            other => literal.push(other),
+        }
+    }
+    flush(&mut literal, &mut pieces);
+    // An empty pattern matches only the empty string, which `PatternExpression`
+    // says with one empty literal rather than with no pieces at all.
+    if pieces.is_empty() {
+        pieces.push(crate::ir::PatternPiece::Literal {
+            value: crate::ir::TextExpression::literal(""),
+        });
+    }
+    Some(crate::ir::PatternExpression { pieces })
 }
 
 /// Group the statements between `in` and `esac` into arms.
@@ -1821,14 +1895,25 @@ fn lower_posix(path: &str, source: &str, interpreter: &Interpreter) -> Result<Lo
                             }
                         };
                         for pattern in patterns {
+                            // A bare `*` is the default arm rather than a case
+                            // that matches everything: the IR runs the default
+                            // when no case matched, which is the same thing and
+                            // is what `esac` with no `*` leaves undone.
                             if pattern == "*" {
                                 default = Some(Box::new(node.clone()));
-                            } else {
-                                cases.push(crate::ir::MatchCase {
-                                    pattern: crate::ir::TextExpression::literal(pattern),
-                                    body: node.clone(),
-                                });
+                                continue;
                             }
+                            let Some(pattern) = case_pattern(pattern) else {
+                                modelled = false;
+                                break;
+                            };
+                            cases.push(crate::ir::MatchCase {
+                                pattern,
+                                body: node.clone(),
+                            });
+                        }
+                        if !modelled {
+                            break;
                         }
                     }
                 }
@@ -5104,6 +5189,141 @@ mod tests {
         assert_eq!(semantic_model, &expected);
     }
 
+    /// The pattern model answers what the shells answer, or refuses.
+    ///
+    /// Reads `contracts/golden/case-pattern-semantics-v1.json`, which
+    /// `cargo xtask case-patterns` re-measures on every runner. A pattern this
+    /// lowers has to reach the same verdict as every shell that agreed on one;
+    /// a pattern the shells disagree about has to be refused, because there is
+    /// no single answer to lower.
+    ///
+    /// The corpus marks two cases where all four shells agree and the agreement
+    /// is not evidence — a guard built from a command substitution that lost
+    /// its newline, and a bracket set that answers the same by opposite rules.
+    /// Both carry a `script` this cannot reproduce from a pattern alone, so they
+    /// are skipped by the same rule that skips the rest: they are not patterns
+    /// this reads.
+    #[test]
+    fn the_case_pattern_model_answers_what_the_shells_answer() {
+        let raw = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/contracts/golden/case-pattern-semantics-v1.json"
+        ))
+        .expect("corpus is readable");
+        let corpus: serde_json::Value = serde_json::from_str(&raw).expect("corpus is JSON");
+        let shells: Vec<&str> = corpus["shells"]
+            .as_array()
+            .expect("corpus lists shells")
+            .iter()
+            .map(|value| value.as_str().expect("shell is a string"))
+            .collect();
+        let cases = corpus["cases"].as_array().expect("corpus has cases");
+        assert!(!cases.is_empty());
+
+        let mut lowered = 0_usize;
+        let mut refused = 0_usize;
+        for case in cases {
+            let id = case["id"].as_str().expect("case has an id");
+            // The pattern is read out of the script rather than out of the
+            // `pattern` field, which is written for a reader: a pattern holding
+            // a real newline is shown there as `<LF>`.
+            //
+            // A case whose script does more than match a pattern is measuring
+            // something else — a variable built by a command substitution, for
+            // one — and there is no pattern here to read.
+            let script = case["script"].as_str().expect("case has a script");
+            let Some(pattern) = script
+                .strip_prefix("case \"$1\" in\n  ")
+                .and_then(|rest| rest.split(") printf MATCH").next())
+            else {
+                continue;
+            };
+            let word = decode_base64(case["word_base64"].as_str().expect("case has a word"));
+            let word = String::from_utf8(word).expect("word is UTF-8");
+            let answers: std::collections::BTreeSet<&str> = shells
+                .iter()
+                .map(|shell| case[*shell].as_str().expect("case records this shell"))
+                .collect();
+
+            // An alternation is several patterns in the source and several cases
+            // in the IR, so each side is read on its own.
+            let alternatives: Vec<&str> = pattern.split('|').collect();
+            let models: Option<Vec<crate::ir::PatternExpression>> =
+                alternatives.iter().map(|one| case_pattern(one)).collect();
+            let Some(models) = models else {
+                refused += 1;
+                continue;
+            };
+            lowered += 1;
+
+            // Only a verdict every shell shares is one to be checked against.
+            assert_eq!(
+                answers.len(),
+                1,
+                "{id} lowers but the shells disagree: {answers:?}"
+            );
+            let expected = answers.iter().next().copied().expect("one answer");
+            assert_ne!(expected, "ERROR", "{id} lowers but every shell refuses it");
+            let matched = models.iter().any(|model| {
+                let pieces: Vec<crate::ir::MatchPiece<'_>> = model
+                    .pieces
+                    .iter()
+                    .map(|piece| match piece {
+                        crate::ir::PatternPiece::Literal { value } => {
+                            let text: String = value
+                                .parts
+                                .iter()
+                                .map(|part| match part {
+                                    TextPart::Literal { value } => value.clone(),
+                                    other => panic!("{id} has a dynamic piece: {other:#?}"),
+                                })
+                                .collect();
+                            crate::ir::MatchPiece::Literal(text.into())
+                        }
+                        crate::ir::PatternPiece::AnyRun => crate::ir::MatchPiece::AnyRun,
+                        crate::ir::PatternPiece::AnyCharacter => {
+                            crate::ir::MatchPiece::AnyCharacter
+                        }
+                    })
+                    .collect();
+                crate::ir::PatternExpression::matches(&pieces, &word)
+            });
+            assert_eq!(
+                if matched { "MATCH" } else { "NOMATCH" },
+                expected,
+                "{id}: pattern {pattern:?} against {word:?}"
+            );
+        }
+        assert!(
+            lowered > 0 && refused > 0,
+            "{lowered} lowered, {refused} refused"
+        );
+    }
+
+    /// Decode the base64 the pattern corpus stores a word in.
+    fn decode_base64(encoded: &str) -> Vec<u8> {
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut bits = 0_u32;
+        let mut count = 0_u32;
+        let mut output = Vec::new();
+        for byte in encoded.bytes() {
+            if byte == b'=' {
+                break;
+            }
+            let value = ALPHABET
+                .iter()
+                .position(|candidate| *candidate == byte)
+                .expect("base64 alphabet");
+            bits = (bits << 6) | u32::try_from(value).expect("six bits");
+            count += 6;
+            if count >= 8 {
+                count -= 8;
+                output.push(u8::try_from((bits >> count) & 0xff).expect("one byte"));
+            }
+        }
+        output
+    }
+
     /// The `echo` lowering writes the bytes bash writes, checked against a
     /// measurement of bash rather than against a reading of its manual.
     ///
@@ -5636,7 +5856,7 @@ mod tests {
         };
         assert_eq!(value.parts, [TextPart::Argument { name: "1".into() }]);
         assert_eq!(cases.len(), 1, "{cases:#?}");
-        assert_eq!(cases[0].pattern, crate::ir::TextExpression::literal("a"));
+        assert_eq!(cases[0].pattern, crate::ir::PatternExpression::literal("a"));
         assert!(matches!(cases[0].body.operation, Operation::Exec { .. }));
         assert!(default.is_some(), "`*` is the default arm");
 
@@ -5651,8 +5871,8 @@ mod tests {
             panic!("expected match: {node:#?}")
         };
         assert_eq!(cases.len(), 2, "{cases:#?}");
-        assert_eq!(cases[0].pattern, crate::ir::TextExpression::literal("a"));
-        assert_eq!(cases[1].pattern, crate::ir::TextExpression::literal("b"));
+        assert_eq!(cases[0].pattern, crate::ir::PatternExpression::literal("a"));
+        assert_eq!(cases[1].pattern, crate::ir::PatternExpression::literal("b"));
         assert_eq!(cases[0].body.operation, cases[1].body.operation);
 
         // `0|1) ;;` — an arm whose body is empty. It is how a script says "these
@@ -5674,15 +5894,46 @@ mod tests {
         }
         assert!(default.is_some());
 
-        // A glob inside a pattern still delegates: matching is not equality, and
-        // `TextExpression::literal` compares for equality.
+        // A glob is a pattern of pieces rather than a string to compare, and
+        // whether a `*` is a metacharacter was decided by the quoting around it.
         let node = body(
             "build.sh",
             b"case \"$1\" in\n  a*) /bin/echo glob ;;\nesac\n",
         );
+        let Operation::Match { cases, .. } = &node.operation else {
+            panic!("expected match: {node:#?}")
+        };
+        assert_eq!(
+            cases[0].pattern.pieces,
+            [
+                crate::ir::PatternPiece::Literal {
+                    value: crate::ir::TextExpression::literal("a")
+                },
+                crate::ir::PatternPiece::AnyRun,
+            ]
+        );
+        let node = body(
+            "build.sh",
+            b"case \"$1\" in\n  'a*') /bin/echo lit ;;\nesac\n",
+        );
+        let Operation::Match { cases, .. } = &node.operation else {
+            panic!("expected match: {node:#?}")
+        };
+        assert_eq!(
+            cases[0].pattern.exact().as_deref(),
+            Some("a*"),
+            "a quoted star is a character, not a metacharacter"
+        );
+
+        // A bracket set delegates: `[^a]` negates in bash and is the set
+        // `{^, a}` in dash, so there is no single meaning to lower.
+        let node = body(
+            "build.sh",
+            b"case \"$1\" in\n  [ab]) /bin/echo set ;;\nesac\n",
+        );
         assert!(
             matches!(node.operation, Operation::InterpreterCall { .. }),
-            "a glob pattern must delegate: {node:#?}"
+            "a bracket set must delegate: {node:#?}"
         );
     }
 
@@ -6396,7 +6647,7 @@ mod tests {
                     native(Operation::Match {
                         value: TextExpression::literal("value"),
                         cases: vec![crate::ir::MatchCase {
-                            pattern: TextExpression::literal("case"),
+                            pattern: crate::ir::PatternExpression::literal("case"),
                             body: call("nu"),
                         }],
                         default: Some(Box::new(call("nushell"))),

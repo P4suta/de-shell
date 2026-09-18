@@ -836,7 +836,23 @@ impl Executor<'_> {
                 let value = evaluate(value, &context)?;
                 let mut selected = None;
                 for case in cases {
-                    if evaluate(&case.pattern, &context)? == value {
+                    // The pieces are expanded first and matched second, which is
+                    // the order the shell uses: quoting is resolved during word
+                    // expansion, so what a `*` means was already decided by the
+                    // time anything is compared.
+                    let mut pieces = Vec::new();
+                    for piece in &case.pattern.pieces {
+                        pieces.push(match piece {
+                            crate::ir::PatternPiece::Literal { value } => {
+                                crate::ir::MatchPiece::Literal(evaluate(value, &context)?.into())
+                            }
+                            crate::ir::PatternPiece::AnyRun => crate::ir::MatchPiece::AnyRun,
+                            crate::ir::PatternPiece::AnyCharacter => {
+                                crate::ir::MatchPiece::AnyCharacter
+                            }
+                        });
+                    }
+                    if crate::ir::PatternExpression::matches(&pieces, &value) {
                         selected = Some(&case.body);
                         break;
                     }
@@ -2122,11 +2138,11 @@ mod tests {
                     value: TextExpression::literal("selected"),
                     cases: vec![
                         MatchCase {
-                            pattern: TextExpression::literal("other"),
+                            pattern: crate::ir::PatternExpression::literal("other"),
                             body: exec(&["emit", "wrong"]),
                         },
                         MatchCase {
-                            pattern: TextExpression::literal("selected"),
+                            pattern: crate::ir::PatternExpression::literal("selected"),
                             body: exec(&["emit", "matched"]),
                         },
                     ],

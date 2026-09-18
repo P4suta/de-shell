@@ -677,8 +677,8 @@ fn run_case_patterns(root: &Path) -> Result<(), Vec<String>> {
     let path = root.join("contracts/golden/case-pattern-semantics-v1.json");
     let raw = std::fs::read_to_string(&path)
         .map_err(|error| vec![format!("cannot read {}: {error}", path.display())])?;
-    let corpus: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|error| vec![format!("malformed corpus: {error}")])?;
+    let corpus: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|error| vec![format!("malformed corpus: {error}")])?;
     let shells: Vec<&str> = corpus["shells"]
         .as_array()
         .ok_or_else(|| vec!["corpus has no shells array".to_owned()])?
@@ -695,8 +695,7 @@ fn run_case_patterns(root: &Path) -> Result<(), Vec<String>> {
     let mut checked = 0_usize;
     for case in cases {
         let id = case["id"].as_str().unwrap_or("<unnamed>");
-        let (Some(script), Some(encoded)) =
-            (case["script"].as_str(), case["word_base64"].as_str())
+        let (Some(script), Some(encoded)) = (case["script"].as_str(), case["word_base64"].as_str())
         else {
             errors.push(format!("{id} has no script or no word"));
             continue;
