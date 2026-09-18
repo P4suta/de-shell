@@ -109,6 +109,19 @@ blocker DESHELL_BLOCKER_UNIMPLEMENTED_SEMANTIC action.yml@3963..6698:
   status, which is local and static. `-f` and `-x` stay delegated. Note that
   `-f` is `noglob`, not `nosplit`: measured, word splitting still happens under
   it, so modelling it as suppressing field splitting would be wrong.
+- [ ] `-e` needs one new IR value, not a call-graph analysis. Which commands
+  `set -e` stops on is already the shape of the tree: the left of `&&`/`||`, an
+  `if` condition and the operand of `!` each lower into their own node, so the
+  only untested position is a statement of a sequence. A `Sequence` currently
+  continues past a failure unconditionally; giving it the choice — the same shape
+  `PipelineStatus` already has — is what the option selects. Shell function
+  definitions, where the meaning would depend on the call site, are delegated
+  before they reach the lowering, so the dynamic half does not arise. Measured
+  against OComment's six workflows and composite action: 28 `run:` blocks, 6
+  function definitions, and **zero** calls in a tested context.
+  The first attempt at this was reverted. Adding the field makes the compiler
+  name 49 sites, which is the point, but half of them are `|` patterns where an
+  inserted field lands mid-alternative and the edit has to be made by hand.
 - [ ] Do not treat `-e` as the easy one. Measured against bash 3.2.57, `set -e`
   stops on a command that is *not tested*, where tested means the left of
   `&&`/`||`, the condition of `if`/`while`/`until`, the operand of `!`, and every
