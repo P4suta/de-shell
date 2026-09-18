@@ -258,6 +258,7 @@ fn collect_nodes(node: &crate::ir::Node, output: &mut Vec<NodeEvidence>) {
         }
         crate::ir::Operation::Foreach { body, .. }
         | crate::ir::Operation::Scope { body, .. }
+        | crate::ir::Operation::Not { body }
         | crate::ir::Operation::Redirect { body, .. }
         | crate::ir::Operation::CaptureStdout { body, .. }
         | crate::ir::Operation::Spawn { body, .. } => collect_nodes(body, output),

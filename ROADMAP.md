@@ -242,10 +242,10 @@ blocker DESHELL_BLOCKER_UNIMPLEMENTED_SEMANTIC action.yml@3963..6698:
   feature. Its branches are not the shape that was just implemented:
 
   ```
-  case "$2" in                                     — `case` is unimplemented
+  case "$2" in                                     — implemented
+  if [ -n "${INPUT_BINARY_PATH}" ]; then           — implemented (`[` operators)
+  if ! "${binary}" --version >"${version_file}"    — implemented (`!`)
   while [ "$2" = "${delimiter}" ]; do              — `while` is unimplemented
-  if [ -n "${INPUT_BINARY_PATH}" ]; then           — `[` is a shell builtin
-  if ! "${binary}" --version >"${version_file}"    — `!` is delegated
   if [ ... ] && [[ "${ACTION_REF}" == v* ]]        — `[[` is a bash extension
   expected="$(awk ...)"                            — command substitution
   ```

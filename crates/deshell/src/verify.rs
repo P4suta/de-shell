@@ -250,6 +250,7 @@ fn visit_children<'a>(node: &'a Node, mut visit: impl FnMut(&'a Node)) {
         }
         Operation::Foreach { body, .. }
         | Operation::Scope { body, .. }
+        | Operation::Not { body }
         | Operation::Redirect { body, .. }
         | Operation::CaptureStdout { body, .. }
         | Operation::Spawn { body, .. } => visit(body),

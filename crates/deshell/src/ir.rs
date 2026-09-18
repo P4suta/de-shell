@@ -355,6 +355,13 @@ pub(crate) enum Operation {
     Test {
         predicate: TestPredicate,
     },
+    /// `! COMMAND`: the body's exit status inverted to 0 or 1.
+    ///
+    /// The inversion is to a boolean, not an arithmetic negation: a body that
+    /// exits 2 makes this exit 0, the same as one that exits 1.
+    Not {
+        body: Box<Node>,
+    },
     Match {
         value: TextExpression,
         cases: Vec<MatchCase>,
@@ -467,6 +474,7 @@ impl Operation {
             Self::Pipeline { .. } => "pipeline",
             Self::Sequence { .. } => "sequence",
             Self::Test { .. } => "test",
+            Self::Not { .. } => "not",
             Self::Parallel { .. } => "parallel",
             Self::Condition { .. } => "condition",
             Self::Match { .. } => "match",
@@ -789,6 +797,7 @@ fn visit_children_mut<E>(
         }
         Operation::Foreach { body, .. }
         | Operation::Scope { body, .. }
+        | Operation::Not { body }
         | Operation::Redirect { body, .. }
         | Operation::CaptureStdout { body, .. }
         | Operation::Spawn { body, .. } => visit(body)?,
@@ -1036,6 +1045,8 @@ fn validate_node(parts: ValidateNodeArgs<'_>) {
         }
     };
     match &node.operation {
+        // The body is validated by the walk over children; nothing here is its own.
+        Operation::Not { .. } => {}
         Operation::Test { predicate } => match predicate {
             TestPredicate::NonEmpty { value } | TestPredicate::Empty { value } => {
                 expression(value, errors);
@@ -1509,6 +1520,7 @@ fn validate_node(parts: ValidateNodeArgs<'_>) {
 
 fn contains_state_mutation(node: &Node) -> bool {
     match &node.operation {
+        Operation::Not { body } => contains_state_mutation(body),
         Operation::ExpandWords { .. }
         | Operation::SetVariable { .. }
         | Operation::SetEnvironment { .. }

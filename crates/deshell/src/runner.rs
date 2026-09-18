@@ -345,6 +345,23 @@ impl Executor<'_> {
             stack,
         } = parts;
         match &node.operation {
+            // `! cmd` inverts the status to a boolean: a body that exits 2 makes
+            // this exit 0, the same as one that exits 1. Output passes through.
+            Operation::Not { body } => {
+                let (result, next) = self.run_node(RunNodeArgs {
+                    node: body,
+                    context,
+                    stdin,
+                    stack,
+                })?;
+                Ok((
+                    RunResult {
+                        exit_code: i32::from(result.exit_code == 0),
+                        ..result
+                    },
+                    next,
+                ))
+            }
             // `test` succeeds with 0 and fails with 1, and produces no output.
             Operation::Test { predicate } => {
                 let truth = match predicate {

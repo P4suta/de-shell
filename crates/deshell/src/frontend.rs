@@ -322,6 +322,7 @@ fn rebind_source_path(plan: &mut Plan, from: &str, to: &str) -> Result<(), Strin
             *path = to.into();
         }
         match &mut node.operation {
+            Operation::Not { body } => visit(body, from, to),
             Operation::Pipeline { nodes, .. }
             | Operation::Sequence { nodes, .. }
             | Operation::Parallel { nodes } => {
@@ -751,6 +752,7 @@ pub(crate) fn bind_interpreter_pins(
 
 fn bind_node_pin(node: &mut Node, pins: &crate::config::InterpreterPins) -> Result<(), String> {
     match &mut node.operation {
+        Operation::Not { body } => bind_node_pin(body, pins)?,
         Operation::InterpreterCall {
             interpreter,
             interpreter_pin,
@@ -1821,7 +1823,10 @@ fn top_level_controls(source: &str, range: Range) -> Result<Vec<(usize, &'static
             index += 2;
             continue;
         }
-        if byte == b'!' && !token_started {
+        if byte == b'!' && !token_started && index > range.start {
+            // A `!` that opens the statement is handled by the caller as a
+            // prefix; one appearing mid-statement is history expansion or an
+            // operator this does not model.
             return Err("POSIX negation remains delegated".into());
         }
         if byte == b'&' {
@@ -1942,6 +1947,34 @@ fn lower_posix_simple(parts: LowerPosixSimpleArgs<'_>) -> Result<Node, String> {
         ));
     }
 
+    // `! COMMAND` inverts an exit status. Stripping the prefix here keeps the
+    // body on the ordinary path, so `! [ -n "$X" ]` and `! command` both work
+    // without the negation appearing in every branch below.
+    if let Some(rest) = source[range.start..range.end].trim().strip_prefix("! ") {
+        let offset = range.start
+            + source[range.start..range.end]
+                .find(rest)
+                .ok_or("negated command is not inside its range")?;
+        let inner = lower_posix_simple(LowerPosixSimpleArgs {
+            path,
+            source,
+            range: Range {
+                start: offset,
+                end: offset + rest.len(),
+            },
+            interpreter,
+            inputs,
+            environment,
+            locals,
+        })?;
+        return Ok(native_node(
+            Operation::Not {
+                body: Box::new(inner),
+            },
+            &format!("{}-static-negation-v1", interpreter.name()),
+            span_for_range(path, source, range.start, range.end)?,
+        ));
+    }
     // `[ ... ]` has to be recognised before tokenizing, because `[` and `]` are in
     // the glob character set the tokenizer refuses. The brackets are the builtin's
     // syntax here, not a pattern.
@@ -4217,6 +4250,25 @@ mod tests {
                 empty_is_unset: true,
             }]
         );
+    }
+
+    #[test]
+    fn a_negated_command_lowers_to_a_not() {
+        // `! cmd` inverts an exit status, which is what makes `if ! command -v x`
+        // work — the single most common way a CI script asks whether a tool is
+        // missing.
+        let node = body("build.sh", b"! /bin/echo hello\n");
+        let Operation::Not { body: inner } = &node.operation else {
+            panic!("expected not: {node:#?}")
+        };
+        assert!(matches!(inner.operation, Operation::Exec { .. }));
+
+        // It composes with the predicates: `! [ -n "$X" ]`.
+        let node = body("build.sh", b"! [ -n \"$VALUE\" ]\n");
+        let Operation::Not { body: inner } = &node.operation else {
+            panic!("expected not: {node:#?}")
+        };
+        assert!(matches!(inner.operation, Operation::Test { .. }));
     }
 
     #[test]

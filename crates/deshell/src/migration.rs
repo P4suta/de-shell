@@ -3203,6 +3203,7 @@ fn visit_node(node: &crate::ir::Node, mut visit: impl FnMut(&crate::ir::Node)) {
             }
         }
         crate::ir::Operation::Foreach { body, .. }
+        | crate::ir::Operation::Not { body }
         | crate::ir::Operation::Redirect { body, .. }
         | crate::ir::Operation::Scope { body, .. }
         | crate::ir::Operation::CaptureStdout { body, .. }
@@ -3588,6 +3589,13 @@ fn emit_rust_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> 
                 ),
                 indent = indent
             ));
+        }
+        crate::ir::Operation::Not { body } => {
+            // `!` inverts to a boolean, so a body exiting 2 yields 0 just as one
+            // exiting 1 does.
+            output.push_str(&format!("{indent}i32::from(\n"));
+            emit_rust_node(body, output, depth + 1)?;
+            output.push_str(&format!("\n{indent}    == 0)"));
         }
         crate::ir::Operation::Test { predicate } => {
             // `test` succeeds with 0 and fails with 1, so the predicate becomes a
@@ -4026,6 +4034,19 @@ fn emit_go_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> Re
             output.push_str(&format!(
                 concat!(
                     "{indent}\tdeshellLast = deshellExitCode(deshellCommand.Run())\n",
+                    "{indent}}}\n"
+                ),
+                indent = indent
+            ));
+        }
+        crate::ir::Operation::Not { body } => {
+            emit_go_node(body, output, depth)?;
+            output.push_str(&format!(
+                concat!(
+                    "{indent}if deshellLast == 0 {{\n",
+                    "{indent}\tdeshellLast = 1\n",
+                    "{indent}}} else {{\n",
+                    "{indent}\tdeshellLast = 0\n",
                     "{indent}}}\n"
                 ),
                 indent = indent
