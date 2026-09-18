@@ -3872,33 +3872,14 @@ fn emit_rust_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> 
             emit_rust_node(body, output, depth + 1)?;
             output.push_str(&format!("\n{indent}    == 0)"));
         }
+        // `test` succeeds with 0 and fails with 1, so a node that is one becomes
+        // its exit status. A `Condition` whose predicate is one uses the bool
+        // directly — see `emit_rust_node`'s `Condition` arm.
         crate::ir::Operation::Test { predicate } => {
-            // `test` succeeds with 0 and fails with 1, so the predicate becomes a
-            // bool and the node becomes its exit status.
-            let condition = match predicate {
-                crate::ir::TestPredicate::NonEmpty { value } => {
-                    format!("!{}.is_empty()", rust_expression(value)?)
-                }
-                crate::ir::TestPredicate::Empty { value } => {
-                    format!("{}.is_empty()", rust_expression(value)?)
-                }
-                crate::ir::TestPredicate::StringEqual { left, right } => {
-                    format!("{} == {}", rust_expression(left)?, rust_expression(right)?)
-                }
-                crate::ir::TestPredicate::StringNotEqual { left, right } => {
-                    format!("{} != {}", rust_expression(left)?, rust_expression(right)?)
-                }
-                crate::ir::TestPredicate::StartsWith { value, prefix } => {
-                    format!("{}.starts_with({prefix:?})", rust_expression(value)?)
-                }
-                crate::ir::TestPredicate::EndsWith { value, suffix } => {
-                    format!("{}.ends_with({suffix:?})", rust_expression(value)?)
-                }
-                crate::ir::TestPredicate::Contains { value, infix } => {
-                    format!("{}.contains({infix:?})", rust_expression(value)?)
-                }
-            };
-            output.push_str(&format!("{indent}i32::from(!({condition}))"));
+            output.push_str(&format!(
+                "{indent}i32::from(!({}))",
+                rust_test_condition(predicate)?
+            ));
         }
         // Running nothing succeeds, which is what the shell reports for an arm
         // whose body is empty.
@@ -4183,6 +4164,23 @@ fn emit_rust_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> 
             if_true,
             if_false,
         } => {
+            // A `test` predicate is already a bool. Running it through an exit
+            // status and comparing that to zero is the same answer written
+            // twice — `if !(a == b) == 0` where the script said `if a = b`.
+            if let crate::ir::Operation::Test { predicate } = &predicate.operation
+                && if_false.is_some()
+            {
+                output.push_str(&format!(
+                    "{indent}if {} {{\n",
+                    rust_test_condition(predicate)?
+                ));
+                emit_rust_node(if_true, output, depth + 1)?;
+                output.push_str(&format!("\n{indent}}} else {{\n"));
+                let if_false = if_false.as_ref().expect("checked above");
+                emit_rust_node(if_false, output, depth + 1)?;
+                output.push_str(&format!("\n{indent}}}"));
+                return Ok(());
+            }
             output.push_str(&format!(
                 "{indent}{{\n{indent}    let deshell_predicate =\n"
             ));
@@ -4511,6 +4509,45 @@ fn pattern_shape(pattern: &crate::ir::PatternExpression) -> PatternShape<'_> {
         },
         _ => PatternShape::Unsupported("a pattern this does not reduce to one expression"),
     }
+}
+
+/// The bool a `test` predicate is.
+fn rust_test_condition(predicate: &crate::ir::TestPredicate) -> Result<String, String> {
+    Ok(match predicate {
+        crate::ir::TestPredicate::NonEmpty { value } => {
+            format!("!{}.is_empty()", rust_expression(value)?)
+        }
+        crate::ir::TestPredicate::Empty { value } => {
+            format!("{}.is_empty()", rust_expression(value)?)
+        }
+        crate::ir::TestPredicate::StringEqual { left, right } => {
+            format!("{} == {}", rust_expression(left)?, rust_expression(right)?)
+        }
+        crate::ir::TestPredicate::StringNotEqual { left, right } => {
+            format!("{} != {}", rust_expression(left)?, rust_expression(right)?)
+        }
+        crate::ir::TestPredicate::StartsWith { value, prefix } => {
+            format!(
+                "{}.starts_with({})",
+                rust_expression(value)?,
+                rust_needle(prefix)
+            )
+        }
+        crate::ir::TestPredicate::EndsWith { value, suffix } => {
+            format!(
+                "{}.ends_with({})",
+                rust_expression(value)?,
+                rust_needle(suffix)
+            )
+        }
+        crate::ir::TestPredicate::Contains { value, infix } => {
+            format!(
+                "{}.contains({})",
+                rust_expression(value)?,
+                rust_needle(infix)
+            )
+        }
+    })
 }
 
 /// A needle for `contains`, `starts_with` and `ends_with`.
