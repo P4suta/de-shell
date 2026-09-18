@@ -8945,11 +8945,28 @@ fn require_shell_free_tree(root: &Path, phase: &str) -> Result<(), String> {
     {
         return Ok(());
     }
+    // Named, not counted. A reader told that a retirement rolled back because
+    // the tree still holds one error, one finding or one candidate then goes
+    // looking for which — and this function already knows.
+    let mut detail = Vec::new();
+    for finding in &inventory.findings {
+        detail.push(format!("shell at {}", finding.path));
+    }
+    for skipped in &inventory.skipped {
+        detail.push(format!("unresolved candidate at {}", skipped.path));
+    }
+    for error in &inventory.errors {
+        detail.push(match &error.path {
+            Some(path) => format!("{} error at {path}: {}", error.stage, error.message),
+            None => format!("{} error: {}", error.stage, error.message),
+        });
+    }
     Err(format!(
-        "DESHELL_BLOCKER_POST_SCAN: {phase} scan found {} shell findings, {} unresolved candidates, and {} errors",
+        "DESHELL_BLOCKER_POST_SCAN: {phase} scan found {} shell findings, {} unresolved candidates, and {} errors: {}",
         inventory.findings.len(),
         inventory.skipped.len(),
-        inventory.errors.len()
+        inventory.errors.len(),
+        detail.join("; ")
     ))
 }
 
@@ -9287,7 +9304,15 @@ pub(crate) fn status(root: &Path) -> Result<Status, String> {
             ActiveState::Planned => {
                 let digest = status.active_plan.clone().unwrap_or_default();
                 let cell = next_cell.unwrap_or_else(|| "<approved-cell>".into());
-                let output = format!(".deshell/{digest}-{cell}-evidence.json");
+                // Under the root the argv already names, because `--output` is
+                // resolved against the current directory and the rest of the
+                // command is not. A relative path here is a next step that only
+                // works when the caller happens to be standing in the project.
+                let output = std::path::Path::new(&root_value)
+                    .join(".deshell")
+                    .join(format!("{digest}-{cell}-evidence.json"))
+                    .to_string_lossy()
+                    .into_owned();
                 vec![
                     "deshell".into(),
                     "migrate".into(),

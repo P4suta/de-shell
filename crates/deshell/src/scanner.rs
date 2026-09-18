@@ -675,9 +675,20 @@ fn git_inventory(root: &Path) -> Result<Vec<(String, PathBuf)>, String> {
             continue;
         }
         let absolute = root.join(&relative);
-        let metadata = absolute
-            .symlink_metadata()
-            .map_err(|error| format!("cannot inspect git inventory path {relative}: {error}"))?;
+        let metadata = match absolute.symlink_metadata() {
+            Ok(metadata) => metadata,
+            // A path git knows and the tree does not is a file that has been
+            // deleted and not yet staged — which is what a retirement leaves
+            // behind, so reading it as a scan error made the post-apply check
+            // roll back every retirement that removed a tracked file. There is
+            // nothing at the path to scan, which is the whole of it.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!(
+                    "cannot inspect git inventory path {relative}: {error}"
+                ));
+            }
+        };
         if metadata.file_type().is_file() {
             files.push((relative, absolute));
         }
@@ -2126,6 +2137,58 @@ fn kind_order(kind: &FindingKind) -> u8 {
     reason = "tests construct the races and corrupt trees the production ban prevents"
 )]
 mod tests {
+
+    /// A path git knows and the tree does not is not a scan error.
+    ///
+    /// It is a deleted file that has not been staged — which is exactly what a
+    /// retirement leaves behind. Reading it as an error made the post-apply
+    /// check roll back every retirement that removed a tracked file, which is
+    /// every retirement of a shell file: the end-to-end flow could reach
+    /// `verified` and never reach `retired`.
+    #[test]
+    fn a_tracked_path_the_tree_no_longer_holds_is_not_a_scan_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        for argv in [
+            vec!["init", "-q", "."],
+            vec!["config", "user.email", "a@b"],
+            vec!["config", "user.name", "a"],
+        ] {
+            let status = std::process::Command::new("git")
+                .args(&argv)
+                .current_dir(root)
+                .status()
+                .unwrap();
+            assert!(status.success(), "{argv:?}");
+        }
+        std::fs::write(root.join("kept.txt"), b"kept\n").unwrap();
+        std::fs::write(root.join("retired.sh"), b"/usr/bin/true\n").unwrap();
+        for argv in [vec!["add", "-A"], vec!["commit", "-qm", "i"]] {
+            let status = std::process::Command::new("git")
+                .args(&argv)
+                .current_dir(root)
+                .status()
+                .unwrap();
+            assert!(status.success(), "{argv:?}");
+        }
+        // What a retirement does: the file is gone and the index still has it.
+        std::fs::remove_file(root.join("retired.sh")).unwrap();
+
+        let inventory = scan(root).unwrap();
+        assert!(
+            inventory.errors.is_empty(),
+            "a deleted tracked path is not an error: {:?}",
+            inventory.errors
+        );
+        assert!(
+            inventory
+                .findings
+                .iter()
+                .all(|finding| finding.path != "retired.sh"),
+            "{:?}",
+            inventory.findings
+        );
+    }
     use super::*;
     use std::fs;
 

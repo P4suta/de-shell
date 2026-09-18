@@ -66,6 +66,21 @@ Nushell), with both official Rust and Go generators where applicable.
 - [ ] Pass `scenario -> plan -> matrix verify -> evidence import -> apply ->
   scan zero` for shell files and embedded sources across the seven interpreters,
   including input, environment, branch, failure, and parser-blocker cases.
+
+  Walked end to end for one bash file on macOS, following only the argv each
+  step printed: `init`, `scenario approve`, `matrix approve`, `migrate plan`,
+  `migrate verify`, `migrate evidence import`, `migrate apply`,
+  `verify --require shell-free`. It reaches `retired`, `build.sh` is gone,
+  `src/bin/deshell_build.rs` is there, and the shell-free gate passes.
+
+  It did not reach `retired` before this round, and the reason was one this
+  flow was the only thing that could find: `git ls-files` names a path the
+  working tree no longer has after the retirement removes it, and the scanner
+  read that as an error. So every retirement of a tracked shell file rolled
+  itself back at the post-apply check — which reported "1 errors" and did not
+  say which, so nothing pointed at it either.
+
+  The seven interpreters and the embedded-source cases are still to walk.
 - [ ] Run every fast, contract, platform, differential, security, package,
   official-exporter, and workflow gate from `v0.1.0-rc.1`, including the
   required three-operating-system matrix.
