@@ -1193,16 +1193,51 @@ struct Range {
     end: usize,
 }
 
+/// Whether a statement is exactly a `pipefail` toggle, and which way.
+///
+/// Only `-o pipefail` is recognised, and only on its own. `set -e` and `set -u`
+/// are deliberately not handled here: measured against bash 3.2.57, `set -e`
+/// stops on a command that is *not tested* — the left of `&&`/`||`, an `if`
+/// condition, the operand of `!`, every element of a pipeline but the last — and
+/// its meaning depends on the call site, since a function body that aborts when
+/// called directly runs to completion when called as `f || true`. A combined
+/// `set -euo pipefail` therefore stays delegated: recognising the `pipefail` part
+/// of it while silently dropping `-e` would change what the script does.
+fn pipefail_toggle(statement: &str) -> Option<bool> {
+    let mut words = statement.split_whitespace();
+    if words.next()? != "set" {
+        return None;
+    }
+    let enable = match words.next()? {
+        "-o" => true,
+        "+o" => false,
+        _ => return None,
+    };
+    if words.next()? != "pipefail" || words.next().is_some() {
+        return None;
+    }
+    Some(enable)
+}
+
 fn lower_posix(path: &str, source: &str, interpreter: &Interpreter) -> Result<Lowered, String> {
     let statements = shell_statements(source)?;
     let mut inputs = BTreeSet::new();
     let mut environment = BTreeSet::new();
     let mut locals = BTreeSet::new();
     let mut nodes = Vec::new();
+    // Shell options apply from where they are set onwards, so this travels with
+    // the statement cursor rather than being read once for the file.
+    let mut pipefail = false;
     for range in statements {
         let text = &source[range.start..range.end];
         let trimmed = text.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if let Some(enable) = pipefail_toggle(trimmed) {
+            // The toggle is a change of lowering state, not an operation: it emits
+            // no node, and the pipelines after it carry its effect instead.
+            pipefail = enable;
             continue;
         }
         let node = lower_posix_control(LowerPosixControlArgs {
@@ -1213,6 +1248,7 @@ fn lower_posix(path: &str, source: &str, interpreter: &Interpreter) -> Result<Lo
                 inputs: &mut inputs,
                 environment: &mut environment,
                 locals: &mut locals,
+                pipefail: pipefail,
             })?;
         nodes.push(node);
     }
@@ -1326,6 +1362,8 @@ struct LowerPosixControlArgs<'a> {
     inputs: &'a mut BTreeSet<String>,
     environment: &'a mut BTreeSet<String>,
     locals: &'a mut BTreeSet<String>,
+    /// Whether `set -o pipefail` is in effect at this statement.
+    pipefail: bool,
 }
 
 fn lower_posix_control(parts: LowerPosixControlArgs<'_>) -> Result<Node, String> {
@@ -1338,6 +1376,7 @@ fn lower_posix_control(parts: LowerPosixControlArgs<'_>) -> Result<Node, String>
         inputs,
         environment,
         locals,
+        pipefail,
     } = parts;
     let controls = top_level_controls(source, range)?;
     if controls.is_empty() {
@@ -1388,7 +1427,11 @@ fn lower_posix_control(parts: LowerPosixControlArgs<'_>) -> Result<Node, String>
         "|" => Ok(native_node(
             Operation::Pipeline {
                 nodes,
-                status: crate::ir::PipelineStatus::Last,
+                status: if pipefail {
+                    crate::ir::PipelineStatus::Pipefail
+                } else {
+                    crate::ir::PipelineStatus::Last
+                },
             },
             "posix-static-pipeline-v1",
             span,
@@ -3529,6 +3572,45 @@ mod tests {
         };
         assert!(matches!(nodes[0].operation, Operation::Pipeline { .. }));
         assert!(matches!(nodes[1].operation, Operation::Exec { .. }));
+    }
+
+    #[test]
+    fn set_o_pipefail_is_a_modelled_option_and_reaches_the_pipeline() {
+        // `set -o pipefail` decides a pipeline's exit status, which is local and
+        // static — unlike `set -e`, whose meaning depends on the call site. The IR
+        // has carried `PipelineStatus::Pipefail` from the start; nothing read the
+        // option that selects it, so every CI step that opens with
+        // `set -euo pipefail` was delegated whole.
+        let node = body(
+            "build.sh",
+            b"set -o pipefail\n/usr/bin/printf one | grep one\n",
+        );
+        // The toggle emits no node, so the pipeline is the whole body rather than
+        // the first element of a sequence.
+        let Operation::Pipeline { status, .. } = &node.operation else {
+            panic!("expected the pipeline to be the body: {node:#?}")
+        };
+        assert_eq!(*status, crate::ir::PipelineStatus::Pipefail);
+    }
+
+    #[test]
+    fn a_pipeline_before_set_o_pipefail_keeps_last_status() {
+        // The option applies from where it is set, not to the whole file.
+        let node = body(
+            "build.sh",
+            b"/usr/bin/printf one | grep one\nset -o pipefail\n/usr/bin/printf two | grep two\n",
+        );
+        let Operation::Sequence { nodes } = node.operation else {
+            panic!("expected sequence")
+        };
+        let Operation::Pipeline { status, .. } = &nodes[0].operation else {
+            panic!("expected a pipeline first: {nodes:#?}")
+        };
+        assert_eq!(*status, crate::ir::PipelineStatus::Last);
+        let Operation::Pipeline { status, .. } = &nodes[1].operation else {
+            panic!("expected a pipeline second: {nodes:#?}")
+        };
+        assert_eq!(*status, crate::ir::PipelineStatus::Pipefail);
     }
 
     #[test]

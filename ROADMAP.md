@@ -106,8 +106,9 @@ blocker DESHELL_BLOCKER_UNIMPLEMENTED_SEMANTIC action.yml@3963..6698:
   approximately every CI step that exists. The same corpus with `set` removed
   lowers 48% of its bytes natively, so this is a granularity problem rather than
   a capability one. Start with `-o pipefail`: it decides a pipeline's exit
-  status, which is local and static. `-f` (field splitting) and `-x` (tracing)
-  stay delegated.
+  status, which is local and static. `-f` and `-x` stay delegated. Note that
+  `-f` is `noglob`, not `nosplit`: measured, word splitting still happens under
+  it, so modelling it as suppressing field splitting would be wrong.
 - [ ] Do not treat `-e` as the easy one. Measured against bash 3.2.57, `set -e`
   stops on a command that is *not tested*, where tested means the left of
   `&&`/`||`, the condition of `if`/`while`/`until`, the operand of `!`, and every
