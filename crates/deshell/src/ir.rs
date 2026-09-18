@@ -17,6 +17,19 @@ pub(crate) enum TextPart {
     Literal { value: String },
     Variable { name: String },
     Argument { name: String },
+    /// `${name:-fallback}` and `${name-fallback}`.
+    ///
+    /// The fallback is a literal. An expansion nested inside it is delegated
+    /// rather than represented, because this exists to carry the exception table
+    /// `set -u` needs, and that table is written over literals.
+    DefaultValue {
+        name: String,
+        fallback: String,
+        /// `:-` substitutes when the name is unset *or* empty; `-` only when it
+        /// is unset. The two are not interchangeable — `${x:-d}` with `x=""`
+        /// yields `d`, and `${x-d}` yields the empty string.
+        empty_is_unset: bool,
+    },
 }
 
 impl TextExpression {
@@ -43,6 +56,16 @@ impl TextExpression {
                         .get(name)
                         .ok_or_else(|| format!("runtime variable is not defined: {name}"))?,
                 ),
+                TextPart::DefaultValue {
+                    name,
+                    fallback,
+                    empty_is_unset,
+                } => output.push_str(match variables.get(name) {
+                    // `:-` substitutes an empty value as well as an unset one;
+                    // `-` substitutes only an unset one.
+                    Some(value) if !(*empty_is_unset && value.is_empty()) => value,
+                    _ => fallback,
+                }),
                 TextPart::Argument { name } => output.push_str(
                     arguments
                         .get(name)
@@ -1471,6 +1494,11 @@ fn validate_expression(
                 }
                 if index > 0 && matches!(expression.parts[index - 1], TextPart::Literal { .. }) {
                     return Err("adjacent literal expression parts must be merged".into());
+                }
+            }
+            TextPart::DefaultValue { name, .. } => {
+                if !valid_identifier(name) {
+                    return Err(format!("variable name is invalid: {name}"));
                 }
             }
             TextPart::Variable { name } => {

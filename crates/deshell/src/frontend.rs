@@ -3182,7 +3182,34 @@ fn parse_expansion(parts: ParseExpansionArgs<'_>) -> Result<(TextPart, usize), S
             .find('}')
             .ok_or("unterminated braced expansion")?;
         let end = start + 2 + relative;
-        (&source[start + 2..end], end + 1)
+        let inner = &source[start + 2..end];
+        // `${name:-fallback}` and `${name-fallback}`. The fallback is taken as a
+        // literal: an expansion nested inside it is left to delegation rather
+        // than half-represented.
+        if let Some((name, fallback)) = inner
+            .split_once(":-")
+            .map(|(name, fallback)| ((name, true), fallback))
+            .or_else(|| inner.split_once('-').map(|(n, f)| ((n, false), f)))
+        {
+            let ((name, empty_is_unset), fallback) = (name, fallback);
+            if valid_identifier(name)
+                && !fallback.contains('$')
+                && !fallback.contains('`')
+            {
+                if !locals.contains(name) {
+                    environment.insert(name.to_owned());
+                }
+                return Ok((
+                    TextPart::DefaultValue {
+                        name: name.to_owned(),
+                        fallback: fallback.to_owned(),
+                        empty_is_unset,
+                    },
+                    end + 1,
+                ));
+            }
+        }
+        (inner, end + 1)
     } else {
         let mut end = start + 1;
         if bytes.get(end).is_some_and(u8::is_ascii_digit) {
@@ -3646,6 +3673,54 @@ mod tests {
             panic!("expected the pipeline to be the body: {node:#?}")
         };
         assert_eq!(*status, crate::ir::PipelineStatus::Pipefail);
+    }
+
+    #[test]
+    fn a_default_expansion_lowers_natively_with_its_fallback() {
+        // `${VALUE:-fallback}` is the syntax `set -u` excepts, so an IR that
+        // cannot say what it excepts cannot model the option. It is also the most
+        // common expansion in CI scripts by itself.
+        let node = body("build.sh", b"/bin/echo \"${VALUE:-fallback}\"\n");
+        let Operation::Exec { argv, .. } = &node.operation else {
+            panic!("expected exec: {node:#?}")
+        };
+        assert_eq!(
+            argv[1].parts,
+            [TextPart::DefaultValue {
+                name: "VALUE".into(),
+                fallback: "fallback".into(),
+                empty_is_unset: true,
+            }]
+        );
+
+        // `-` differs from `:-`: it substitutes only when the name is unset, not
+        // when it is set to the empty string.
+        let node = body("build.sh", b"/bin/echo \"${VALUE-fallback}\"\n");
+        let Operation::Exec { argv, .. } = &node.operation else {
+            panic!("expected exec")
+        };
+        assert_eq!(
+            argv[1].parts,
+            [TextPart::DefaultValue {
+                name: "VALUE".into(),
+                fallback: "fallback".into(),
+                empty_is_unset: false,
+            }]
+        );
+
+        // An empty fallback is the form that appears in `${GITHUB_STEP_SUMMARY:-}`.
+        let node = body("build.sh", b"/bin/echo \"${VALUE:-}\"\n");
+        let Operation::Exec { argv, .. } = &node.operation else {
+            panic!("expected exec")
+        };
+        assert_eq!(
+            argv[1].parts,
+            [TextPart::DefaultValue {
+                name: "VALUE".into(),
+                fallback: String::new(),
+                empty_is_unset: true,
+            }]
+        );
     }
 
     #[test]
