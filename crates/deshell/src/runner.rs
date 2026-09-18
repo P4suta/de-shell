@@ -213,13 +213,18 @@ pub(crate) fn run_plan_with_io(
         script_arguments: inputs.arguments,
         default_working_directory: inputs.default_working_directory,
     };
-    executor.run_task(RunTaskArgs {
-        name: &plan.entrypoint,
-        provided: inputs.named_inputs,
-        positional: inputs.arguments,
-        stdin: inputs.stdin.to_vec(),
-        stack: &[],
-    })
+    executor
+        .run_task(RunTaskArgs {
+            name: &plan.entrypoint,
+            provided: inputs.named_inputs,
+            positional: inputs.arguments,
+            stdin: inputs.stdin.to_vec(),
+            stack: &[],
+        })
+        // The entry task's flow has nowhere left to travel: whether the plan
+        // ran off its end or left through an `exit`, the run is over and the
+        // status is the same either way.
+        .map(|(result, _)| result)
 }
 
 #[derive(Clone)]
@@ -284,7 +289,12 @@ struct RunTaskArgs<'a> {
 }
 
 impl Executor<'_> {
-    fn run_task(&self, parts: RunTaskArgs<'_>) -> Result<RunResult, RunError> {
+    /// Run a task, and say whether it ended the whole run.
+    ///
+    /// The flow travels out because `exit` inside a called task ends the script
+    /// that called it: discarding it here would let the statement after a call
+    /// to a function that exits keep running.
+    fn run_task(&self, parts: RunTaskArgs<'_>) -> Result<(RunResult, Flow), RunError> {
         // Destructured without `..`: see `RunTaskArgs`.
         let RunTaskArgs {
             name,
@@ -367,14 +377,15 @@ impl Executor<'_> {
             stack: &next_stack,
         })
         .map(|step| {
-            // Destructured without `..`: see `Step`. The task's result is the
-            // body's either way; `exit` ends the task, and the task is over.
+            // Destructured without `..`: see `Step`. The context does not leave
+            // the task — a function's variables are its own here — but the flow
+            // does, because `exit` inside one ends the script that called it.
             let Step {
                 result,
-                flow: _,
+                flow,
                 context: _,
             } = step;
-            result
+            (result, flow)
         })
     }
 
@@ -972,16 +983,25 @@ impl Executor<'_> {
                     }
                 }
             }
-            Operation::TaskCall { task, arguments } => {
+            Operation::TaskCall {
+                task,
+                arguments,
+                positional,
+            } => {
                 let provided = evaluate_named(arguments, &context)?;
-                let result = self.run_task(RunTaskArgs {
+                let positional = evaluate_list(positional, &context)?;
+                let (result, flow) = self.run_task(RunTaskArgs {
                     name: task,
                     provided: &provided,
-                    positional: &[],
+                    positional: &positional,
                     stdin: Vec::new(),
                     stack,
                 })?;
-                Ok(Step::next(result, context))
+                Ok(Step {
+                    result,
+                    flow,
+                    context,
+                })
             }
             Operation::SetVariable {
                 name,
@@ -2268,6 +2288,7 @@ mod tests {
                 name: "message".into(),
                 value: TextExpression::literal("called"),
             }],
+            positional: vec![],
         }));
         task_plan.tasks.push(helper);
         task_plan.assign_node_ids().unwrap();

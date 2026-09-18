@@ -579,6 +579,12 @@ pub(crate) enum Operation {
     TaskCall {
         task: String,
         arguments: Vec<NamedExpression>,
+        /// The positional arguments the callee reads as `$1`, `$2` and so on.
+        ///
+        /// A shell function takes these and nothing else, so a call with none
+        /// is a call with an empty list rather than a different operation.
+        #[serde(default)]
+        positional: Vec<TextExpression>,
     },
     SetVariable {
         name: String,
@@ -1539,8 +1545,15 @@ fn validate_node(parts: ValidateNodeArgs<'_>) {
                 errors: &mut *errors,
             });
         }
-        Operation::TaskCall { task, arguments } => {
+        Operation::TaskCall {
+            task,
+            arguments,
+            positional,
+        } => {
             require_nonempty("task call target", task, errors);
+            for value in positional {
+                expression(value, errors);
+            }
             let names = duplicate_strings(
                 "task argument",
                 arguments.iter().map(|argument| argument.name.as_str()),
@@ -2772,9 +2785,11 @@ mod tests {
                 native(Operation::TaskCall {
                     task: String::new(),
                     arguments: vec![],
+                    positional: vec![],
                 }),
                 native(Operation::TaskCall {
                     task: "missing".into(),
+                    positional: vec![],
                     arguments: vec![
                         NamedExpression {
                             name: "arg".into(),
@@ -2900,6 +2915,7 @@ mod tests {
                     name: "unknown".into(),
                     value: TextExpression::literal("value"),
                 }],
+                positional: vec![],
             }));
         } else {
             unreachable!()

@@ -1575,6 +1575,41 @@ fn case_pattern(pattern: &str) -> Option<crate::ir::PatternExpression> {
     Some(crate::ir::PatternExpression { pieces })
 }
 
+/// Decode the base64 a corpus stores a word in.
+///
+/// Shared with the generator tests, which check the compiled expressions
+/// against the same recording this module's tests check the matcher against.
+#[cfg(test)]
+pub(crate) fn decode_base64(encoded: &str) -> Vec<u8> {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut bits = 0_u32;
+    let mut count = 0_u32;
+    let mut output = Vec::new();
+    for byte in encoded.bytes() {
+        if byte == b'=' {
+            break;
+        }
+        let value = ALPHABET
+            .iter()
+            .position(|candidate| *candidate == byte)
+            .expect("base64 alphabet");
+        bits = (bits << 6) | u32::try_from(value).expect("six bits");
+        count += 6;
+        if count >= 8 {
+            count -= 8;
+            output.push(u8::try_from((bits >> count) & 0xff).expect("one byte"));
+        }
+    }
+    output
+}
+
+/// [`case_pattern`], for the generator tests that check the compiled
+/// expressions against the same corpus this reads.
+#[cfg(test)]
+pub(crate) fn case_pattern_for_tests(pattern: &str) -> Option<crate::ir::PatternExpression> {
+    case_pattern(pattern)
+}
+
 /// Group the statements between `in` and `esac` into arms.
 ///
 /// An arm is `PATTERN) BODY` ended by `;;`, and `BODY` can span any number of
@@ -5238,7 +5273,9 @@ mod tests {
             else {
                 continue;
             };
-            let word = decode_base64(case["word_base64"].as_str().expect("case has a word"));
+            let word = crate::frontend::decode_base64(
+                case["word_base64"].as_str().expect("case has a word"),
+            );
             let word = String::from_utf8(word).expect("word is UTF-8");
             let answers: std::collections::BTreeSet<&str> = shells
                 .iter()
@@ -5298,30 +5335,6 @@ mod tests {
             lowered > 0 && refused > 0,
             "{lowered} lowered, {refused} refused"
         );
-    }
-
-    /// Decode the base64 the pattern corpus stores a word in.
-    fn decode_base64(encoded: &str) -> Vec<u8> {
-        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        let mut bits = 0_u32;
-        let mut count = 0_u32;
-        let mut output = Vec::new();
-        for byte in encoded.bytes() {
-            if byte == b'=' {
-                break;
-            }
-            let value = ALPHABET
-                .iter()
-                .position(|candidate| *candidate == byte)
-                .expect("base64 alphabet");
-            bits = (bits << 6) | u32::try_from(value).expect("six bits");
-            count += 6;
-            if count >= 8 {
-                count -= 8;
-                output.push(u8::try_from((bits >> count) & 0xff).expect("one byte"));
-            }
-        }
-        output
     }
 
     /// The `echo` lowering writes the bytes bash writes, checked against a
