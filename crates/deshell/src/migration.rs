@@ -5372,15 +5372,15 @@ fn execute_ir_node(
             let mut requests = Vec::new();
             for (index, child) in nodes.iter().enumerate() {
                 visited.insert(child.id.clone());
-                requests.push(ir_exec_request(
-                    root,
-                    child,
-                    variables,
-                    arguments,
-                    if index == 0 { stdin } else { &[] },
-                    default_cwd,
-                    limits,
-                )?);
+                requests.push(ir_exec_request(IrExecRequestArgs {
+                        _root: root,
+                        node: child,
+                        variables: variables,
+                        arguments: arguments,
+                        stdin: if index == 0 { stdin } else { &[] },
+                        default_cwd: default_cwd,
+                        limits: limits,
+                    })?);
             }
             let outcomes = crate::agent_process::execute_pipeline(root, requests)?;
             let selected = match status {
@@ -5458,15 +5458,33 @@ fn execute_ir_node(
     }
 }
 
-fn ir_exec_request(
-    _root: &Path,
-    node: &crate::ir::Node,
-    variables: &BTreeMap<String, String>,
-    arguments: &BTreeMap<String, String>,
-    stdin: &[u8],
-    default_cwd: Option<&str>,
+/// The inputs of [`ir_exec_request`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`ir_exec_request`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct IrExecRequestArgs<'a> {
+    _root: &'a Path,
+    node: &'a crate::ir::Node,
+    variables: &'a BTreeMap<String, String>,
+    arguments: &'a BTreeMap<String, String>,
+    stdin: &'a [u8],
+    default_cwd: Option<&'a str>,
     limits: crate::config::ResourceLimits,
-) -> Result<crate::agent_process::Request, String> {
+}
+
+fn ir_exec_request(parts: IrExecRequestArgs<'_>) -> Result<crate::agent_process::Request, String> {
+    // Destructured without `..`: see `IrExecRequestArgs`.
+    let IrExecRequestArgs {
+        _root,
+        node,
+        variables,
+        arguments,
+        stdin,
+        default_cwd,
+        limits,
+    } = parts;
     let crate::ir::Operation::Exec {
         argv,
         environment,
