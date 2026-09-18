@@ -1085,6 +1085,18 @@ fn build_request_and_proposal(
         }
     };
     if !targets.insert(target.clone()) {
+        // Two generated programs cannot be one file, and that is what the set
+        // is for. A host rewrite is different: several shell blocks in one
+        // workflow or action are several spans of the same file, and each
+        // proposal carries a whole-file replacement computed from the original
+        // — so two of them describe the same file twice rather than a file
+        // twice rewritten. Saying which of the two it is, is the difference
+        // between "this cannot be done" and "this is what has to change".
+        if selection.target == crate::config::MigrationTarget::Host {
+            return Err(format!(
+                "DESHELL_BLOCKER_DUPLICATE_TARGET: {target} holds more than one shell block, and a host rewrite replaces the whole file; the blocks have to be rewritten together rather than one at a time"
+            ));
+        }
         return Err(format!(
             "DESHELL_BLOCKER_DUPLICATE_TARGET: multiple sources generate {target}"
         ));
@@ -2537,6 +2549,19 @@ fn generate_structured_host(
     {
         return generate_github_action_host(root, finding, plan);
     }
+    // A composite action is a `run:` step like a workflow's, and the rewrite
+    // that replaces one is not the same. A workflow step becomes `uses:
+    // ./.github/actions/...`, a path GitHub resolves against the repository the
+    // workflow lives in. Inside a composite action that is published and used
+    // by another repository, what such a path resolves against is a fact about
+    // GitHub that this tool has no way to measure, and a replacement that
+    // resolves somewhere else is a broken action rather than a delegated one.
+    if lower == "action.yml" || lower == "action.yaml" {
+        return Err(format!(
+            "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: {} is a composite action, and how a local path inside one resolves for a consuming repository is not established here; the rewrite is refused rather than guessed",
+            finding.path
+        ));
+    }
     Err(format!(
         "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: structured host generator does not support {}",
         finding.path
@@ -3656,13 +3681,18 @@ fn generate_rust(plan: &crate::ir::Plan) -> Result<Vec<u8>, String> {
             "{pipeline_helper}",
             "{lookup_helper}",
             "{functions}",
-            "fn main() {{\n",
+            "/// The retired script's own statements.\n",
+            "///\n",
+            "/// A function rather than `main` because `set -e` stops the script\n",
+            "/// at a failing statement, which is a return rather than a jump.\n",
+            "fn deshell_main() -> i32 {{\n",
             "{argument_binding}",
             "{variable_binding}",
             "{binding}",
             "{body}",
-            ";\n",
-            "{ending}",
+            "\n}}\n\n",
+            "fn main() {{\n",
+            "    std::process::exit(deshell_main());\n",
             "}}\n"
         ),
         import = import,
@@ -3671,19 +3701,7 @@ fn generate_rust(plan: &crate::ir::Plan) -> Result<Vec<u8>, String> {
         functions = functions,
         argument_binding = argument_binding,
         variable_binding = variable_binding,
-        // A body that always exits leaves nothing after it to run, and the
-        // generated program's own `-D warnings` build rejects an unreachable
-        // statement. The status is the body's either way.
-        binding = if node_always_exits(&task.body) {
-            "    let _: i32 =\n"
-        } else {
-            "    let deshell_status =\n"
-        },
-        ending = if node_always_exits(&task.body) {
-            ""
-        } else {
-            "    std::process::exit(deshell_status);\n"
-        },
+        binding = "",
         body = body,
     );
     rustfmt_generated(source.as_bytes())
@@ -4036,15 +4054,29 @@ fn emit_rust_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> 
                 contents = rust_expression(contents)?
             ));
         }
-        crate::ir::Operation::Sequence { nodes, .. } => {
+        // Destructured without `..`: `on_failure` is `set -e`, and discarding
+        // it emitted `let _ =` for every statement but the last — a program
+        // that runs on after a failure the script would have stopped at.
+        crate::ir::Operation::Sequence { nodes, on_failure } => {
             let Some((last, preceding)) = reachable_nodes(nodes).split_last() else {
                 return Err("generator received an empty sequence".into());
             };
             output.push_str(&format!("{indent}{{\n"));
             for child in preceding {
-                output.push_str(&format!("{indent}    let _ =\n"));
-                emit_rust_node(child, output, depth + 2)?;
-                output.push_str(";\n");
+                match on_failure {
+                    crate::ir::SequenceFailure::Continue => {
+                        output.push_str(&format!("{indent}    let _ =\n"));
+                        emit_rust_node(child, output, depth + 2)?;
+                        output.push_str(";\n");
+                    }
+                    crate::ir::SequenceFailure::Stop => {
+                        output.push_str(&format!("{indent}    let deshell_step =\n"));
+                        emit_rust_node(child, output, depth + 2)?;
+                        output.push_str(&format!(
+                            ";\n{indent}    if deshell_step != 0 {{\n{indent}        return deshell_step;\n{indent}    }}\n"
+                        ));
+                    }
+                }
             }
             emit_rust_node(last, output, depth + 1)?;
             output.push_str(&format!("\n{indent}}}"));
@@ -4930,7 +4962,7 @@ fn emit_rust_command(parts: EmitRustCommandArgs<'_>) -> Result<(), String> {
     for argument in &argv[1..] {
         output.push_str(&format!(
             "{indent}{variable}.arg({});\n",
-            rust_expression(argument)?
+            rust_expression_borrowed(argument)?
         ));
     }
     for value in environment {
@@ -4955,18 +4987,43 @@ fn emit_rust_command(parts: EmitRustCommandArgs<'_>) -> Result<(), String> {
 /// `to_owned` — and `clippy` says so. Everywhere a `String` is required,
 /// [`rust_expression`] is the one to call.
 fn rust_expression_borrowed(expression: &crate::ir::TextExpression) -> Result<String, String> {
-    if let [crate::ir::TextPart::Literal { value }] = expression.parts.as_slice() {
-        return Ok(format!("{value:?}"));
+    // An owning expression of one part ends in `.to_owned()`, which a caller
+    // taking `impl AsRef<_>` does not need and `clippy::pedantic` names.
+    // Trimming the suffix rather than rebuilding the expression keeps the two
+    // forms from drifting: the suffix is written in one place, just below.
+    let owned = rust_expression(expression)?;
+    if expression.parts.len() == 1
+        && let Some(borrowed) = owned.strip_suffix(".to_owned()")
+    {
+        return Ok(borrowed.to_owned());
     }
-    rust_expression(expression)
+    Ok(owned)
 }
 
 fn rust_expression(expression: &crate::ir::TextExpression) -> Result<String, String> {
-    // An expression that is one literal is that literal. Building it with a
-    // `String::new()` and a `push_str` produces the same bytes and gives the
-    // reader of the migration a block to read where a string would do.
-    if let [crate::ir::TextPart::Literal { value }] = expression.parts.as_slice() {
-        return Ok(format!("{value:?}.to_owned()"));
+    // An expression of one part is that part. Building it with a `String::new()`
+    // and a `push_str` produces the same bytes and gives the reader of the
+    // migration four lines to read where one would do — and `$1` alone is the
+    // most common expression a script writes.
+    match expression.parts.as_slice() {
+        [crate::ir::TextPart::Literal { value }] => return Ok(format!("{value:?}.to_owned()")),
+        [crate::ir::TextPart::Variable { name }] => {
+            return Ok(format!("deshell_lookup({name:?}, &deshell_vars)"));
+        }
+        [crate::ir::TextPart::Argument { name }] => {
+            let index = name
+                .parse::<usize>()
+                .ok()
+                .and_then(|position| position.checked_sub(1))
+                .ok_or_else(|| format!("generator cannot bind named argument {name}"))?;
+            let lookup = if index == 0 {
+                "deshell_args.first()".to_owned()
+            } else {
+                format!("deshell_args.get({index})")
+            };
+            return Ok(format!("{lookup}.map_or(\"\", String::as_str).to_owned()"));
+        }
+        _ => {}
     }
     let mut output = "{ let mut deshell_value = String::new();".to_owned();
     for part in &expression.parts {
@@ -5239,12 +5296,19 @@ fn generate_go(plan: &crate::ir::Plan) -> Result<Vec<u8>, String> {
             "{pipeline_helper}",
             "{argument_helper}{lookup_helper}{default_helper}",
             "{functions}",
-            "func main() {{\n",
+            "// deshellMain holds the retired script's own statements.\n",
+            "//\n",
+            "// A function rather than main because `set -e` stops the script at\n",
+            "// a failing statement, which is a return rather than a jump.\n",
+            "func deshellMain() int {{\n",
             "{argument_binding}",
             "{variable_binding}",
             "\tdeshellLast := 0\n",
             "{body}",
-            "\tos.Exit(deshellLast)\n",
+            "\treturn deshellLast\n",
+            "}}\n\n",
+            "func main() {{\n",
+            "\tos.Exit(deshellMain())\n",
             "}}\n"
         ),
         imports = imports,
@@ -5557,9 +5621,14 @@ fn emit_go_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> Re
                 contents = go_expression(contents)?
             ));
         }
-        crate::ir::Operation::Sequence { nodes, .. } => {
+        crate::ir::Operation::Sequence { nodes, on_failure } => {
             for child in reachable_nodes(nodes) {
                 emit_go_node(child, output, depth)?;
+                if *on_failure == crate::ir::SequenceFailure::Stop {
+                    output.push_str(&format!(
+                        "{indent}if deshellLast != 0 {{\n{indent}\treturn deshellLast\n{indent}}}\n"
+                    ));
+                }
             }
         }
         crate::ir::Operation::Pipeline { nodes, status } => {
@@ -10487,6 +10556,130 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
                 "{program} wrote other bytes"
             );
         }
+    }
+
+    /// `set -e` reaches the generated programs.
+    ///
+    /// The sequence emitters read `on_failure` with `..`, so every statement
+    /// but the last became `let _ =` in Rust and a bare call in Go: a program
+    /// that runs on past a failure the script would have stopped at, with the
+    /// wrong exit status at the end of it. The plan said `Stop` the whole time.
+    #[test]
+    fn set_e_stops_the_generated_programs_where_it_stops_the_shell() {
+        let script = concat!("set -e\n", "/bin/sh -c 'exit 3'\n", "echo reached\n");
+        let plan = crate::frontend::lower(
+            "stop.sh",
+            format!("#!/bin/bash\n{script}").as_bytes(),
+            crate::config::UnknownInterpreter::TraceOnly,
+        )
+        .unwrap();
+        let crate::ir::Operation::Sequence { on_failure, .. } = &plan.tasks[0].body.operation
+        else {
+            panic!("expected a sequence: {plan:#?}")
+        };
+        assert_eq!(*on_failure, crate::ir::SequenceFailure::Stop);
+
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("stop.sh"), script).unwrap();
+        std::fs::write(
+            directory.path().join("stop.rs"),
+            generate_rust(&plan).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("stop.go"),
+            generate_go(&plan).unwrap(),
+        )
+        .unwrap();
+        for (program, arguments) in [
+            (
+                "rustc",
+                vec![
+                    "stop.rs",
+                    "--edition=2024",
+                    "-D",
+                    "warnings",
+                    "-o",
+                    "stop-rust",
+                ],
+            ),
+            ("go", vec!["build", "-o", "stop-go", "stop.go"]),
+        ] {
+            let built = std::process::Command::new(program)
+                .args(&arguments)
+                .current_dir(directory.path())
+                .output()
+                .unwrap();
+            assert!(
+                built.status.success(),
+                "{program} rejected generated source:\n{}",
+                String::from_utf8_lossy(&built.stderr)
+            );
+        }
+
+        let shell = std::process::Command::new("bash")
+            .arg("stop.sh")
+            .current_dir(directory.path())
+            .output()
+            .unwrap();
+        assert_eq!(shell.stdout, b"", "the shell stops before `echo reached`");
+        assert_eq!(shell.status.code(), Some(3));
+        for program in ["./stop-rust", "./stop-go"] {
+            let ran = std::process::Command::new(program)
+                .current_dir(directory.path())
+                .output()
+                .unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&ran.stdout),
+                String::from_utf8_lossy(&shell.stdout),
+                "{program} ran past the failure"
+            );
+            assert_eq!(ran.status.code(), shell.status.code(), "{program}");
+        }
+
+        // Without `set -e` the shell runs on, and so do the programs.
+        let script = concat!("/bin/sh -c 'exit 3'\n", "echo reached\n");
+        let plan = crate::frontend::lower(
+            "go-on.sh",
+            format!("#!/bin/bash\n{script}").as_bytes(),
+            crate::config::UnknownInterpreter::TraceOnly,
+        )
+        .unwrap();
+        std::fs::write(directory.path().join("go-on.sh"), script).unwrap();
+        std::fs::write(
+            directory.path().join("go-on.rs"),
+            generate_rust(&plan).unwrap(),
+        )
+        .unwrap();
+        let built = std::process::Command::new("rustc")
+            .args([
+                "go-on.rs",
+                "--edition=2024",
+                "-D",
+                "warnings",
+                "-o",
+                "go-on-rust",
+            ])
+            .current_dir(directory.path())
+            .output()
+            .unwrap();
+        assert!(
+            built.status.success(),
+            "{}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        let shell = std::process::Command::new("bash")
+            .arg("go-on.sh")
+            .current_dir(directory.path())
+            .output()
+            .unwrap();
+        assert_eq!(shell.stdout, b"reached\n");
+        let ran = std::process::Command::new("./go-on-rust")
+            .current_dir(directory.path())
+            .output()
+            .unwrap();
+        assert_eq!(ran.stdout, shell.stdout);
+        assert_eq!(ran.status.code(), shell.status.code());
     }
 
     /// A shell function arrives as a function, and behaves like one.
