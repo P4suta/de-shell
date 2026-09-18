@@ -6103,10 +6103,9 @@ fn observe_replacement(
         stdin: &[],
         limits: build_limits,
     })?;
-    if build.exit_code != 0 || build.timed_out || build.limit_exceeded.is_some() {
+    if let Some(reason) = classify_build(&build, build_limits.timeout_ms) {
         return Err(format!(
-            "replacement build failed with exit {}: {}",
-            build.exit_code,
+            "{reason}: {}",
             String::from_utf8_lossy(&build.stderr)
         ));
     }
@@ -6154,6 +6153,41 @@ fn verification_validation_environment(root: &Path) -> Vec<(String, String)> {
     verification_build_environment(root, &["go".into()])
 }
 
+/// Why the replacement build produced no comparison, or `None` if it built.
+///
+/// A build that ran out of budget is not a build that failed. Both leave a
+/// non-zero status — a timeout leaves 124 — so the status alone cannot tell
+/// them apart, and reporting one as the other says the generated code is wrong
+/// when what happened is that nothing was learned about it. The budget is
+/// checked before the status for exactly that reason.
+fn classify_build(build: &crate::agent_process::Outcome, timeout_ms: u64) -> Option<String> {
+    if build.timed_out {
+        return Some(format!(
+            "replacement build reached its {timeout_ms} ms budget, so nothing was compared"
+        ));
+    }
+    if let Some(limit) = &build.limit_exceeded {
+        return Some(format!(
+            "replacement build reached its {limit} limit, so nothing was compared"
+        ));
+    }
+    if build.exit_code != 0 {
+        return Some(format!(
+            "replacement build failed with exit {}",
+            build.exit_code
+        ));
+    }
+    None
+}
+
+/// The budget for building the replacement.
+///
+/// A scenario's limits bound the script under verification. Building the
+/// replacement is de-shell's own toolchain invocation, which happens to share
+/// the field — so the two were already separated for memory and for process
+/// count, and the omission of time was the one that showed: a `cargo build` on
+/// a busy machine ran out of the script's budget and was reported as the
+/// replacement failing to build.
 fn verification_build_limits(
     argv: &[String],
     mut limits: crate::config::ResourceLimits,
@@ -6164,9 +6198,17 @@ fn verification_build_limits(
     {
         limits.memory_bytes = limits.memory_bytes.max(8 * 1024 * 1024 * 1024);
         limits.processes = 60_000;
+        limits.timeout_ms = limits.timeout_ms.max(TOOLCHAIN_BUILD_TIMEOUT_MS);
     }
     limits
 }
+
+/// How long a compiler is given to build the replacement.
+///
+/// Not a threshold tuned until a test passed: a scenario's timeout describes
+/// the script, and this describes a toolchain. Ten minutes is the same budget
+/// the workflows give a build step.
+const TOOLCHAIN_BUILD_TIMEOUT_MS: u64 = 600_000;
 
 fn observe_ir(
     root: &Path,
@@ -9551,6 +9593,54 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
             .unwrap();
         assert_eq!(ran.stdout, shell.stdout, "generated Go wrote other bytes");
         assert_eq!(ran.status.code(), shell.status.code());
+    }
+
+    /// A build that ran out of time is not a build that failed.
+    ///
+    /// A timeout leaves exit 124, so a check that reads the status first calls
+    /// it a build failure — which is what it did, and what sent a reader to
+    /// inspect generated code that had compiled fine the run before.
+    #[test]
+    fn a_build_that_ran_out_of_budget_is_not_reported_as_one_that_failed() {
+        let outcome = |exit_code, timed_out, limit_exceeded| crate::agent_process::Outcome {
+            exit_code,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            timed_out,
+            limit_exceeded,
+            signal: None,
+        };
+
+        assert_eq!(classify_build(&outcome(0, false, None), 1000), None);
+
+        let timed_out = classify_build(&outcome(124, true, None), 30_000).unwrap();
+        assert!(
+            timed_out.contains("30000 ms budget") && !timed_out.contains("failed"),
+            "{timed_out}"
+        );
+
+        let limited = classify_build(&outcome(137, false, Some("memory".into())), 1000).unwrap();
+        assert!(
+            limited.contains("memory limit") && !limited.contains("failed"),
+            "{limited}"
+        );
+
+        // A real failure still reads as one, and still names the status.
+        let failed = classify_build(&outcome(101, false, None), 1000).unwrap();
+        assert!(failed.contains("failed with exit 101"), "{failed}");
+
+        // A toolchain gets a build-sized budget; a script keeps the scenario's.
+        let scenario = crate::config::ResourceLimits {
+            timeout_ms: 30_000,
+            memory_bytes: 1024,
+            processes: 8,
+            stdout_bytes: 1024,
+            stderr_bytes: 1024,
+        };
+        let build = verification_build_limits(&["cargo".into(), "build".into()], scenario);
+        assert_eq!(build.timeout_ms, TOOLCHAIN_BUILD_TIMEOUT_MS);
+        let script = verification_build_limits(&["./build.sh".into()], scenario);
+        assert_eq!(script.timeout_ms, scenario.timeout_ms);
     }
 
     #[test]

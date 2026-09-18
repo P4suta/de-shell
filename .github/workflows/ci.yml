@@ -82,6 +82,8 @@ jobs:
           cargo run --locked -p xtask -- test-semantics
           cargo run --locked -p xtask -- echo-semantics
           cargo run --locked -p xtask -- exit-semantics
+          cargo run --locked -p xtask -- builtin-table
+          cargo run --locked -p xtask -- posix-divergence
 
       - name: Run shared CLI, schema, golden, and agent conformance
         run: |

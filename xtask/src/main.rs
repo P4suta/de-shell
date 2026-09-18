@@ -371,6 +371,227 @@ fn run_exit_semantics(root: &Path) -> Result<(), Vec<String>> {
     Err(errors)
 }
 
+/// Ask the shells on this runner for their own builtins and require the
+/// frontend's table to answer for each one.
+///
+/// A builtin never reaches the `PATH` lookup, so a name the table does not
+/// mention is lowered to an `Exec` of whatever program `PATH` holds — `which`
+/// is a zsh builtin and a program in `/usr/bin`, and they do not answer the
+/// same way. Checking against a hand-written list would only restate the list.
+///
+/// One direction only. A runner carrying bash 3.2 does not report `mapfile`,
+/// which bash 5 does, so a name in the recording that this shell does not have
+/// is printed rather than failed; a name this shell has that the recording does
+/// not is the failure.
+fn run_builtin_table(root: &Path) -> Result<(), Vec<String>> {
+    let path = root.join("contracts/golden/shell-builtin-inventory-v1.json");
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|error| vec![format!("cannot read {}: {error}", path.display())])?;
+    let corpus: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|error| vec![format!("malformed corpus: {error}")])?;
+    let treatments = corpus["treatments"]
+        .as_object()
+        .ok_or_else(|| vec!["corpus has no treatments object".to_owned()])?;
+    if treatments.is_empty() {
+        return Err(vec!["corpus answers for no builtin".to_owned()]);
+    }
+    let mut errors = Vec::new();
+    let mut observed_total = 0_usize;
+    for (shell, argument) in [
+        ("bash", "compgen -b"),
+        ("sh", "compgen -b"),
+        ("zsh", "print -l ${(k)builtins}"),
+    ] {
+        let output = std::process::Command::new(shell)
+            .arg("-c")
+            .arg(argument)
+            .output();
+        let output = match output {
+            Ok(output) if output.status.success() => output,
+            Ok(output) => {
+                // A `/bin/sh` that is dash has no `compgen`, and a shell that
+                // cannot list its builtins is one this gate cannot check — which
+                // is worth printing and is not a disagreement.
+                println!(
+                    "skipped  {shell}: cannot list builtins (exit {:?})",
+                    output.status.code()
+                );
+                continue;
+            }
+            Err(error) => {
+                println!("skipped  {shell}: {error}");
+                continue;
+            }
+        };
+        let listing = String::from_utf8_lossy(&output.stdout).into_owned();
+        let observed: std::collections::BTreeSet<&str> = listing.split_whitespace().collect();
+        if observed.is_empty() {
+            println!("skipped  {shell}: reported no builtins");
+            continue;
+        }
+        observed_total += observed.len();
+        for name in &observed {
+            if !treatments.contains_key(*name) {
+                errors.push(format!(
+                    "{shell} resolves {name} as a builtin and the table does not answer for it"
+                ));
+            }
+        }
+        let recorded = corpus["shells"][shell].as_array();
+        if let Some(recorded) = recorded {
+            let recorded: std::collections::BTreeSet<&str> =
+                recorded.iter().filter_map(|value| value.as_str()).collect();
+            for name in recorded.difference(&observed) {
+                println!("absent   {shell}: the recording has {name} and this build does not");
+            }
+            for name in observed.difference(&recorded) {
+                println!("added    {shell}: this build has {name} and the recording does not");
+            }
+        }
+    }
+    if observed_total == 0 {
+        return Err(vec![
+            "no shell on this runner could list its builtins, so nothing was checked".to_owned(),
+        ]);
+    }
+    if errors.is_empty() {
+        println!(
+            "{} builtin name(s) answered for across {observed_total} observation(s)",
+            treatments.len()
+        );
+        return Ok(());
+    }
+    Err(errors)
+}
+
+/// Re-measure the constructs that are not in POSIX, and decide by behaviour
+/// which shell `/bin/sh` is on this runner.
+///
+/// `/bin/sh` is not one program: bash on macOS, dash on Debian and Ubuntu.
+/// Reading a version string would name the binary; running the same scripts
+/// through it names what it does, which is what a script depends on. Most of
+/// these diverge in silence — a newline check written with `$'\n'` accepts
+/// everything under dash without a word — so the point of the gate is that the
+/// silence is written down somewhere a change has to pass through.
+fn run_posix_divergence(root: &Path) -> Result<(), Vec<String>> {
+    let path = root.join("contracts/golden/posix-sh-divergence-v1.json");
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|error| vec![format!("cannot read {}: {error}", path.display())])?;
+    let corpus: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|error| vec![format!("malformed corpus: {error}")])?;
+    let shells: Vec<&str> = corpus["shells"]
+        .as_array()
+        .ok_or_else(|| vec!["corpus has no shells array".to_owned()])?
+        .iter()
+        .filter_map(|value| value.as_str())
+        .collect();
+    let cases = corpus["cases"]
+        .as_array()
+        .ok_or_else(|| vec!["corpus has no cases array".to_owned()])?;
+    if cases.is_empty() || shells.is_empty() {
+        return Err(vec!["corpus is empty".to_owned()]);
+    }
+
+    let observe = |shell: &str, script: &str| -> Option<(String, i64)> {
+        let output = std::process::Command::new(shell)
+            .arg("-c")
+            .arg(script)
+            .output()
+            .ok()?;
+        Some((
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            i64::from(output.status.code().unwrap_or(-1)),
+        ))
+    };
+
+    let mut errors = Vec::new();
+    let mut checked = 0_usize;
+    // A shell the runner does not carry is reported and skipped once, rather
+    // than once per case.
+    let present: Vec<&str> = shells
+        .iter()
+        .copied()
+        .filter(|shell| {
+            let ok = observe(shell, "exit 0").is_some();
+            if !ok {
+                println!("skipped  {shell}: not on this runner");
+            }
+            ok
+        })
+        .collect();
+    if present.is_empty() {
+        return Err(vec!["no recorded shell is on this runner".to_owned()]);
+    }
+
+    for case in cases {
+        let name = case["name"].as_str().unwrap_or("<unnamed>");
+        let Some(script) = case["script"].as_str() else {
+            errors.push(format!("{name} has no script"));
+            continue;
+        };
+        for shell in &present {
+            let Some(recorded) = case[*shell].as_object() else {
+                errors.push(format!("{name} has no {shell} column"));
+                continue;
+            };
+            let Some((stdout, code)) = observe(shell, script) else {
+                errors.push(format!("{name}: cannot run {shell}"));
+                continue;
+            };
+            checked += 1;
+            let expected = recorded["stdout"].as_str().unwrap_or_default();
+            let expected_code = recorded["exit"].as_i64().unwrap_or(-1);
+            if stdout != expected || code != expected_code {
+                errors.push(format!(
+                    "{name}/{shell}: recorded ({expected:?}, {expected_code}), observed ({stdout:?}, {code})"
+                ));
+            }
+        }
+    }
+
+    // Which column does `/bin/sh` belong to here? Decided by running the same
+    // scripts through it, not by asking it what it is.
+    let mut differences: Vec<(&str, Vec<&str>)> = Vec::new();
+    for shell in &present {
+        let mut differs = Vec::new();
+        for case in cases {
+            let name = case["name"].as_str().unwrap_or("<unnamed>");
+            let script = case["script"].as_str().unwrap_or_default();
+            let Some((stdout, code)) = observe("/bin/sh", script) else {
+                differs.push(name);
+                continue;
+            };
+            if case[*shell]["stdout"].as_str() != Some(stdout.as_str())
+                || case[*shell]["exit"].as_i64() != Some(code)
+            {
+                differs.push(name);
+            }
+        }
+        differences.push((shell, differs));
+    }
+    match differences.iter().find(|(_, differs)| differs.is_empty()) {
+        Some((shell, _)) => println!("/bin/sh here behaves like {shell}"),
+        // Naming the closest and the cases it differs on is the useful answer:
+        // macOS ships bash as `/bin/sh`, and bash in that mode is neither the
+        // bash on `PATH` nor dash.
+        None => {
+            println!("/bin/sh here behaves like none of the recorded shells");
+            for (shell, differs) in &differences {
+                println!("  unlike {shell} on: {}", differs.join(", "));
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        println!(
+            "{} construct(s) match the recording across {checked} shell observation(s)",
+            cases.len()
+        );
+        return Ok(());
+    }
+    Err(errors)
+}
+
 fn run_test_semantics(root: &Path) -> Result<(), Vec<String>> {
     let path = root.join("contracts/golden/test-builtin-semantics-v1.json");
     let raw = std::fs::read_to_string(&path)
@@ -1446,6 +1667,8 @@ fn dispatch(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Vec<Str
         Some("test-semantics") => run_test_semantics(root),
         Some("echo-semantics") => run_echo_semantics(root),
         Some("exit-semantics") => run_exit_semantics(root),
+        Some("builtin-table") => run_builtin_table(root),
+        Some("posix-divergence") => run_posix_divergence(root),
         Some("validate-contracts") => validate_contract_tree(root).map(|_| ()),
         Some("performance") => {
             let binary = arguments

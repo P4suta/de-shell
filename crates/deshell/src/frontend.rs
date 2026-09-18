@@ -2364,10 +2364,24 @@ fn lower_posix_simple(parts: LowerPosixSimpleArgs<'_>) -> Result<Node, String> {
         }
         return Err("exit status requires pinned interpreter delegation".into());
     }
-    if shell_builtin(&executable) {
-        return Err(format!(
-            "shell builtin {executable} requires pinned interpreter delegation"
-        ));
+    if let Some(treatment) = builtin_treatment(&executable) {
+        // Reaching here means no branch above lowered the name, so whatever the
+        // table says, this call is delegated. The reason says which of the two
+        // reasons it is, because "this shell's builtin differs from the one that
+        // is modelled" and "nobody has looked at this name" send a reader to
+        // different places.
+        return Err(match treatment {
+            BuiltinTreatment::Modelled => format!(
+                "shell builtin {executable} is modelled for another interpreter; {} requires pinned interpreter delegation",
+                interpreter.name()
+            ),
+            BuiltinTreatment::Delegated => {
+                format!("shell builtin {executable} requires pinned interpreter delegation")
+            }
+            BuiltinTreatment::Unexamined => format!(
+                "shell builtin {executable} has no model yet and requires pinned interpreter delegation"
+            ),
+        });
     }
     let mut command_environment = Vec::new();
     let mut argv_start = 0;
@@ -2552,72 +2566,157 @@ fn test_predicate(operands: &[TextExpression]) -> Option<crate::ir::TestPredicat
     }
 }
 
-fn shell_builtin(executable: &str) -> bool {
-    [
-        "!",
-        ".",
-        ":",
-        "[",
-        "alias",
-        "bg",
-        "bind",
-        "break",
-        "builtin",
-        "caller",
-        "cd",
-        "command",
-        "compgen",
-        "complete",
-        "continue",
-        "declare",
-        "dirs",
-        "disown",
-        "echo",
-        "enable",
-        "eval",
-        "exec",
-        "exit",
-        "export",
-        "false",
-        "fc",
-        "fg",
-        "getopts",
-        "hash",
-        "help",
-        "history",
-        "jobs",
-        "kill",
-        "let",
-        "local",
-        "logout",
-        "mapfile",
-        "newgrp",
-        "popd",
-        "printf",
-        "pushd",
-        "pwd",
-        "read",
-        "readarray",
-        "readonly",
-        "return",
-        "set",
-        "shift",
-        "shopt",
-        "source",
-        "suspend",
-        "test",
-        "times",
-        "trap",
-        "true",
-        "type",
-        "typeset",
-        "ulimit",
-        "umask",
-        "unalias",
-        "unset",
-        "wait",
-    ]
-    .contains(&executable)
+/// What the frontend does with a shell builtin.
+///
+/// Three values, not two. A builtin never reaches the shell's `PATH` lookup, so
+/// lowering one to an `Exec` substitutes a different program — `which` is a zsh
+/// builtin *and* a program in `/usr/bin`, and they do not answer the same way.
+/// A name the table does not mention takes exactly that wrong path, silently.
+///
+/// So "read it and chose to delegate" is kept apart from "nobody has decided".
+/// Both delegate, which is the safe side; separating them is what makes the
+/// remaining work a value a gate can read rather than an absence nothing can
+/// see. `cargo xtask builtin-table` asks the shells on the runner for their own
+/// list and fails on a name this table does not answer for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BuiltinTreatment {
+    /// Lowered to an operation, for at least one interpreter, against a
+    /// measurement in `contracts/golden/`.
+    Modelled,
+    /// Read, and handed to the pinned interpreter on purpose.
+    Delegated,
+    /// Nobody has decided. Delegated too, and named differently so that saying
+    /// so is not the same as never having looked.
+    Unexamined,
+}
+
+/// Every name a measured shell resolves as a builtin, and this frontend's
+/// answer for it.
+///
+/// The union across `bash`, `/bin/sh` and `zsh` rather than one table per
+/// interpreter: over-delegating a zsh builtin in a bash script costs a
+/// delegation, while under-delegating runs a different program.
+/// `contracts/golden/shell-builtin-inventory-v1.json` holds the same answers
+/// and the measurement they came from, and a test compares the two.
+const SHELL_BUILTINS: &[(&str, BuiltinTreatment)] = &[
+    ("-", BuiltinTreatment::Unexamined),
+    (".", BuiltinTreatment::Unexamined),
+    (":", BuiltinTreatment::Unexamined),
+    ("[", BuiltinTreatment::Modelled),
+    ("alias", BuiltinTreatment::Unexamined),
+    ("autoload", BuiltinTreatment::Unexamined),
+    ("bg", BuiltinTreatment::Unexamined),
+    ("bind", BuiltinTreatment::Unexamined),
+    ("bindkey", BuiltinTreatment::Unexamined),
+    ("break", BuiltinTreatment::Unexamined),
+    ("builtin", BuiltinTreatment::Unexamined),
+    ("bye", BuiltinTreatment::Unexamined),
+    ("caller", BuiltinTreatment::Unexamined),
+    ("cd", BuiltinTreatment::Unexamined),
+    ("chdir", BuiltinTreatment::Unexamined),
+    ("command", BuiltinTreatment::Unexamined),
+    ("compadd", BuiltinTreatment::Unexamined),
+    ("comparguments", BuiltinTreatment::Unexamined),
+    ("compcall", BuiltinTreatment::Unexamined),
+    ("compctl", BuiltinTreatment::Unexamined),
+    ("compdescribe", BuiltinTreatment::Unexamined),
+    ("compfiles", BuiltinTreatment::Unexamined),
+    ("compgen", BuiltinTreatment::Unexamined),
+    ("compgroups", BuiltinTreatment::Unexamined),
+    ("complete", BuiltinTreatment::Unexamined),
+    ("compquote", BuiltinTreatment::Unexamined),
+    ("compset", BuiltinTreatment::Unexamined),
+    ("comptags", BuiltinTreatment::Unexamined),
+    ("comptry", BuiltinTreatment::Unexamined),
+    ("compvalues", BuiltinTreatment::Unexamined),
+    ("continue", BuiltinTreatment::Unexamined),
+    ("declare", BuiltinTreatment::Unexamined),
+    ("dirs", BuiltinTreatment::Unexamined),
+    ("disable", BuiltinTreatment::Unexamined),
+    ("disown", BuiltinTreatment::Unexamined),
+    ("echo", BuiltinTreatment::Modelled),
+    ("echotc", BuiltinTreatment::Unexamined),
+    ("echoti", BuiltinTreatment::Unexamined),
+    ("emulate", BuiltinTreatment::Unexamined),
+    ("enable", BuiltinTreatment::Unexamined),
+    ("eval", BuiltinTreatment::Unexamined),
+    ("exec", BuiltinTreatment::Unexamined),
+    ("exit", BuiltinTreatment::Modelled),
+    ("export", BuiltinTreatment::Unexamined),
+    ("false", BuiltinTreatment::Unexamined),
+    ("fc", BuiltinTreatment::Unexamined),
+    ("fg", BuiltinTreatment::Unexamined),
+    ("float", BuiltinTreatment::Unexamined),
+    ("functions", BuiltinTreatment::Unexamined),
+    ("getln", BuiltinTreatment::Unexamined),
+    ("getopts", BuiltinTreatment::Unexamined),
+    ("hash", BuiltinTreatment::Unexamined),
+    ("help", BuiltinTreatment::Unexamined),
+    ("history", BuiltinTreatment::Unexamined),
+    ("integer", BuiltinTreatment::Unexamined),
+    ("jobs", BuiltinTreatment::Unexamined),
+    ("kill", BuiltinTreatment::Unexamined),
+    ("let", BuiltinTreatment::Unexamined),
+    ("limit", BuiltinTreatment::Unexamined),
+    ("local", BuiltinTreatment::Unexamined),
+    ("log", BuiltinTreatment::Unexamined),
+    ("logout", BuiltinTreatment::Unexamined),
+    ("noglob", BuiltinTreatment::Unexamined),
+    ("popd", BuiltinTreatment::Unexamined),
+    ("print", BuiltinTreatment::Unexamined),
+    ("printf", BuiltinTreatment::Unexamined),
+    ("private", BuiltinTreatment::Unexamined),
+    ("pushd", BuiltinTreatment::Unexamined),
+    ("pushln", BuiltinTreatment::Unexamined),
+    ("pwd", BuiltinTreatment::Unexamined),
+    ("r", BuiltinTreatment::Unexamined),
+    ("read", BuiltinTreatment::Unexamined),
+    ("readonly", BuiltinTreatment::Unexamined),
+    ("rehash", BuiltinTreatment::Unexamined),
+    ("return", BuiltinTreatment::Unexamined),
+    ("sched", BuiltinTreatment::Unexamined),
+    ("set", BuiltinTreatment::Delegated),
+    ("setopt", BuiltinTreatment::Unexamined),
+    ("shift", BuiltinTreatment::Unexamined),
+    ("shopt", BuiltinTreatment::Unexamined),
+    ("source", BuiltinTreatment::Unexamined),
+    ("suspend", BuiltinTreatment::Unexamined),
+    ("test", BuiltinTreatment::Modelled),
+    ("times", BuiltinTreatment::Unexamined),
+    ("trap", BuiltinTreatment::Unexamined),
+    ("true", BuiltinTreatment::Unexamined),
+    ("ttyctl", BuiltinTreatment::Unexamined),
+    ("type", BuiltinTreatment::Unexamined),
+    ("typeset", BuiltinTreatment::Unexamined),
+    ("ulimit", BuiltinTreatment::Unexamined),
+    ("umask", BuiltinTreatment::Unexamined),
+    ("unalias", BuiltinTreatment::Unexamined),
+    ("unfunction", BuiltinTreatment::Unexamined),
+    ("unhash", BuiltinTreatment::Unexamined),
+    ("unlimit", BuiltinTreatment::Unexamined),
+    ("unset", BuiltinTreatment::Unexamined),
+    ("unsetopt", BuiltinTreatment::Unexamined),
+    ("vared", BuiltinTreatment::Unexamined),
+    ("wait", BuiltinTreatment::Unexamined),
+    ("whence", BuiltinTreatment::Unexamined),
+    ("where", BuiltinTreatment::Unexamined),
+    ("which", BuiltinTreatment::Unexamined),
+    ("zcompile", BuiltinTreatment::Unexamined),
+    ("zformat", BuiltinTreatment::Unexamined),
+    ("zle", BuiltinTreatment::Unexamined),
+    ("zmodload", BuiltinTreatment::Unexamined),
+    ("zparseopts", BuiltinTreatment::Unexamined),
+    ("zregexparse", BuiltinTreatment::Unexamined),
+    ("zstyle", BuiltinTreatment::Unexamined),
+];
+
+/// This frontend's answer for a name, or `None` if no measured shell resolves
+/// it as a builtin.
+fn builtin_treatment(executable: &str) -> Option<BuiltinTreatment> {
+    SHELL_BUILTINS
+        .iter()
+        .find(|(name, _)| *name == executable)
+        .map(|(_, treatment)| *treatment)
 }
 
 fn standalone_assignment(value: &str) -> Option<(&str, &str)> {
@@ -4637,6 +4736,76 @@ mod tests {
                 "a statement of the arm ran with another statement's words"
             );
         }
+    }
+
+    /// The builtin table answers for every name a measured shell reports.
+    ///
+    /// Reads `contracts/golden/shell-builtin-inventory-v1.json`, which
+    /// `cargo xtask builtin-table` re-measures on each runner. Before this, the
+    /// table was a hand-written list of 62 names against 109 that the shells on
+    /// this machine report — so `which`, `print`, `whence` and forty others fell
+    /// through to the external-command path and became an `Exec` of whatever
+    /// program `PATH` happened to hold.
+    #[test]
+    fn the_builtin_table_answers_for_every_measured_builtin() {
+        let raw = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/contracts/golden/shell-builtin-inventory-v1.json"
+        ))
+        .expect("corpus is readable");
+        let corpus: serde_json::Value = serde_json::from_str(&raw).expect("corpus is JSON");
+        let treatments = corpus["treatments"]
+            .as_object()
+            .expect("corpus records treatments");
+
+        for (name, treatment) in treatments {
+            let expected = match treatment.as_str().expect("treatment is a string") {
+                "modelled" => BuiltinTreatment::Modelled,
+                "delegated" => BuiltinTreatment::Delegated,
+                "unexamined" => BuiltinTreatment::Unexamined,
+                other => panic!("{name} has an unknown treatment {other:?}"),
+            };
+            assert_eq!(
+                builtin_treatment(name),
+                Some(expected),
+                "the table and the recording disagree about {name}"
+            );
+        }
+        for (name, _) in SHELL_BUILTINS {
+            assert!(
+                treatments.contains_key(*name),
+                "{name} is in the table but not in the recording"
+            );
+        }
+
+        // Every name a shell reports has to be answered for, whatever the
+        // answer is. An absent name is the one state the table cannot express.
+        for shell in ["bash", "sh", "zsh"] {
+            for name in corpus["shells"][shell]
+                .as_array()
+                .expect("corpus records this shell")
+            {
+                let name = name.as_str().expect("builtin name is a string");
+                assert!(
+                    builtin_treatment(name).is_some(),
+                    "{shell} resolves {name} as a builtin and the table does not mention it"
+                );
+            }
+        }
+
+        // The table is sorted, so a name added out of order is a diff that reads
+        // as one line rather than as a move.
+        let names: Vec<&str> = SHELL_BUILTINS.iter().map(|(name, _)| *name).collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(names, sorted, "the builtin table is not sorted");
+        let mut deduped = sorted.clone();
+        deduped.dedup();
+        assert_eq!(
+            deduped.len(),
+            names.len(),
+            "the builtin table repeats a name"
+        );
     }
 
     /// The `echo` lowering writes the bytes bash writes, checked against a
