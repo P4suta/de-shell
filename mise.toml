@@ -124,6 +124,7 @@ run = [
   "cargo run --locked -p xtask -- builtin-table",
   "cargo run --locked -p xtask -- posix-divergence",
   "cargo run --locked -p xtask -- printf-semantics",
+  "cargo run --locked -p xtask -- case-patterns",
 ]
 
 [tasks.test]
@@ -138,6 +139,7 @@ run = [
   "cargo run --locked -p xtask -- builtin-table",
   "cargo run --locked -p xtask -- posix-divergence",
   "cargo run --locked -p xtask -- printf-semantics",
+  "cargo run --locked -p xtask -- case-patterns",
 ]
 
 [tasks.performance]

@@ -666,6 +666,110 @@ fn run_printf_semantics(root: &Path) -> Result<(), Vec<String>> {
     Err(errors)
 }
 
+/// Re-measure what each shell matches for the recorded `case` patterns.
+///
+/// The word is base64 so a newline survives the file, and the answer is an
+/// ASCII token the shell prints, so nothing here depends on how bytes are
+/// decoded. A shell that refuses the pattern is `ERROR` and nothing more — the
+/// message names the interpreter's own path, which is not a property of the
+/// pattern.
+fn run_case_patterns(root: &Path) -> Result<(), Vec<String>> {
+    let path = root.join("contracts/golden/case-pattern-semantics-v1.json");
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|error| vec![format!("cannot read {}: {error}", path.display())])?;
+    let corpus: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|error| vec![format!("malformed corpus: {error}")])?;
+    let shells: Vec<&str> = corpus["shells"]
+        .as_array()
+        .ok_or_else(|| vec!["corpus has no shells array".to_owned()])?
+        .iter()
+        .filter_map(|value| value.as_str())
+        .collect();
+    let cases = corpus["cases"]
+        .as_array()
+        .ok_or_else(|| vec!["corpus has no cases array".to_owned()])?;
+    if cases.is_empty() || shells.is_empty() {
+        return Err(vec!["corpus is empty".to_owned()]);
+    }
+    let mut errors = Vec::new();
+    let mut checked = 0_usize;
+    for case in cases {
+        let id = case["id"].as_str().unwrap_or("<unnamed>");
+        let (Some(script), Some(encoded)) =
+            (case["script"].as_str(), case["word_base64"].as_str())
+        else {
+            errors.push(format!("{id} has no script or no word"));
+            continue;
+        };
+        let Some(word) = decode_base64(encoded) else {
+            errors.push(format!("{id} has a word that is not base64"));
+            continue;
+        };
+        let Ok(word) = String::from_utf8(word) else {
+            errors.push(format!("{id} has a word that is not UTF-8"));
+            continue;
+        };
+        for shell in &shells {
+            let Some(recorded) = case[*shell].as_str() else {
+                errors.push(format!("{id} has no {shell} column"));
+                continue;
+            };
+            let output = std::process::Command::new(shell)
+                .arg("-c")
+                .arg(script)
+                .arg(shell)
+                .arg(&word)
+                .output();
+            let Ok(output) = output else {
+                println!("skipped  {id}/{shell}: not on this runner");
+                continue;
+            };
+            let observed = match String::from_utf8_lossy(&output.stdout).into_owned() {
+                token if token == "MATCH" || token == "NOMATCH" => token,
+                _ => "ERROR".to_owned(),
+            };
+            checked += 1;
+            if observed != recorded {
+                errors.push(format!(
+                    "{id}/{shell}: recorded {recorded}, observed {observed}"
+                ));
+            }
+        }
+    }
+    if errors.is_empty() {
+        println!(
+            "{} case pattern(s) match the recording across {checked} shell observation(s)",
+            cases.len()
+        );
+        return Ok(());
+    }
+    Err(errors)
+}
+
+/// Decode the base64 a corpus stores a word in.
+///
+/// Written out rather than pulled in: `xtask` is a build tool the workspace
+/// lock has to stay small for, and this is the only place that needs it.
+fn decode_base64(encoded: &str) -> Option<Vec<u8>> {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut bits = 0_u32;
+    let mut count = 0_u32;
+    let mut output = Vec::new();
+    for byte in encoded.bytes() {
+        if byte == b'=' {
+            break;
+        }
+        let value = ALPHABET.iter().position(|candidate| *candidate == byte)?;
+        bits = (bits << 6) | u32::try_from(value).ok()?;
+        count += 6;
+        if count >= 8 {
+            count -= 8;
+            output.push(u8::try_from((bits >> count) & 0xff).ok()?);
+        }
+    }
+    Some(output)
+}
+
 fn run_test_semantics(root: &Path) -> Result<(), Vec<String>> {
     let path = root.join("contracts/golden/test-builtin-semantics-v1.json");
     let raw = std::fs::read_to_string(&path)
@@ -1744,6 +1848,7 @@ fn dispatch(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Vec<Str
         Some("builtin-table") => run_builtin_table(root),
         Some("posix-divergence") => run_posix_divergence(root),
         Some("printf-semantics") => run_printf_semantics(root),
+        Some("case-patterns") => run_case_patterns(root),
         Some("validate-contracts") => validate_contract_tree(root).map(|_| ()),
         Some("performance") => {
             let binary = arguments

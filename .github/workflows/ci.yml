@@ -85,6 +85,7 @@ jobs:
           cargo run --locked -p xtask -- builtin-table
           cargo run --locked -p xtask -- posix-divergence
           cargo run --locked -p xtask -- printf-semantics
+          cargo run --locked -p xtask -- case-patterns
 
       - name: Run shared CLI, schema, golden, and agent conformance
         run: |
