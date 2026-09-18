@@ -21,8 +21,8 @@ pub(crate) fn private_snapshot(source: &Path) -> Result<PrivateWorkspace, String
         .tempdir()
         .map_err(|error| format!("cannot create private workspace: {error}"))?;
     let root = directory.path().join("workspace");
-    std::fs::create_dir(&root)
-        .map_err(|error| format!("cannot create private workspace root: {error}"))?;
+    crate::patch::create_new_directory(&root)
+        .map_err(|error| format!("cannot create private workspace root: {error:?}"))?;
     for entry in walkdir::WalkDir::new(&source)
         .follow_links(false)
         .into_iter()
@@ -50,14 +50,14 @@ pub(crate) fn private_snapshot(source: &Path) -> Result<PrivateWorkspace, String
             ));
         }
         if kind.is_dir() {
-            std::fs::create_dir(&target).map_err(|error| {
+            crate::patch::create_new_directory(&target).map_err(|error| {
                 format!(
-                    "cannot create snapshot directory {}: {error}",
+                    "cannot create snapshot directory {}: {error:?}",
                     target.display()
                 )
             })?;
         } else if kind.is_file() {
-            std::fs::copy(entry.path(), &target).map_err(|error| {
+            crate::patch::scratch::copy(entry.path(), &target).map_err(|error| {
                 format!("cannot copy snapshot file {}: {error}", relative.display())
             })?;
             let permissions = entry
@@ -69,7 +69,7 @@ pub(crate) fn private_snapshot(source: &Path) -> Result<PrivateWorkspace, String
                     )
                 })?
                 .permissions();
-            std::fs::set_permissions(&target, permissions).map_err(|error| {
+            crate::patch::scratch::set_permissions(&target, permissions).map_err(|error| {
                 format!(
                     "cannot preserve snapshot permissions {}: {error}",
                     relative.display()
@@ -369,12 +369,24 @@ fn ensure_parents(root: &Path, relative: &str) -> Result<(), String> {
                 ));
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                std::fs::create_dir(&current).map_err(|error| {
-                    format!(
-                        "cannot create fixture directory {}: {error}",
-                        current.display()
-                    )
-                })?
+                match crate::patch::ensure_directory(&current) {
+                    Ok(
+                        crate::patch::DirectoryState::Created
+                        | crate::patch::DirectoryState::Existing,
+                    ) => {}
+                    Err(crate::patch::DirectoryError::Occupied) => {
+                        return Err(format!(
+                            "fixture parent is not a regular directory: {}",
+                            current.display()
+                        ));
+                    }
+                    Err(crate::patch::DirectoryError::Io(error)) => {
+                        return Err(format!(
+                            "cannot create fixture directory {}: {error}",
+                            current.display()
+                        ));
+                    }
+                }
             }
             Err(error) => {
                 return Err(format!(
@@ -408,6 +420,11 @@ fn executable(_metadata: &std::fs::Metadata) -> bool {
 }
 
 #[cfg(test)]
+// Tests reach for the raw APIs on purpose: they stage corrupt trees, race two
+// writers against one path, and assert on what the transactional layer does with
+// the result. Constructing those situations is precisely what the production ban
+// exists to prevent, so the ban is lifted here and nowhere else.
+#[expect(clippy::disallowed_methods, reason = "tests construct the races and corrupt trees the production ban prevents")]
 mod tests {
     use super::*;
 

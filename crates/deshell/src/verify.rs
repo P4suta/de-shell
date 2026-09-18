@@ -33,7 +33,7 @@ pub(crate) struct AuditContext<'a> {
     pub provider_fingerprint: &'a str,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(test), expect(dead_code, reason = "reachable only from the test-only differential harness; kept compiled in release so the two paths cannot drift"))]
 pub(crate) fn audit(plan: &Plan, evidence: Option<&Evidence>) -> Result<AuditReport, Vec<String>> {
     audit_inner(plan, evidence, None)
 }

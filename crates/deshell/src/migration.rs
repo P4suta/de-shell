@@ -980,7 +980,7 @@ fn generator_selection<'a>(
         )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "the arguments are a contract record; grouping them into a struct would hide which fields the caller must supply")]
 fn build_request_and_proposal(
     root: &Path,
     config: &crate::config::ProjectConfig,
@@ -1196,7 +1196,6 @@ fn build_request_and_proposal(
     Ok((request, proposal))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn official_call_site_patches(
     root: &Path,
     config: &crate::config::ProjectConfig,
@@ -1872,12 +1871,12 @@ fn invoke_external_generator(
     let copied = isolated.path().join("generator.exe");
     #[cfg(not(windows))]
     let copied = isolated.path().join("generator");
-    std::fs::copy(&executable, &copied)
+    crate::patch::scratch::copy(&executable, &copied)
         .map_err(|error| format!("cannot copy external generator into isolation: {error}"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&copied, std::fs::Permissions::from_mode(0o500))
+        crate::patch::scratch::set_permissions(&copied, std::fs::Permissions::from_mode(0o500))
             .map_err(|error| format!("cannot make isolated generator executable: {error}"))?;
     }
     let baseline = isolated_tree_digest(isolated.path())?;
@@ -4516,23 +4515,18 @@ fn ensure_child_directory(parent: &Path, name: &str) -> Result<PathBuf, String> 
             ));
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            match std::fs::create_dir(&target) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let metadata = target.symlink_metadata().map_err(|inspect| {
-                        format!(
-                            "cannot inspect {} after concurrent create: {inspect}",
-                            target.display()
-                        )
-                    })?;
-                    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
-                        return Err(format!(
-                            "migration directory is not a regular directory: {}",
-                            target.display()
-                        ));
-                    }
+            match crate::patch::ensure_directory(&target) {
+                Ok(
+                    crate::patch::DirectoryState::Created
+                    | crate::patch::DirectoryState::Existing,
+                ) => {}
+                Err(crate::patch::DirectoryError::Occupied) => {
+                    return Err(format!(
+                        "migration directory is not a regular directory: {}",
+                        target.display()
+                    ));
                 }
-                Err(error) => {
+                Err(crate::patch::DirectoryError::Io(error)) => {
                     return Err(format!("cannot create {}: {error}", target.display()));
                 }
             }
@@ -4989,7 +4983,7 @@ fn embedded_original_invocation(
             .tempdir()
             .map_err(|error| format!("cannot create embedded cmd script directory: {error}"))?;
         let script = directory.path().join("snippet.cmd");
-        std::fs::write(&script, snippet.as_bytes())
+        crate::patch::scratch::write(&script, snippet.as_bytes())
             .map_err(|error| format!("cannot write embedded cmd script: {error}"))?;
         let script = script
             .to_str()
@@ -5153,7 +5147,7 @@ fn observe_ir(
     ))
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "the arguments are a contract record; grouping them into a struct would hide which fields the caller must supply")]
 fn execute_ir_node(
     root: &Path,
     node: &crate::ir::Node,
@@ -5320,7 +5314,6 @@ fn execute_ir_node(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn ir_exec_request(
     _root: &Path,
     node: &crate::ir::Node,
@@ -6233,11 +6226,22 @@ fn ensure_retirement_directories(root: &Path) -> Result<Vec<PathBuf>, String> {
                 ));
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                if let Err(error) = std::fs::create_dir(&path) {
-                    cleanup_empty_directories(&created);
-                    return Err(format!("cannot create {}: {error}", path.display()));
+                match crate::patch::ensure_directory(&path) {
+                    Ok(crate::patch::DirectoryState::Created) => created.push(path),
+                    // A concurrent writer created it, so rollback must leave it alone.
+                    Ok(crate::patch::DirectoryState::Existing) => {}
+                    Err(crate::patch::DirectoryError::Occupied) => {
+                        cleanup_empty_directories(&created);
+                        return Err(format!(
+                            "retirement directory is not a regular directory: {}",
+                            path.display()
+                        ));
+                    }
+                    Err(crate::patch::DirectoryError::Io(error)) => {
+                        cleanup_empty_directories(&created);
+                        return Err(format!("cannot create {}: {error}", path.display()));
+                    }
                 }
-                created.push(path);
             }
             Err(error) => {
                 cleanup_empty_directories(&created);
@@ -6281,11 +6285,22 @@ fn ensure_patch_directories(
                     ));
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    if let Err(error) = std::fs::create_dir(&current) {
-                        cleanup_empty_directories(&created);
-                        return Err(format!("cannot create {}: {error}", current.display()));
+                    match crate::patch::ensure_directory(&current) {
+                        Ok(crate::patch::DirectoryState::Created) => created.push(current.clone()),
+                        // A concurrent writer created it, so rollback must leave it alone.
+                        Ok(crate::patch::DirectoryState::Existing) => {}
+                        Err(crate::patch::DirectoryError::Occupied) => {
+                            cleanup_empty_directories(&created);
+                            return Err(format!(
+                                "generator patch parent is not a regular directory: {}",
+                                current.display()
+                            ));
+                        }
+                        Err(crate::patch::DirectoryError::Io(error)) => {
+                            cleanup_empty_directories(&created);
+                            return Err(format!("cannot create {}: {error}", current.display()));
+                        }
                     }
-                    created.push(current.clone());
                 }
                 Err(error) => {
                     cleanup_empty_directories(&created);
@@ -6311,7 +6326,7 @@ fn ensure_plan_patch_directories(
 
 fn cleanup_empty_directories(paths: &[PathBuf]) {
     for path in paths.iter().rev() {
-        let _ = std::fs::remove_dir(path);
+        crate::patch::remove_empty_directory(path);
     }
 }
 
@@ -7225,6 +7240,11 @@ fn archive_executable(_metadata: &std::fs::Metadata) -> bool {
 }
 
 #[cfg(test)]
+// Tests reach for the raw APIs on purpose: they stage corrupt trees, race two
+// writers against one path, and assert on what the transactional layer does with
+// the result. Constructing those situations is precisely what the production ban
+// exists to prevent, so the ban is lifted here and nowhere else.
+#[expect(clippy::disallowed_methods, reason = "tests construct the races and corrupt trees the production ban prevents")]
 mod tests {
     use super::*;
 

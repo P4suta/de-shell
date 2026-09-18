@@ -4,6 +4,16 @@ use std::path::{Path, PathBuf};
 pub(crate) enum Expectation {
     Existing(String),
     Missing,
+    /// Content-addressed creation. The target path is derived from the digest of
+    /// the very bytes being written, so any writer that reached this path wrote
+    /// these bytes. Observing the file already present is the same write completing
+    /// twice, not a conflict. Differing content at the path means the digest no
+    /// longer addresses the content, which stays an error.
+    ///
+    /// Unlike `Missing`, this intent carries no pre-check: a caller cannot inspect
+    /// the path first and then decide, so there is no window between the decision
+    /// and the write for a racing writer to invalidate.
+    MissingOrIdentical,
 }
 
 #[derive(Clone, Debug)]
@@ -104,6 +114,147 @@ pub(crate) fn prepare_create(
         expected: Expectation::Missing,
         replacement: _replacement,
         permissions: _permissions,
+        mutation: Mutation::Write,
+    })
+}
+
+/// Remove a directory that this process created and then abandoned.
+///
+/// Used only on the rollback path, where the directories being removed are the
+/// ones [`ensure_directory`] reported as [`DirectoryState::Created`]. A directory
+/// a concurrent writer created is never passed here, and a non-empty directory is
+/// left alone rather than emptied, so a failure is not worth propagating: the
+/// caller is already unwinding a different error.
+pub(crate) fn remove_empty_directory(path: &Path) {
+    let _ = std::fs::remove_dir(path);
+}
+
+/// Operations on a scratch tree that lies outside the project.
+///
+/// Isolated generator copies, decoded snippets handed to an interpreter, and
+/// private workspace snapshots all live in a temporary directory that is deleted
+/// wholesale afterwards. They need no staging, no rollback and no digest
+/// expectation, because nothing in the project can observe them.
+///
+/// They still do not get the raw API. Naming the destination as scratch is what
+/// keeps "this is outside the project" an assertion a reader can check, rather
+/// than something inferred from how the path was built several frames up.
+pub(crate) mod scratch {
+    use std::path::Path;
+
+    /// Write `bytes` to a path inside a scratch tree.
+    pub(crate) fn write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        std::fs::write(path, bytes)
+    }
+
+    /// Copy a file into a scratch tree.
+    pub(crate) fn copy(from: &Path, to: &Path) -> std::io::Result<u64> {
+        std::fs::copy(from, to)
+    }
+
+    /// Set permissions on a path inside a scratch tree.
+    pub(crate) fn set_permissions(
+        path: &Path,
+        permissions: std::fs::Permissions,
+    ) -> std::io::Result<()> {
+        std::fs::set_permissions(path, permissions)
+    }
+
+    /// Remove a file inside a scratch tree.
+    pub(crate) fn remove_file(path: &Path) -> std::io::Result<()> {
+        std::fs::remove_file(path)
+    }
+}
+
+/// Whether [`ensure_directory`] is what brought the directory into existence.
+///
+/// Callers that roll back on a later failure must remove only what they created;
+/// deleting a directory a concurrent writer created would destroy someone else's
+/// work. Returning that distinction as a value — rather than leaving each caller
+/// to infer it from an error kind — is what makes the rollback decision checkable.
+#[must_use]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DirectoryState {
+    /// This call created the directory, so this call owns removing it.
+    Created,
+    /// The directory was already present. It is not ours to remove.
+    Existing,
+}
+
+/// Why [`ensure_directory`] could not establish a directory at the path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum DirectoryError {
+    /// Something that is not a directory (or is a symlink) occupies the path.
+    /// This is a genuine conflict, not a lost race.
+    Occupied,
+    /// The directory could not be created or inspected.
+    Io(String),
+}
+
+/// Establish a directory at `path`, tolerating a writer that got there first.
+///
+/// The postcondition callers need is "a directory exists at this path", never
+/// "this call is what created it" — and where the latter does matter, it comes
+/// back as [`DirectoryState`] instead of being recovered from an error kind.
+///
+/// `std::fs::create_dir` reports only the latter, so every call site had to decide
+/// for itself what `AlreadyExists` means, and an existence check placed *before* it
+/// merely narrows the race window rather than closing it. Here the attempt comes
+/// first and the inspection second, so no window exists between deciding and acting.
+pub(crate) fn ensure_directory(path: &Path) -> Result<DirectoryState, DirectoryError> {
+    match std::fs::create_dir(path) {
+        Ok(()) => Ok(DirectoryState::Created),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = path
+                .symlink_metadata()
+                .map_err(|error| DirectoryError::Io(error.to_string()))?;
+            if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+                return Err(DirectoryError::Occupied);
+            }
+            Ok(DirectoryState::Existing)
+        }
+        Err(error) => Err(DirectoryError::Io(error.to_string())),
+    }
+}
+
+/// Create a directory that must not already exist.
+///
+/// The counterpart to [`ensure_directory`]. Isolation boundaries — a private
+/// workspace root, a fresh snapshot tree — are only isolated because nothing was
+/// there before, so a pre-existing directory is a failure rather than a race that
+/// was lost. Making the caller name which of the two it means is the point: the
+/// raw `std::fs::create_dir` has one behaviour and two possible intents, and
+/// picking the wrong one silently is exactly how the concurrent-approval defect
+/// and six untreated `AlreadyExists` sites happened.
+pub(crate) fn create_new_directory(path: &Path) -> Result<(), DirectoryError> {
+    match std::fs::create_dir(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(DirectoryError::Occupied)
+        }
+        Err(error) => Err(DirectoryError::Io(error.to_string())),
+    }
+}
+
+/// Propose a content-addressed creation.
+///
+/// This deliberately performs no existence pre-check. `prepare_create` asks
+/// whether the target is absent *now* and then writes later, which is a
+/// time-of-check/time-of-use window: a racing writer between the two makes the
+/// proposal fail even when it wrote byte-identical content. Content-addressed
+/// writes cannot express that as a conflict, so the intent is declared instead
+/// and resolved once, inside this module.
+pub(crate) fn prepare_create_idempotent(
+    path: &Path,
+    replacement: Vec<u8>,
+    permissions: u32,
+) -> Result<Proposal, String> {
+    checked_parent_directory(path, "create target")?;
+    Ok(Proposal {
+        path: path.to_path_buf(),
+        expected: Expectation::MissingOrIdentical,
+        replacement,
+        permissions,
         mutation: Mutation::Write,
     })
 }
@@ -355,6 +506,44 @@ fn validate_proposal(proposal: &Proposal) -> Result<PathBuf, String> {
             })?;
             Ok(parent.join(name))
         }
+        Expectation::MissingOrIdentical => {
+            let parent = checked_parent_directory(&proposal.path, "create target")?;
+            match proposal.path.symlink_metadata() {
+                Ok(metadata)
+                    if metadata.file_type().is_file() && !metadata.file_type().is_symlink() =>
+                {
+                    let canonical = proposal.path.canonicalize().map_err(|error| {
+                        format!("cannot resolve {}: {error}", proposal.path.display())
+                    })?;
+                    let current = std::fs::read(&canonical)
+                        .map_err(|error| format!("cannot read {}: {error}", canonical.display()))?;
+                    if current != proposal.replacement {
+                        return Err(format!(
+                            "content-addressed target differs: {}",
+                            proposal.path.display()
+                        ));
+                    }
+                    Ok(canonical)
+                }
+                Ok(_) => Err(format!(
+                    "content-addressed target is not a regular non-symlink file: {}",
+                    proposal.path.display()
+                )),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    let parent = parent.canonicalize().map_err(|error| {
+                        format!("cannot resolve create parent {}: {error}", parent.display())
+                    })?;
+                    let name = proposal.path.file_name().ok_or_else(|| {
+                        format!("create target has no filename: {}", proposal.path.display())
+                    })?;
+                    Ok(parent.join(name))
+                }
+                Err(error) => Err(format!(
+                    "cannot inspect {}: {error}",
+                    proposal.path.display()
+                )),
+            }
+        }
     }
 }
 
@@ -380,6 +569,24 @@ fn validate_current(validated: &[Validated]) -> Result<(), String> {
                 ));
             }
             Expectation::Missing => {}
+            Expectation::MissingOrIdentical => match std::fs::read(&item.canonical) {
+                // A writer that won the race wrote these exact bytes, so the staged
+                // write remains correct and the rename below is idempotent.
+                Ok(current) if current == item.proposal.replacement => {}
+                Ok(_) => {
+                    return Err(format!(
+                        "content-addressed target differs: {}",
+                        item.canonical.display()
+                    ));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "cannot re-read {}: {error}",
+                        item.canonical.display()
+                    ));
+                }
+            },
         }
     }
     Ok(())
@@ -509,6 +716,11 @@ fn set_permissions(path: &Path, mode: u32) -> Result<(), String> {
 }
 
 #[cfg(test)]
+// Tests reach for the raw APIs on purpose: they stage corrupt trees, race two
+// writers against one path, and assert on what the transactional layer does with
+// the result. Constructing those situations is precisely what the production ban
+// exists to prevent, so the ban is lifted here and nowhere else.
+#[expect(clippy::disallowed_methods, reason = "tests construct the races and corrupt trees the production ban prevents")]
 mod tests {
     use super::*;
     use std::fs;
@@ -880,5 +1092,40 @@ mod tests {
             assert!(sync_parent(Path::new("/")).is_err());
             assert!(set_permissions(&temporary.path().join("absent"), 0o600).is_err());
         }
+    }
+
+    #[test]
+    fn identical_concurrent_creation_is_not_a_conflict() {
+        // A content-addressed path is derived from the digest of its own bytes, so a
+        // racing writer that produced the same path necessarily produced the same
+        // bytes. Losing that race is not a conflict; it is the same write completing
+        // twice. Callers must not have to re-check or retry to discover that.
+        let temporary = tempfile::tempdir().unwrap();
+        let target = temporary.path().join("a61b1897.json");
+        let bytes = b"{\n  \"schema_version\": 1\n}\n".to_vec();
+
+        let create = prepare_create_idempotent(&target, bytes.clone(), 0o644).unwrap();
+        fs::write(&target, &bytes).unwrap();
+
+        apply_all(&[create]).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), bytes);
+    }
+
+    #[test]
+    fn differing_concurrent_creation_is_still_a_conflict() {
+        // Same path, different bytes, means the digest no longer addresses the
+        // content. That must stay an error even under the idempotent intent.
+        let temporary = tempfile::tempdir().unwrap();
+        let target = temporary.path().join("a61b1897.json");
+
+        let create = prepare_create_idempotent(&target, b"expected".to_vec(), 0o644).unwrap();
+        fs::write(&target, b"different").unwrap();
+
+        assert!(
+            apply_all(&[create])
+                .unwrap_err()
+                .contains("content-addressed target")
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"different");
     }
 }

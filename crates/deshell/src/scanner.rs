@@ -1963,6 +1963,11 @@ fn kind_order(kind: &FindingKind) -> u8 {
 }
 
 #[cfg(test)]
+// Tests reach for the raw APIs on purpose: they stage corrupt trees, race two
+// writers against one path, and assert on what the transactional layer does with
+// the result. Constructing those situations is precisely what the production ban
+// exists to prevent, so the ban is lifted here and nowhere else.
+#[expect(clippy::disallowed_methods, reason = "tests construct the races and corrupt trees the production ban prevents")]
 mod tests {
     use super::*;
     use std::fs;

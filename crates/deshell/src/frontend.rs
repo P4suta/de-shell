@@ -933,7 +933,7 @@ fn validate_nushell_syntax(path: &str, source: &str) -> Result<(), String> {
         ));
     }
     let source_path = directory.path().join("source.nu");
-    std::fs::write(&source_path, source)
+    crate::patch::scratch::write(&source_path, source.as_bytes())
         .map_err(|error| format!("runtime unavailable for {path}: {error}"))?;
     let parsed = execute_parser_process(
         directory.path(),
@@ -1038,7 +1038,7 @@ fn validate_powershell_syntax(path: &str, source: &str) -> Result<(), String> {
         .tempdir()
         .map_err(|error| format!("runtime unavailable for {path}: {error}"))?;
     let adapter = directory.path().join("adapter.ps1");
-    std::fs::write(
+    crate::patch::scratch::write(
         &adapter,
         include_bytes!("../../../adapters/powershell/adapter.ps1"),
     )

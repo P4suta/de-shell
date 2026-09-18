@@ -1,4 +1,4 @@
-#![cfg_attr(not(test), allow(dead_code))]
+#![cfg_attr(not(test), expect(dead_code, reason = "reachable only from the test-only differential harness; kept compiled in release so the two paths cannot drift"))]
 
 use crate::config::Scenario;
 use crate::evidence::Evidence;
@@ -6,7 +6,6 @@ use crate::ir::Plan;
 use crate::runner::{Backend, Policy, RunResult};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(dead_code)]
 pub(crate) enum ProviderFailureKind {
     Unavailable,
     Failed,

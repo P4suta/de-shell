@@ -1342,8 +1342,22 @@ fn ensure_directory(path: &Path) -> Result<(), String> {
             "path is not a regular directory: {}",
             path.display()
         )),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir(path)
-            .map_err(|error| format!("cannot create directory {}: {error}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match crate::patch::ensure_directory(path) {
+                Ok(
+                    crate::patch::DirectoryState::Created
+                    | crate::patch::DirectoryState::Existing,
+                ) => Ok(()),
+                Err(crate::patch::DirectoryError::Occupied) => Err(format!(
+                    "path is not a regular directory: {}",
+                    path.display()
+                )),
+                Err(crate::patch::DirectoryError::Io(error)) => Err(format!(
+                    "cannot create directory {}: {error}",
+                    path.display()
+                )),
+            }
+        }
         Err(error) => Err(format!(
             "cannot inspect directory {}: {error}",
             path.display()
@@ -1611,6 +1625,11 @@ fn prepare_write(path: &Path, contents: Vec<u8>) -> Result<crate::patch::Proposa
 }
 
 #[cfg(test)]
+// Tests reach for the raw APIs on purpose: they stage corrupt trees, race two
+// writers against one path, and assert on what the transactional layer does with
+// the result. Constructing those situations is precisely what the production ban
+// exists to prevent, so the ban is lifted here and nowhere else.
+#[expect(clippy::disallowed_methods, reason = "tests construct the races and corrupt trees the production ban prevents")]
 mod tests {
     use super::*;
 

@@ -1,3 +1,8 @@
+#![expect(
+    clippy::disallowed_methods,
+    reason = "xtask is the repository's own build and conformance tooling. It works in build outputs and temporary corpora, never in a project `de-shell` is migrating, so the transactional layer in `deshell::patch` — staging, rollback, digest expectations — has nothing to protect here. Until this crate inherited the workspace lints it was never checked at all."
+)]
+
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Instant;

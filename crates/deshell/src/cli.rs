@@ -2672,7 +2672,6 @@ fn disposable_provider(lock: &crate::config::Lockfile) -> Result<crate::lab::Pro
     Ok(provider)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_disposable(
     root: &Path,
     entrypoint: &str,
@@ -3466,9 +3465,24 @@ fn safe_output_path(root: &Path, output: &Path) -> Result<PathBuf, Failure> {
                 )));
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                std::fs::create_dir(&current).map_err(|error| {
-                    Failure::io(format!("cannot create {}: {error}", current.display()))
-                })?;
+                match crate::patch::ensure_directory(&current) {
+                    Ok(
+                        crate::patch::DirectoryState::Created
+                        | crate::patch::DirectoryState::Existing,
+                    ) => {}
+                    Err(crate::patch::DirectoryError::Occupied) => {
+                        return Err(Failure::policy(format!(
+                            "export output parent is not a regular directory: {}",
+                            current.display()
+                        )));
+                    }
+                    Err(crate::patch::DirectoryError::Io(error)) => {
+                        return Err(Failure::io(format!(
+                            "cannot create {}: {error}",
+                            current.display()
+                        )));
+                    }
+                }
             }
             Err(error) => {
                 return Err(Failure::io(format!(
@@ -4307,6 +4321,11 @@ fn writeln_io(writer: &mut dyn Write, arguments: std::fmt::Arguments<'_>) -> Res
 }
 
 #[cfg(test)]
+// Tests reach for the raw APIs on purpose: they stage corrupt trees, race two
+// writers against one path, and assert on what the transactional layer does with
+// the result. Constructing those situations is precisely what the production ban
+// exists to prevent, so the ban is lifted here and nowhere else.
+#[expect(clippy::disallowed_methods, reason = "tests construct the races and corrupt trees the production ban prevents")]
 mod tests {
     use super::*;
     use crate::config::ProjectConfig;

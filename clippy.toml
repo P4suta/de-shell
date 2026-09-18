@@ -1,0 +1,104 @@
+# Mechanical enforcement of the invariants de-shell sells.
+
+# --- Thresholds and test relaxations, adopted from the njutest configuration ---
+
+msrv = "1.98.0"
+
+# Tests may unwrap/expect/panic; production code stays strict. This is clippy's
+# own mechanism for the distinction, so it does not need an `#[allow]` per module.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+
+# Complexity thresholds — tighter than clippy's defaults.
+# A function reaching a fifth argument is carrying a record, and a record should
+# be a type. Making it one is not bookkeeping: an argument list admits no
+# exhaustive destructuring, so a parameter added later is invisible to every
+# caller that already compiles, while a struct can be taken apart field by field
+# in a test that fails to compile until somebody accounts for the new one.
+too-many-arguments-threshold = 4
+cognitive-complexity-threshold = 18
+type-complexity-threshold = 250
+max-fn-params-bools = 1
+enum-variant-size-threshold = 256
+
+# Pre-1.0: the CLI, generated files, JSON Schemas and JSON-RPC v1 are the stable
+# surface. The Rust modules are private and explicitly unstable.
+avoid-breaking-exported-api = false
+
+pass-by-value-size-limit = 128
+
+doc-valid-idents = [
+  "..",
+  "GitHub",
+  "UTF-8",
+  "UTF-16",
+  "SARIF",
+  "JSON",
+  "JSONC",
+  "TOML",
+  "YAML",
+  "OCaml",
+  "PowerShell",
+  "Nushell",
+  "POSIX",
+  "CycloneDX",
+  "RFC8785",
+  "Podman",
+  "Sigstore",
+]
+
+disallowed-types = [
+  { path = "once_cell::sync::Lazy", reason = "use std::sync::LazyLock" },
+  { path = "once_cell::sync::OnceCell", reason = "use std::sync::OnceLock" },
+]
+
+#
+# Every entry here replaced a rule that was previously kept by review. The
+# concurrent-approval defect (a time-of-check/time-of-use window between an
+# existence check and a create) and six untreated `AlreadyExists` sites all
+# passed review; none of them would have passed this file.
+#
+# `crates/deshell/src/patch.rs` is the one module allowed to call these directly.
+# It is the transactional layer these intents are expressed in terms of, so the
+# allow lives on its `mod` declaration in `main.rs` rather than being scattered.
+
+disallowed-methods = [
+  # --- Filesystem mutation ------------------------------------------------
+  # These must go through `patch::`, which stages to a temporary file, revalidates
+  # the whole read set, and commits by rename. A direct call skips the
+  # transaction, the rollback, and the digest expectations.
+  { path = "std::fs::write", reason = "stage the change through `patch::prepare*` + `patch::apply_all` so it is atomic and rollback-covered" },
+  { path = "std::fs::rename", reason = "`patch::apply_all` owns commit ordering and rollback; a bare rename cannot participate" },
+  { path = "std::fs::copy", reason = "route through `patch::` so the write is staged, digest-checked and reversible" },
+  { path = "std::fs::remove_file", reason = "use `patch::prepare_delete` so the removal is expectation-checked and reversible" },
+  { path = "std::fs::remove_dir", reason = "removals belong to the transactional layer in `patch::`" },
+  { path = "std::fs::remove_dir_all", reason = "recursive removal is never proposed by de-shell; express the intent in `patch::` if it ever is" },
+  { path = "std::fs::set_permissions", reason = "permissions are part of a staged proposal in `patch::`, applied before the commit rename" },
+
+  # Directory creation has one behaviour and two possible intents. Naming the
+  # intent is the point: `ensure_directory` (idempotent, tolerates a racing
+  # creator) versus `create_new_directory` (exclusive, a pre-existing directory
+  # is a real conflict). Picking wrong silently is how six sites went untreated.
+  { path = "std::fs::create_dir", reason = "say which intent you mean: `patch::ensure_directory` (idempotent) or `patch::create_new_directory` (exclusive)" },
+  { path = "std::fs::create_dir_all", reason = "de-shell creates each component deliberately so it can roll back exactly what it created; use `patch::ensure_directory` per component" },
+
+  # --- Determinism --------------------------------------------------------
+  # `SystemTime::now`, `Instant::now`, `env::var` and `env::vars` belong here too:
+  # de-shell claims deterministic output and canonical digest bytes, and an
+  # unmediated reading of the clock or the ambient environment makes that claim
+  # untestable. They are deliberately NOT banned yet, because there is no injected
+  # `HostEnvironment` for callers to reach for instead.
+  #
+  # Banning an API before its replacement exists does not remove the calls; it
+  # converts each one into an `#[allow]` that nobody ever revisits. The filesystem
+  # entries above were only enforceable in one pass because `patch::` already named
+  # every intent they redirect to. The five remaining call sites are tracked in
+  # ROADMAP.md and the ban lands with the type, not before it.
+  { path = "std::env::set_var", reason = "races with other threads and mutates ambient state a later read cannot distinguish from configuration" },
+  { path = "std::env::remove_var", reason = "see std::env::set_var" },
+
+  # --- Process and memory ---
+  { path = "std::mem::forget", reason = "leaks destructors; a leaked temporary file or lock outlives the transaction that owns it" },
+  { path = "std::process::exit", reason = "bypasses destructors, so a staged temporary or rollback backup can be left behind; return an exit code instead" },
+]

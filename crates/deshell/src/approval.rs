@@ -274,47 +274,12 @@ fn persist_approval(
     let sha256 = ensure_child_directory(&approvals, "sha256")?;
     let path = sha256.join(format!("{raw_digest}.json"));
     let bytes = pretty_bytes(&approval)?;
-    match path.symlink_metadata() {
-        Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {
-            let current = std::fs::read(&path)
-                .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-            if current != bytes {
-                return Err(format!(
-                    "content-addressed approval differs at {}",
-                    path.display()
-                ));
-            }
-        }
-        Ok(_) => {
-            return Err(format!(
-                "approval target is not a regular file: {}",
-                path.display()
-            ));
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let proposal = crate::patch::prepare_create(&path, bytes, 0o644)?;
-            if let Err(error) = crate::patch::apply_all(&[proposal]) {
-                let mut matched_concurrent_write = false;
-                for _ in 0..32 {
-                    match std::fs::read(&path) {
-                        Ok(current) if current == pretty_bytes(&approval)? => {
-                            matched_concurrent_write = true;
-                            break;
-                        }
-                        Ok(_) => break,
-                        Err(read_error) if read_error.kind() == std::io::ErrorKind::NotFound => {
-                            std::thread::yield_now();
-                        }
-                        Err(_) => break,
-                    }
-                }
-                if !matched_concurrent_write {
-                    return Err(error);
-                }
-            }
-        }
-        Err(error) => return Err(format!("cannot inspect {}: {error}", path.display())),
-    }
+    // The path is `<approval digest>.json`, so any writer that reached it wrote
+    // these same bytes. Declaring that intent lets the patch layer settle the race
+    // once; this function cannot re-check the path and therefore cannot reintroduce
+    // the time-of-check/time-of-use window that made concurrent approval fail.
+    let proposal = crate::patch::prepare_create_idempotent(&path, bytes, 0o644)?;
+    crate::patch::apply_all(&[proposal])?;
     Ok(approval)
 }
 
@@ -485,21 +450,16 @@ fn safe_existing_directory(path: &Path) -> Result<PathBuf, String> {
 
 fn ensure_child_directory(parent: &Path, name: &str) -> Result<PathBuf, String> {
     let path = parent.join(name);
-    match path.symlink_metadata() {
-        Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
+    match crate::patch::ensure_directory(&path) {
+        Ok(crate::patch::DirectoryState::Created | crate::patch::DirectoryState::Existing) => {
             Ok(path)
         }
-        Ok(_) => Err(format!("path is not a safe directory: {}", path.display())),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            match std::fs::create_dir(&path) {
-                Ok(()) => Ok(path),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    safe_existing_directory(&path)
-                }
-                Err(error) => Err(format!("cannot create {}: {error}", path.display())),
-            }
+        Err(crate::patch::DirectoryError::Occupied) => {
+            Err(format!("path is not a safe directory: {}", path.display()))
         }
-        Err(error) => Err(format!("cannot inspect {}: {error}", path.display())),
+        Err(crate::patch::DirectoryError::Io(error)) => {
+            Err(format!("cannot create {}: {error}", path.display()))
+        }
     }
 }
 
@@ -512,6 +472,11 @@ fn portable_id(value: &str) -> bool {
 }
 
 #[cfg(test)]
+// Tests reach for the raw APIs on purpose: they stage corrupt trees, race two
+// writers against one path, and assert on what the transactional layer does with
+// the result. Constructing those situations is precisely what the production ban
+// exists to prevent, so the ban is lifted here and nowhere else.
+#[expect(clippy::disallowed_methods, reason = "tests construct the races and corrupt trees the production ban prevents")]
 mod tests {
     use super::*;
 
@@ -588,31 +553,47 @@ mod tests {
 
     #[test]
     fn identical_parallel_approval_updates_are_idempotent() {
-        let directory = initialized_project();
-        let review = scenario_reviews(directory.path()).unwrap().remove(0);
-        let root = directory.path().to_path_buf();
-        let handles = (0..8)
-            .map(|_| {
-                let root = root.clone();
-                let name = review.name.clone();
-                let digest = review.digest.clone();
-                std::thread::spawn(move || approve_scenario(&root, &name, &digest))
-            })
-            .collect::<Vec<_>>();
-        let approvals = handles
-            .into_iter()
-            .map(|handle| handle.join().unwrap().unwrap())
-            .collect::<Vec<_>>();
-        assert!(
-            approvals
-                .windows(2)
-                .all(|pair| pair[0].approval_digest == pair[1].approval_digest)
-        );
-        assert_eq!(
-            std::fs::read_dir(root.join(".deshell/approvals/sha256"))
-                .unwrap()
-                .count(),
-            1
-        );
+        // Approving the same review from several workers must converge on one
+        // immutable file. The threads are released from a barrier so they contend
+        // for the same instant rather than drifting apart, and several rounds run
+        // so a pass is evidence rather than luck: the defect this covers survived
+        // because the suite ran under `--test-threads=1`, where the racing writer
+        // never existed.
+        const WORKERS: usize = 64;
+        const ROUNDS: usize = 8;
+
+        for _ in 0..ROUNDS {
+            let directory = initialized_project();
+            let review = scenario_reviews(directory.path()).unwrap().remove(0);
+            let root = directory.path().to_path_buf();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(WORKERS));
+            let handles = (0..WORKERS)
+                .map(|_| {
+                    let root = root.clone();
+                    let name = review.name.clone();
+                    let digest = review.digest.clone();
+                    let barrier = std::sync::Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        approve_scenario(&root, &name, &digest)
+                    })
+                })
+                .collect::<Vec<_>>();
+            let approvals = handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap().unwrap())
+                .collect::<Vec<_>>();
+            assert!(
+                approvals
+                    .windows(2)
+                    .all(|pair| pair[0].approval_digest == pair[1].approval_digest)
+            );
+            assert_eq!(
+                std::fs::read_dir(root.join(".deshell/approvals/sha256"))
+                    .unwrap()
+                    .count(),
+                1
+            );
+        }
     }
 }

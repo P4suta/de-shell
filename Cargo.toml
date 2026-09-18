@@ -2,6 +2,26 @@
 members = ["xtask"]
 resolver = "3"
 
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage)", "cfg(deshell_sanitizer_address)", "cfg(deshell_sanitizer_undefined)"] }
+
+[workspace.lints.clippy]
+# The raw APIs listed in clippy.toml are unavailable outside the module that
+# implements the intent they belong to. See clippy.toml for the reasoning.
+disallowed_methods = "deny"
+disallowed_types = "deny"
+
+# An `#[allow]` must say why. The exemptions this crate carries are narrow — the
+# transactional layer, and test modules that construct the very situations the
+# production ban exists to prevent — and both are only reviewable if the reason
+# travels with the attribute.
+allow_attributes_without_reason = "deny"
+
+# `#[allow]` itself is banned in favour of `#[expect]`. An `expect` that stops
+# being necessary warns, so a suppression cannot outlive the thing it suppressed;
+# an `allow` goes quiet forever and is how a ban rots into decoration.
+allow_attributes = "deny"
+
 [package]
 name = "deshell"
 description = "Shell retirement migration oracle with independent equivalence evidence"
@@ -68,8 +88,8 @@ walkdir.workspace = true
 [target.'cfg(windows)'.dependencies]
 find-msvc-tools.workspace = true
 
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage)", "cfg(deshell_sanitizer_address)", "cfg(deshell_sanitizer_undefined)"] }
+[lints]
+workspace = true
 
 [profile.release]
 lto = "thin"

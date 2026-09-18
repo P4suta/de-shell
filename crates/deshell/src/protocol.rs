@@ -155,7 +155,6 @@ pub(crate) fn serve_stdio(kind: AgentKind, output: &mut dyn Write) -> Result<i32
     serve(kind, &mut stdin.lock(), output)
 }
 
-#[allow(dead_code)]
 pub(crate) fn decode_response(
     input: &[u8],
     expected_id: &serde_json::Value,
@@ -934,6 +933,11 @@ fn read_frame(input: &mut dyn BufRead) -> Result<Option<Frame>, String> {
 }
 
 #[cfg(test)]
+// Tests reach for the raw APIs on purpose: they stage corrupt trees, race two
+// writers against one path, and assert on what the transactional layer does with
+// the result. Constructing those situations is precisely what the production ban
+// exists to prevent, so the ban is lifted here and nowhere else.
+#[expect(clippy::disallowed_methods, reason = "tests construct the races and corrupt trees the production ban prevents")]
 mod tests {
     use super::*;
 

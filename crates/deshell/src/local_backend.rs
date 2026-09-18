@@ -276,19 +276,13 @@ impl Backend for LocalBackend {
             ));
         }
         let directory = self.root.join(".deshell/runtime");
-        match directory.symlink_metadata() {
-            Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
+        match crate::patch::ensure_directory(&directory) {
+            Ok(crate::patch::DirectoryState::Created | crate::patch::DirectoryState::Existing) => {}
+            Err(crate::patch::DirectoryError::Occupied) => {
+                return Err("delegation runtime path is not a regular directory".into());
             }
-            Ok(_) => return Err("delegation runtime path is not a regular directory".into()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                std::fs::create_dir(&directory).map_err(|error| {
-                    format!("cannot create delegation runtime directory: {error}")
-                })?;
-            }
-            Err(error) => {
-                return Err(format!(
-                    "cannot inspect delegation runtime directory: {error}"
-                ));
+            Err(crate::patch::DirectoryError::Io(error)) => {
+                return Err(format!("cannot create delegation runtime directory: {error}"));
             }
         }
         let suffix = match interpreter.as_str() {
@@ -400,7 +394,7 @@ impl Backend for LocalBackend {
 
     fn remove_file(&self, path: &str) -> Result<(), String> {
         let path = self.resolve_existing(path, false)?;
-        std::fs::remove_file(&path)
+        crate::patch::scratch::remove_file(&path)
             .map_err(|error| format!("cannot remove {}: {error}", path.display()))
     }
 
@@ -423,6 +417,11 @@ fn validate_path(path: &str) -> Result<(), String> {
 }
 
 #[cfg(test)]
+// Tests reach for the raw APIs on purpose: they stage corrupt trees, race two
+// writers against one path, and assert on what the transactional layer does with
+// the result. Constructing those situations is precisely what the production ban
+// exists to prevent, so the ban is lifted here and nowhere else.
+#[expect(clippy::disallowed_methods, reason = "tests construct the races and corrupt trees the production ban prevents")]
 mod tests {
     use super::*;
     use std::fs;

@@ -426,7 +426,7 @@ fn cmd_comment_ranges(source: &str) -> Vec<(usize, usize)> {
     ranges
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "the arguments are a contract record; grouping them into a struct would hide which fields the caller must supply")]
 fn make_finding(
     rule_id: &str,
     category: Category,
@@ -574,6 +574,11 @@ fn civil_from_days(days_since_epoch: i64) -> (i64, u32, u32) {
 }
 
 #[cfg(test)]
+// Tests reach for the raw APIs on purpose: they stage corrupt trees, race two
+// writers against one path, and assert on what the transactional layer does with
+// the result. Constructing those situations is precisely what the production ban
+// exists to prevent, so the ban is lifted here and nowhere else.
+#[expect(clippy::disallowed_methods, reason = "tests construct the races and corrupt trees the production ban prevents")]
 mod tests {
     use super::*;
     use crate::scanner::{
