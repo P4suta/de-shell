@@ -163,13 +163,13 @@ pub(crate) fn run_plan_with_io(
         script_arguments: inputs.arguments,
         default_working_directory: inputs.default_working_directory,
     };
-    executor.run_task(
-        &plan.entrypoint,
-        inputs.named_inputs,
-        inputs.arguments,
-        inputs.stdin.to_vec(),
-        &[],
-    )
+    executor.run_task(RunTaskArgs {
+            name: &plan.entrypoint,
+            provided: inputs.named_inputs,
+            positional: inputs.arguments,
+            stdin: inputs.stdin.to_vec(),
+            stack: &[],
+        })
 }
 
 #[derive(Clone)]
@@ -190,15 +190,56 @@ struct Executor<'a> {
     default_working_directory: Option<&'a str>,
 }
 
+/// The inputs of [`run_parallel`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`run_parallel`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct RunParallelArgs<'a> {
+    nodes: &'a [Node],
+    context: Context,
+    stdin: Vec<u8>,
+    stack: &'a [String],
+}
+
+/// The inputs of [`run_node`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`run_node`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct RunNodeArgs<'a> {
+    node: &'a Node,
+    context: Context,
+    stdin: Vec<u8>,
+    stack: &'a [String],
+}
+
+/// The inputs of [`run_task`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`run_task`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct RunTaskArgs<'a> {
+    name: &'a str,
+    provided: &'a BTreeMap<String, String>,
+    positional: &'a [String],
+    stdin: Vec<u8>,
+    stack: &'a [String],
+}
+
 impl Executor<'_> {
-    fn run_task(
-        &self,
-        name: &str,
-        provided: &BTreeMap<String, String>,
-        positional: &[String],
-        stdin: Vec<u8>,
-        stack: &[String],
-    ) -> Result<RunResult, RunError> {
+    fn run_task(&self, parts: RunTaskArgs<'_>) -> Result<RunResult, RunError> {
+        // Destructured without `..`: see `RunTaskArgs`.
+        let RunTaskArgs {
+            name,
+            provided,
+            positional,
+            stdin,
+            stack,
+        } = parts;
         if stack.iter().any(|item| item == name) {
             return Err(invalid(format!(
                 "recursive task call detected: {} -> {name}",
@@ -261,17 +302,23 @@ impl Executor<'_> {
         };
         let mut next_stack = stack.to_vec();
         next_stack.push(name.to_owned());
-        self.run_node(&task.body, context, stdin, &next_stack)
+        self.run_node(RunNodeArgs {
+                node: &task.body,
+                context: context,
+                stdin: stdin,
+                stack: &next_stack,
+            })
             .map(|(result, _)| result)
     }
 
-    fn run_node(
-        &self,
-        node: &Node,
-        context: Context,
-        stdin: Vec<u8>,
-        stack: &[String],
-    ) -> Result<(RunResult, Context), RunError> {
+    fn run_node(&self, parts: RunNodeArgs<'_>) -> Result<(RunResult, Context), RunError> {
+        // Destructured without `..`: see `RunNodeArgs`.
+        let RunNodeArgs {
+            node,
+            context,
+            stdin,
+            stack,
+        } = parts;
         match &node.operation {
             Operation::Exec {
                 argv,
@@ -419,7 +466,12 @@ impl Executor<'_> {
                 let mut exit_code = 0;
                 let mut stdout = Vec::new();
                 for child in nodes {
-                    let (result, _) = self.run_node(child, context.clone(), input, stack)?;
+                    let (result, _) = self.run_node(RunNodeArgs {
+                            node: child,
+                            context: context.clone(),
+                            stdin: input,
+                            stack: stack,
+                        })?;
                     input = result.stdout.clone();
                     stdout = result.stdout;
                     stderr.extend(result.stderr);
@@ -448,21 +500,36 @@ impl Executor<'_> {
                 let mut input = stdin;
                 for child in nodes {
                     let (result, child_context) =
-                        self.run_node(child, next_context, input, stack)?;
+                        self.run_node(RunNodeArgs {
+                                node: child,
+                                context: next_context,
+                                stdin: input,
+                                stack: stack,
+                            })?;
                     aggregate = combine(aggregate, result);
                     next_context = child_context;
                     input = Vec::new();
                 }
                 Ok((aggregate, next_context))
             }
-            Operation::Parallel { nodes } => self.run_parallel(nodes, context, stdin, stack),
+            Operation::Parallel { nodes } => self.run_parallel(RunParallelArgs {
+                    nodes: nodes,
+                    context: context,
+                    stdin: stdin,
+                    stack: stack,
+                }),
             Operation::Condition {
                 predicate,
                 if_true,
                 if_false,
             } => {
                 let (condition, predicate_context) =
-                    self.run_node(predicate, context, stdin, stack)?;
+                    self.run_node(RunNodeArgs {
+                            node: predicate,
+                            context: context,
+                            stdin: stdin,
+                            stack: stack,
+                        })?;
                 let branch = if condition.exit_code == 0 {
                     Some(if_true.as_ref())
                 } else {
@@ -470,7 +537,12 @@ impl Executor<'_> {
                 };
                 if let Some(branch) = branch {
                     let (result, branch_context) =
-                        self.run_node(branch, predicate_context, Vec::new(), stack)?;
+                        self.run_node(RunNodeArgs {
+                                node: branch,
+                                context: predicate_context,
+                                stdin: Vec::new(),
+                                stack: stack,
+                            })?;
                     Ok((combine(condition, result), branch_context))
                 } else {
                     Ok((condition, predicate_context))
@@ -490,7 +562,12 @@ impl Executor<'_> {
                     }
                 }
                 if let Some(branch) = selected.or(default.as_deref()) {
-                    self.run_node(branch, context, stdin, stack)
+                    self.run_node(RunNodeArgs {
+                            node: branch,
+                            context: context,
+                            stdin: stdin,
+                            stack: stack,
+                        })
                 } else {
                     Ok((RunResult::empty(), context))
                 }
@@ -507,7 +584,12 @@ impl Executor<'_> {
                 for value in values {
                     next_context.variables.insert(variable.clone(), value);
                     let (result, child_context) =
-                        self.run_node(body, next_context, stdin.clone(), stack)?;
+                        self.run_node(RunNodeArgs {
+                                node: body,
+                                context: next_context,
+                                stdin: stdin.clone(),
+                                stack: stack,
+                            })?;
                     aggregate = combine(aggregate, result);
                     next_context = child_context;
                 }
@@ -522,8 +604,18 @@ impl Executor<'_> {
                 Ok((aggregate, next_context))
             }
             Operation::TryFinally { body, finalizer } => {
-                match self.run_node(body, context.clone(), stdin, stack) {
-                    Err(body_error) => match self.run_node(finalizer, context, Vec::new(), stack) {
+                match self.run_node(RunNodeArgs {
+                        node: body,
+                        context: context.clone(),
+                        stdin: stdin,
+                        stack: stack,
+                    }) {
+                    Err(body_error) => match self.run_node(RunNodeArgs {
+                            node: finalizer,
+                            context: context,
+                            stdin: Vec::new(),
+                            stack: stack,
+                        }) {
                         Ok(_) => Err(body_error),
                         Err(finalizer_error) => Err(RunError {
                             kind: body_error.kind,
@@ -535,7 +627,12 @@ impl Executor<'_> {
                     },
                     Ok((body_result, body_context)) => {
                         let (finalizer_result, finalizer_context) =
-                            self.run_node(finalizer, body_context, Vec::new(), stack)?;
+                            self.run_node(RunNodeArgs {
+                                    node: finalizer,
+                                    context: body_context,
+                                    stdin: Vec::new(),
+                                    stack: stack,
+                                })?;
                         let exit_code = if finalizer_result.exit_code != 0 {
                             finalizer_result.exit_code
                         } else {
@@ -549,7 +646,13 @@ impl Executor<'_> {
             }
             Operation::TaskCall { task, arguments } => {
                 let provided = evaluate_named(arguments, &context)?;
-                let result = self.run_task(task, &provided, &[], Vec::new(), stack)?;
+                let result = self.run_task(RunTaskArgs {
+                        name: task,
+                        provided: &provided,
+                        positional: &[],
+                        stdin: Vec::new(),
+                        stack: stack,
+                    })?;
                 Ok((result, context))
             }
             Operation::SetVariable {
@@ -578,7 +681,12 @@ impl Executor<'_> {
                 value_type,
                 body,
             } => {
-                let (mut captured, _) = self.run_node(body, context.clone(), stdin, stack)?;
+                let (mut captured, _) = self.run_node(RunNodeArgs {
+                        node: body,
+                        context: context.clone(),
+                        stdin: stdin,
+                        stack: stack,
+                    })?;
                 while captured.stdout.last() == Some(&b'\n') {
                     captured.stdout.pop();
                 }
@@ -751,13 +859,14 @@ impl Executor<'_> {
         }
     }
 
-    fn run_parallel(
-        &self,
-        nodes: &[Node],
-        context: Context,
-        stdin: Vec<u8>,
-        stack: &[String],
-    ) -> Result<(RunResult, Context), RunError> {
+    fn run_parallel(&self, parts: RunParallelArgs<'_>) -> Result<(RunResult, Context), RunError> {
+        // Destructured without `..`: see `RunParallelArgs`.
+        let RunParallelArgs {
+            nodes,
+            context,
+            stdin,
+            stack,
+        } = parts;
         if nodes.is_empty() {
             return Ok((RunResult::empty(), context));
         }
@@ -781,7 +890,12 @@ impl Executor<'_> {
                         let index = next.fetch_add(1, Ordering::Relaxed);
                         let Some(node) = nodes.get(index) else { break };
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            self.run_node(node, context.clone(), stdin.clone(), stack)
+                            self.run_node(RunNodeArgs {
+                                    node: node,
+                                    context: context.clone(),
+                                    stdin: stdin.clone(),
+                                    stack: stack,
+                                })
                         }))
                         .unwrap_or_else(|_| Err(execution("parallel worker panicked")));
                         let Ok(mut output) = results.lock() else {
