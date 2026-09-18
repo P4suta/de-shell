@@ -286,6 +286,53 @@ blocker DESHELL_BLOCKER_UNIMPLEMENTED_SEMANTIC action.yml@3963..6698:
   contained no `set` at all, which is why none of this surfaced until the tool
   was pointed at a repository that was not its own.
 
+## A coverage number that improved when the tool got a fact wrong
+
+Measured on OComment's `action.yml`, one file, five `run:` blocks, against
+three builds of de-shell:
+
+| de-shell | blocks still delegated |
+| --- | --- |
+| `b0e74d7` — `case` arms lower | 4 |
+| `3108e8d` — an arm is a list of statements | 5 |
+| `265fe32` — `case` patterns match | 5 |
+
+The middle row is the fix for an arm whose body was several statements being
+joined into a single command. Under `b0e74d7` the block containing
+
+```sh
+*)
+  echo "::error::OComment failed with exit code ${EXIT_CODE:-2}; ..."
+  exit "${EXIT_CODE:-2}"
+  ;;
+```
+
+lowered, because the two statements became one `Exec` whose argv was the words
+of both — and that one command lowered without complaint. Fixing it put the
+`exit` back where it belongs, the dynamic status is refused, and the block is
+delegated again.
+
+So the number went up when the tool started telling the truth. Anyone reading
+"four blocks left" as progress over "five blocks left" would have been reading
+a defect. A migration oracle's own coverage figure is not a score: it moves for
+two unrelated reasons, and only one of them is work getting done.
+
+Three things follow, and they are open:
+
+- [ ] Report coverage beside the count of guarantees each block rests on, so a
+  block that got shorter because a claim got weaker does not read as a block
+  that got closer.
+- [ ] Give `deshell migrate plan` a way to say *why* a count changed between two
+  runs against the same file — which blocks moved, and in which direction.
+- [ ] Decide what to do with a status that is native over a domain. `exit 2` is
+  modelled and `exit "${EXIT_CODE:-2}"` is refused, and the only difference is
+  whether the value can be read at lowering time. The shells agree on every
+  numeric status and disagree only outside that domain — bash exits 255 with a
+  message naming its own path, zsh exits 0 in silence — so the claim that wants
+  making is "native where the status is a number, and nothing outside it". The
+  guarantee vocabulary has no way to say that, which is why the whole block is
+  delegated for a case that never arises in the script that wrote it.
+
 ## After 0.1.0
 
 - Keep the unpublished OCaml reference aligned for deterministic IR, analysis,
