@@ -266,13 +266,14 @@ blocker DESHELL_BLOCKER_UNIMPLEMENTED_SEMANTIC action.yml@3963..6698:
                                                      emit it
   ```
 
-  The substitution case is a different kind of gap from the rest. `x=$(cmd)`
-  lowers to `CaptureStdout` now — the assignment parser was rejecting it only
-  because its right-hand side contains spaces — but no generator emits it, and
-  neither does any generator emit `SetVariable`. **The generated programs have no
-  notion of a shell-local variable at all**: an expansion becomes
-  `std::env::var(...)`, so a name the script assigns to itself has nowhere to
-  live. That is the work, and it is larger than the substitution.
+  The substitution case is done. The generated Rust now carries a map of
+  shell-local names, an expansion consults it before the environment the way the
+  shell resolves a name, and both `SetVariable` and `CaptureStdout` emit into it.
+  The map and its lookup helper are emitted together: one without the other is a
+  program that does not compile.
+
+  The Go generator still refuses both, so a script that assigns to a name is
+  Rust-only for now.
 
   `[` was the one that gated the most and is done: its string operators are
   modelled, measured against the builtin and the external utility, and recorded
