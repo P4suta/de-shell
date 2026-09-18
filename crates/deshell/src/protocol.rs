@@ -12,6 +12,17 @@ pub(crate) enum AgentKind {
     Generator,
 }
 
+impl AgentKind {
+    /// Whether this agent produces project-native source rather than running or
+    /// watching something.
+    pub(crate) fn writes_source(self) -> bool {
+        match self {
+            Self::Generator => true,
+            Self::Process | Self::Observer | Self::Nushell => false,
+        }
+    }
+}
+
 pub(crate) fn handle_message(kind: AgentKind, input: &[u8]) -> Vec<u8> {
     if input.len() > MAX_MESSAGE_BYTES {
         return response(error(
@@ -75,7 +86,7 @@ pub(crate) fn handle_message(kind: AgentKind, input: &[u8]) -> Vec<u8> {
                 &format!("unsupported protocol version {version}; supported version is 1"),
             ));
         }
-        if kind == AgentKind::Generator {
+        if kind.writes_source() {
             return result_response(
                 id,
                 serde_json::json!({

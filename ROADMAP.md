@@ -299,24 +299,17 @@ whose type has more than two variants. With two, `!= A` is `== B` and there is
 nowhere for a third answer to hide; with three there is, and the compiler stops
 helping exactly where the question gets harder.
 
-Twenty-six today:
+Twenty-six when the gate was written; zero now, and it fails rather than
+reports.
 
-| type | sites |
-| --- | --- |
-| `FindingKind` | 10 |
-| `EvidenceStatus` | 5 |
-| `ReviewStatus` | 4 |
-| `OutputFormat` | 2 |
-| six others | 1 each |
-
-`MigrationTarget` was the first fixed, and the shape is the remedy for all of
-them: not rewriting the comparison but asking the question once, in a method
-whose body is a `match`, so a variant added later does not compile until
-somebody answers for it.
-
-- [ ] Drive the twenty-six to zero, then wire the gate into `mise run lint` so
-  it fails rather than reports. It reports today because a gate that fails on
-  twenty-six pre-existing sites is a gate somebody suppresses.
+The remedy was not rewriting each comparison but asking the question once, in
+a method whose body is a `match`, so a variant added later does not compile
+until somebody answers for it — `FindingKind::is_a_shell_file`,
+`EvidenceStatus::is_verified`, `ReviewStatus::is_current`,
+`OutputFormat::is_structured` and five more. `OutputFormat` is the one that
+had already gone wrong: `Agent` was added to it after its comparison sites
+were written, and each of them answered "not JSON" for the new form without
+anybody deciding that it should.
 
 ## What one real `action.yml` still needs
 

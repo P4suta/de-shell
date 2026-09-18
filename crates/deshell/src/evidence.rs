@@ -55,6 +55,17 @@ pub(crate) enum ObservationStatus {
     Nondeterministic,
 }
 
+impl ObservationStatus {
+    /// Whether the observation says the two behaved differently, as opposed to
+    /// saying nothing because the run could not be made.
+    pub(crate) fn is_a_difference(&self) -> bool {
+        match self {
+            Self::Different => true,
+            Self::Verified | Self::Unavailable | Self::Failed | Self::Nondeterministic => false,
+        }
+    }
+}
+
 impl Evidence {
     pub(crate) fn from_plan(plan: &Plan, source_path: &str, source: &[u8]) -> Result<Self, String> {
         plan.validate().map_err(|errors| errors.join("; "))?;
@@ -323,7 +334,7 @@ fn validate_observation(observation: &ObservationEvidence) -> Result<(), Vec<Str
             {
                 errors.push("verified or different observation requires a SHA-256 digest".into());
             }
-            if observation.status == ObservationStatus::Different
+            if observation.status.is_a_difference()
                 && observation.reason.as_deref().is_none_or(str::is_empty)
             {
                 errors.push("different observation requires a reason".into());

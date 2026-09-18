@@ -168,7 +168,7 @@ pub(crate) fn plan(root: &Path) -> Result<PlanOutput, String> {
     let mut blockers = Vec::new();
     let mut diffs = Vec::new();
     for finding in findings {
-        if finding.kind != crate::scanner::FindingKind::ShellFile {
+        if !finding.kind.is_a_shell_file() {
             blockers.push(HardenBlocker {
                 code: "DESHELL_HARDEN_STRUCTURED_REVIEW_REQUIRED".into(),
                 message: "embedded or dynamic shell hardening requires a structured host proposal"

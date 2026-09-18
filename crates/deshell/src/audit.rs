@@ -1,5 +1,5 @@
 use crate::config::{AuditAcknowledgement, AuditSeverity};
-use crate::scanner::{FindingKind, Inventory};
+use crate::scanner::Inventory;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::LazyLock;
@@ -246,7 +246,7 @@ pub(crate) fn analyze(
 ) -> Result<Vec<Finding>, String> {
     let mut output = Vec::new();
     for location in &inventory.findings {
-        if location.kind == FindingKind::Candidate {
+        if location.kind.is_a_candidate() {
             let source = read_host_source(root, &location.path)?;
             output.push(make_finding(
                 "shell.dynamic-command",
@@ -269,7 +269,7 @@ pub(crate) fn analyze(
             Err(_) => continue,
         };
         let protected = audit_protected_ranges(location.interpreter.as_deref(), snippet);
-        let host_source = if location.kind == FindingKind::ShellFile {
+        let host_source = if location.kind.is_a_shell_file() {
             snippet.to_owned()
         } else {
             read_host_source(root, &location.path)?
@@ -289,7 +289,7 @@ pub(crate) fn analyze(
                 {
                     continue;
                 }
-                let (start, end) = if location.kind == FindingKind::ShellFile {
+                let (start, end) = if location.kind.is_a_shell_file() {
                     (matched.start(), matched.end())
                 } else {
                     embedded_host_match_span(&host_source, snippet, location, &matched)
@@ -603,6 +603,7 @@ fn civil_from_days(days_since_epoch: i64) -> (i64, u32, u32) {
 )]
 mod tests {
     use super::*;
+    use crate::scanner::FindingKind;
     use crate::scanner::{
         ByteSpan, Finding as InventoryFinding, InterpreterConfidence, ScanError, Skipped,
     };

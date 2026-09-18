@@ -82,6 +82,41 @@ pub(crate) enum FindingKind {
     Candidate,
 }
 
+impl FindingKind {
+    /// Whether the finding is a file that is shell, rather than shell inside
+    /// something else or a guess at one.
+    ///
+    /// A method rather than `== FindingKind::ShellFile` at each site: `==` is
+    /// outside the exhaustiveness check a `match` gets, so a kind added later
+    /// compiles everywhere and answers "no" everywhere. Asking here means a new
+    /// kind does not compile until somebody answers for it.
+    pub(crate) fn is_a_shell_file(&self) -> bool {
+        match self {
+            Self::ShellFile => true,
+            Self::EmbeddedShell | Self::Candidate => false,
+        }
+    }
+
+    /// Whether the shell is inside a file of another kind — a workflow, an
+    /// action, a Dockerfile — so retiring it rewrites that file rather than
+    /// replacing it.
+    pub(crate) fn is_embedded(&self) -> bool {
+        match self {
+            Self::EmbeddedShell => true,
+            Self::ShellFile | Self::Candidate => false,
+        }
+    }
+
+    /// Whether the finding is a guess rather than a reading: something that
+    /// looks like shell and has not been confirmed to be.
+    pub(crate) fn is_a_candidate(&self) -> bool {
+        match self {
+            Self::Candidate => true,
+            Self::ShellFile | Self::EmbeddedShell => false,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Finding {

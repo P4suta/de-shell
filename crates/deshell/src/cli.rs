@@ -216,6 +216,21 @@ enum OutputFormat {
     Agent,
 }
 
+impl OutputFormat {
+    /// Whether this form is a structure a program reads, as opposed to lines a
+    /// person does.
+    ///
+    /// A method rather than `== OutputFormat::Json` at each site: `==` is
+    /// outside the exhaustiveness check a `match` gets, and `Agent` was added
+    /// to this enum after those sites were written.
+    fn is_structured(self) -> bool {
+        match self {
+            Self::Json | Self::Agent => true,
+            Self::Human => false,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum AuditOutputFormat {
     Human,
@@ -1370,7 +1385,7 @@ fn dispatch(
                     Failure::io(message)
                 }
             })?;
-            if format == OutputFormat::Json {
+            if format.is_structured() {
                 let value = serde_json::json!({
                     "created": result.created,
                     "entrypoints": result.entrypoints,
@@ -2124,7 +2139,7 @@ fn scenario_synthesize_command(
     format: OutputFormat,
     stdout: &mut dyn Write,
 ) -> Result<i32, Failure> {
-    if format == OutputFormat::Json {
+    if format.is_structured() {
         let mut output = Vec::new();
         let code = scenario_synthesize_human(root, apply, &mut output)?;
         let value = serde_json::json!({
@@ -2296,7 +2311,7 @@ fn scenario_review_command(
                         review.path.as_deref().unwrap_or("-")
                     ),
                 )?;
-                if review.status != crate::approval::ReviewStatus::Approved {
+                if !review.status.is_current() {
                     let argv = vec![
                         "deshell".to_owned(),
                         "scenario".to_owned(),
@@ -2402,7 +2417,7 @@ fn matrix_review_command(
                         review.digest
                     ),
                 )?;
-                if review.status != crate::approval::ReviewStatus::Approved {
+                if !review.status.is_current() {
                     let argv = vec![
                         "deshell".to_owned(),
                         "matrix".to_owned(),
@@ -2660,7 +2675,7 @@ fn audit_command(
         .iter()
         .filter(|finding| !finding.acknowledged && finding.severity >= config.audit.fail_on)
         .count();
-    if format == AuditOutputFormat::Human {
+    if matches!(format, AuditOutputFormat::Human) {
         writeln_io(
             stdout,
             format_args!(
@@ -4092,7 +4107,7 @@ fn modernize_command(parts: ModernizeCommandArgs<'_>) -> Result<i32, Failure> {
     let mut paths = inventory
         .findings
         .into_iter()
-        .filter(|finding| finding.kind == crate::scanner::FindingKind::ShellFile)
+        .filter(|finding| finding.kind.is_a_shell_file())
         .map(|finding| finding.path)
         .collect::<Vec<_>>();
     paths.sort();

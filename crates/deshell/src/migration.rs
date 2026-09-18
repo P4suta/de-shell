@@ -190,6 +190,38 @@ pub(crate) enum EvidenceStatus {
 }
 
 impl EvidenceStatus {
+    /// Whether the evidence says the two behaved alike.
+    ///
+    /// A method rather than `== EvidenceStatus::Verified`: a status added later
+    /// is not verification, and `==` would let it pass as "not verified"
+    /// without anybody deciding that it should.
+    pub(crate) fn is_verified(&self) -> bool {
+        match self {
+            Self::Verified => true,
+            Self::Different | Self::Unavailable | Self::Failed | Self::Nondeterministic => false,
+        }
+    }
+
+    /// Whether the evidence says the two behaved differently, as opposed to
+    /// saying nothing because the run could not be made.
+    pub(crate) fn is_a_difference(&self) -> bool {
+        match self {
+            Self::Different => true,
+            Self::Verified | Self::Unavailable | Self::Failed | Self::Nondeterministic => false,
+        }
+    }
+
+    /// Whether the two runs of the same thing disagreed with each other, which
+    /// is a property of the thing rather than of the comparison.
+    pub(crate) fn is_nondeterministic(&self) -> bool {
+        match self {
+            Self::Nondeterministic => true,
+            Self::Verified | Self::Different | Self::Unavailable | Self::Failed => false,
+        }
+    }
+}
+
+impl EvidenceStatus {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Verified => "verified",
@@ -443,7 +475,7 @@ pub(crate) fn create_plan(root: &Path) -> Result<PlanOutput, String> {
         } else {
             for review in scenario_reviews
                 .iter()
-                .filter(|review| review.status != crate::approval::ReviewStatus::Approved)
+                .filter(|review| !review.status.is_current())
             {
                 blockers.push(Blocker {
                     code: "DESHELL_BLOCKER_UNAPPROVED_SCENARIO".into(),
@@ -469,7 +501,7 @@ pub(crate) fn create_plan(root: &Path) -> Result<PlanOutput, String> {
         } else {
             for review in matrix_reviews
                 .iter()
-                .filter(|review| review.status != crate::approval::ReviewStatus::Approved)
+                .filter(|review| !review.status.is_current())
             {
                 blockers.push(Blocker {
                     code: "DESHELL_BLOCKER_UNAPPROVED_MATRIX_CELL".into(),
@@ -564,7 +596,7 @@ pub(crate) fn create_plan(root: &Path) -> Result<PlanOutput, String> {
             start_byte: finding.span.start_byte,
             end_byte: finding.span.end_byte,
         };
-        if finding.kind == crate::scanner::FindingKind::Candidate {
+        if finding.kind.is_a_candidate() {
             blockers.push(Blocker {
                 code: "DESHELL_BLOCKER_DYNAMIC_CANDIDATE".into(),
                 message: format!(
@@ -859,7 +891,7 @@ fn thin_project_interface_target(
     finding: &crate::scanner::Finding,
     references: &[crate::scanner::ScriptReference],
 ) -> Option<String> {
-    if finding.kind != crate::scanner::FindingKind::EmbeddedShell
+    if !finding.kind.is_embedded()
         || !(is_make_or_package_path(&finding.path) || is_github_workflow_path(&finding.path))
     {
         return None;
@@ -878,7 +910,7 @@ fn thin_shell_file_target(
     finding: &crate::scanner::Finding,
     retiring_paths: &BTreeSet<String>,
 ) -> Option<String> {
-    if finding.kind != crate::scanner::FindingKind::ShellFile {
+    if !finding.kind.is_a_shell_file() {
         return None;
     }
     let source = std::str::from_utf8(&finding.source).ok()?;
@@ -1668,7 +1700,7 @@ fn static_shell_words(command: &str) -> Result<Vec<String>, &'static str> {
             },
         }
     }
-    if escaped || quote != Quote::None {
+    if escaped || !matches!(quote, Quote::None) {
         return Err("contains an unterminated quote or escape");
     }
     if started {
@@ -6962,13 +6994,10 @@ pub(crate) fn verify(
     let validation = verify_validation_commands(root, &directory, &plan)?;
     let status = if checks
         .iter()
-        .any(|check| check.status == EvidenceStatus::Nondeterministic)
+        .any(|check| check.status.is_nondeterministic())
     {
         EvidenceStatus::Nondeterministic
-    } else if checks
-        .iter()
-        .any(|check| check.status == EvidenceStatus::Different)
-    {
+    } else if checks.iter().any(|check| check.status.is_a_difference()) {
         EvidenceStatus::Different
     } else if validation.iter().any(|command| command.exit_code != 0) {
         EvidenceStatus::Failed
@@ -7116,7 +7145,7 @@ fn validate_current_source(root: &Path, source: &PlanSource) -> Result<(), Strin
 fn current_shell_source(root: &Path, source: &PlanSource) -> Result<Vec<u8>, String> {
     let inventory = crate::project::scan(root)?;
     let finding = inventory.findings.iter().find(|finding| {
-        finding.kind == crate::scanner::FindingKind::ShellFile
+        finding.kind.is_a_shell_file()
             && finding.path == source.location.path
             && finding.span.start_byte == source.location.start_byte
             && finding.span.end_byte == source.location.end_byte
@@ -7134,7 +7163,7 @@ fn current_shell_source(root: &Path, source: &PlanSource) -> Result<Vec<u8>, Str
 fn current_embedded_source(root: &Path, source: &PlanSource) -> Result<(Vec<u8>, String), String> {
     let inventory = crate::project::scan(root)?;
     let finding = inventory.findings.iter().find(|finding| {
-        finding.kind == crate::scanner::FindingKind::EmbeddedShell
+        finding.kind.is_embedded()
             && finding.path == source.location.path
             && finding.span.start_byte == source.location.start_byte
             && finding.span.end_byte == source.location.end_byte
@@ -8035,7 +8064,7 @@ fn validate_evidence_document(evidence: &MigrationEvidence) -> Result<(), String
                 return Err("migration Evidence key contains an invalid digest".into());
             }
         }
-        if check.status == EvidenceStatus::Verified
+        if check.status.is_verified()
             && check
                 .comparisons
                 .iter()
@@ -8447,9 +8476,9 @@ fn load_complete_evidence(
         }
         validate_evidence_against(root, directory, plan, &document)?;
         if document.repetitions < 2
-            || document.status != EvidenceStatus::Verified
+            || !document.status.is_verified()
             || document.checks.iter().any(|check| {
-                check.status != EvidenceStatus::Verified
+                !check.status.is_verified()
                     || check
                         .comparisons
                         .iter()

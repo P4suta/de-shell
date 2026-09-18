@@ -1661,7 +1661,7 @@ fn validate_node(parts: ValidateNodeArgs<'_>) {
             if !valid_identifier(name) {
                 errors.push(format!("runtime variable name is invalid: {name}"));
             }
-            if *value_type != PrimitiveType::Text {
+            if !matches!(value_type, PrimitiveType::Text) {
                 errors.push("stdout capture value_type must be text".into());
             }
             validate_node(ValidateNodeArgs {

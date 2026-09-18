@@ -36,6 +36,7 @@ run = "pwsh -NoLogo -NoProfile -File scripts/audit-corpus.ps1"
 [tasks.lint]
 description = "Lint Rust, repository metadata, and GitHub Actions"
 run = [
+  "cargo run --locked -p xtask -- enum-equality",
   "cargo clippy --locked --workspace --all-targets -- -D warnings",
   "mise run repository:guardrails",
   "actionlint .github/workflows/ci.yml .github/workflows/release.yml .github/workflows/nightly.yml .github/workflows/dependency-review.yml .github/workflows/scorecard.yml",

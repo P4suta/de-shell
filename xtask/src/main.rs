@@ -965,17 +965,13 @@ fn run_enum_equality(root: &Path) -> Result<(), Vec<String>> {
             ));
         }
     }
-    // Reported rather than failed, for now: twenty-six sites predate the rule,
-    // and a gate that fails on all of them is a gate somebody suppresses. The
-    // count is in ROADMAP.md with the work to drive it to zero.
-    println!(
-        "{} of {checked} enum comparison(s) are against a type with more than two variants",
-        errors.len()
-    );
-    for error in &errors {
-        println!("  {error}");
+    if errors.is_empty() {
+        println!(
+            "{checked} enum comparison(s) are against a type with two variants, where `==` and a `match` say the same thing"
+        );
+        return Ok(());
     }
-    Ok(())
+    Err(errors)
 }
 
 /// Every `.rs` file this repository owns.

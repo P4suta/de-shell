@@ -28,6 +28,21 @@ pub(crate) enum ReviewStatus {
     Stale,
 }
 
+impl ReviewStatus {
+    /// Whether the review stands: approved, and not left behind by a change to
+    /// what it approved.
+    ///
+    /// A method rather than `== ReviewStatus::Approved` at each site: `==` is
+    /// outside the exhaustiveness check a `match` gets, so a status added later
+    /// compiles everywhere and answers "no" everywhere.
+    pub(crate) fn is_current(&self) -> bool {
+        match self {
+            Self::Approved => true,
+            Self::Draft | Self::Stale => false,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Review {
