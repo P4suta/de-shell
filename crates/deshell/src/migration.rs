@@ -4063,8 +4063,16 @@ fn emit_rust_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> 
             };
             output.push_str(&format!("{indent}{{\n"));
             for child in preceding {
+                // A statement that always ends the task needs no check after
+                // it: there is nothing to skip to, and the branch would be one
+                // a reader has to work out is dead.
                 match on_failure {
                     crate::ir::SequenceFailure::Continue => {
+                        output.push_str(&format!("{indent}    let _ =\n"));
+                        emit_rust_node(child, output, depth + 2)?;
+                        output.push_str(";\n");
+                    }
+                    crate::ir::SequenceFailure::Stop if node_always_exits(child) => {
                         output.push_str(&format!("{indent}    let _ =\n"));
                         emit_rust_node(child, output, depth + 2)?;
                         output.push_str(";\n");
@@ -5622,9 +5630,17 @@ fn emit_go_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> Re
             ));
         }
         crate::ir::Operation::Sequence { nodes, on_failure } => {
-            for child in reachable_nodes(nodes) {
+            let reachable = reachable_nodes(nodes);
+            for (index, child) in reachable.iter().enumerate() {
                 emit_go_node(child, output, depth)?;
-                if *on_failure == crate::ir::SequenceFailure::Stop {
+                // The check belongs between statements. After the last one there
+                // is nothing to skip, and after one that always ends the task
+                // there is nothing to reach — either would be a branch a reader
+                // has to work out is dead.
+                if *on_failure == crate::ir::SequenceFailure::Stop
+                    && index + 1 < reachable.len()
+                    && !node_always_exits(child)
+                {
                     output.push_str(&format!(
                         "{indent}if deshellLast != 0 {{\n{indent}\treturn deshellLast\n{indent}}}\n"
                     ));
