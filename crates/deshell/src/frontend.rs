@@ -1572,7 +1572,17 @@ fn top_level_controls(source: &str, range: Range) -> Result<Vec<(usize, &'static
         if byte == b'!' && !token_started {
             return Err("POSIX negation remains delegated".into());
         }
-        if matches!(byte, b'<' | b'>' | b'&') {
+        if byte == b'&' {
+            // `>&` and `<&` duplicate a descriptor; the `&` there belongs to the
+            // redirection, not to the control grammar.
+            if index > range.start && matches!(bytes[index - 1], b'>' | b'<') {
+                token_started = true;
+                index += 1;
+                continue;
+            }
+            // A lone `&` is background execution, which is not in the native
+            // subset. `<` and `>` are redirections and are split off the simple
+            // command later, so they are not control operators and pass through.
             return Err(
                 "redirection or background execution requires pinned interpreter delegation".into(),
             );
@@ -1680,7 +1690,8 @@ fn lower_posix_simple(parts: LowerPosixSimpleArgs<'_>) -> Result<Node, String> {
         ));
     }
 
-    let words = tokenize_posix(&source[range.start..range.end], inputs, environment, locals)?;
+    let (command, redirections) = split_redirections(&source[range.start..range.end])?;
+    let words = tokenize_posix(&command, inputs, environment, locals)?;
     if words.is_empty() {
         return Err("empty shell command".into());
     }
@@ -1712,14 +1723,26 @@ fn lower_posix_simple(parts: LowerPosixSimpleArgs<'_>) -> Result<Node, String> {
     if argv_start == words.len() {
         return Err("command-local environment is missing an executable".into());
     }
-    Ok(native_node(
+    let span = span_for_range(path, source, range.start, range.end)?;
+    let exec = native_node(
         Operation::Exec {
             argv: words[argv_start..].to_vec(),
             environment: command_environment,
             working_directory: None,
         },
         &format!("{}-explicit-command-v1", interpreter.name()),
-        span_for_range(path, source, range.start, range.end)?,
+        span.clone(),
+    );
+    if redirections.is_empty() {
+        return Ok(exec);
+    }
+    Ok(native_node(
+        Operation::Redirect {
+            redirections,
+            body: Box::new(exec),
+        },
+        &format!("{}-explicit-redirection-v1", interpreter.name()),
+        span,
     ))
 }
 
@@ -2969,6 +2992,140 @@ fn tokenize_nushell_external(
     Ok(output)
 }
 
+/// Split trailing redirections off a simple command.
+///
+/// Returns the command text with the redirections removed, and the redirections
+/// in the order they were written. Only the unambiguous forms are recognised —
+/// `>`, `>>`, `<`, an optional single-digit descriptor before any of them, and
+/// `N>&M`. A heredoc (`<<`), `<>`, `>|` or a descriptor wider than one digit
+/// leaves the whole statement to delegation, because getting those wrong changes
+/// where a script's output goes.
+fn split_redirections(source: &str) -> Result<(String, Vec<crate::ir::Redirection>), String> {
+    let bytes = source.as_bytes();
+    // Bytes rather than chars: `byte as char` would map each byte of a multi-byte
+    // scalar to its own Latin-1 character and corrupt the text.
+    let mut command = Vec::<u8>::new();
+    let mut redirections = Vec::new();
+    let mut index = 0;
+    let mut quote: Option<u8> = None;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if let Some(open) = quote {
+            command.push(byte);
+            if byte == open {
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        if byte == b'\'' || byte == b'"' {
+            quote = Some(byte);
+            command.push(byte);
+            index += 1;
+            continue;
+        }
+        if byte == b'\\' {
+            command.push(byte);
+            index += 1;
+            if index < bytes.len() {
+                command.push(bytes[index]);
+                index += 1;
+            }
+            continue;
+        }
+        // A descriptor is only a descriptor when a redirection operator follows it
+        // immediately; `echo 2 > file` redirects stdout and prints "2".
+        let (fd, operator_at) = if byte.is_ascii_digit()
+            && bytes.get(index + 1).is_some_and(|next| matches!(next, b'>' | b'<'))
+            && !command.last().is_some_and(|last| !last.is_ascii_whitespace())
+        {
+            (u32::from(byte - b'0'), index + 1)
+        } else if matches!(byte, b'>' | b'<') {
+            (if byte == b'>' { 1 } else { 0 }, index)
+        } else {
+            command.push(byte);
+            index += 1;
+            continue;
+        };
+        let operator = bytes[operator_at];
+        let mut cursor = operator_at + 1;
+        let append = operator == b'>' && bytes.get(cursor) == Some(&b'>');
+        if append {
+            cursor += 1;
+        }
+        if operator == b'<' && bytes.get(cursor) == Some(&b'<') {
+            return Err("heredoc requires pinned interpreter delegation".into());
+        }
+        if matches!(bytes.get(cursor), Some(b'|' | b'<' | b'>')) {
+            return Err("redirection form requires pinned interpreter delegation".into());
+        }
+        if bytes.get(cursor) == Some(&b'&') {
+            let target = bytes
+                .get(cursor + 1)
+                .filter(|byte| byte.is_ascii_digit())
+                .ok_or("descriptor duplication requires pinned interpreter delegation")?;
+            redirections.push(crate::ir::Redirection::Duplicate {
+                fd,
+                target_fd: u32::from(target - b'0'),
+            });
+            index = cursor + 2;
+            continue;
+        }
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        let start = cursor;
+        let mut target_quote: Option<u8> = None;
+        while cursor < bytes.len() {
+            let current = bytes[cursor];
+            if let Some(open) = target_quote {
+                if current == open {
+                    target_quote = None;
+                }
+            } else if current == b'\'' || current == b'"' {
+                target_quote = Some(current);
+            } else if current.is_ascii_whitespace() {
+                break;
+            }
+            cursor += 1;
+        }
+        if start == cursor {
+            return Err("redirection target is missing".into());
+        }
+        let target = &source[start..cursor];
+        let unquoted = strip_matching_quotes(target)
+            .ok_or("redirection target requires pinned interpreter delegation")?;
+        let path = crate::ir::TextExpression::literal(unquoted);
+        redirections.push(if operator == b'<' {
+            crate::ir::Redirection::Read { fd, path }
+        } else {
+            crate::ir::Redirection::Write { fd, path, append }
+        });
+        index = cursor;
+    }
+    if quote.is_some() {
+        return Err("unterminated quote".into());
+    }
+    let command = String::from_utf8(command).map_err(|_| "command is not valid UTF-8".to_owned())?;
+    Ok((command, redirections))
+}
+
+/// A redirection target this frontend can represent: a bare or wholly quoted
+/// word with no expansion in it. Anything else is delegated rather than guessed.
+fn strip_matching_quotes(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let inner = match (bytes.first(), bytes.last()) {
+        (Some(b'"'), Some(b'"')) | (Some(b'\''), Some(b'\'')) if bytes.len() >= 2 => {
+            &value[1..value.len() - 1]
+        }
+        _ => value,
+    };
+    if inner.is_empty() || inner.bytes().any(|byte| matches!(byte, b'$' | b'`' | b'*' | b'?' | b'"' | b'\'')) {
+        return None;
+    }
+    Some(inner.to_owned())
+}
+
 fn tokenize_posix(
     source: &str,
     inputs: &mut BTreeSet<String>,
@@ -3736,6 +3893,62 @@ mod tests {
                 name: "VALUE".into(),
                 fallback: String::new(),
                 empty_is_unset: true,
+            }]
+        );
+    }
+
+    fn body_of(path: &str, source: &[u8]) -> crate::ir::Node {
+        body(path, source)
+    }
+
+    #[test]
+    fn a_simple_redirection_lowers_natively() {
+        // `Operation::Redirect` and every `Redirection` form have been in the IR
+        // from the start; the tokenizer refused the operators that select them, so
+        // `cmd >file` was delegated whole. Redirections are the most common reason
+        // a CI step leaves the native subset after `set`.
+        let node = body("build.sh", b"/bin/echo hello >\"out.txt\"\n");
+        let Operation::Redirect {
+            redirections,
+            body,
+        } = &node.operation
+        else {
+            panic!("expected redirect: {node:#?}")
+        };
+        assert_eq!(
+            redirections,
+            &[crate::ir::Redirection::Write {
+                fd: 1,
+                path: crate::ir::TextExpression::literal("out.txt"),
+                append: false,
+            }]
+        );
+        assert!(matches!(body.operation, Operation::Exec { .. }));
+
+        // `2>` names a descriptor, and `>>` appends.
+        let node = body_of("build.sh", b"/bin/echo hello 2>>\"log.txt\"\n");
+        let Operation::Redirect { redirections, .. } = &node.operation else {
+            panic!("expected redirect: {node:#?}")
+        };
+        assert_eq!(
+            redirections,
+            &[crate::ir::Redirection::Write {
+                fd: 2,
+                path: crate::ir::TextExpression::literal("log.txt"),
+                append: true,
+            }]
+        );
+
+        // `2>&1` duplicates rather than opening a path.
+        let node = body_of("build.sh", b"/bin/echo hello 2>&1\n");
+        let Operation::Redirect { redirections, .. } = &node.operation else {
+            panic!("expected redirect: {node:#?}")
+        };
+        assert_eq!(
+            redirections,
+            &[crate::ir::Redirection::Duplicate {
+                fd: 2,
+                target_fd: 1,
             }]
         );
     }

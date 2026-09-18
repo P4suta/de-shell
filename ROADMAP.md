@@ -184,7 +184,16 @@ blocker DESHELL_BLOCKER_UNIMPLEMENTED_SEMANTIC action.yml@3963..6698:
   delegated because the parser timed out is the absence of one, and it is
   retryable where the first is not. Both currently surface as `delegated` with a
   blocker, so a plan cannot be read to tell them apart.
-- [ ] Model `case`, redirection, and `2>/dev/null`. These blocked three of six
+- [x] Redirection. `Operation::Redirect` and every `Redirection` form were
+  already in the IR; the tokenizer refused `<`, `>` and `&` as control syntax
+  before a simple command could carry them. `>`, `>>`, `<`, a single-digit
+  descriptor and `N>&M` now lower natively; heredocs, `<>`, `>|` and an expanded
+  target stay delegated.
+
+  It did not move OComment's composite action, whose five blockers are unchanged
+  at three `dynamic expansion or control syntax` and two `shell compound syntax`.
+  Redirection was not what those five were waiting on.
+- [ ] Model `case`, `if` and the remaining expansions. These blocked three of six
   steps in a corpus with no `set` in it, and unlike the above they are missing
   implementation rather than unsettled semantics.
 - [ ] Carry the thirteen `set` semantics cases into the golden corpus. The corpus
