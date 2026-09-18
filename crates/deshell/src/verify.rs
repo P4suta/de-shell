@@ -17,6 +17,12 @@ pub(crate) struct AuditReport {
     pub nondeterministic: usize,
     pub stale: usize,
     pub unobserved: usize,
+    /// Which scenarios were not observed, in the order they are declared.
+    ///
+    /// The count says how much is missing and not what: a reader who has to
+    /// find out which four of twelve went unobserved is reading the project's
+    /// files to answer a question the report already knew.
+    pub unobserved_scenarios: Vec<String>,
     pub source_bytes: usize,
     pub native_bytes: usize,
     pub delegated_bytes: usize,
@@ -63,6 +69,7 @@ fn audit_inner(
         delegated: 0,
         residual: 0,
         residual_reasons: vec![],
+        unobserved_scenarios: vec![],
         observations: evidence.map_or(0, |value| value.observations.len()),
         verified: 0,
         different: 0,
@@ -115,14 +122,17 @@ fn audit_inner(
             return Err(vec!["evidence node inventory does not match plan".into()]);
         }
         if let Some(context) = &context {
-            report.unobserved = context
+            report.unobserved_scenarios = context
                 .scenario_digests
                 .keys()
                 .filter(|scenario| !observed_scenarios.contains(scenario.as_str()))
-                .count();
+                .cloned()
+                .collect();
+            report.unobserved = report.unobserved_scenarios.len();
         }
     } else if let Some(context) = &context {
-        report.unobserved = context.scenario_digests.len();
+        report.unobserved_scenarios = context.scenario_digests.keys().cloned().collect();
+        report.unobserved = report.unobserved_scenarios.len();
     }
     Ok(report)
 }
@@ -578,6 +588,15 @@ mod tests {
         assert_eq!(report.stale, 1);
         assert_eq!(report.unavailable, 0);
         assert_eq!(report.unobserved, 1);
+        // Named, not just counted: the count says how much is missing and the
+        // names say what, which is the difference between a reader knowing
+        // there is work and knowing where it is.
+        assert_eq!(report.unobserved_scenarios.len(), report.unobserved);
+        assert!(
+            !report.unobserved_scenarios[0].is_empty(),
+            "{:?}",
+            report.unobserved_scenarios
+        );
     }
 
     #[test]

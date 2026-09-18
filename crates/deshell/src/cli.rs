@@ -1668,6 +1668,12 @@ fn dispatch(
                         report.uncovered_bytes
                     ),
                 )?;
+                // Named rather than counted: a reader who has to find out which
+                // of twelve scenarios went unobserved is reading the project's
+                // files to answer a question the report already knew.
+                for scenario in &report.unobserved_scenarios {
+                    writeln_io(stdout, format_args!("{prefix}unobserved: {scenario}"))?;
+                }
                 for reason in report.residual_reasons {
                     writeln_io(stdout, format_args!("{prefix}residual: {reason}"))?;
                 }
