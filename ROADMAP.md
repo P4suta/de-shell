@@ -286,6 +286,34 @@ blocker DESHELL_BLOCKER_UNIMPLEMENTED_SEMANTIC action.yml@3963..6698:
   contained no `set` at all, which is why none of this surfaced until the tool
   was pointed at a repository that was not its own.
 
+## An empty map in a generated file, and why it is still there
+
+A script with no assignment to a shell-local name has no locals, and the
+generated program still carries
+
+```rust
+let deshell_vars: std::collections::BTreeMap<String, String> =
+    std::collections::BTreeMap::new();
+```
+
+along with the two helpers that thread it. The OComment session named it
+reading a generated file: three things to follow to find out they do nothing.
+
+Two ways to remove it were tried and both are worse than keeping it.
+
+A thread-local holding "this plan keeps locals", read by the expression
+emitters, is a hidden global — the shape this repository spent the day
+removing from its walks. A textual rewrite of the emitted code, replacing the
+lookup where no assignment was emitted, decides by reading generated text
+rather than by how it was built, which is the shape that was just replaced in
+`rust_expression_as_str`.
+
+The remedy that is not worse is to carry the answer down the expression layer
+as a parameter, which is about thirty call sites and touches nothing else.
+
+- [ ] Give the expression emitters the plan's answer, and stop emitting a map
+  for a program with no locals to keep.
+
 ## `==` against an enum is outside the exhaustiveness check
 
 From the OComment session, on finding two of nine call sites left behind when a
