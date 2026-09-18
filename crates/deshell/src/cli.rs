@@ -493,6 +493,63 @@ struct ReportSpec {
 }
 
 impl Command {
+    /// The root this command needs an initialized project at, if it needs one.
+    ///
+    /// Listed rather than defaulted: a command added without an answer here
+    /// does not compile. A command that reads `.deshell` and finds nothing
+    /// otherwise reports a missing directory, which is true and says nothing
+    /// about what to do — and the next step it used to print was `--help`,
+    /// which is three commands away from `deshell init`.
+    fn requires_initialized_project(&self) -> Option<&Path> {
+        match self {
+            // These make or inspect a tree that need not exist yet.
+            Self::Init { .. }
+            | Self::Scan { .. }
+            | Self::Audit { .. }
+            | Self::Schema { .. }
+            | Self::Doctor { .. } => None,
+            // Agent and adapter entry points are spoken to over a pipe by
+            // de-shell itself; they read no project tree.
+            Self::ProcessAgent | Self::ObserverAgent | Self::NushellAdapter | Self::Generator => {
+                None
+            }
+            Self::Analyze { root, .. }
+            | Self::Rewrite { root, .. }
+            | Self::Modernize { root, .. }
+            | Self::Verify { root, .. }
+            | Self::Observe { root, .. }
+            | Self::Run { root, .. }
+            | Self::Export { root, .. }
+            | Self::Check { root, .. }
+            | Self::Explain { root, .. } => Some(root),
+            Self::Scenario { command } => match command {
+                ScenarioCommand::List { root, .. }
+                | ScenarioCommand::Show { root, .. }
+                | ScenarioCommand::Synthesize { root, .. }
+                | ScenarioCommand::Approve { root, .. } => Some(root),
+            },
+            Self::Matrix { command } => match command {
+                MatrixCommand::List { root, .. } | MatrixCommand::Approve { root, .. } => {
+                    Some(root)
+                }
+            },
+            Self::Harden { command } => match command {
+                HardenCommand::Plan { root, .. }
+                | HardenCommand::Verify { root, .. }
+                | HardenCommand::Apply { root, .. } => Some(root),
+            },
+            Self::Migrate { command } => match command {
+                MigrateCommand::Plan { root, .. }
+                | MigrateCommand::Verify { root, .. }
+                | MigrateCommand::Apply { root, .. }
+                | MigrateCommand::Status { root, .. } => Some(root),
+                MigrateCommand::Evidence { command } => match command {
+                    MigrateEvidenceCommand::Import { root, .. } => Some(root),
+                },
+            },
+        }
+    }
+
     fn report_spec(&self) -> Option<ReportSpec> {
         fn root_value(root: &Path) -> String {
             root.to_string_lossy().into_owned()
@@ -751,6 +808,30 @@ struct Failure {
 }
 
 impl Failure {
+    /// The project has no `.deshell`, and the next step is to make one.
+    ///
+    /// Its own constructor because the remedy is known here and nowhere else:
+    /// the read that fails reports a missing directory, which is true and does
+    /// not say what to do about it.
+    fn uninitialized(root: &Path) -> Self {
+        Self {
+            exit: 3,
+            code: "DESHELL_UNINITIALIZED",
+            message: format!(
+                "{} has no .deshell directory; the project is not initialized",
+                root.display()
+            ),
+            help: Some("Run deshell init to create the canonical project files.".into()),
+            next_actions: vec![crate::report::Action::Command {
+                argv: vec![
+                    "deshell".into(),
+                    "init".into(),
+                    "--root".into(),
+                    root.to_string_lossy().into_owned(),
+                ],
+            }],
+        }
+    }
     fn io(message: impl Into<String>) -> Self {
         Self {
             exit: 1,
@@ -864,7 +945,7 @@ where
                     Err(_) => 1,
                 };
             }
-            let diagnostic = crate::diagnostics::Diagnostic::error(
+            let diagnostic = crate::diagnostics::Diagnostic::usage(
                 "DESHELL_USAGE",
                 error.to_string().trim().to_owned(),
             );
@@ -1207,6 +1288,18 @@ fn dispatch(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<i32, Failure> {
+    // Asked before the command runs, so the answer is "the project is not
+    // initialized, run `deshell init`" rather than whatever read happened to
+    // fail first.
+    // A root that is not there at all is a different condition from one that is
+    // there and holds no project: `deshell init` is the answer to the second
+    // and not to the first.
+    if let Some(root) = command.requires_initialized_project()
+        && root.is_dir()
+        && !root.join(".deshell").is_dir()
+    {
+        return Err(Failure::uninitialized(root));
+    }
     match command {
         Command::Init {
             root,
@@ -5429,6 +5522,49 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    /// A project with no `.deshell` says so, and says what to run.
+    ///
+    /// It used to report whichever read failed first — `cannot inspect
+    /// .../.deshell: No such file` — and offer `deshell --help` as the next
+    /// step. Following that costs three commands to arrive at `deshell init`.
+    /// A wrong next step is more expensive than a missing one, because it stops
+    /// the search somewhere else.
+    #[test]
+    fn a_project_that_is_not_initialized_says_so_and_says_what_to_run() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_string_lossy().into_owned();
+        let (code, stdout, stderr) = invoke(&[
+            "deshell",
+            "analyze",
+            "--root",
+            &root,
+            "--entry",
+            "build.sh",
+            "--diagnostics=jsonl",
+        ]);
+        assert_eq!(code, 3);
+        assert!(stdout.is_empty());
+        let diagnostic: serde_json::Value =
+            serde_json::from_slice(stderr.split(|byte| *byte == b'\n').next().unwrap()).unwrap();
+        assert_eq!(diagnostic["code"], "DESHELL_UNINITIALIZED");
+        assert_eq!(
+            diagnostic["next_actions"][0]["argv"],
+            serde_json::json!(["deshell", "init", "--root", root])
+        );
+
+        // Not every error has a next step, and inventing one is the defect this
+        // replaced: a usage error is where `--help` is the answer.
+        let (code, _, stderr) = invoke(&["deshell", "schema", "unknown", "--diagnostics=jsonl"]);
+        assert_eq!(code, 2);
+        let diagnostic: serde_json::Value =
+            serde_json::from_slice(stderr.split(|byte| *byte == b'\n').next().unwrap()).unwrap();
+        assert_eq!(diagnostic["code"], "DESHELL_USAGE");
+        assert_eq!(
+            diagnostic["next_actions"][0]["argv"],
+            serde_json::json!(["deshell", "--help"])
+        );
     }
 
     #[test]
