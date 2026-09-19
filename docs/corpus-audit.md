@@ -1,6 +1,6 @@
 # Corpus audit
 
-`deshell-audit-corpus.ps1` provides a reproducible, non-executing audit of the
+`cargo xtask corpus-audit` provides a reproducible, non-executing audit of the
 immediate repository children under a corpus directory. It inventories every
 supported embedded format and analyzes shell files on isolated temporary
 copies. The report conforms to
@@ -8,21 +8,21 @@ copies. The report conforms to
 
 ## Run it
 
-Run the audit through the mise-managed PowerShell. The task depends on `build`,
-so it cannot analyze with a stale compiler binary. Quote the complete
-comma-separated exclusion value: an unquoted list can be split by the caller
-before it reaches the script.
+The task depends on `build`, so it cannot analyze with a stale compiler binary.
+Quote the complete comma-separated exclusion value: an unquoted list can be
+split by the caller before it reaches the gate.
 
 ```console
-mise run corpus:audit -- -CorpusRoot .. -ExcludeRepository 'de-shell,workflow-verifier,beamtrace' -ExcludePattern 'cargo-mutants-wt-*' -DeshellExecutable target/debug/deshell -Format Json -OutputPath target/local-corpus-audit.json
+mise run corpus:audit -- --corpus-root .. --exclude-repository 'de-shell,workflow-verifier,beamtrace' --exclude-pattern 'cargo-mutants-wt-*' --deshell target/debug/deshell --format json --output target/local-corpus-audit.json
 ```
 
-Exact exclusions must name an immediate child of `-CorpusRoot`; a typo fails
+Exact exclusions must name an immediate child of `--corpus-root`; a typo fails
 closed instead of silently broadening the audit. The JSON records the normalized
 exact exclusions, patterns, selected repositories, and `source_execution=false`
-so the selection can be reviewed with the result. Use `-Format Human` for a
-concise terminal summary. `target/local-corpus-audit.json` is a local evidence
-artifact and is not committed.
+so the selection can be reviewed with the result. `--format` takes `text`
+(the default, a concise terminal summary) or `json`, and refuses anything else
+rather than falling back to one of them. `target/local-corpus-audit.json` is a
+local evidence artifact and is not committed.
 
 The auditor:
 
@@ -60,7 +60,7 @@ The report could not carry a location's content digest either — the auditor
 verifies it after the scan — because a Scan Report is built by re-reading the
 command's human output, and that line did not print one. It does now.
 
-    mise run corpus:audit -- -CorpusRoot .. -ExcludeRepository 'de-shell,workflow-verifier' -DeshellExecutable target/debug/deshell -Format Human
+    mise run corpus:audit -- --corpus-root .. --exclude-repository 'de-shell,workflow-verifier' --deshell target/debug/deshell
 
 | Measure | Result |
 | --- | ---: |
@@ -92,6 +92,51 @@ snapshot made with 2 of 47: that one counted the obsolete pre-v1 vocabulary, and
 94 of the 114 nodes here are `delegated`, which is a pinned interpreter running
 the exact bytes and not a translation. What it does say is that every file
 reached a guarantee rather than an unexamined remainder.
+
+## Retired into xtask, 2026-09-19
+
+The auditor was 661 lines of PowerShell that de-shell itself refuses, and it is
+a `0.1.0` release gate, so every release runner had to carry a PowerShell to
+run it. It is `cargo xtask corpus-audit` now, and none does.
+
+Ported rather than reimplemented, and checked by running both against the same
+fourteen repositories and comparing the reports. Every count, every file
+result, every residual reason and all 103 inventory groups matched. One
+ordering differed, and the difference was the script's:
+
+| | `RUN` / `sh` | `run` / `bash` |
+| --- | --- | --- |
+| PowerShell | after | before |
+| xtask | before | after |
+
+`Sort-Object` and `Group-Object` are case-insensitive unless told otherwise, so
+a Dockerfile `RUN` and a workflow `run:` tied and fell through to the
+interpreter. Had their interpreters matched, `Group-Object` would have merged
+two different origins into one row. The port groups and orders on the exact
+bytes, so the ordering is total and the origins stay distinct.
+
+Two things the port fails closed on that the script did not:
+
+- a Scan Report location whose `kind` is none of `shell_file`,
+  `embedded_shell` or `candidate`. The script read "not an error and not a
+  skip" as a location, so a sixth kind would have been counted as shell to
+  migrate;
+- a `--format` that is neither `text` nor `json`.
+
+Re-measured immediately after the port, against the same fourteen
+repositories. The counts differ from the run recorded above because the
+neighbouring repositories moved between the two measurements, not because the
+implementations disagree — both produced these numbers in the same minute:
+
+| Measure | Result |
+| --- | ---: |
+| Inventory locations | 977 |
+| Shell files | 98 |
+| Embedded shell locations | 587 |
+| Conservative candidates | 292 |
+| Analysis failures | 0 |
+| Fully non-residual shell files | 98 / 98 |
+| IR nodes: native / delegated / residual | 20 / 94 / 0 |
 
 ## Historical pre-cutover baseline: 2026-08-25
 

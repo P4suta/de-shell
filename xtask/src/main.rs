@@ -4,6 +4,7 @@
 )]
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -1368,6 +1369,723 @@ fn run_enum_equality(root: &Path) -> Result<(), Vec<String>> {
 ///
 /// Measured against the script it replaces before it replaced it: same count,
 /// same limits, same sentence.
+/// The inputs of [`run_corpus_audit`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to
+/// a many-argument function stays invisible to every call site that already
+/// compiles. [`run_corpus_audit`] takes this apart without `..`.
+struct CorpusAuditArgs<'a> {
+    root: &'a Path,
+    corpus_root: PathBuf,
+    excluded_repositories: Vec<String>,
+    excluded_patterns: Vec<String>,
+    deshell: PathBuf,
+    json: bool,
+    output: Option<PathBuf>,
+}
+
+/// A non-executing audit of every repository under a corpus directory.
+///
+/// This was `scripts/audit-corpus.ps1`, 661 lines of PowerShell that de-shell
+/// refuses. It is a 0.1.0 release gate, so every release runner needed a
+/// PowerShell to run it; now none does.
+///
+/// Ported rather than reimplemented, and checked by running both against the
+/// same fourteen repositories and comparing the reports they produce.
+fn run_corpus_audit(parts: CorpusAuditArgs<'_>) -> Result<(), Vec<String>> {
+    // Destructured without `..`: see `CorpusAuditArgs`.
+    let CorpusAuditArgs {
+        root,
+        corpus_root,
+        excluded_repositories,
+        excluded_patterns,
+        deshell,
+        json,
+        output,
+    } = parts;
+    let corpus_root = corpus_root
+        .canonicalize()
+        .map_err(|error| vec![format!("CorpusRoot is not a directory: {error}")])?;
+    if !corpus_root.is_dir() {
+        return Err(vec![format!(
+            "CorpusRoot is not a directory: {}",
+            corpus_root.display()
+        )]);
+    }
+
+    let mut candidates = Vec::new();
+    for entry in std::fs::read_dir(&corpus_root)
+        .map_err(|error| vec![format!("cannot read {}: {error}", corpus_root.display())])?
+    {
+        let entry = entry.map_err(|error| vec![format!("cannot read an entry: {error}")])?;
+        if entry.path().is_dir() {
+            candidates.push(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    candidates.sort();
+    // An exact exclusion that names nothing fails closed rather than silently
+    // broadening the audit.
+    for name in &excluded_repositories {
+        if !candidates.contains(name) {
+            return Err(vec![format!(
+                "Exact repository exclusion '{name}' did not match an immediate child of {}",
+                corpus_root.display()
+            )]);
+        }
+    }
+    let repositories = candidates
+        .into_iter()
+        .filter(|name| {
+            !excluded_repositories.contains(name)
+                && !excluded_patterns
+                    .iter()
+                    .any(|pattern| wildcard_matches(pattern, name))
+        })
+        .collect::<Vec<_>>();
+
+    let temporary = tempfile::Builder::new()
+        .prefix("deshell-corpus-audit-")
+        .tempdir()
+        .map_err(|error| vec![format!("cannot create the audit directory: {error}")])?;
+
+    let mut findings: Vec<AuditFinding> = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
+
+    for repository in &repositories {
+        let repository_root = corpus_root.join(repository);
+        let scan = audit_deshell(
+            &deshell,
+            &[
+                "scan".into(),
+                "--root".into(),
+                repository_root.to_string_lossy().into_owned(),
+                "--format".into(),
+                "json".into(),
+            ],
+        );
+        let Some(scan) = scan else {
+            failures.push(format!("{repository}: scan failed to start"));
+            continue;
+        };
+        if !scan.0 {
+            failures.push(format!("{repository}: scan failed: {}", scan.1.trim()));
+            continue;
+        }
+        let report: serde_json::Value = match serde_json::from_str(&scan.1) {
+            Ok(report) => report,
+            Err(error) => {
+                failures.push(format!("{repository}: scan emitted invalid JSON: {error}"));
+                continue;
+            }
+        };
+        if report["schema_version"].as_i64() != Some(1) {
+            failures.push(format!(
+                "{repository}: Scan Report schema_version must be 1"
+            ));
+            continue;
+        }
+        let Some(items) = report["details"]["items"].as_array() else {
+            failures.push(format!("{repository}: Scan Report has no details.items"));
+            continue;
+        };
+        // The same scan twice, byte for byte. A report that moves between two
+        // runs of the same bytes is not evidence about the repository.
+        let repeat = audit_deshell(
+            &deshell,
+            &[
+                "scan".into(),
+                "--root".into(),
+                repository_root.to_string_lossy().into_owned(),
+                "--format".into(),
+                "json".into(),
+            ],
+        );
+        if repeat.is_none_or(|repeat| !repeat.0 || repeat.1 != scan.1) {
+            failures.push(format!(
+                "{repository}: repeated Inventory v1 scan was not byte-identical"
+            ));
+            continue;
+        }
+        for item in items {
+            let kind = item["kind"].as_str().unwrap_or_default();
+            let path = item["path"].as_str().unwrap_or_default();
+            let message = item["message"].as_str().unwrap_or_default();
+            match kind {
+                "error" => failures.push(format!(
+                    "{repository}: scan {} error at {path}: {message}",
+                    item["name"].as_str().unwrap_or_default()
+                )),
+                "skipped" => {
+                    failures.push(format!("{repository}: scan skipped {path}: {message}"));
+                }
+                // Named, not defaulted. `scan_details` in `crates/deshell` emits
+                // exactly these five kinds; the script treated "not an error and
+                // not a skip" as a location, so a sixth kind would have been
+                // silently counted as shell to migrate.
+                "shell_file" | "embedded_shell" | "candidate" => {
+                    let digest = item["digest"].as_str().unwrap_or_default();
+                    if kind.is_empty() || path.is_empty() || digest.is_empty() {
+                        failures.push(format!(
+                            "{repository}: Scan Report holds a location with no kind, path or digest"
+                        ));
+                        continue;
+                    }
+                    findings.push(AuditFinding {
+                        root: repository_root.clone(),
+                        path: path.to_owned(),
+                        location: format!("{repository}/{path}"),
+                        kind: kind.to_owned(),
+                        interpreter: item["name"].as_str().unwrap_or_default().to_owned(),
+                        locator: message.to_owned(),
+                        content_hash: digest.to_owned(),
+                    });
+                }
+                unknown => failures.push(format!(
+                    "{repository}: Scan Report holds an unknown location kind '{unknown}' at {path}"
+                )),
+            }
+        }
+    }
+
+    let mut shell_files = findings
+        .iter()
+        .filter(|finding| finding.kind == "shell_file")
+        .cloned()
+        .collect::<Vec<_>>();
+    shell_files.sort_by(|left, right| left.location.cmp(&right.location));
+
+    let mut results = Vec::new();
+    for (index, file) in shell_files.iter().enumerate() {
+        let case_root = temporary.path().join(format!("case-{:06}", index + 1));
+        let failed = |message: String, failures: &mut Vec<String>| {
+            failures.push(message.clone());
+            audit_result(
+                file,
+                AuditOutcome {
+                    native: 0,
+                    delegated: 0,
+                    observations: 0,
+                    residual_reasons: Vec::new(),
+                    error: Some(message),
+                },
+            )
+        };
+        if let Err(message) = std::fs::create_dir_all(&case_root) {
+            results.push(failed(
+                format!("{}: cannot stage: {message}", file.location),
+                &mut failures,
+            ));
+            continue;
+        }
+        let source = file.root.join(&file.path);
+        // The scanner reported this path; reading it must stay inside the
+        // repository it came from.
+        if !source.starts_with(&file.root) {
+            results.push(failed(
+                format!(
+                    "{}: scanner returned a path outside its repository",
+                    file.location
+                ),
+                &mut failures,
+            ));
+            continue;
+        }
+        let bytes = match std::fs::read(&source) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                results.push(failed(
+                    format!("{}: cannot read: {error}", file.location),
+                    &mut failures,
+                ));
+                continue;
+            }
+        };
+        if sha256_hex(&bytes) != file.content_hash {
+            results.push(failed(
+                format!("{}: content changed after scan", file.location),
+                &mut failures,
+            ));
+            continue;
+        }
+        let destination = case_root.join(&file.path);
+        if let Some(parent) = destination.parent()
+            && let Err(error) = std::fs::create_dir_all(parent)
+        {
+            results.push(failed(
+                format!("{}: cannot stage: {error}", file.location),
+                &mut failures,
+            ));
+            continue;
+        }
+        if let Err(error) = std::fs::write(&destination, &bytes) {
+            results.push(failed(
+                format!("{}: cannot stage: {error}", file.location),
+                &mut failures,
+            ));
+            continue;
+        }
+        // The isolated copy holds one shell file and no project markers, so
+        // `init` cannot infer a migration target and refuses — correctly. The
+        // audit only lowers, and the target does not reach the IR.
+        let initialize = audit_deshell(
+            &deshell,
+            &[
+                "init".into(),
+                "--root".into(),
+                case_root.to_string_lossy().into_owned(),
+                "--target".into(),
+                "rust".into(),
+            ],
+        );
+        if initialize.as_ref().is_none_or(|run| !run.0) {
+            let text = initialize.map(|run| run.1).unwrap_or_default();
+            results.push(failed(
+                format!("{}: init failed: {}", file.location, text.trim()),
+                &mut failures,
+            ));
+            continue;
+        }
+        let analysis = audit_deshell(
+            &deshell,
+            &[
+                "analyze".into(),
+                "--root".into(),
+                case_root.to_string_lossy().into_owned(),
+                "--entry".into(),
+                file.path.clone(),
+            ],
+        );
+        if analysis.as_ref().is_none_or(|run| !run.0) {
+            let text = analysis.map(|run| run.1).unwrap_or_default();
+            results.push(failed(
+                format!("{}: analyze failed: {}", file.location, text.trim()),
+                &mut failures,
+            ));
+            continue;
+        }
+        let manifest = std::fs::read_to_string(case_root.join(".deshell/manifest.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+        let evidence_path = manifest
+            .as_ref()
+            .and_then(|manifest| manifest["entries"].as_array())
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter(|entry| entry["entrypoint"].as_str() == Some(file.path.as_str()))
+                    .collect::<Vec<_>>()
+            })
+            .filter(|entries| entries.len() == 1)
+            .and_then(|entries| entries[0]["evidence_path"].as_str().map(str::to_owned));
+        let Some(evidence_path) = evidence_path else {
+            results.push(failed(
+                format!("{}: manifest has no unique active entry", file.location),
+                &mut failures,
+            ));
+            continue;
+        };
+        let evidence = std::fs::read_to_string(case_root.join(&evidence_path))
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+        let Some(evidence) = evidence else {
+            results.push(failed(
+                format!("{}: evidence is unreadable", file.location),
+                &mut failures,
+            ));
+            continue;
+        };
+        let nodes = evidence["nodes"].as_array().cloned().unwrap_or_default();
+        let level = |wanted: &str| {
+            nodes
+                .iter()
+                .filter(|node| node["guarantee"]["level"].as_str() == Some(wanted))
+                .count()
+        };
+        let residual_reasons = nodes
+            .iter()
+            .filter(|node| node["guarantee"]["level"].as_str() == Some("residual"))
+            .map(|node| {
+                node["guarantee"]["reason"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        if !residual_reasons.is_empty() {
+            failures.push(format!(
+                "{}: residual nodes remain: {}",
+                file.location,
+                residual_reasons.join("; ")
+            ));
+        }
+        let observations = evidence["observations"]
+            .as_array()
+            .map_or(0, |values| values.len());
+        results.push(audit_result(
+            file,
+            AuditOutcome {
+                native: level("native"),
+                delegated: level("delegated"),
+                observations,
+                residual_reasons,
+                error: None,
+            },
+        ));
+    }
+
+    if results.len() != shell_files.len() {
+        failures.push(format!(
+            "audit produced {} file results for {} shell files",
+            results.len(),
+            shell_files.len()
+        ));
+    }
+    let report = audit_report(AuditReportArgs {
+        excluded_repositories: &excluded_repositories,
+        excluded_patterns: &excluded_patterns,
+        repositories: &repositories,
+        findings: &findings,
+        results: &results,
+        failures: &failures,
+    });
+    let text = serde_json::to_string_pretty(&report)
+        .map_err(|error| vec![format!("cannot render the report: {error}")])?;
+    if let Some(output) = output {
+        let parent = output.parent().unwrap_or(root);
+        if !parent.is_dir() {
+            return Err(vec![format!(
+                "OutputPath parent does not exist: {}",
+                parent.display()
+            )]);
+        }
+        std::fs::write(&output, format!("{text}\n"))
+            .map_err(|error| vec![format!("cannot write {}: {error}", output.display())])?;
+    }
+    if json {
+        println!("{text}");
+    } else {
+        print_audit_summary(&report);
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures)
+    }
+}
+
+/// One shell location the scan reported.
+#[derive(Clone, Debug)]
+struct AuditFinding {
+    root: PathBuf,
+    path: String,
+    location: String,
+    kind: String,
+    interpreter: String,
+    locator: String,
+    content_hash: String,
+}
+
+/// Whether `name` matches a PowerShell-style wildcard pattern.
+///
+/// `*` and `?`, which is what `-like` offered and what the exclusions in
+/// `docs/corpus-audit.md` use.
+fn wildcard_matches(pattern: &str, name: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let name: Vec<char> = name.chars().collect();
+    fn walk(pattern: &[char], name: &[char]) -> bool {
+        match pattern.split_first() {
+            None => name.is_empty(),
+            Some(('*', rest)) => (0..=name.len()).any(|split| walk(rest, &name[split..])),
+            Some(('?', rest)) => !name.is_empty() && walk(rest, &name[1..]),
+            Some((first, rest)) => {
+                name.first().is_some_and(|next| next == first) && walk(rest, &name[1..])
+            }
+        }
+    }
+    walk(&pattern, &name)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(bytes);
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Run `deshell` and return whether it succeeded and what it wrote.
+///
+/// Both streams together, the way the script read them: a failure's message is
+/// as likely to be on one as the other.
+fn audit_deshell(deshell: &Path, arguments: &[String]) -> Option<(bool, String)> {
+    let output = std::process::Command::new(deshell)
+        .args(arguments)
+        .output()
+        .ok()?;
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    Some((output.status.success(), text))
+}
+
+/// What the audit learned about one shell file.
+///
+/// `fully_non_residual` and the residual count are not fields: both follow from
+/// the reasons and the error, and a caller that could state them separately
+/// could state them wrongly.
+struct AuditOutcome {
+    native: usize,
+    delegated: usize,
+    observations: usize,
+    residual_reasons: Vec<String>,
+    error: Option<String>,
+}
+
+fn audit_result(file: &AuditFinding, outcome: AuditOutcome) -> serde_json::Value {
+    // Destructured without `..`: see `AuditOutcome`.
+    let AuditOutcome {
+        native,
+        delegated,
+        observations,
+        residual_reasons,
+        error,
+    } = outcome;
+    serde_json::json!({
+        "location": file.location,
+        "interpreter": file.interpreter,
+        "content_hash": file.content_hash,
+        "fully_non_residual": error.is_none() && residual_reasons.is_empty(),
+        "nodes": {
+            "native": native,
+            "delegated": delegated,
+            "observations": observations,
+            "residual": residual_reasons.len(),
+        },
+        "residual_reasons": residual_reasons,
+        "error": error,
+    })
+}
+
+/// Where a location came from, as the inventory groups say it.
+fn audit_origin(kind: &str, locator: &str) -> String {
+    if kind == "shell_file" {
+        return "shell-file".into();
+    }
+    if locator.trim().is_empty() {
+        return "repository-format".into();
+    }
+    if let Some(rest) = locator.strip_prefix("source:")
+        && let Some(first) = rest.split(':').next()
+        && !first.trim().is_empty()
+    {
+        return first.to_owned();
+    }
+    match locator.find(':') {
+        Some(0) | None => locator.to_owned(),
+        Some(index) => locator[..index].to_owned(),
+    }
+}
+
+/// The inputs of [`audit_report`].
+struct AuditReportArgs<'a> {
+    excluded_repositories: &'a [String],
+    excluded_patterns: &'a [String],
+    repositories: &'a [String],
+    findings: &'a [AuditFinding],
+    results: &'a [serde_json::Value],
+    failures: &'a [String],
+}
+
+fn audit_report(parts: AuditReportArgs<'_>) -> serde_json::Value {
+    // Destructured without `..`: see `AuditReportArgs`.
+    let AuditReportArgs {
+        excluded_repositories,
+        excluded_patterns,
+        repositories,
+        findings,
+        results,
+        failures,
+    } = parts;
+    let mut sorted = results.to_vec();
+    sorted.sort_by(|left, right| {
+        left["location"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(right["location"].as_str().unwrap_or_default())
+    });
+    let successful = sorted
+        .iter()
+        .filter(|result| result["error"].is_null())
+        .collect::<Vec<_>>();
+    let sum = |field: &str| -> u64 {
+        successful
+            .iter()
+            .map(|result| result["nodes"][field].as_u64().unwrap_or_default())
+            .sum()
+    };
+    let fully_non_residual = successful
+        .iter()
+        .filter(|result| result["fully_non_residual"].as_bool().unwrap_or_default())
+        .map(|result| result["location"].as_str().unwrap_or_default().to_owned())
+        .collect::<Vec<_>>();
+
+    let mut reason_counts: BTreeMap<(String, String), usize> = BTreeMap::new();
+    for result in &successful {
+        let interpreter = result["interpreter"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        for reason in result["residual_reasons"].as_array().into_iter().flatten() {
+            *reason_counts
+                .entry((
+                    interpreter.clone(),
+                    reason.as_str().unwrap_or_default().to_owned(),
+                ))
+                .or_default() += 1;
+        }
+    }
+    let mut reason_groups = reason_counts
+        .into_iter()
+        .map(|((interpreter, reason), count)| (count, interpreter, reason))
+        .collect::<Vec<_>>();
+    // Most frequent first, then by interpreter and reason, the way the script
+    // sorted them.
+    reason_groups.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.2.cmp(&right.2))
+    });
+
+    let mut inventory_counts: BTreeMap<(String, String, String), usize> = BTreeMap::new();
+    for finding in findings {
+        let interpreter = if finding.interpreter.trim().is_empty() {
+            "unknown".to_owned()
+        } else {
+            finding.interpreter.clone()
+        };
+        *inventory_counts
+            .entry((
+                finding.kind.clone(),
+                audit_origin(&finding.kind, &finding.locator),
+                interpreter,
+            ))
+            .or_default() += 1;
+    }
+    let kind_count = |wanted: &str| {
+        findings
+            .iter()
+            .filter(|finding| finding.kind == wanted)
+            .count()
+    };
+
+    serde_json::json!({
+        "schema_version": 1,
+        "selection_date": "2026-08-25",
+        "analysis_scope": "shell_files",
+        "selection": {
+            "repository_scope": "immediate_children",
+            "excluded_repositories": excluded_repositories,
+            "excluded_patterns": excluded_patterns,
+            "source_execution": false,
+        },
+        "repositories": repositories,
+        "summary": {
+            "repositories_scanned": repositories.len(),
+            "locations": {
+                "total": findings.len(),
+                "shell_files": kind_count("shell_file"),
+                "embedded_shell": kind_count("embedded_shell"),
+                "candidates": kind_count("candidate"),
+            },
+            "analysis_failures": failures.len(),
+            "fully_non_residual": fully_non_residual.len(),
+            "nodes": {
+                "native": sum("native"),
+                "delegated": sum("delegated"),
+                "observations": sum("observations"),
+                "residual": sum("residual"),
+            },
+        },
+        "fully_non_residual_files": fully_non_residual,
+        "inventory_groups": inventory_counts
+            .into_iter()
+            .map(|((kind, origin, interpreter), count)| serde_json::json!({
+                "count": count,
+                "kind": kind,
+                "origin": origin,
+                "interpreter": interpreter,
+            }))
+            .collect::<Vec<_>>(),
+        "residual_reason_groups": reason_groups
+            .into_iter()
+            .map(|(count, interpreter, reason)| serde_json::json!({
+                "count": count,
+                "interpreter": interpreter,
+                "reason": reason,
+            }))
+            .collect::<Vec<_>>(),
+        "files": sorted,
+        "failures": failures,
+    })
+}
+
+fn print_audit_summary(report: &serde_json::Value) {
+    let selection = &report["selection"];
+    println!(
+        "selection scope={} excluded_repositories={} excluded_patterns={} source_execution={}",
+        selection["repository_scope"].as_str().unwrap_or_default(),
+        selection["excluded_repositories"]
+            .as_array()
+            .map_or(0, Vec::len),
+        selection["excluded_patterns"]
+            .as_array()
+            .map_or(0, Vec::len),
+        selection["source_execution"].as_bool().unwrap_or_default()
+    );
+    let summary = &report["summary"];
+    let locations = &summary["locations"];
+    println!(
+        "repositories={} locations={} shell_files={} embedded_shell={} candidates={} fully_non_residual={}",
+        summary["repositories_scanned"],
+        locations["total"],
+        locations["shell_files"],
+        locations["embedded_shell"],
+        locations["candidates"],
+        summary["fully_non_residual"]
+    );
+    let nodes = &summary["nodes"];
+    println!(
+        "nodes native={} delegated={} observations={} residual={}",
+        nodes["native"], nodes["delegated"], nodes["observations"], nodes["residual"]
+    );
+    for location in report["fully_non_residual_files"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        println!("classified file: {}", location.as_str().unwrap_or_default());
+    }
+    for group in report["residual_reason_groups"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        println!(
+            "residual {}x [{}] {}",
+            group["count"],
+            group["interpreter"].as_str().unwrap_or_default(),
+            group["reason"].as_str().unwrap_or_default()
+        );
+    }
+    for failure in report["failures"].as_array().into_iter().flatten() {
+        eprintln!("audit failure: {}", failure.as_str().unwrap_or_default());
+    }
+}
+
 fn run_repository_guardrails(root: &Path) -> Result<(), Vec<String>> {
     const MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
     const MAX_PATH_CHARACTERS: usize = 240;
@@ -2645,6 +3363,53 @@ fn dispatch(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Vec<Str
         Some("enum-equality") => run_enum_equality(root),
         Some("lint-expectations") => run_lint_expectations(root),
         Some("repository-guardrails") => run_repository_guardrails(root),
+        Some("corpus-audit") => {
+            let option = |name: &str| {
+                arguments
+                    .iter()
+                    .position(|value| value == name)
+                    .and_then(|index| arguments.get(index + 1))
+                    .map(|value| value.to_string_lossy().into_owned())
+            };
+            let list = |name: &str| {
+                option(name).map_or_else(Vec::new, |value: String| {
+                    let mut names = value
+                        .split([',', ';'])
+                        .map(str::trim)
+                        .filter(|entry| !entry.is_empty())
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>();
+                    names.sort();
+                    names.dedup();
+                    names
+                })
+            };
+            let deshell = option("--deshell").map_or_else(
+                || root.join("target/debug/deshell"),
+                PathBuf::from,
+            );
+            // Named, not defaulted: `--format xml` must not quietly print a
+            // human summary and exit 0.
+            let json = match option("--format").as_deref() {
+                None | Some("text") => Ok(false),
+                Some("json") => Ok(true),
+                Some(other) => Err(vec![format!(
+                    "corpus-audit --format must be text or json, not '{other}'"
+                )]),
+            };
+            json.and_then(|json| {
+                run_corpus_audit(CorpusAuditArgs {
+                    root,
+                    corpus_root: option("--corpus-root")
+                        .map_or_else(|| root.join(".."), PathBuf::from),
+                    excluded_repositories: list("--exclude-repository"),
+                    excluded_patterns: list("--exclude-pattern"),
+                    deshell,
+                    json,
+                    output: option("--output").map(PathBuf::from),
+                })
+            })
+        }
         Some("validate-contracts") => validate_contract_tree(root).map(|_| ()),
         Some("performance") => {
             let binary = arguments
@@ -2717,7 +3482,15 @@ mod tests {
         git(&["init", "-q"]);
         std::fs::write(root.join("small.txt"), b"x").unwrap();
         git(&["add", "-A"]);
-        git(&["-c", "user.email=a@b", "-c", "user.name=a", "commit", "-qm", "i"]);
+        git(&[
+            "-c",
+            "user.email=a@b",
+            "-c",
+            "user.name=a",
+            "commit",
+            "-qm",
+            "i",
+        ]);
         run_repository_guardrails(root).expect("a clean repository passes");
 
         // A path over the limit.
@@ -2728,16 +3501,349 @@ mod tests {
         // A file over the limit.
         std::fs::write(root.join("big.bin"), vec![0_u8; 11 * 1024 * 1024]).unwrap();
         git(&["add", "-A"]);
-        git(&["-c", "user.email=a@b", "-c", "user.name=a", "commit", "-qm", "two"]);
+        git(&[
+            "-c",
+            "user.email=a@b",
+            "-c",
+            "user.name=a",
+            "commit",
+            "-qm",
+            "two",
+        ]);
 
         let errors = run_repository_guardrails(root).expect_err("two violations");
         assert!(
-            errors.iter().any(|error| error.contains("characters; maximum is 240")),
+            errors
+                .iter()
+                .any(|error| error.contains("characters; maximum is 240")),
             "{errors:#?}"
         );
         assert!(
-            errors.iter().any(|error| error.contains("bytes; maximum is 10485760 bytes")),
+            errors
+                .iter()
+                .any(|error| error.contains("bytes; maximum is 10485760 bytes")),
             "{errors:#?}"
+        );
+    }
+
+    /// A `deshell` that answers only what the corpus audit asks.
+    ///
+    /// `scan` replays a report the test wrote, so the test owns the exact
+    /// bytes — including the digests the audit re-checks against the file it
+    /// stages. `analyze` reads the staged copy and reports a residual node
+    /// when the file says so.
+    fn compile_audit_deshell(path: &Path) {
+        let source = path.with_extension("rs");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &source,
+            r###"
+use std::path::PathBuf;
+
+fn option(args: &[String], name: &str) -> Option<String> {
+    args.iter()
+        .position(|value| value == name)
+        .and_then(|index| args.get(index + 1))
+        .cloned()
+}
+
+fn main() {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    match args.first().map(String::as_str) {
+        Some("scan") => {
+            let root = PathBuf::from(option(&args, "--root").unwrap());
+            let counter = root.join(".audit-fixture/scans");
+            let runs = std::fs::read_to_string(&counter)
+                .ok()
+                .and_then(|text| text.trim().parse::<u32>().ok())
+                .unwrap_or(0);
+            std::fs::write(&counter, (runs + 1).to_string()).unwrap();
+            let report =
+                std::fs::read_to_string(root.join(".audit-fixture/scan.json")).unwrap();
+            // A repository named `unstable` moves between two runs of the
+            // same bytes, which is what the audit must catch.
+            if root.file_name().unwrap() == "unstable" {
+                println!("{}", report.replace("RUNS", &runs.to_string()));
+            } else {
+                println!("{report}");
+            }
+        }
+        Some("init") => {
+            let root = PathBuf::from(option(&args, "--root").unwrap());
+            std::fs::create_dir_all(root.join(".deshell")).unwrap();
+        }
+        Some("analyze") => {
+            let root = PathBuf::from(option(&args, "--root").unwrap());
+            let entry = option(&args, "--entry").unwrap();
+            let staged = std::fs::read_to_string(root.join(&entry)).unwrap();
+            let nodes = if staged.contains("RESIDUAL") {
+                concat!(
+                    r#"{"guarantee":{"level":"native","reason":""}},"#,
+                    r#"{"guarantee":{"level":"residual","reason":"dynamic command"}}"#,
+                )
+                .to_owned()
+            } else {
+                concat!(
+                    r#"{"guarantee":{"level":"native","reason":""}},"#,
+                    r#"{"guarantee":{"level":"native","reason":""}},"#,
+                    r#"{"guarantee":{"level":"delegated","reason":"awk"}}"#,
+                )
+                .to_owned()
+            };
+            std::fs::write(
+                root.join(".deshell/evidence.json"),
+                format!(r#"{{"nodes":[{nodes}],"observations":[]}}"#),
+            )
+            .unwrap();
+            std::fs::write(
+                root.join(".deshell/manifest.json"),
+                format!(
+                    r#"{{"entries":[{{"entrypoint":"{entry}","evidence_path":".deshell/evidence.json"}}]}}"#
+                ),
+            )
+            .unwrap();
+        }
+        _ => {
+            eprintln!("unsupported audit invocation: {args:?}");
+            std::process::exit(64);
+        }
+    }
+}
+"###,
+        )
+        .unwrap();
+        let output = std::process::Command::new("rustc")
+            .args(["--edition=2024", "-o"])
+            .arg(path)
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Write one repository into the corpus and return its scan report bytes.
+    fn audit_repository(corpus: &Path, name: &str, files: &[(&str, &str)], items: &str) -> String {
+        let root = corpus.join(name);
+        std::fs::create_dir_all(root.join(".audit-fixture")).unwrap();
+        let mut rendered = items.to_owned();
+        for (path, contents) in files {
+            let file = root.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, contents).unwrap();
+            rendered = rendered.replace(
+                &format!("<digest:{path}>"),
+                &sha256_hex(contents.as_bytes()),
+            );
+        }
+        assert!(!rendered.contains("<digest:"), "{rendered}");
+        let report = format!(
+            r#"{{"schema_version":1,"command":"scan","status":"ok","summary":"s","next_actions":[],"details":{{"counts":{{}},"values":{{}},"paths":[],"output":[],"items":[{rendered}]}}}}"#
+        );
+        std::fs::write(root.join(".audit-fixture/scan.json"), &report).unwrap();
+        report
+    }
+
+    /// The audit over a whole corpus, excluding nothing and keeping no report.
+    /// Each test narrows it by naming the fields it cares about.
+    fn audit_arguments<'a>(root: &'a Path, corpus: &Path, deshell: &Path) -> CorpusAuditArgs<'a> {
+        CorpusAuditArgs {
+            root,
+            corpus_root: corpus.to_path_buf(),
+            excluded_repositories: Vec::new(),
+            excluded_patterns: Vec::new(),
+            deshell: deshell.to_path_buf(),
+            json: false,
+            output: None,
+        }
+    }
+
+    /// The audit reports every shell location, and fails on a residual node.
+    ///
+    /// `alpha` holds a shell file that lowers clean plus an embedded `RUN` and
+    /// a workflow `run`, which differ only in case. `beta` holds a shell file
+    /// that keeps a residual node.
+    #[test]
+    fn the_corpus_audit_counts_every_location_and_refuses_a_residual_node() {
+        let directory = tempfile::tempdir().unwrap();
+        let deshell = directory.path().join(if cfg!(windows) {
+            "audit-deshell.exe"
+        } else {
+            "audit-deshell"
+        });
+        compile_audit_deshell(&deshell);
+        let corpus = directory.path().join("corpus");
+        std::fs::create_dir_all(&corpus).unwrap();
+
+        audit_repository(
+            &corpus,
+            "alpha",
+            &[
+                ("scripts/build.sh", "#!/bin/sh\nexec cargo build\n"),
+                ("Dockerfile", "RUN set -eu; make\n"),
+                (".github/workflows/ci.yml", "jobs: {}\n"),
+                ("Makefile", "all:\n\tcargo build\n"),
+            ],
+            concat!(
+                r#"{"kind":"shell_file","path":"scripts/build.sh","name":"sh","#,
+                r#""message":"","digest":"<digest:scripts/build.sh>"},"#,
+                r#"{"kind":"embedded_shell","path":"Dockerfile","name":"sh","#,
+                r#""message":"RUN:1","digest":"<digest:Dockerfile>"},"#,
+                r#"{"kind":"embedded_shell","path":".github/workflows/ci.yml","name":"bash","#,
+                r#""message":"run:3","digest":"<digest:.github/workflows/ci.yml>"},"#,
+                r#"{"kind":"candidate","path":"Makefile","name":"sh","#,
+                r#""message":"line:7","digest":"<digest:Makefile>"}"#,
+            ),
+        );
+        audit_repository(
+            &corpus,
+            "beta",
+            &[("deploy.sh", "#!/bin/sh\nRESIDUAL=1\neval \"$1\"\n")],
+            concat!(
+                r#"{"kind":"shell_file","path":"deploy.sh","name":"bash","#,
+                r#""message":"","digest":"<digest:deploy.sh>"}"#,
+            ),
+        );
+        audit_repository(&corpus, "vendor-skipped", &[], "");
+
+        let root = directory.path();
+        let mut arguments = audit_arguments(root, &corpus, &deshell);
+        arguments.excluded_patterns = vec!["vendor-*".into()];
+        let failures = run_corpus_audit(arguments).expect_err("a residual node fails the audit");
+        assert_eq!(
+            failures,
+            vec!["beta/deploy.sh: residual nodes remain: dynamic command".to_owned()],
+            "{failures:#?}"
+        );
+
+        // The same run again, this time keeping the report.
+        let output = root.join("audit.json");
+        let mut arguments = audit_arguments(root, &corpus, &deshell);
+        arguments.excluded_patterns = vec!["vendor-*".into()];
+        arguments.output = Some(output.clone());
+        run_corpus_audit(arguments).expect_err("a residual node fails the audit");
+        let text = std::fs::read_to_string(&output).unwrap();
+        let report: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        // The persistence the PowerShell auditor hand-rolled: keys sorted, two
+        // spaces, one trailing LF and no CR anywhere, on every platform.
+        assert!(text.ends_with("}\n") && !text.ends_with("}\n\n"), "{text}");
+        assert!(!text.contains('\r'), "{text}");
+        assert!(
+            text.contains("\n  \"analysis_scope\": \"shell_files\",\n"),
+            "{text}"
+        );
+        let keys = report
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut sorted = keys.clone();
+        sorted.sort();
+        assert_eq!(keys, sorted);
+
+        assert_eq!(report["repositories"], serde_json::json!(["alpha", "beta"]));
+        assert_eq!(report["summary"]["locations"]["total"], 5);
+        assert_eq!(report["summary"]["locations"]["shell_files"], 2);
+        assert_eq!(report["summary"]["locations"]["embedded_shell"], 2);
+        assert_eq!(report["summary"]["locations"]["candidates"], 1);
+        assert_eq!(report["summary"]["analysis_failures"], 1);
+        assert_eq!(report["summary"]["fully_non_residual"], 1);
+        assert_eq!(report["summary"]["nodes"]["native"], 3);
+        assert_eq!(report["summary"]["nodes"]["delegated"], 1);
+        assert_eq!(report["summary"]["nodes"]["residual"], 1);
+        assert_eq!(
+            report["fully_non_residual_files"],
+            serde_json::json!(["alpha/scripts/build.sh"])
+        );
+
+        // `RUN` and `run` are different origins. PowerShell's `Sort-Object`
+        // and `Group-Object` are case-insensitive by default, so the script
+        // ordered these two by whichever happened to come first and would have
+        // merged them outright had their interpreters matched.
+        let groups = report["inventory_groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|group| {
+                format!(
+                    "{}/{}/{}x{}",
+                    group["kind"].as_str().unwrap(),
+                    group["origin"].as_str().unwrap(),
+                    group["interpreter"].as_str().unwrap(),
+                    group["count"],
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            groups,
+            vec![
+                "candidate/line/shx1",
+                "embedded_shell/RUN/shx1",
+                "embedded_shell/run/bashx1",
+                "shell_file/shell-file/bashx1",
+                "shell_file/shell-file/shx1",
+            ]
+        );
+    }
+
+    /// Every way the audit refuses before it reports.
+    #[test]
+    fn the_corpus_audit_fails_closed_on_a_moving_scan_and_an_empty_exclusion() {
+        let directory = tempfile::tempdir().unwrap();
+        let deshell = directory.path().join(if cfg!(windows) {
+            "audit-deshell.exe"
+        } else {
+            "audit-deshell"
+        });
+        compile_audit_deshell(&deshell);
+        let corpus = directory.path().join("corpus");
+        std::fs::create_dir_all(&corpus).unwrap();
+        let root = directory.path();
+
+        // An exact exclusion that names nothing broadens the audit silently.
+        let mut arguments = audit_arguments(root, &corpus, &deshell);
+        arguments.excluded_repositories = vec!["never-cloned".into()];
+        let failures =
+            run_corpus_audit(arguments).expect_err("an exclusion that matches nothing fails");
+        assert!(
+            failures[0].contains("Exact repository exclusion 'never-cloned'"),
+            "{failures:#?}"
+        );
+
+        audit_repository(
+            &corpus,
+            "unstable",
+            &[("run.sh", "#!/bin/sh\necho hi\n")],
+            concat!(
+                r#"{"kind":"shell_file","path":"run.sh","name":"sh","#,
+                r#""message":"RUNS","digest":"<digest:run.sh>"}"#,
+            ),
+        );
+        audit_repository(
+            &corpus,
+            "unknown-kind",
+            &[("odd.txt", "x\n")],
+            r#"{"kind":"future_kind","path":"odd.txt","name":"sh","message":"","digest":"d"}"#,
+        );
+
+        let failures = run_corpus_audit(audit_arguments(root, &corpus, &deshell))
+            .expect_err("a moving scan and an unknown kind both fail");
+        assert!(
+            failures
+                .iter()
+                .any(|failure| failure
+                    == "unstable: repeated Inventory v1 scan was not byte-identical"),
+            "{failures:#?}"
+        );
+        assert!(
+            failures.iter().any(|failure| failure
+                == "unknown-kind: Scan Report holds an unknown location kind 'future_kind' at odd.txt"),
+            "{failures:#?}"
         );
     }
 

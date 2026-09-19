@@ -248,6 +248,19 @@ All notable changes are documented here. No compatibility contract predates
   .NET types and formats with `-f` — so the answer is the one the tool exists to
   prompt: write it in the project's own language.
 
+- `scripts/audit-corpus.ps1`, rewritten as `cargo xtask corpus-audit`. The
+  corpus audit is a 0.1.0 release gate, so every release runner had to carry a
+  PowerShell to run a gate; none does now. Ported rather than reimplemented and
+  checked against the script on the same fourteen repositories: every count,
+  file result, residual reason and all 103 inventory groups matched. The one
+  ordering that differed was the script's — `Sort-Object` and `Group-Object`
+  are case-insensitive by default, so a Dockerfile `RUN` and a workflow `run:`
+  tied, and would have been merged into one row had their interpreters matched.
+  The port also refuses a Scan Report location whose `kind` is none of
+  `shell_file`, `embedded_shell` or `candidate`, where the script read "not an
+  error and not a skip" as a location, and refuses a `--format` that is neither
+  `text` nor `json`.
+
 
 - Pre-v1 Effect IR and lock migration promises.
 - Public OCaml library/runtime/install artifacts and legacy executable-name

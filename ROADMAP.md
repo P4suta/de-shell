@@ -216,16 +216,24 @@ Nushell), with both official Rust and Go generators where applicable.
   | blockers | 118 |
   | retired | 0 |
 
-  The blockers, by code, on 2026-09-19 after the work below:
+  The blockers, by code, on 2026-09-19 after the work below. 30 of the 118:
 
   | count | code | what it is |
   | --- | --- | --- |
-  | 18 | `UNIMPLEMENTED_SEMANTIC` | PowerShell steps and scripts using control syntax outside the modelled subset |
-  | 11 | `DYNAMIC_CANDIDATE` | shell in `mise.toml` tasks and a Python contract validator |
-  | 9 | `UNRESOLVED_CALL_SITE` | `run: ./scripts/install-nushell.ps1`, whose target is one of those scripts |
+  | 9 | `UNRESOLVED_CALL_SITE` | `run: ./scripts/install-nushell.ps1`, whose target is one of the scripts below |
+  | 9 | `DYNAMIC_CANDIDATE` | shell in `mise.toml` tasks and a Python contract validator |
   | 6 | `RESIDUAL_SOURCE` | steps holding `${{ }}`, which GitHub substitutes before a shell sees them |
-  | 2 | `GENERATOR_UNSUPPORTED` | |
-  | 2 | `SCENARIO_INPUT_COVERAGE` | |
+  | 6 | `UNIMPLEMENTED_SEMANTIC` | the three remaining PowerShell scripts, using control syntax outside the modelled subset |
+
+  `GENERATOR_UNSUPPORTED` and `SCENARIO_INPUT_COVERAGE` are both zero: a step
+  with several commands generates a program that runs them in order and stops
+  where the step stops, and `init` synthesizes a scenario for every shell
+  location rather than only the ones it could name.
+
+  Two PowerShell scripts have been retired into `xtask` since: the repository
+  guardrails (`repository-guardrails`, ee6f9ff) and the corpus auditor
+  (`corpus-audit`). Each took its `mise.toml` invocation with it, so each
+  removed one `DYNAMIC_CANDIDATE` and one `UNIMPLEMENTED_SEMANTIC`.
 
   It started at 118. What came off, and what each was:
 
@@ -298,6 +306,15 @@ Nushell), with both official Rust and Go generators where applicable.
   It runs now, and `docs/corpus-audit.md` records the result: 14 repositories,
   1,006 locations, 98 shell files, zero analysis failures, 98 of 98 fully
   non-residual, validated against `corpus-audit-v1.schema.json`.
+
+  The auditor is `cargo xtask corpus-audit` now rather than 661 lines of
+  PowerShell that de-shell refuses, so a release runner no longer needs a
+  PowerShell to run a release gate. Verified by running both against the same
+  fourteen repositories: every count, every file result, every residual reason
+  and all 103 inventory groups matched, and the one ordering that differed was
+  the script's — `Sort-Object` and `Group-Object` are case-insensitive by
+  default, so a Dockerfile `RUN` and a workflow `run:` tied, and would have been
+  merged into one row had their interpreters matched.
 
   **The declared selection is still not reproducible from this repository.** The
   2026-08-25 run named 48 repositories and wrote down only two of their file

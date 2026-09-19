@@ -545,13 +545,22 @@ mod tests {
         assert!(schema["$defs"]["file"]["properties"].get("error").is_some());
     }
 
+    /// The corpus audit is a 0.1.0 release gate, so every release runner had to
+    /// carry a PowerShell to run it. It is `cargo xtask corpus-audit` now, and
+    /// the sorted two-space LF persistence it used to hand-roll belongs to
+    /// `serde_json` — `the_corpus_audit_counts_every_location_and_refuses_a_
+    /// residual_node` in `xtask` checks the bytes it writes.
     #[test]
-    fn corpus_auditor_persists_sorted_two_space_lf_json() {
-        let script = fs::read_to_string(root().join("scripts/audit-corpus.ps1")).unwrap();
-        assert!(script.contains("function ConvertTo-SortedJsonValue"));
-        assert!(script.contains("ConvertTo-SortedJsonValue $report"));
-        assert!(script.contains("$json + \"`n\""));
-        assert!(!script.contains("$json + [Environment]::NewLine"));
+    fn corpus_auditor_is_not_a_shell_script() {
+        assert!(
+            !root().join("scripts/audit-corpus.ps1").exists(),
+            "the corpus auditor was retired into xtask; it must not return as a script"
+        );
+        let mise = fs::read_to_string(root().join("mise.toml")).unwrap();
+        assert!(
+            mise.contains("cargo run --locked -p xtask -- corpus-audit"),
+            "mise must run the corpus audit through xtask"
+        );
     }
 
     #[test]
