@@ -55,6 +55,23 @@ All notable changes are documented here. No compatibility contract predates
 
 ### Fixed
 
+- Gave the ambient inputs a name and landed the ban that was waiting for it.
+  `clippy.toml` said the clock and environment entries were "deliberately NOT
+  banned yet, because there is no injected `HostEnvironment` for callers to
+  reach for instead", and that banning an API before its replacement exists
+  converts each call into a suppression nobody revisits. `host::` is that
+  replacement — `variable`, `text_variable`, `wall_clock` and `Stopwatch`, one
+  module, answerable by a test — so `std::env::var`, `var_os`, `vars`,
+  `vars_os`, `SystemTime::now` and `Instant::now` are disallowed everywhere
+  else, the way the filesystem APIs already were. The set of things de-shell
+  reads from outside the repository is now a list a reader can finish.
+
+  It immediately paid for itself: an audit acknowledgement's expiry is compared
+  against the clock, so no test could check that one stops suppressing its
+  finding — the existing test uses `expires = "2099-01-01"` precisely because
+  the real clock would never reach it, which is the same as not testing the
+  window. The day can be moved across the boundary now, and is.
+
 - Read a process launch for its program and the command it hands over, rather
   than for whether every argument is a literal. Those are different questions,
   and the second answered the first wrongly in both directions:

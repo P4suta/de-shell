@@ -6173,7 +6173,7 @@ mod tests {
             &["sh".into(), "-c".into(), "sleep 30".into()],
         )
         .unwrap();
-        let started = std::time::Instant::now();
+        let started = crate::host::Stopwatch::start();
         let answer = agent.request(b"{}", std::time::Duration::from_millis(250));
         assert!(matches!(
             answer,

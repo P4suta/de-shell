@@ -3297,7 +3297,7 @@ fn run_plan(
     let backend = crate::local_backend::LocalBackend::for_validated_project(&project);
     let mut environment = std::collections::BTreeMap::new();
     for name in plan.tasks.iter().flat_map(|task| &task.environment) {
-        if let Ok(value) = std::env::var(name) {
+        if let Some(value) = crate::host::text_variable(name) {
             environment.insert(name.clone(), value);
         }
     }
@@ -3417,7 +3417,7 @@ fn run_disposable(parts: RunDisposableArgs<'_>) -> Result<i32, Failure> {
         .tasks
         .iter()
         .flat_map(|task| &task.environment)
-        .filter_map(|name| std::env::var(name).ok().map(|value| (name.clone(), value)))
+        .filter_map(|name| crate::host::text_variable(name).map(|value| (name.clone(), value)))
         .collect();
     let request = crate::lab::Request {
         workspace: path_string(workspace.path(), "private workspace")?,

@@ -12,6 +12,15 @@ mod evidence;
 mod exporter;
 mod frontend;
 mod harden;
+// The ambient-input layer. Every raw clock and environment read that
+// `clippy.toml` bans elsewhere is implemented here exactly once, so the set of
+// things de-shell reads from outside the repository is a list a reader can
+// finish and a test can supply.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "host implements the readings the ban redirects callers to; it is the one place the raw APIs may appear"
+)]
+mod host;
 mod ir;
 mod lab;
 mod local_backend;

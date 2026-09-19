@@ -539,7 +539,7 @@ fn acknowledgement_is_active(expires: &str, max_days: u32, today: i64) -> bool {
 }
 
 fn current_unix_days() -> i64 {
-    std::time::SystemTime::now()
+    crate::host::wall_clock()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |duration| duration.as_secs() / 86_400) as i64
 }
@@ -868,6 +868,69 @@ mod tests {
         )
         .unwrap();
         assert!(acknowledged.acknowledged);
+    }
+
+    /// An acknowledgement stops suppressing its finding once it expires.
+    ///
+    /// The property that makes an acknowledgement an exception rather than a
+    /// deletion, and nothing could check it: the expiry is compared against
+    /// `SystemTime::now`, so a test could only pick a date far enough away that
+    /// the real clock would not reach it — which is the same as not testing the
+    /// window at all. The test beside this one uses `2099-01-01` for exactly
+    /// that reason.
+    ///
+    /// `host::wall_clock` is answerable now, so the day can be moved across the
+    /// boundary instead.
+    #[test]
+    fn an_acknowledgement_expires_when_the_day_passes_its_expiry() {
+        let source = "rm -rf target\n";
+        let digest = crate::digest::sha256(source.as_bytes());
+        let finding_on = |day: &str, acknowledgements: &[AuditAcknowledgement]| {
+            let expires = crate::host::Fixed {
+                wall_clock: Some(
+                    std::time::UNIX_EPOCH
+                        + std::time::Duration::from_secs(
+                            u64::try_from(parse_date_days(day).unwrap()).unwrap() * 86_400,
+                        ),
+                ),
+                ..crate::host::Fixed::default()
+            };
+            crate::host::with(expires, || {
+                make_finding(
+                    "filesystem.dangerous-delete",
+                    Category::Filesystem,
+                    AuditSeverity::High,
+                    Confidence::High,
+                    "dangerous",
+                    "build.sh",
+                    source,
+                    0,
+                    13,
+                    &digest,
+                    acknowledgements,
+                    30,
+                )
+                .unwrap()
+            })
+        };
+        let unacknowledged = finding_on("2026-09-19", &[]);
+        let acknowledgement = AuditAcknowledgement {
+            rule: unacknowledged.rule_id.clone(),
+            location_digest: unacknowledged.location_digest.clone(),
+            reason: "reviewed".into(),
+            owner: "security".into(),
+            expires: "2026-10-01".into(),
+        };
+        let one = std::slice::from_ref(&acknowledgement);
+
+        // The day before, and the expiry day itself: still an exception.
+        assert!(finding_on("2026-09-30", one).acknowledged);
+        assert!(finding_on("2026-10-01", one).acknowledged);
+        // The day after: the finding is reported again.
+        assert!(!finding_on("2026-10-02", one).acknowledged);
+        // And a window this acknowledgement outruns is refused from either
+        // side, however close the day is.
+        assert!(!finding_on("2026-08-01", one).acknowledged);
     }
 
     #[test]

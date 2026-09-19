@@ -55,13 +55,13 @@ pub(crate) trait Clock: Sync {
 }
 
 pub(crate) struct SystemClock {
-    start: std::time::Instant,
+    start: crate::host::Stopwatch,
 }
 
 impl SystemClock {
     pub(crate) fn start() -> Self {
         Self {
-            start: std::time::Instant::now(),
+            start: crate::host::Stopwatch::start(),
         }
     }
 }
@@ -573,7 +573,7 @@ fn valid_environment_name(name: &str) -> bool {
 
 fn add_essential_environment(command: &mut std::process::Command) {
     let toolchain = msvc_toolchain_environment();
-    add_essential_environment_with(command, |name| std::env::var_os(name), toolchain);
+    add_essential_environment_with(command, crate::host::variable, toolchain);
 }
 
 fn add_essential_environment_with(
@@ -644,7 +644,7 @@ fn discover_msvc_toolchain_environment() -> Vec<(std::ffi::OsString, std::ffi::O
         .iter()
         .find(|(name, _)| name.to_string_lossy().eq_ignore_ascii_case("PATH"))
         .map(|(_, value)| value.clone())
-        .or_else(|| std::env::var_os("PATH"))
+        .or_else(|| crate::host::variable("PATH"))
         .unwrap_or_default();
     let mut paths = tool
         .path()

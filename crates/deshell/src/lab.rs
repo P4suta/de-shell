@@ -399,7 +399,7 @@ impl Probe for SystemProbe {
         if !cfg!(windows) {
             return false;
         }
-        let root = std::env::var_os("SystemRoot")
+        let root = crate::host::variable("SystemRoot")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
         match feature {
@@ -817,10 +817,10 @@ fn command_path(command: &str) -> Option<PathBuf> {
     if command.is_empty() || command.contains(['/', '\\', '\0']) {
         return None;
     }
-    let path = std::env::var_os("PATH")?;
+    let path = crate::host::variable("PATH")?;
     let extensions: Vec<String> = if cfg!(windows) {
-        std::env::var("PATHEXT")
-            .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into())
+        crate::host::text_variable("PATHEXT")
+            .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".into())
             .split(';')
             .map(str::to_owned)
             .collect()

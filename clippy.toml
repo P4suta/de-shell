@@ -84,17 +84,22 @@ disallowed-methods = [
   { path = "std::fs::create_dir_all", reason = "de-shell creates each component deliberately so it can roll back exactly what it created; use `patch::ensure_directory` per component" },
 
   # --- Determinism --------------------------------------------------------
-  # `SystemTime::now`, `Instant::now`, `env::var` and `env::vars` belong here too:
   # de-shell claims deterministic output and canonical digest bytes, and an
   # unmediated reading of the clock or the ambient environment makes that claim
-  # untestable. They are deliberately NOT banned yet, because there is no injected
-  # `HostEnvironment` for callers to reach for instead.
+  # untestable: the inputs are not written down, so a test cannot supply them and
+  # a reader cannot enumerate them.
   #
-  # Banning an API before its replacement exists does not remove the calls; it
-  # converts each one into an `#[allow]` that nobody ever revisits. The filesystem
-  # entries above were only enforceable in one pass because `patch::` already named
-  # every intent they redirect to. The five remaining call sites are tracked in
-  # ROADMAP.md and the ban lands with the type, not before it.
+  # This ban waited for its replacement. Banning an API before one exists does not
+  # remove the calls, it converts each one into a suppression nobody revisits — the
+  # filesystem entries above were enforceable in one pass only because `patch::`
+  # already named every intent they redirect to. `host::` now names these, so the
+  # ban lands with the type as promised.
+  { path = "std::env::var", reason = "read it through `host::text_variable`, which is the one place de-shell reads the ambient environment and the one place a test can answer for it" },
+  { path = "std::env::var_os", reason = "read it through `host::variable`" },
+  { path = "std::env::vars", reason = "de-shell reads the variables it names; `host::variable` per name is what makes the set enumerable" },
+  { path = "std::env::vars_os", reason = "see std::env::vars" },
+  { path = "std::time::SystemTime::now", reason = "a timestamp de-shell records comes from `host::wall_clock`, so a test can fix it" },
+  { path = "std::time::Instant::now", reason = "measure with `host::Stopwatch`, which a test can answer for" },
   { path = "std::env::set_var", reason = "races with other threads and mutates ambient state a later read cannot distinguish from configuration" },
   { path = "std::env::remove_var", reason = "see std::env::set_var" },
 
