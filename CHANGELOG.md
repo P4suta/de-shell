@@ -163,6 +163,14 @@ All notable changes are documented here. No compatibility contract predates
   `bash --noprofile --norc -eo pipefail {0}`, the scanner reports both as
   `bash`, and the two statuses are two programs.
 
+- Generated a program for a workflow step with several commands instead of
+  refusing it. The program writes each command with its own literal argv and
+  stops where the step stops, and `run_argv` is the program rather than the
+  step's first command.
+- Ran the original of a workflow step the way the runner does — `bash -e {0}`
+  over a file, not `bash -c <text>` — so the comparison has the baseline the
+  step actually has.
+
 ### Removed
 
 - Pre-v1 Effect IR and lock migration promises.
