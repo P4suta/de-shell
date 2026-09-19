@@ -8,7 +8,8 @@ it says so.
 
 Last updated from clean base `d89eacc`, on branch
 `feat/observability-and-native-platforms`; the mutation results below were
-measured from the current working tree on 2026-09-20.
+measured from the current working tree on 2026-09-20. The coverage result below
+is from a clean profile collected from that same tree.
 
 ## What the campaign is
 
@@ -219,6 +220,20 @@ Reproduce only in a trusted disposable git worktree. `cargo-mutants --in-place`
 edits source while it runs, and a mutant can leave approval artifacts outside
 the project metadata directory. Remove the whole temporary worktree after
 recording results rather than treating those leftovers as product defects.
+
+## Coverage gate
+
+The line threshold remains 90%; it was not lowered to absorb the new migration
+and frontend scope. `coverage:collect` first deletes stale profiles, runs all
+workspace targets serially, then adds real-binary coverage for the CLI contract
+checks, shell semantic matrices, conformance/performance checks, and Bash/Rust,
+PowerShell/Go and Nushell/Rust migration paths. `coverage` reports only after
+that shared collection step, so CI and release cannot accidentally measure a
+smaller test surface.
+
+The trusted clean run on 2026-09-20 passed all 521 workspace tests (481
+`deshell`, 40 `xtask`) and finished at **90.40% line coverage**: 54,234 lines,
+5,204 missed. `cargo llvm-cov` enforced `--fail-under-lines 90` on the result.
 
 ## Next, in the order I would take it
 

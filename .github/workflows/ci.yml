@@ -145,7 +145,7 @@ jobs:
         run: mise run test:schema-validator
 
       - name: Enforce the v0.1 line-coverage contract
-        run: cargo llvm-cov --locked --workspace --all-targets --summary-only --fail-under-lines 90 -- --test-threads=1
+        run: mise run coverage
 
   dynamic-analysis:
     name: Undefined behaviour and fuzz smoke

@@ -676,6 +676,7 @@ dependencies = [
  "sha2",
  "syn",
  "tempfile",
+ "toml",
 ]
 
 [[package]]

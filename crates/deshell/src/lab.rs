@@ -3,6 +3,11 @@ use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+#[cfg(test)]
+use std::cell::RefCell;
+#[cfg(test)]
+use std::collections::VecDeque;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Platform {
     Linux,
@@ -107,6 +112,14 @@ pub(crate) fn execution_connected(provider: Provider) -> bool {
 }
 
 pub(crate) fn select<P: Probe>(platform: Platform, probe: &P) -> Result<Provider, String> {
+    #[cfg(test)]
+    let chosen = TEST_EXECUTION.with(|execution| {
+        execution.borrow().as_ref().map_or_else(
+            || choose(platform, probe),
+            |execution| Ok(execution.provider),
+        )
+    });
+    #[cfg(not(test))]
     let chosen = choose(platform, probe);
     // What the probe saw is what decided this, and a run that ends in exit 6
     // says only that nothing was available. The record says which platform was
@@ -262,10 +275,84 @@ pub(crate) struct ExecutionFailure {
     pub message: String,
 }
 
+#[cfg(test)]
+struct TestExecution {
+    provider: Provider,
+    results: VecDeque<Result<crate::runner::RunResult, ExecutionFailure>>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_EXECUTION: RefCell<Option<TestExecution>> = const { RefCell::new(None) };
+}
+
+/// Runs one synchronous command with exact disposable-provider outcomes.
+///
+/// This hook is deliberately thread-local: Rust's test runner may exercise an
+/// unrelated provider on another thread at the same time. Every supplied result
+/// must be consumed, so a test cannot accidentally pass after observing only a
+/// prefix of the interaction it intended to specify.
+#[cfg(test)]
+pub(crate) fn with_test_execution<T>(
+    provider: Provider,
+    results: Vec<Result<crate::runner::RunResult, ExecutionFailure>>,
+    action: impl FnOnce() -> T,
+) -> T {
+    struct Reset;
+
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_EXECUTION.with(|execution| {
+                execution.borrow_mut().take();
+            });
+        }
+    }
+
+    TEST_EXECUTION.with(|execution| {
+        let mut execution = execution.borrow_mut();
+        assert!(
+            execution.is_none(),
+            "test execution hook is already installed"
+        );
+        *execution = Some(TestExecution {
+            provider,
+            results: results.into(),
+        });
+    });
+    let reset = Reset;
+    let result = action();
+    TEST_EXECUTION.with(|execution| {
+        assert!(
+            execution
+                .borrow()
+                .as_ref()
+                .is_some_and(|execution| execution.results.is_empty()),
+            "test execution hook did not consume every result"
+        );
+    });
+    drop(reset);
+    result
+}
+
 pub(crate) fn execute(
     provider: Provider,
     request: &Request,
 ) -> Result<crate::runner::RunResult, ExecutionFailure> {
+    #[cfg(test)]
+    if let Some(result) = TEST_EXECUTION.with(|execution| {
+        execution.borrow_mut().as_mut().map(|execution| {
+            assert_eq!(
+                provider, execution.provider,
+                "test execution hook received the wrong provider"
+            );
+            execution
+                .results
+                .pop_front()
+                .expect("test execution hook has no result for this call")
+        })
+    }) {
+        return result;
+    }
     execute_with(provider, request, crate::agent_process::execute)
 }
 

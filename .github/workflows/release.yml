@@ -45,12 +45,13 @@ jobs:
 
       - name: Keep the release-candidate measurement reproducible
         if: github.ref_name != 'v0.1.0'
-        run: cargo llvm-cov --locked --workspace --all-targets --summary-only --fail-under-lines 90 -- --test-threads=1
+        run: mise run coverage
 
       - name: Enforce the final 0.1.0 coverage contract
         if: github.ref_name == 'v0.1.0'
         run: |
-          cargo llvm-cov --locked --workspace --all-targets --json --summary-only --fail-under-lines 90 --output-path target/release-coverage.json -- --test-threads=1
+          mise run coverage:collect
+          cargo llvm-cov report -p deshell -p xtask --json --summary-only --fail-under-lines 90 --output-path target/release-coverage.json
           python3 scripts/check-release-coverage.py target/release-coverage.json
 
   dynamic-analysis:

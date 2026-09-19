@@ -11531,6 +11531,91 @@ mod tests {
         ]
     }
 
+    /// Every generator-side classifier and emitter must make an explicit
+    /// decision for every IR operation. This is deliberately driven by the
+    /// same exhaustive fixture as the independent verifier: adding an
+    /// operation cannot leave a quiet wildcard or an unexecuted refusal arm.
+    #[test]
+    fn generator_classifiers_and_emitters_decide_every_ir_operation() {
+        let mut captures = Vec::new();
+        let mut sets_variables = Vec::new();
+        let mut redirects = Vec::new();
+        let mut exits = Vec::new();
+        let mut starts_process = Vec::new();
+        let mut uses_pipeline = Vec::new();
+
+        for (name, subject) in one_node_per_operation() {
+            assert_eq!(subject.operation.name(), name);
+            if node_captures_stdout(&subject) {
+                captures.push(name);
+            }
+            if rust_node_sets_variables(&subject) {
+                sets_variables.push(name);
+            }
+            if rust_node_redirects(&subject) {
+                redirects.push(name);
+            }
+            if node_always_exits(&subject) {
+                exits.push(name);
+            }
+            if rust_node_starts_a_process(&subject) {
+                starts_process.push(name);
+            }
+            if rust_node_uses_pipeline(&subject) {
+                uses_pipeline.push(name);
+            }
+            assert!(!rust_node_uses_arguments(&subject), "{name}");
+            assert!(!go_node_uses_defaults(&subject), "{name}");
+            assert!(!go_node_checks_exit_status(&subject), "{name}");
+            assert_eq!(go_pattern_packages(&subject), (false, false), "{name}");
+
+            let mut rust = String::new();
+            match emit_rust_node(&subject, &mut rust, 1, Locals::Kept) {
+                Ok(()) => assert!(!rust.is_empty(), "Rust silently erased {name}"),
+                Err(error) => assert!(!error.trim().is_empty(), "Rust refused {name} silently"),
+            }
+            let mut go = String::new();
+            match emit_go_node(&subject, &mut go, 1) {
+                Ok(()) if name == "sequence" => assert!(go.is_empty()),
+                Ok(()) => assert!(!go.is_empty(), "Go silently erased {name}"),
+                Err(error) => assert!(!error.trim().is_empty(), "Go refused {name} silently"),
+            }
+
+            let plan = plan_with_body(subject.clone());
+            let top_level = literal_exec_sequence(&plan, "exhaustive host classifier");
+            if matches!(name, "exec" | "set_variable") {
+                assert!(top_level.is_ok(), "host refused {name}: {top_level:?}");
+            } else {
+                let error = top_level.unwrap_err();
+                assert!(error.starts_with("DESHELL_BLOCKER_GENERATOR_UNSUPPORTED:"));
+            }
+
+            let mut steps = Vec::new();
+            let flattened = flatten_literal_commands(
+                &subject,
+                crate::ir::SequenceFailure::Continue,
+                "exhaustive host classifier",
+                &mut steps,
+            );
+            if matches!(
+                name,
+                "exec" | "sequence" | "write_stdout" | "exit" | "set_variable"
+            ) {
+                assert!(flattened.is_ok(), "host step refused {name}: {flattened:?}");
+            } else {
+                let error = flattened.unwrap_err();
+                assert!(error.starts_with("DESHELL_BLOCKER_GENERATOR_UNSUPPORTED:"));
+            }
+        }
+
+        assert_eq!(captures, ["capture_stdout"]);
+        assert_eq!(sets_variables, ["set_variable", "capture_stdout"]);
+        assert_eq!(redirects, ["redirect"]);
+        assert_eq!(exits, ["exit"]);
+        assert_eq!(starts_process, ["exec", "pipeline", "interpreter_call"]);
+        assert_eq!(uses_pipeline, ["pipeline"]);
+    }
+
     /// What the independent IR verifier does with every operation, recorded.
     ///
     /// The ledger is *derived by running the verifier*, not written beside it:
@@ -12955,8 +13040,16 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
                 "no",
             )]))),
         });
+        let capture = node(crate::ir::Operation::CaptureStdout {
+            name: "captured".into(),
+            value_type: crate::ir::PrimitiveType::Text,
+            body: Box::new(exec(vec![
+                crate::ir::TextExpression::literal("/usr/bin/printf"),
+                crate::ir::TextExpression::literal("captured\n\n"),
+            ])),
+        });
         let plan = plan_with_body(node(crate::ir::Operation::Sequence {
-            nodes: vec![command, pipeline, condition],
+            nodes: vec![command, pipeline, condition, capture],
             on_failure: crate::ir::SequenceFailure::Continue,
         }));
         let rust = String::from_utf8(generate_rust(&plan).unwrap()).unwrap();
@@ -12970,6 +13063,7 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
             ".current_dir",
             "deshell_run_pipeline",
             "if deshell_predicate == 0",
+            "deshell_captured.trim_end_matches('\\n')",
         ] {
             assert!(
                 rust.contains(expected),
@@ -12985,6 +13079,7 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
             ".Dir =",
             "deshellRunPipeline",
             "if deshellLast == 0",
+            "strings.TrimRight(string(deshellOut), \"\\n\")",
         ] {
             assert!(go.contains(expected), "missing {expected:?} in Go output");
         }

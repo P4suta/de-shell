@@ -3296,7 +3296,7 @@ fn migration_fixture(interpreter: &str) -> Result<MigrationFixture, String> {
             source: concat!(
                 "#!/bin/sh\n",
                 "/usr/bin/printf '%s:%s\\n' \"$1\" \"$CORPUS_ENV\"\n",
-                "/usr/bin/test \"$1\" = pass && /usr/bin/printf '%s\\n' branch\n",
+                "/bin/test \"$1\" = pass && /usr/bin/printf '%s\\n' branch\n",
             )
             .as_bytes(),
         }),
@@ -3305,7 +3305,7 @@ fn migration_fixture(interpreter: &str) -> Result<MigrationFixture, String> {
             source: concat!(
                 "#!/usr/bin/env bash\n",
                 "/usr/bin/printf '%s:%s\\n' \"$1\" \"$CORPUS_ENV\"\n",
-                "/usr/bin/test \"$1\" = pass && /usr/bin/printf '%s\\n' branch\n",
+                "/bin/test \"$1\" = pass && /usr/bin/printf '%s\\n' branch\n",
             )
             .as_bytes(),
         }),
@@ -3314,7 +3314,7 @@ fn migration_fixture(interpreter: &str) -> Result<MigrationFixture, String> {
             source: concat!(
                 "#!/usr/bin/env zsh\n",
                 "/usr/bin/printf '%s:%s\\n' \"$1\" \"$CORPUS_ENV\"\n",
-                "/usr/bin/test \"$1\" = pass && /usr/bin/printf '%s\\n' branch\n",
+                "/bin/test \"$1\" = pass && /usr/bin/printf '%s\\n' branch\n",
             )
             .as_bytes(),
         }),
@@ -3323,7 +3323,7 @@ fn migration_fixture(interpreter: &str) -> Result<MigrationFixture, String> {
             source: concat!(
                 "#!/usr/bin/env fish\n",
                 "command /usr/bin/printf '%s:%s\\n' \"$argv[1]\" \"$CORPUS_ENV\"\n",
-                "command /usr/bin/test \"$argv[1]\" = pass && command /usr/bin/printf '%s\\n' branch\n",
+                "command /bin/test \"$argv[1]\" = pass && command /usr/bin/printf '%s\\n' branch\n",
             )
             .as_bytes(),
         }),
@@ -3359,7 +3359,7 @@ fn migration_fixture(interpreter: &str) -> Result<MigrationFixture, String> {
             source: concat!(
                 "def main [value: string] {\n",
                 "  ^/usr/bin/printf '%s:%s\\n' $value $env.CORPUS_ENV\n",
-                "  ^/usr/bin/test $value '=' pass\n",
+                "  ^/bin/test $value '=' pass\n",
                 "  if $env.LAST_EXIT_CODE == 0 {\n",
                 "    ^/usr/bin/printf '%s\\n' branch\n",
                 "  } else {\n",
@@ -3489,11 +3489,276 @@ fn migration_interpreter_supported_on(interpreter: &str, operating_system: &str)
     }
 }
 
-fn run_migration_e2e(
-    repository: &Path,
-    interpreter: &str,
+fn migration_table<'a>(
+    value: &'a mut toml::Value,
+    field: &str,
+    context: &str,
+) -> Result<&'a mut toml::Table, String> {
+    value
+        .get_mut(field)
+        .and_then(toml::Value::as_table_mut)
+        .ok_or_else(|| format!("{context} omitted table '{field}'"))
+}
+
+fn migration_array<'a>(
+    value: &'a mut toml::Value,
+    field: &str,
+    context: &str,
+) -> Result<&'a mut Vec<toml::Value>, String> {
+    value
+        .get_mut(field)
+        .and_then(toml::Value::as_array_mut)
+        .ok_or_else(|| format!("{context} omitted array '{field}'"))
+}
+
+fn read_migration_toml(path: &Path, context: &str) -> Result<toml::Value, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    toml::from_str(&text).map_err(|error| format!("invalid {context} TOML: {error}"))
+}
+
+fn write_migration_toml(path: &Path, value: &toml::Value, context: &str) -> Result<(), String> {
+    let text = toml::to_string_pretty(value)
+        .map_err(|error| format!("cannot encode {context} TOML: {error}"))?;
+    std::fs::write(path, text).map_err(|error| format!("cannot write {}: {error}", path.display()))
+}
+
+fn approve_migration_config(
+    path: &Path,
     generator: &str,
+    embedded_path: &str,
+) -> Result<(), String> {
+    let mut config = read_migration_toml(path, "migration config")?;
+    let migration = migration_table(&mut config, "migration", "migration config")?;
+    for field in ["generator", "target"] {
+        let actual = migration.get(field).and_then(toml::Value::as_str);
+        if actual != Some(generator) {
+            return Err(format!(
+                "initialized migration config {field} was {actual:?}, expected {generator:?}"
+            ));
+        }
+    }
+
+    let overrides = migration_array(&mut config, "location_overrides", "migration config")?;
+    let embedded = overrides
+        .iter()
+        .filter_map(toml::Value::as_table)
+        .find(|entry| entry.get("path").and_then(toml::Value::as_str) == Some(embedded_path))
+        .ok_or_else(|| {
+            format!("initialized migration config omitted host override for {embedded_path}")
+        })?;
+    for (field, expected) in [
+        ("generator", "host"),
+        ("target", "host"),
+        ("module_root", ".deshell/host"),
+    ] {
+        let actual = embedded.get(field).and_then(toml::Value::as_str);
+        if actual != Some(expected) {
+            return Err(format!(
+                "initialized host override {field} was {actual:?}, expected {expected:?}"
+            ));
+        }
+    }
+
+    let cells = migration_array(&mut config, "platform_cells", "migration config")?;
+    let count = cells.len();
+    let [cell] = cells.as_mut_slice() else {
+        return Err(format!(
+            "initialized migration config must contain exactly one platform cell, found {count}"
+        ));
+    };
+    let cell = cell
+        .as_table_mut()
+        .ok_or("initialized migration platform cell is not a table")?;
+    cell.insert("id".into(), toml::Value::String("host".into()));
+    write_migration_toml(path, &config, "migration config")
+}
+
+fn set_scenario_named_value(
+    scenario: &mut toml::Value,
+    field: &str,
+    name: &str,
+    value: &str,
+) -> Result<(), String> {
+    let values = migration_array(scenario, field, "migration scenario")?;
+    let mut found = false;
+    for entry in &mut *values {
+        let entry = entry
+            .as_table_mut()
+            .ok_or_else(|| format!("migration scenario {field} entry is not a table"))?;
+        if entry.get("name").and_then(toml::Value::as_str) == Some(name) {
+            entry.insert("value".into(), toml::Value::String(value.into()));
+            found = true;
+        }
+    }
+    if !found {
+        values.push(toml::Value::Table(toml::Table::from_iter([
+            ("name".into(), toml::Value::String(name.into())),
+            ("value".into(), toml::Value::String(value.into())),
+        ])));
+    }
+    Ok(())
+}
+
+fn set_scenario_argv(scenario: &mut toml::Value, value: &str) -> Result<(), String> {
+    let table = scenario
+        .as_table_mut()
+        .ok_or("migration scenario root is not a table")?;
+    table.insert(
+        "argv".into(),
+        toml::Value::Array(vec![toml::Value::String(value.into())]),
+    );
+    Ok(())
+}
+
+fn configure_migration_scenarios(
+    directory: &Path,
+    interpreter: &str,
+) -> Result<Vec<String>, String> {
+    let scenario_directory = directory.join(".deshell/scenarios");
+    let mut paths = std::fs::read_dir(&scenario_directory)
+        .map_err(|error| format!("cannot read {}: {error}", scenario_directory.display()))?
+        .map(|entry| {
+            entry
+                .map(|entry| entry.path())
+                .map_err(|error| format!("cannot read migration scenario entry: {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    paths.sort();
+
+    let success_name = "synthesized-corpus";
+    let mut success = None;
+    let mut success_names = Vec::new();
+    for path in paths {
+        let mut scenario = read_migration_toml(&path, "migration scenario")?;
+        let table = scenario
+            .as_table_mut()
+            .ok_or("migration scenario root is not a table")?;
+        let name = table
+            .get("name")
+            .and_then(toml::Value::as_str)
+            .ok_or("migration scenario omitted its name")?
+            .to_owned();
+        set_scenario_named_value(&mut scenario, "arguments", "1", "pass")?;
+        set_scenario_named_value(&mut scenario, "environment", "CORPUS_ENV", "matrix")?;
+        set_scenario_argv(&mut scenario, "pass")?;
+        if interpreter == "powershell" {
+            let table = scenario
+                .as_table_mut()
+                .ok_or("migration scenario root is not a table")?;
+            let limits = table
+                .get_mut("limits")
+                .and_then(toml::Value::as_table_mut)
+                .ok_or("PowerShell migration scenario omitted limits")?;
+            limits.insert("memory_bytes".into(), toml::Value::Integer(8_589_934_592));
+            let runtime_path = powershell_runtime_path()?;
+            set_scenario_named_value(&mut scenario, "environment", "PATH", &runtime_path)?;
+        }
+        if name == success_name {
+            success = Some(scenario.clone());
+        }
+        success_names.push(name);
+        write_migration_toml(&path, &scenario, "migration scenario")?;
+    }
+
+    let mut failure = success
+        .ok_or_else(|| format!("initialized project omitted migration scenario {success_name}"))?;
+    let table = failure
+        .as_table_mut()
+        .ok_or("migration scenario root is not a table")?;
+    table.insert("name".into(), toml::Value::String("failure".into()));
+    set_scenario_named_value(&mut failure, "arguments", "1", "fail")?;
+    set_scenario_argv(&mut failure, "fail")?;
+    write_migration_toml(
+        &scenario_directory.join("failure.toml"),
+        &failure,
+        "failure migration scenario",
+    )?;
+    Ok(success_names)
+}
+
+#[derive(Clone, Copy)]
+enum MigrationApprovalSubject {
+    Scenario,
+    Matrix,
+}
+
+impl MigrationApprovalSubject {
+    fn command(self) -> &'static str {
+        match self {
+            Self::Scenario => "scenario",
+            Self::Matrix => "matrix",
+        }
+    }
+
+    fn identifier_flag(self) -> &'static str {
+        match self {
+            Self::Scenario => "--name",
+            Self::Matrix => "--cell",
+        }
+    }
+}
+
+fn approve_migration_reviews(
+    binary: &Path,
+    directory: &Path,
+    subject: MigrationApprovalSubject,
 ) -> Result<(), Vec<String>> {
+    let command = subject.command();
+    let reviews = run_deshell(
+        binary,
+        directory,
+        &[command, "list", "--root", ".", "--format", "json"],
+    )?;
+    let reviews: serde_json::Value = serde_json::from_str(&reviews)
+        .map_err(|error| vec![format!("invalid {command} review JSON: {error}")])?;
+    let reviews = reviews["details"]["items"].as_array().ok_or_else(|| {
+        vec![format!(
+            "{command} review report omitted details.items: {reviews}"
+        )]
+    })?;
+    if reviews.is_empty() {
+        return Err(vec![format!("{command} review output was empty")]);
+    }
+    for review in reviews {
+        let name = review["name"]
+            .as_str()
+            .ok_or_else(|| vec![format!("{command} review omitted its name")])?;
+        let digest = review["digest"]
+            .as_str()
+            .ok_or_else(|| vec![format!("{command} review {name} omitted its digest")])?;
+        run_deshell(
+            binary,
+            directory,
+            &[
+                command,
+                "approve",
+                "--root",
+                ".",
+                subject.identifier_flag(),
+                name,
+                "--digest",
+                digest,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+struct MigrationE2eArgs<'a> {
+    repository: &'a Path,
+    interpreter: &'a str,
+    generator: &'a str,
+    binary: Option<&'a Path>,
+}
+
+fn run_migration_e2e(parts: MigrationE2eArgs<'_>) -> Result<(), Vec<String>> {
+    let MigrationE2eArgs {
+        repository,
+        interpreter,
+        generator,
+        binary,
+    } = parts;
     if !matches!(generator, "rust" | "go") {
         return Err(vec![format!(
             "unsupported migration E2E generator: {generator}"
@@ -3508,7 +3773,10 @@ fn run_migration_e2e(
     let embedded = migration_embedded_fixture(interpreter).map_err(|error| vec![error])?;
     let directory = tempfile::tempdir()
         .map_err(|error| vec![format!("cannot create migration E2E project: {error}")])?;
-    let mut binary = repository.join("target/debug/deshell");
+    let mut binary = binary.map_or_else(
+        || repository.join("target/debug/deshell"),
+        Path::to_path_buf,
+    );
     if cfg!(windows) {
         binary.set_extension("exe");
     }
@@ -3528,97 +3796,40 @@ fn run_migration_e2e(
     run_deshell(
         &binary,
         directory.path(),
-        &["init", "--root", ".", "--entry", fixture.path],
+        &[
+            "init",
+            "--root",
+            ".",
+            "--entry",
+            fixture.path,
+            "--target",
+            generator,
+        ],
     )?;
     let config_path = directory.path().join(".deshell/project.toml");
-    let mut config = std::fs::read_to_string(&config_path)
-        .map_err(|error| vec![format!("cannot read {}: {error}", config_path.display())])?;
-    let embedded_start = embedded
-        .source
-        .find("        run: |-")
-        .ok_or_else(|| vec!["embedded migration fixture omitted its run span".into()])?;
     let encoded_command = embedded.command.replace('\n', "\n          ");
     if !embedded.source.contains(&encoded_command) {
         return Err(vec![
             "embedded migration fixture source map omitted its decoded command".into(),
         ]);
     }
-    let embedded_end = embedded
-        .source
-        .strip_suffix('\n')
-        .map_or(embedded.source.len(), str::len);
-    config = config.replace(
-        "location_overrides = []",
-        &format!(
-            "location_overrides = [{{ path = \"{}\", start_byte = {embedded_start}, end_byte = {embedded_end}, generator = \"host\", target = \"host\", module_root = \"host\" }}]",
-            embedded.path,
-        ),
-    );
-    config = config.replace(
-        "platform_cells = []",
-        &format!(
-            "platform_cells = [{{ id = \"host\", operating_system = \"{}\", architecture = \"{}\", runtime = \"native\", approval = \"approved\" }}]",
-            std::env::consts::OS,
-            std::env::consts::ARCH
-        ),
-    );
+    approve_migration_config(&config_path, generator, embedded.path)
+        .map_err(|error| vec![error])?;
     let module_root = if generator == "go" { "cmd" } else { "src/bin" };
-    if generator == "go" {
-        config = config
-            .replacen("generator = \"rust\"", "generator = \"go\"", 1)
-            .replacen("target = \"rust\"", "target = \"go\"", 1)
-            .replacen("module_root = \"src/bin\"", "module_root = \"cmd\"", 1);
-    }
-    std::fs::write(&config_path, config)
-        .map_err(|error| vec![format!("cannot write {}: {error}", config_path.display())])?;
     std::fs::create_dir_all(directory.path().join(module_root))
         .map_err(|error| vec![format!("cannot create {module_root}: {error}")])?;
-    let scenario_path = directory.path().join(".deshell/scenarios/default.toml");
-    let mut scenario_template = std::fs::read_to_string(&scenario_path)
-        .map_err(|error| vec![format!("cannot read {}: {error}", scenario_path.display())])?;
-    if interpreter == "powershell" {
-        scenario_template =
-            scenario_template.replace("memory_bytes = 1073741824", "memory_bytes = 8589934592");
-    }
     let rich_matrix = matches!(
         interpreter,
         "sh" | "bash" | "zsh" | "fish" | "powershell" | "cmd" | "nu"
     );
-    let scenario_environment = if interpreter == "powershell" {
-        let runtime_path =
-            serde_json::to_string(&powershell_runtime_path().map_err(|error| vec![error])?)
-                .map_err(|error| vec![format!("cannot encode PowerShell runtime PATH: {error}")])?;
-        format!(
-            "environment = [{{ name = \"CORPUS_ENV\", value = \"matrix\" }}, {{ name = \"PATH\", value = {runtime_path} }}]"
-        )
-    } else {
-        "environment = [{ name = \"CORPUS_ENV\", value = \"matrix\" }]".into()
-    };
-    let mut scenario = scenario_template.replace("approval = \"draft\"", "approval = \"approved\"");
-    if rich_matrix {
-        scenario = scenario
-            .replace(
-                "arguments = []",
-                "arguments = [{ name = \"1\", value = \"pass\" }]",
-            )
-            .replace("argv = []", "argv = [\"pass\"]")
-            .replace("environment = []", &scenario_environment);
-
-        let failure = scenario_template
-            .replace("name = \"default\"", "name = \"failure\"")
-            .replace("approval = \"draft\"", "approval = \"approved\"")
-            .replace(
-                "arguments = []",
-                "arguments = [{ name = \"1\", value = \"fail\" }]",
-            )
-            .replace("argv = []", "argv = [\"fail\"]")
-            .replace("environment = []", &scenario_environment);
-        let failure_path = directory.path().join(".deshell/scenarios/failure.toml");
-        std::fs::write(&failure_path, failure)
-            .map_err(|error| vec![format!("cannot write {}: {error}", failure_path.display())])?;
-    }
-    std::fs::write(&scenario_path, scenario)
-        .map_err(|error| vec![format!("cannot write {}: {error}", scenario_path.display())])?;
+    let success_scenarios = configure_migration_scenarios(directory.path(), interpreter)
+        .map_err(|error| vec![error])?;
+    approve_migration_reviews(
+        &binary,
+        directory.path(),
+        MigrationApprovalSubject::Scenario,
+    )?;
+    approve_migration_reviews(&binary, directory.path(), MigrationApprovalSubject::Matrix)?;
 
     let planned = run_deshell(
         &binary,
@@ -3674,10 +3885,11 @@ fn run_migration_e2e(
                 ))
             })
             .collect::<std::collections::BTreeSet<_>>();
-        let expected = std::collections::BTreeSet::from([
-            ("default".to_owned(), 0),
-            ("failure".to_owned(), 1),
-        ]);
+        let mut expected = success_scenarios
+            .into_iter()
+            .map(|name| (name, 0))
+            .collect::<std::collections::BTreeSet<_>>();
+        expected.insert(("failure".to_owned(), 1));
         if outcomes != expected {
             return Err(vec![format!(
                 "{interpreter}/{generator} Evidence omitted success/failure branch outcomes: {outcomes:?}"
@@ -3769,10 +3981,11 @@ fn run_deshell(binary: &Path, root: &Path, arguments: &[&str]) -> Result<String,
         })?;
     if !output.status.success() {
         return Err(vec![format!(
-            "{} {} failed with {}: {}",
+            "{} {} failed with {}; stdout={}; stderr={}",
             binary.display(),
             arguments.join(" "),
             output.status,
+            String::from_utf8_lossy(&output.stdout).trim(),
             String::from_utf8_lossy(&output.stderr).trim()
         )]);
     }
@@ -3780,8 +3993,64 @@ fn run_deshell(binary: &Path, root: &Path, arguments: &[&str]) -> Result<String,
         .map_err(|error| vec![format!("deshell stdout is not UTF-8: {error}")])
 }
 
+/// Exercise every real-process contract that contributes to the release
+/// coverage measurement.
+///
+/// This goes through the same dispatcher as a developer invocation. Keeping the
+/// list here gives CI, release qualification, and a local `mise run coverage`
+/// one definition instead of three drifting shell-script copies.
+fn run_coverage_exercise(root: &Path, binary: &Path) -> Result<(), Vec<String>> {
+    for command in [
+        "bash-semantics",
+        "test-semantics",
+        "echo-semantics",
+        "exit-semantics",
+        "powershell-invocation",
+        "powershell-step-invocation",
+        "powershell-variables",
+        "powershell-preference",
+        "builtin-table",
+        "posix-divergence",
+        "printf-semantics",
+        "case-patterns",
+        "shell-variables",
+        "enum-equality",
+        "report-item-kinds",
+        "trace-events",
+        "fuzz-modules",
+        "lint-expectations",
+        "rust-policy",
+        "repository-guardrails",
+        "validate-contracts",
+    ] {
+        dispatch(root, &[command.into()])?;
+    }
+    for command in ["conformance", "performance"] {
+        dispatch(root, &[command.into(), binary.as_os_str().to_owned()])?;
+    }
+    for (interpreter, generator) in [("bash", "rust"), ("powershell", "go"), ("nu", "rust")] {
+        dispatch(
+            root,
+            &[
+                "migration-e2e".into(),
+                interpreter.into(),
+                generator.into(),
+                binary.as_os_str().to_owned(),
+            ],
+        )?;
+    }
+    Ok(())
+}
+
 fn dispatch(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Vec<String>> {
     match arguments.first().and_then(|value| value.to_str()) {
+        Some("coverage-exercise") => {
+            let binary = arguments
+                .get(1)
+                .map(PathBuf::from)
+                .ok_or_else(|| vec!["coverage-exercise requires DESHELL_BINARY".into()])?;
+            run_coverage_exercise(root, &binary)
+        }
         Some("conformance") => {
             let binary = arguments
                 .get(1)
@@ -3874,9 +4143,12 @@ fn dispatch(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Vec<Str
                 .and_then(|value| value.to_str())
                 .ok_or_else(|| vec!["migration-e2e requires GENERATOR".into()]);
             match (interpreter, generator) {
-                (Ok(interpreter), Ok(generator)) => {
-                    run_migration_e2e(root, interpreter, generator)
-                }
+                (Ok(interpreter), Ok(generator)) => run_migration_e2e(MigrationE2eArgs {
+                    repository: root,
+                    interpreter,
+                    generator,
+                    binary: arguments.get(3).map(PathBuf::from).as_deref(),
+                }),
                 (Err(mut left), Err(right)) => {
                     left.extend(right);
                     Err(left)
@@ -3885,7 +4157,7 @@ fn dispatch(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Vec<Str
             }
         }
         _ => Err(vec![
-            "usage: cargo run -p xtask -- conformance [DESHELL_BINARY] | migration-e2e INTERPRETER GENERATOR | performance [DESHELL_BINARY] | validate-contracts".into(),
+            "usage: cargo run -p xtask -- conformance [DESHELL_BINARY] | coverage-exercise DESHELL_BINARY | migration-e2e INTERPRETER GENERATOR [DESHELL_BINARY] | performance [DESHELL_BINARY] | validate-contracts".into(),
         ]),
     }
 }
@@ -4602,28 +4874,32 @@ fn corpus_path() -> PathBuf {
 
 fn initialize(args: &[String]) {
     let root = project_root(args);
+    let target = option(args, "--target").unwrap_or_else(|| "rust".into());
+    let module_root = if target == "go" { "cmd" } else { "src/bin" };
     std::fs::create_dir_all(root.join(".deshell/scenarios")).unwrap();
     std::fs::write(
         root.join(".deshell/project.toml"),
-        concat!(
+        format!(concat!(
             "entrypoints = []\n",
-            "generator = \"rust\"\n",
-            "target = \"rust\"\n",
-            "module_root = \"src/bin\"\n",
-            "location_overrides = []\n",
-            "platform_cells = []\n",
+            "location_overrides = [{{ path = \".github/workflows/embedded.yml\", start_byte = 0, end_byte = 1, generator = \"host\", target = \"host\", module_root = \".deshell/host\" }}]\n",
+            "platform_cells = [{{ id = \"fixture\", operating_system = \"fixture\", architecture = \"fixture\", runtime = \"native\", approval = \"draft\" }}]\n",
             "allow_local = false\n",
-        ),
+            "[migration]\n",
+            "generator = \"{}\"\n",
+            "target = \"{}\"\n",
+            "module_root = \"{}\"\n",
+        ), target, target, module_root),
     )
     .unwrap();
     std::fs::write(
-        root.join(".deshell/scenarios/default.toml"),
+        root.join(".deshell/scenarios/synthesized-corpus.toml"),
         concat!(
-            "name = \"default\"\n",
+            "name = \"synthesized-corpus\"\n",
             "approval = \"draft\"\n",
             "arguments = []\n",
             "argv = []\n",
             "environment = []\n",
+            "[limits]\n",
             "memory_bytes = 1073741824\n",
         ),
     )
@@ -4635,7 +4911,7 @@ fn write_evidence(args: &[String]) {
     let source = corpus_path();
     let source = source.file_name().unwrap().to_string_lossy();
     let evidence = format!(
-        "{{\"checks\":[{{\"comparisons\":[{{\"original\":{{\"exit_code\":0}}}}],\"scenario\":\"default\",\"source\":{{\"path\":\"{source}\"}}}},{{\"comparisons\":[{{\"original\":{{\"exit_code\":1}}}}],\"scenario\":\"failure\",\"source\":{{\"path\":\"{source}\"}}}}]}}"
+        "{{\"checks\":[{{\"comparisons\":[{{\"original\":{{\"exit_code\":0}}}}],\"scenario\":\"synthesized-corpus\",\"source\":{{\"path\":\"{source}\"}}}},{{\"comparisons\":[{{\"original\":{{\"exit_code\":1}}}}],\"scenario\":\"failure\",\"source\":{{\"path\":\"{source}\"}}}}]}}"
     );
     std::fs::write(output, evidence).unwrap();
 }
@@ -4691,6 +4967,15 @@ fn main() {
             println!("{{}}");
         }
         Some("init") => initialize(&args),
+        Some("scenario") if args.get(1).map(String::as_str) == Some("list") => println!(
+            "{{\"details\":{{\"items\":[{{\"name\":\"synthesized-corpus\",\"digest\":\"sha256:success\"}},{{\"name\":\"failure\",\"digest\":\"sha256:failure\"}}]}}}}"
+        ),
+        Some("matrix") if args.get(1).map(String::as_str) == Some("list") => {
+            println!(
+                "{{\"details\":{{\"items\":[{{\"name\":\"host\",\"digest\":\"sha256:host\"}}]}}}}"
+            );
+        }
+        Some("scenario" | "matrix") if args.get(1).map(String::as_str) == Some("approve") => {}
         Some("analyze") if option(&args, "--entry").as_deref() == Some("unknown.ext") => {
             println!("{{\"command\":\"analyze\",\"schema_version\":1}}");
             std::process::exit(4);
@@ -4927,12 +5212,16 @@ fn main() {
         assert!(ci.contains("cargo deny --locked check"));
         assert!(ci.contains("mise run test:schema-validator"));
         assert!(!ci.contains("--fail-under-lines 74"));
-        assert!(ci.contains(
-            "cargo llvm-cov --locked --workspace --all-targets --summary-only --fail-under-lines 90 -- --test-threads=1"
-        ));
+        assert!(ci.contains("run: mise run coverage"));
         assert!(!mise.contains("--fail-under-lines 74"));
         assert!(mise.contains(
-            "cargo llvm-cov --locked --workspace --all-targets --summary-only --fail-under-lines 90 -- --test-threads=1"
+            "cargo llvm-cov --locked --workspace --all-targets --no-report -- --test-threads=1"
+        ));
+        assert!(mise.contains(
+            "cargo llvm-cov report -p deshell -p xtask --summary-only --fail-under-lines 90"
+        ));
+        assert!(mise.contains(
+            "cargo llvm-cov --locked --no-report run -p xtask -- coverage-exercise target/llvm-cov-target/debug/deshell"
         ));
         assert!(ci.contains("MISE_AUTO_INSTALL: \"false\""));
     }
@@ -5204,13 +5493,15 @@ fn main() {
     #[test]
     fn executable_corpus_fixtures_use_portable_system_paths() {
         let root = repository_root();
+        let non_portable_test = ["/usr/bin", "/test"].concat();
         for relative in [
             "crates/deshell/src/cli.rs",
             "crates/deshell/src/frontend.rs",
+            "xtask/src/main.rs",
         ] {
             let source = std::fs::read_to_string(root.join(relative)).unwrap();
             assert!(
-                !source.contains("/usr/bin/test"),
+                !source.contains(&non_portable_test),
                 "{relative} contains a fixture path absent on macOS"
             );
         }
@@ -5229,14 +5520,17 @@ fn main() {
 
     #[test]
     fn final_release_requires_ninety_percent_coverage_and_the_seven_interpreter_corpus() {
-        let workflow =
-            std::fs::read_to_string(repository_root().join(".github/workflows/release.yml"))
-                .unwrap();
+        let root = repository_root();
+        let workflow = std::fs::read_to_string(root.join(".github/workflows/release.yml")).unwrap();
+        let mise = std::fs::read_to_string(root.join("mise.toml")).unwrap();
         assert!(workflow.contains("release-qualification:"));
         assert!(workflow.contains("migration-e2e:"));
         assert!(workflow.contains("--fail-under-lines 90"));
         assert!(!workflow.contains("--fail-under-lines 74"));
-        assert!(workflow.contains("-- --test-threads=1"));
+        assert!(workflow.contains("mise run coverage"));
+        assert!(workflow.contains("mise run coverage:collect"));
+        assert!(mise.contains("-- --test-threads=1"));
+        assert!(mise.contains("coverage-exercise"));
         assert!(workflow.contains("scripts/check-release-coverage.py"));
         assert!(workflow.contains("cargo run --locked -p xtask -- migration-e2e"));
         for interpreter in ["sh", "bash", "zsh", "fish", "powershell", "cmd", "nu"] {
@@ -5644,14 +5938,30 @@ fn main() {
         }
         compile_fake_deshell(&binary);
         let interpreter = if cfg!(windows) { "cmd" } else { "sh" };
-        run_migration_e2e(repository.path(), interpreter, "rust").unwrap();
-        run_migration_e2e(repository.path(), "powershell", "go").unwrap();
-        assert!(run_migration_e2e(repository.path(), interpreter, "unknown").is_err());
+        let run = |interpreter, generator| {
+            run_migration_e2e(MigrationE2eArgs {
+                repository: repository.path(),
+                interpreter,
+                generator,
+                binary: None,
+            })
+        };
+        run(interpreter, "rust").unwrap();
+        run("powershell", "go").unwrap();
+        assert!(run(interpreter, "unknown").is_err());
         let wrong_platform = if cfg!(windows) { "sh" } else { "cmd" };
-        assert!(run_migration_e2e(repository.path(), wrong_platform, "rust").is_err());
+        assert!(run(wrong_platform, "rust").is_err());
 
         let missing = tempfile::tempdir().unwrap();
-        assert!(run_migration_e2e(missing.path(), interpreter, "rust").is_err());
+        assert!(
+            run_migration_e2e(MigrationE2eArgs {
+                repository: missing.path(),
+                interpreter,
+                generator: "rust",
+                binary: None,
+            })
+            .is_err()
+        );
         assert!(migration_embedded_fixture("unknown").is_err());
         assert!(!powershell_runtime_path().unwrap().is_empty());
     }
@@ -5704,6 +6014,10 @@ fn main() {
         let root = repository_root();
         assert!(dispatch(&root, &[OsString::from("validate-contracts")]).is_ok());
         assert!(dispatch(&root, &[]).unwrap_err()[0].contains("usage:"));
+        assert_eq!(
+            dispatch(&root, &[OsString::from("coverage-exercise")]).unwrap_err(),
+            ["coverage-exercise requires DESHELL_BINARY"]
+        );
         assert_eq!(
             dispatch(&root, &[OsString::from("migration-e2e")])
                 .unwrap_err()

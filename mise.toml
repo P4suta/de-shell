@@ -159,12 +159,20 @@ description = "Validate schemas and generated v1 documents with an independent e
 depends = ["build"]
 run = "python3 scripts/validate-json-contracts.py target/debug/deshell"
 
-[tasks.coverage]
-description = "Measure line coverage and enforce the v0.1 90 percent release floor"
+[tasks."coverage:collect"]
+description = "Collect unit, conformance, semantic-corpus, migration, and performance coverage"
 run = [
   "rustup component add llvm-tools-preview",
-  "cargo llvm-cov --locked --workspace --all-targets --summary-only --fail-under-lines 90 -- --test-threads=1",
+  "cargo llvm-cov clean --workspace",
+  "cargo llvm-cov --locked --workspace --all-targets --no-report -- --test-threads=1",
+  "cargo llvm-cov --locked --no-report run -p deshell --bin deshell -- --version",
+  "cargo llvm-cov --locked --no-report run -p xtask -- coverage-exercise target/llvm-cov-target/debug/deshell",
 ]
+
+[tasks.coverage]
+description = "Measure line coverage and enforce the v0.1 90 percent release floor"
+depends = ["coverage:collect"]
+run = "cargo llvm-cov report -p deshell -p xtask --summary-only --fail-under-lines 90"
 
 [tasks."test:builtin-semantics"]
 description = "Measure the builtins against their recordings and the table"

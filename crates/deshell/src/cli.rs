@@ -5343,6 +5343,458 @@ mod tests {
     use crate::config::ProjectConfig;
     use std::path::Path;
 
+    #[test]
+    fn disposable_boundary_preserves_every_scenario_input_and_failure_class() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut config = ProjectConfig::decode(&ProjectConfig::default_text()).unwrap();
+        config.policy.network = crate::config::NetworkPolicy::RecordReplay;
+        let mut scenario = crate::config::Scenario::decode(
+            &crate::config::Scenario::default_text()
+                .replace("name = \"default\"", "name = \"full\""),
+        )
+        .unwrap();
+        scenario.argv = vec!["one".into(), "two".into()];
+        scenario.arguments = vec![crate::config::NamedValue {
+            name: "1".into(),
+            value: "named".into(),
+        }];
+        scenario.environment = vec![crate::config::NamedValue {
+            name: "VALUE".into(),
+            value: "environment".into(),
+        }];
+        scenario.stdin = Some(crate::config::BinaryData::from_utf8("stdin"));
+        scenario.cwd = Some("work".into());
+        scenario.fixtures = vec![crate::config::Fixture {
+            path: "fixture.txt".into(),
+            contents: crate::config::BinaryData::from_utf8("fixture"),
+            executable: false,
+        }];
+        scenario.expect.files = vec![crate::config::ExpectedFile {
+            path: "result.txt".into(),
+            sha256: format!("sha256:{}", "a".repeat(64)),
+        }];
+
+        let request = lab_scenario_request(LabScenarioRequestArgs {
+            workspace: workspace.path(),
+            target: crate::lab::Target::Original {
+                interpreter: "bash".into(),
+                script: "build.sh".into(),
+            },
+            scenario: &scenario,
+            config: &config,
+            image: "image@sha256:fixture",
+        })
+        .unwrap();
+        assert_eq!(request.arguments, ["one", "two"]);
+        assert_eq!(request.named_inputs, [("1".into(), "named".into())]);
+        assert_eq!(
+            request.environment,
+            [("VALUE".into(), "environment".into())]
+        );
+        assert_eq!(request.stdin, b"stdin");
+        assert_eq!(request.working_directory.as_deref(), Some("work"));
+        assert_eq!(request.fixtures, scenario.fixtures);
+        assert_eq!(request.expected_files, scenario.expect.files);
+        assert_eq!(request.limits, scenario.limits);
+        assert_eq!(
+            request.network,
+            crate::lab::Network::Replay {
+                proxy: "http://deshell-replay:8080".into(),
+                tape: "/workspace/.deshell/replay.json".into(),
+            }
+        );
+        assert!(
+            request
+                .result_path
+                .ends_with(".deshell/provider-result.json")
+        );
+
+        config.policy.network = crate::config::NetworkPolicy::Deny;
+        assert_eq!(lab_network(&config), crate::lab::Network::Deny);
+        for (kind, exit, code) in [
+            (
+                crate::lab::ExecutionFailureKind::Unavailable,
+                6,
+                "DESHELL_PROVIDER_UNAVAILABLE",
+            ),
+            (crate::lab::ExecutionFailureKind::Failed, 1, "DESHELL_IO"),
+        ] {
+            let failure = classify_lab_failure(crate::lab::ExecutionFailure {
+                kind,
+                message: "classified".into(),
+            });
+            assert_eq!(
+                (failure.exit, failure.code, failure.message.as_str()),
+                (exit, code, "classified")
+            );
+        }
+
+        let scenarios = vec![
+            crate::project::ValidatedScenario {
+                scenario: scenario.clone(),
+                digest: "first".into(),
+            },
+            crate::project::ValidatedScenario {
+                scenario: crate::config::Scenario {
+                    name: "second".into(),
+                    ..scenario
+                },
+                digest: "second".into(),
+            },
+        ];
+        assert_eq!(select_scenarios(&scenarios, &[]).unwrap(), scenarios);
+        assert_eq!(
+            select_scenarios(&scenarios, &["second".into()])
+                .unwrap()
+                .iter()
+                .map(|value| value.scenario.name.as_str())
+                .collect::<Vec<_>>(),
+            ["second"]
+        );
+        assert!(select_scenarios(&scenarios, &["missing".into()]).is_err());
+        assert!(select_scenarios(&[], &[]).is_err());
+
+        assert_eq!(
+            [
+                crate::evidence::ObservationStatus::Verified,
+                crate::evidence::ObservationStatus::Different,
+                crate::evidence::ObservationStatus::Unavailable,
+                crate::evidence::ObservationStatus::Failed,
+                crate::evidence::ObservationStatus::Nondeterministic,
+            ]
+            .map(observation_status),
+            [
+                "verified",
+                "different",
+                "unavailable",
+                "failed",
+                "nondeterministic",
+            ]
+        );
+
+        let mut lock =
+            crate::config::Lockfile::decode(&crate::config::Lockfile::default_text()).unwrap();
+        let unavailable = disposable_provider(&lock).unwrap_err();
+        assert_eq!(unavailable.exit, 6);
+        lock.lab.image = "not-pinned".into();
+        let invalid = disposable_provider(&lock).unwrap_err();
+        assert_eq!(invalid.exit, 3);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt as _;
+            let path = PathBuf::from(std::ffi::OsString::from_vec(vec![0xff]));
+            let failure = path_string(&path, "fixture").unwrap_err();
+            assert_eq!(failure.exit, 3);
+            assert!(failure.message.contains("not valid UTF-8"));
+        }
+    }
+
+    #[test]
+    fn connected_disposable_run_preserves_raw_output_and_exit_status() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        configure(directory.path(), "build.sh", b"/usr/bin/printf hello\n");
+        let lock_path = directory.path().join("deshell.lock");
+        let lock = std::fs::read_to_string(&lock_path).unwrap().replace(
+            "image = \"unconfigured\"",
+            &format!("image = \"example.invalid/lab@sha256:{}\"", "a".repeat(64)),
+        );
+        std::fs::write(lock_path, lock).unwrap();
+        crate::project::analyze(directory.path(), "build.sh").unwrap();
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let status = crate::lab::with_test_execution(
+            crate::lab::Provider::DockerRootless,
+            vec![Ok(crate::runner::RunResult {
+                exit_code: 23,
+                stdout: vec![0, b'o', b'k', 0xff],
+                stderr: vec![0xfe, b'e', b'r', b'r'],
+                trace: Vec::new(),
+            })],
+            || {
+                run_disposable(RunDisposableArgs {
+                    root: directory.path(),
+                    entrypoint: "build.sh",
+                    node_id: None,
+                    arguments: &["argument".into()],
+                    stdout: &mut stdout,
+                    stderr: &mut stderr,
+                })
+                .unwrap()
+            },
+        );
+        assert_eq!(status, 23);
+        assert_eq!(stdout, [0, b'o', b'k', 0xff]);
+        assert_eq!(stderr, [0xfe, b'e', b'r', b'r']);
+
+        let failure = crate::lab::with_test_execution(
+            crate::lab::Provider::Podman,
+            vec![Err(crate::lab::ExecutionFailure {
+                kind: crate::lab::ExecutionFailureKind::Failed,
+                message: "guest transport failed".into(),
+            })],
+            || {
+                run_disposable(RunDisposableArgs {
+                    root: directory.path(),
+                    entrypoint: "build.sh",
+                    node_id: None,
+                    arguments: &[],
+                    stdout: &mut Vec::new(),
+                    stderr: &mut Vec::new(),
+                })
+                .unwrap_err()
+            },
+        );
+        assert_eq!(
+            (failure.exit, failure.code, failure.message.as_str()),
+            (1, "DESHELL_IO", "guest transport failed")
+        );
+    }
+
+    #[test]
+    fn node_selection_and_explanation_walk_every_recursive_shape() {
+        fn node(id: &str, operation: crate::ir::Operation) -> crate::ir::Node {
+            crate::ir::Node {
+                id: id.into(),
+                operation,
+                guarantee: crate::ir::Guarantee::Native {
+                    semantic_model: "test model".into(),
+                },
+                source: None,
+            }
+        }
+
+        fn leaf(id: &str) -> crate::ir::Node {
+            node(id, crate::ir::Operation::NoOp)
+        }
+
+        let tree = node(
+            "root",
+            crate::ir::Operation::Sequence {
+                nodes: vec![
+                    node(
+                        "parallel",
+                        crate::ir::Operation::Parallel {
+                            nodes: vec![node(
+                                "pipeline",
+                                crate::ir::Operation::Pipeline {
+                                    nodes: vec![leaf("pipeline-leaf")],
+                                    status: crate::ir::PipelineStatus::Last,
+                                },
+                            )],
+                        },
+                    ),
+                    node(
+                        "condition",
+                        crate::ir::Operation::Condition {
+                            predicate: Box::new(leaf("predicate")),
+                            if_true: Box::new(leaf("if-true")),
+                            if_false: Some(Box::new(leaf("if-false"))),
+                        },
+                    ),
+                    node(
+                        "match",
+                        crate::ir::Operation::Match {
+                            value: crate::ir::TextExpression::literal("value"),
+                            cases: vec![crate::ir::MatchCase {
+                                pattern: crate::ir::PatternExpression::literal("case"),
+                                body: leaf("match-case"),
+                            }],
+                            default: Some(Box::new(leaf("match-default"))),
+                        },
+                    ),
+                    node(
+                        "foreach",
+                        crate::ir::Operation::Foreach {
+                            variable: "item".into(),
+                            items: vec![crate::ir::TextExpression::literal("one")],
+                            body: Box::new(leaf("foreach-body")),
+                        },
+                    ),
+                    node(
+                        "capture",
+                        crate::ir::Operation::CaptureStdout {
+                            name: "captured".into(),
+                            value_type: crate::ir::PrimitiveType::Text,
+                            body: Box::new(leaf("capture-body")),
+                        },
+                    ),
+                    node(
+                        "try-finally",
+                        crate::ir::Operation::TryFinally {
+                            body: Box::new(leaf("try-body")),
+                            finalizer: Box::new(leaf("finally-body")),
+                        },
+                    ),
+                ],
+                on_failure: crate::ir::SequenceFailure::Continue,
+            },
+        );
+        let expected = [
+            "root",
+            "parallel",
+            "pipeline",
+            "pipeline-leaf",
+            "condition",
+            "predicate",
+            "if-true",
+            "if-false",
+            "match",
+            "match-case",
+            "match-default",
+            "foreach",
+            "foreach-body",
+            "capture",
+            "capture-body",
+            "try-finally",
+            "try-body",
+            "finally-body",
+        ];
+        let mut collected = Vec::new();
+        collect_nodes(&tree, &mut collected);
+        assert_eq!(
+            collected
+                .iter()
+                .map(|node| node.id.as_str())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        for id in expected {
+            assert_eq!(find_node(&tree, id).map(|node| node.id.as_str()), Some(id));
+        }
+        assert!(find_node(&tree, "missing").is_none());
+
+        let plan = crate::frontend::lower(
+            "build.sh",
+            b"#!/bin/sh\n/usr/bin/printf one\n/usr/bin/printf two\n",
+            crate::config::UnknownInterpreter::Reject,
+        )
+        .unwrap();
+        assert_eq!(select_node(plan.clone(), None).unwrap(), plan);
+        let mut nodes = Vec::new();
+        collect_nodes(&plan.tasks[0].body, &mut nodes);
+        let child = nodes.last().unwrap().id.clone();
+        let selected = select_node(plan.clone(), Some(&child)).unwrap();
+        assert_eq!(selected.entrypoint, plan.tasks[0].name);
+        assert!(matches!(
+            selected.tasks[0].body.operation,
+            crate::ir::Operation::Exec { .. }
+        ));
+        assert_eq!(
+            select_node(plan, Some("missing")).unwrap_err(),
+            "node not found: missing"
+        );
+    }
+
+    #[test]
+    fn doctor_reports_verified_assets_and_each_required_capability() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+
+        let mut config = crate::project::load_config(directory.path()).unwrap();
+        config.sandbox.allow_local = true;
+        std::fs::write(
+            directory.path().join(".deshell/project.toml"),
+            config.encode_pretty().unwrap(),
+        )
+        .unwrap();
+
+        let runtime_path = directory.path().join("runtime.bin");
+        std::fs::write(&runtime_path, b"runtime").unwrap();
+        let (_, runtime_digest) = crate::digest::file_sha256(&runtime_path).unwrap();
+        let mut lock = crate::project::load_lock(directory.path()).unwrap();
+        lock.lab.image = format!("example.invalid/runtime@sha256:{}", "a".repeat(64));
+        lock.targets.dagger_image = format!("example.invalid/dagger@sha256:{}", "b".repeat(64));
+        lock.lab.assets = vec![
+            crate::config::LabAsset {
+                name: "runtime".into(),
+                role: crate::config::LabAssetRole::Runtime,
+                operating_system: std::env::consts::OS.into(),
+                architecture: std::env::consts::ARCH.into(),
+                path: "runtime.bin".into(),
+                sha256: format!("sha256:{runtime_digest}"),
+                executable: false,
+            },
+            crate::config::LabAsset {
+                name: "missing-helper".into(),
+                role: crate::config::LabAssetRole::Helper,
+                operating_system: std::env::consts::OS.into(),
+                architecture: std::env::consts::ARCH.into(),
+                path: "missing.bin".into(),
+                sha256: format!("sha256:{}", "c".repeat(64)),
+                executable: false,
+            },
+            crate::config::LabAsset {
+                name: "foreign".into(),
+                role: crate::config::LabAssetRole::Helper,
+                operating_system: if cfg!(target_os = "linux") {
+                    "macos".into()
+                } else {
+                    "linux".into()
+                },
+                architecture: std::env::consts::ARCH.into(),
+                path: "foreign.bin".into(),
+                sha256: format!("sha256:{}", "d".repeat(64)),
+                executable: false,
+            },
+        ];
+        let lock_text = toml::to_string_pretty(&lock).unwrap();
+        crate::config::Lockfile::decode(&lock_text).unwrap();
+        std::fs::write(directory.path().join("deshell.lock"), lock_text).unwrap();
+
+        let mut json = Vec::new();
+        let code = doctor_command(directory.path(), OutputFormat::Json, None, &mut json).unwrap();
+        assert_eq!(code, 0);
+        let report: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(report["bundle"]["ready"], true);
+        assert_eq!(report["bundle"]["assets"].as_array().unwrap().len(), 2);
+        assert_eq!(report["capabilities"]["planning"], true);
+        assert_eq!(report["capabilities"]["local"], true);
+        assert_eq!(report["capabilities"]["bundle"], true);
+        assert_eq!(report["capabilities"]["dagger"], true);
+
+        let mut human = Vec::new();
+        assert_eq!(
+            doctor_command(directory.path(), OutputFormat::Human, None, &mut human).unwrap(),
+            0
+        );
+        let human = String::from_utf8(human).unwrap();
+        for expected in [
+            "binary: ok",
+            "config: ok",
+            "lock: ok",
+            "lab image: pinned",
+            "Dagger target: pinned",
+            "bundle assets: ready",
+            "disposable execution:",
+            "planning=true local=true",
+        ] {
+            assert!(human.contains(expected), "missing {expected:?} in {human}");
+        }
+
+        for (requirement, expected) in [
+            (DoctorRequirement::Planning, 0),
+            (DoctorRequirement::Local, 0),
+            (DoctorRequirement::Disposable, 6),
+            (DoctorRequirement::Bundle, 0),
+            (DoctorRequirement::Dagger, 0),
+        ] {
+            assert_eq!(
+                doctor_command(
+                    directory.path(),
+                    OutputFormat::Agent,
+                    Some(requirement),
+                    &mut Vec::new(),
+                )
+                .unwrap(),
+                expected,
+                "{requirement:?}"
+            );
+        }
+    }
+
     /// A `scan` line naming a kind the report does not model becomes a scan
     /// error, not a kind.
     ///
@@ -6006,7 +6458,7 @@ mod tests {
             "scenario".into(),
             "synthesize".into(),
             "--root".into(),
-            root,
+            root.clone(),
             "--apply".into(),
         ]);
         assert_eq!(applied.0, 0, "{}", String::from_utf8_lossy(&applied.2));
@@ -6017,6 +6469,42 @@ mod tests {
         )
         .unwrap();
         assert!(persisted.contains("approval = \"draft\""));
+
+        let idempotent = invoke_owned(vec![
+            "deshell".into(),
+            "scenario".into(),
+            "synthesize".into(),
+            "--root".into(),
+            root.clone(),
+            "--apply".into(),
+        ]);
+        assert_eq!(
+            idempotent.0,
+            0,
+            "{}",
+            String::from_utf8_lossy(&idempotent.2)
+        );
+
+        std::fs::write(
+            directory
+                .path()
+                .join(".deshell/scenarios/synthesized-build.toml"),
+            b"occupied by a different review\n",
+        )
+        .unwrap();
+        let occupied = invoke_owned(vec![
+            "deshell".into(),
+            "scenario".into(),
+            "synthesize".into(),
+            "--root".into(),
+            root,
+            "--apply".into(),
+        ]);
+        assert_eq!(occupied.0, 4);
+        assert!(
+            String::from_utf8_lossy(&occupied.1)
+                .contains("refusing to overwrite an existing scenario draft")
+        );
     }
 
     #[test]
@@ -6462,6 +6950,32 @@ mod tests {
 
     #[test]
     fn failures_use_the_fixed_io_invalid_and_policy_categories() {
+        let fixed = [
+            (Failure::io("io"), 1, "DESHELL_IO"),
+            (Failure::limit("limit"), 1, "DESHELL_LIMIT_EXCEEDED"),
+            (Failure::usage("usage"), 2, "DESHELL_USAGE"),
+            (Failure::invalid("invalid"), 3, "DESHELL_INVALID_CONTRACT"),
+            (Failure::policy("policy"), 4, "DESHELL_POLICY"),
+            (
+                Failure::shell_reintroduced("shell"),
+                4,
+                "DESHELL_SHELL_REINTRODUCED",
+            ),
+            (Failure::difference("different"), 5, "DESHELL_DIFFERENCE"),
+            (
+                Failure::unavailable("unavailable"),
+                6,
+                "DESHELL_PROVIDER_UNAVAILABLE",
+            ),
+            (Failure::internal("internal"), 70, "DESHELL_INTERNAL"),
+        ];
+        for (failure, exit, code) in fixed {
+            assert_eq!((failure.exit, failure.code), (exit, code));
+            assert!(!failure.message.is_empty());
+            assert!(failure.help.is_none());
+            assert!(failure.next_actions.is_empty());
+        }
+
         let missing = tempfile::tempdir().unwrap().path().join("gone");
         let checked = invoke_owned(vec![
             "deshell".into(),
@@ -7006,6 +7520,140 @@ mod tests {
             String::from_utf8(verified.1)
                 .unwrap()
                 .contains("unavailable=1")
+        );
+    }
+
+    #[test]
+    fn observation_records_every_connected_execution_outcome() {
+        fn result(stdout: &[u8]) -> crate::runner::RunResult {
+            crate::runner::RunResult {
+                exit_code: 0,
+                stdout: stdout.to_vec(),
+                stderr: Vec::new(),
+                trace: Vec::new(),
+            }
+        }
+
+        fn failure(
+            kind: crate::lab::ExecutionFailureKind,
+            message: &str,
+        ) -> Result<crate::runner::RunResult, crate::lab::ExecutionFailure> {
+            Err(crate::lab::ExecutionFailure {
+                kind,
+                message: message.into(),
+            })
+        }
+
+        fn observe(
+            expected_stdout: Option<&str>,
+            results: Vec<Result<crate::runner::RunResult, crate::lab::ExecutionFailure>>,
+        ) -> (i32, String, crate::evidence::ObservationEvidence) {
+            let directory = tempfile::tempdir().unwrap();
+            crate::project::init(directory.path()).unwrap();
+            configure(directory.path(), "build.sh", b"/usr/bin/printf hello\n");
+            let lock_path = directory.path().join("deshell.lock");
+            let lock = std::fs::read_to_string(&lock_path).unwrap().replace(
+                "image = \"unconfigured\"",
+                &format!("image = \"example.invalid/lab@sha256:{}\"", "a".repeat(64)),
+            );
+            std::fs::write(lock_path, lock).unwrap();
+            if let Some(expected_stdout) = expected_stdout {
+                let scenario_path = directory.path().join(".deshell/scenarios/default.toml");
+                let scenario = std::fs::read_to_string(&scenario_path).unwrap().replace(
+                    "[expect]\n",
+                    &format!("[expect]\nstdout = {{ utf8 = {expected_stdout:?} }}\n"),
+                );
+                std::fs::write(scenario_path, scenario).unwrap();
+            }
+            crate::project::analyze(directory.path(), "build.sh").unwrap();
+            let mut output = Vec::new();
+            let code =
+                crate::lab::with_test_execution(crate::lab::Provider::Podman, results, || {
+                    observe_command(directory.path(), None, &[], &mut output).unwrap()
+                });
+            let (_, evidence) =
+                crate::project::load_entry_artifacts(directory.path(), "build.sh").unwrap();
+            assert_eq!(evidence.observations.len(), 1);
+            (
+                code,
+                String::from_utf8(output).unwrap(),
+                evidence.observations[0].clone(),
+            )
+        }
+
+        let verified = observe(None, vec![Ok(result(b"same")), Ok(result(b"same"))]);
+        assert_eq!(verified.0, 0);
+        assert_eq!(verified.1, "default: verified\n");
+        assert_eq!(
+            verified.2.status,
+            crate::evidence::ObservationStatus::Verified
+        );
+        assert_eq!(verified.2.provider, "podman");
+        assert!(verified.2.reason.is_none());
+        assert!(verified.2.digest.is_some());
+
+        let different = observe(None, vec![Ok(result(b"original")), Ok(result(b"plan"))]);
+        assert_eq!(different.0, 5);
+        assert_eq!(different.1, "default: different\n");
+        assert_eq!(
+            different.2.status,
+            crate::evidence::ObservationStatus::Different
+        );
+        assert!(different.2.reason.as_deref().unwrap().contains("stdout"));
+
+        let unavailable = observe(
+            None,
+            vec![failure(
+                crate::lab::ExecutionFailureKind::Unavailable,
+                "provider disappeared",
+            )],
+        );
+        assert_eq!(unavailable.0, 6);
+        assert!(unavailable.1.is_empty());
+        assert_eq!(
+            unavailable.2.status,
+            crate::evidence::ObservationStatus::Unavailable
+        );
+        assert_eq!(
+            unavailable.2.reason.as_deref(),
+            Some("provider disappeared")
+        );
+
+        let original_failed = observe(
+            None,
+            vec![failure(
+                crate::lab::ExecutionFailureKind::Failed,
+                "original crashed",
+            )],
+        );
+        assert_eq!(original_failed.0, 1);
+        assert_eq!(
+            original_failed.2.status,
+            crate::evidence::ObservationStatus::Failed
+        );
+        assert_eq!(
+            original_failed.2.reason.as_deref(),
+            Some("original crashed")
+        );
+
+        let expectation_failed = observe(Some("wanted"), vec![Ok(result(b"observed"))]);
+        assert_eq!(expectation_failed.0, 1);
+        assert_eq!(
+            expectation_failed.2.reason.as_deref(),
+            Some("scenario expected stdout did not match the original observation")
+        );
+
+        let plan_failed = observe(
+            None,
+            vec![
+                Ok(result(b"original")),
+                failure(crate::lab::ExecutionFailureKind::Failed, "plan crashed"),
+            ],
+        );
+        assert_eq!(plan_failed.0, 1);
+        assert_eq!(
+            plan_failed.2.reason.as_deref(),
+            Some("plan execution failed: plan crashed")
         );
     }
 
@@ -10037,8 +10685,47 @@ for line in sys.stdin:
             ]);
             assert_eq!(exported.0, 4, "{}", String::from_utf8_lossy(&exported.2));
         }
+
+        let nested =
+            safe_output_path(directory.path(), Path::new("nested/deeper/internal.json")).unwrap();
+        assert_eq!(
+            nested
+                .strip_prefix(directory.path().canonicalize().unwrap())
+                .unwrap(),
+            Path::new("nested/deeper/internal.json")
+        );
+        assert!(directory.path().join("nested/deeper").is_dir());
+        std::fs::write(&nested, b"existing").unwrap();
+        assert_eq!(
+            safe_output_path(directory.path(), Path::new("nested/deeper/internal.json")).unwrap(),
+            nested
+        );
+
+        std::fs::create_dir(directory.path().join("directory-output")).unwrap();
+        assert_eq!(
+            safe_output_path(directory.path(), Path::new("directory-output"))
+                .unwrap_err()
+                .message,
+            "export output must be a regular file"
+        );
+        std::fs::write(directory.path().join("file-parent"), b"occupied").unwrap();
+        assert!(
+            safe_output_path(directory.path(), Path::new("file-parent/output.json"))
+                .unwrap_err()
+                .message
+                .contains("parent is not a regular directory")
+        );
         #[cfg(unix)]
         {
+            use std::os::unix::ffi::OsStringExt as _;
+
+            let non_utf8 = PathBuf::from(std::ffi::OsString::from_vec(vec![0xff]));
+            assert_eq!(
+                safe_output_path(directory.path(), &non_utf8)
+                    .unwrap_err()
+                    .message,
+                "export --output must be valid UTF-8"
+            );
             let outside = tempfile::NamedTempFile::new().unwrap();
             std::os::unix::fs::symlink(outside.path(), directory.path().join("output.json"))
                 .unwrap();
@@ -10268,6 +10955,26 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn large_previews_use_the_bounded_linear_diff_without_losing_context() {
+        let prefix = (0..1_000)
+            .map(|index| format!("prefix-{index}\n"))
+            .collect::<String>();
+        let suffix = (0..1_000)
+            .map(|index| format!("suffix-{index}\n"))
+            .collect::<String>();
+        let before = format!("{prefix}before\n{suffix}");
+        let after = format!("{prefix}after\n{suffix}");
+        let diff = preview("large.sh", &before, &after);
+        assert!(diff.starts_with("--- a/large.sh\n+++ b/large.sh\n"));
+        assert!(diff.contains(" prefix-999\n-before\n+after\n suffix-0\n"));
+        assert!(
+            diff.len() < 1_000,
+            "bounded preview grew to {} bytes",
+            diff.len()
+        );
+    }
+
+    #[test]
     fn modernize_rolls_back_sources_when_reanalysis_cannot_commit() {
         let directory = tempfile::tempdir().unwrap();
         crate::project::init(directory.path()).unwrap();
@@ -10422,10 +11129,35 @@ for line in sys.stdin:
             "deshell".into(),
             "explain".into(),
             "--root".into(),
-            root,
+            root.clone(),
         ]);
         assert_eq!(explained.0, 0);
         assert!(String::from_utf8(explained.1).unwrap().contains("nodes: 1"));
+
+        let (plan, _) = crate::project::load_artifacts(directory.path()).unwrap();
+        let node_id = plan.tasks[0].body.id.clone();
+        let node = invoke_owned(vec![
+            "deshell".into(),
+            "explain".into(),
+            "--root".into(),
+            root.clone(),
+            node_id.clone(),
+        ]);
+        assert_eq!(node.0, 0, "{}", String::from_utf8_lossy(&node.2));
+        let node = String::from_utf8(node.1).unwrap();
+        assert!(node.contains(&format!("{node_id}\n")));
+        assert!(node.contains("\"level\": \"native\""));
+        assert!(node.contains("\"semantic_model\""));
+
+        let missing = invoke_owned(vec![
+            "deshell".into(),
+            "explain".into(),
+            "--root".into(),
+            root,
+            "missing-node".into(),
+        ]);
+        assert_eq!(missing.0, 3);
+        assert!(String::from_utf8_lossy(&missing.2).contains("node not found: missing-node"));
     }
 
     #[test]
