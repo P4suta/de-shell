@@ -55,6 +55,22 @@ All notable changes are documented here. No compatibility contract predates
 
 ### Fixed
 
+- Closed the set of `details.items[].kind`. All fifteen report contracts
+  declared it `"type": "string"`, and the structured report is built by
+  re-reading the command's human output, so `scan` took whatever token stood in
+  a line's first tab-separated field and called it a kind. A consumer branching
+  on `kind` — the corpus audit does, and so does any agent reading a report —
+  had nothing to branch over. `ItemKind` is an enum now, a `scan` line naming a
+  kind outside it is reported as a scan error rather than carried as a kind,
+  every report contract names the same twelve kinds in the same order, and
+  `cargo xtask report-item-kinds` fails when the enum and the contracts
+  disagree.
+
+- Returned three doc comments to the items they describe. `walk_rust_sources`,
+  `run_lint_expectations` and `run_repository_guardrails` had ended up with
+  their three paragraphs stacked into one comment on the last of them, so two
+  gates were documented by prose attached to a third.
+
 - Made the independent IR verifier run sixteen of the IR's thirty-five
   operations instead of four, and replaced its `other => Err(...)` catch-all
   with an exhaustive `match`. `contracts/golden/ir-verifier-coverage-v1.json`

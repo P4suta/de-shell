@@ -1336,39 +1336,104 @@ fn run_enum_equality(root: &Path) -> Result<(), Vec<String>> {
     Err(errors)
 }
 
-/// Every `.rs` file this repository owns.
-/// Every lint suppression is narrow, conditional on not being a test, and
-/// attached to the item it is about.
+/// `ItemKind` and every report contract name the same kinds, in the same order.
 ///
-/// Three rules, each from something that actually happened in this repository.
+/// `details.items[].kind` was `"type": "string"` in all fifteen report schemas,
+/// and the structured report is built by re-reading the command's human output,
+/// so `scan` took whatever token stood in a line's first tab-separated field
+/// and called it a kind. A consumer branching on `kind` — the corpus audit
+/// does, and so does any agent reading a report — had nothing to branch over.
 ///
-/// `allow` is banned outright. It silences without recording why, and an
-/// `expect` at least fails when the lint stops firing — a suppression that has
-/// outlived its reason is a suppression that is now hiding something else.
-///
-/// A `dead_code` expectation must be `cfg_attr(not(test), ...)`. Code that not
-/// even a test constructs is code nobody has looked at; the conditional form
-/// says "the tests reach this and the release build does not", which is a fact
-/// the compiler then checks in both directions.
-///
-/// A `dead_code` expectation must not sit on a `mod` declaration. `mod lab`
-/// carried one reading "constructed by contract paths that are exercised only
-/// under specific platforms or feature gates". Exactly one item in that
-/// nine-hundred-line module was dead — `validate_provider`, a fail-closed
-/// provider check with no caller — and the blanket covered it along with
-/// everything else, so nothing could say how much it was hiding or when that
-/// grew.
-/// No tracked file is larger than the limit, and no tracked path is longer.
-///
-/// This was `scripts/repository-guardrails.ps1`, 57 lines of PowerShell that
-/// de-shell refuses: it reads `.NET` types, uses `Set-StrictMode`, and formats
-/// its output with `-f`. de-shell's answer to a file like that is
-/// `DESHELL_BLOCKER_UNIMPLEMENTED_SEMANTIC` — it cannot be migrated — and the
-/// answer to that is to write it in the project's own language, which is what
-/// the tool exists to prompt.
-///
-/// Measured against the script it replaces before it replaced it: same count,
-/// same limits, same sentence.
+/// The set is closed in `crates/deshell/src/report.rs` now. This keeps the
+/// contracts closed over the same set: a variant added to the enum without a
+/// contract, or named differently in one of them, fails here rather than
+/// reaching a reader.
+fn run_report_item_kinds(root: &Path) -> Result<(), Vec<String>> {
+    let source = std::fs::read_to_string(root.join("crates/deshell/src/report.rs"))
+        .map_err(|error| vec![format!("cannot read report.rs: {error}")])?;
+    let body = source
+        .split_once("    pub(crate) fn as_str(self) -> &'static str {")
+        .and_then(|(_, rest)| rest.split_once("\n    }\n"))
+        .map(|(body, _)| body)
+        .ok_or_else(|| vec!["report.rs has no ItemKind::as_str".to_owned()])?;
+    // The arm order is the contract's order, so the two are compared as
+    // sequences rather than as sets: a reader diffing them sees one list.
+    let kinds = body
+        .lines()
+        .filter_map(|line| line.split_once("=> \"")?.1.split_once('"'))
+        .map(|(kind, _)| kind.to_owned())
+        .collect::<Vec<_>>();
+    if kinds.is_empty() {
+        return Err(vec!["ItemKind::as_str named no kinds".to_owned()]);
+    }
+    let declared = source
+        .split_once("    pub(crate) const ALL: [Self; ")
+        .and_then(|(_, rest)| rest.split_once(']'))
+        .and_then(|(count, _)| count.parse::<usize>().ok())
+        .ok_or_else(|| vec!["report.rs has no ItemKind::ALL".to_owned()])?;
+    let mut failures = Vec::new();
+    if declared != kinds.len() {
+        failures.push(format!(
+            "ItemKind::ALL holds {declared} kinds and ItemKind::as_str names {}",
+            kinds.len()
+        ));
+    }
+
+    let mut checked = 0;
+    let directory = root.join("contracts/schema");
+    let entries = std::fs::read_dir(&directory)
+        .map_err(|error| vec![format!("cannot read {}: {error}", directory.display())])?;
+    let mut paths = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with("-report-v1.schema.json"))
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    for path in paths {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            failures.push(format!("{name}: cannot read"));
+            continue;
+        };
+        let Ok(schema) = serde_json::from_str::<serde_json::Value>(&text) else {
+            failures.push(format!("{name}: is not JSON"));
+            continue;
+        };
+        let kind = &schema["$defs"]["item"]["properties"]["kind"];
+        let Some(values) = kind["enum"].as_array() else {
+            failures.push(format!(
+                "{name}: $defs.item.properties.kind must be an enum, not {kind}"
+            ));
+            continue;
+        };
+        let contracted = values
+            .iter()
+            .map(|value| value.as_str().unwrap_or_default().to_owned())
+            .collect::<Vec<_>>();
+        if contracted != kinds {
+            failures.push(format!(
+                "{name}: contracts {contracted:?}; ItemKind names {kinds:?}"
+            ));
+        }
+        checked += 1;
+    }
+    if checked == 0 {
+        failures.push("no report schema was checked".to_owned());
+    }
+    if failures.is_empty() {
+        println!(
+            "{checked} report contract(s) name the same {} item kinds as `ItemKind`, in the same order",
+            kinds.len()
+        );
+        return Ok(());
+    }
+    Err(failures)
+}
+
 /// The inputs of [`run_corpus_audit`].
 ///
 /// An argument list admits no exhaustive destructuring, so a parameter added to
@@ -2086,6 +2151,17 @@ fn print_audit_summary(report: &serde_json::Value) {
     }
 }
 
+/// No tracked file is larger than the limit, and no tracked path is longer.
+///
+/// This was `scripts/repository-guardrails.ps1`, 57 lines of PowerShell that
+/// de-shell refuses: it reads `.NET` types, uses `Set-StrictMode`, and formats
+/// its output with `-f`. de-shell's answer to a file like that is
+/// `DESHELL_BLOCKER_UNIMPLEMENTED_SEMANTIC` — it cannot be migrated — and the
+/// answer to that is to write it in the project's own language, which is what
+/// the tool exists to prompt.
+///
+/// Measured against the script it replaces before it replaced it: same count,
+/// same limits, same sentence.
 fn run_repository_guardrails(root: &Path) -> Result<(), Vec<String>> {
     const MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
     const MAX_PATH_CHARACTERS: usize = 240;
@@ -2154,6 +2230,27 @@ fn run_repository_guardrails(root: &Path) -> Result<(), Vec<String>> {
     Ok(())
 }
 
+/// Every lint suppression is narrow, conditional on not being a test, and
+/// attached to the item it is about.
+///
+/// Three rules, each from something that actually happened in this repository.
+///
+/// `allow` is banned outright. It silences without recording why, and an
+/// `expect` at least fails when the lint stops firing — a suppression that has
+/// outlived its reason is a suppression that is now hiding something else.
+///
+/// A `dead_code` expectation must be `cfg_attr(not(test), ...)`. Code that not
+/// even a test constructs is code nobody has looked at; the conditional form
+/// says "the tests reach this and the release build does not", which is a fact
+/// the compiler then checks in both directions.
+///
+/// A `dead_code` expectation must not sit on a `mod` declaration. `mod lab`
+/// carried one reading "constructed by contract paths that are exercised only
+/// under specific platforms or feature gates". Exactly one item in that
+/// nine-hundred-line module was dead — `validate_provider`, a fail-closed
+/// provider check with no caller — and the blanket covered it along with
+/// everything else, so nothing could say how much it was hiding or when that
+/// grew.
 fn run_lint_expectations(root: &Path) -> Result<(), Vec<String>> {
     let mut failures = Vec::new();
     for entry in walk_rust_sources(root)? {
@@ -2240,6 +2337,7 @@ fn run_lint_expectations(root: &Path) -> Result<(), Vec<String>> {
     Err(failures)
 }
 
+/// Every `.rs` file this repository owns.
 fn walk_rust_sources(root: &Path) -> Result<Vec<std::path::PathBuf>, Vec<String>> {
     let mut sources = Vec::new();
     for directory in ["crates", "xtask"] {
@@ -3361,6 +3459,7 @@ fn dispatch(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Vec<Str
         Some("case-patterns") => run_case_patterns(root),
         Some("shell-variables") => run_shell_variables(root),
         Some("enum-equality") => run_enum_equality(root),
+        Some("report-item-kinds") => run_report_item_kinds(root),
         Some("lint-expectations") => run_lint_expectations(root),
         Some("repository-guardrails") => run_repository_guardrails(root),
         Some("corpus-audit") => {
@@ -3524,6 +3623,63 @@ mod tests {
                 .any(|error| error.contains("bytes; maximum is 10485760 bytes")),
             "{errors:#?}"
         );
+    }
+
+    /// The gate reads both sides and fails when either moves.
+    #[test]
+    fn the_report_item_kinds_gate_catches_a_contract_that_lost_a_kind() {
+        run_report_item_kinds(&repository_root()).expect("the repository agrees with itself");
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::create_dir_all(root.join("crates/deshell/src")).unwrap();
+        std::fs::create_dir_all(root.join("contracts/schema")).unwrap();
+        std::fs::write(
+            root.join("crates/deshell/src/report.rs"),
+            concat!(
+                "    pub(crate) const ALL: [Self; 2] = [Self::Blocker, Self::Matrix];\n",
+                "    pub(crate) fn as_str(self) -> &'static str {\n",
+                "        match self {\n",
+                "            Self::Blocker => \"blocker\",\n",
+                "            Self::Matrix => \"matrix\",\n",
+                "        }\n",
+                "    }\n",
+            ),
+        )
+        .unwrap();
+        let schema = |kinds: &str| {
+            format!(r#"{{"$defs":{{"item":{{"properties":{{"kind":{{"enum":[{kinds}]}}}}}}}}}}"#)
+        };
+        let path = root.join("contracts/schema/scan-report-v1.schema.json");
+        std::fs::write(&path, schema(r#""blocker","matrix""#)).unwrap();
+        run_report_item_kinds(root).expect("a contract that names the same kinds passes");
+
+        // One kind short.
+        std::fs::write(&path, schema(r#""blocker""#)).unwrap();
+        let errors = run_report_item_kinds(root).expect_err("a missing kind fails");
+        assert!(
+            errors[0].contains("scan-report-v1.schema.json"),
+            "{errors:#?}"
+        );
+
+        // The same kinds in a different order: a reader diffing the two lists
+        // should not have to sort them first.
+        std::fs::write(&path, schema(r#""matrix","blocker""#)).unwrap();
+        run_report_item_kinds(root).expect_err("a reordered contract fails");
+
+        // A free string, which is what all fifteen contracts said before.
+        std::fs::write(
+            &path,
+            r#"{"$defs":{"item":{"properties":{"kind":{"type":"string"}}}}}"#,
+        )
+        .unwrap();
+        let errors = run_report_item_kinds(root).expect_err("a free string fails");
+        assert!(errors[0].contains("must be an enum"), "{errors:#?}");
+
+        // No report schema at all is not a pass.
+        std::fs::remove_file(&path).unwrap();
+        let errors = run_report_item_kinds(root).expect_err("an empty contract tree fails");
+        assert_eq!(errors, vec!["no report schema was checked".to_owned()]);
     }
 
     /// A `deshell` that answers only what the corpus audit asks.

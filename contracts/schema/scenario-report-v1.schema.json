@@ -148,7 +148,20 @@
           "type": "string"
         },
         "kind": {
-          "type": "string"
+          "enum": [
+            "shell_file",
+            "embedded_shell",
+            "candidate",
+            "skipped",
+            "error",
+            "failure",
+            "entrypoint",
+            "matrix_cell",
+            "not_ready",
+            "blocker",
+            "scenario",
+            "matrix"
+          ]
         },
         "message": {
           "type": "string"

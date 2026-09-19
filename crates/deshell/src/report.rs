@@ -58,11 +58,91 @@ fn anchored_source(root: &Path, message: &str) -> Option<serde_json::Value> {
     }))
 }
 
+/// What an item in `details.items` is.
+///
+/// Every report schema declared this a free string, and the structured report
+/// is built by re-reading the command's human output, so `scan` took whatever
+/// token stood in the line's first tab-separated field and called it a kind.
+/// A consumer branching on `kind` — the corpus auditor does, and so does any
+/// agent reading a report — had no way to know the set it was branching over.
+/// It is a closed set now, and a token outside it is refused where it is read
+/// rather than passed on.
+///
+/// The variants are what the commands emit, and `contracts/schema/*-report-
+/// v1.schema.json` names the subset each command may emit. `cargo xtask
+/// report-item-kinds` checks that the two agree, so a variant added here
+/// without a contract fails the lint.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ItemKind {
+    /// A shell file, an embedded shell block, or a conservative candidate:
+    /// Inventory v1's three location kinds, reported by `scan`.
+    ShellFile,
+    EmbeddedShell,
+    Candidate,
+    /// A path `scan` did not read, and the reason.
+    Skipped,
+    /// A failure `scan` hit at a path, and the stage it hit it in.
+    Error,
+    /// The failure a command exited with: its code and its message.
+    Failure,
+    /// An entrypoint `init` chose.
+    Entrypoint,
+    /// A platform cell a plan requires.
+    MatrixCell,
+    /// Why a command that is otherwise valid is not ready.
+    NotReady,
+    /// A reason a source cannot be retired yet.
+    Blocker,
+    /// One row of `scenario list` or `matrix list`.
+    Scenario,
+    Matrix,
+}
+
+impl ItemKind {
+    pub(crate) const ALL: [Self; 12] = [
+        Self::ShellFile,
+        Self::EmbeddedShell,
+        Self::Candidate,
+        Self::Skipped,
+        Self::Error,
+        Self::Failure,
+        Self::Entrypoint,
+        Self::MatrixCell,
+        Self::NotReady,
+        Self::Blocker,
+        Self::Scenario,
+        Self::Matrix,
+    ];
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::ShellFile => "shell_file",
+            Self::EmbeddedShell => "embedded_shell",
+            Self::Candidate => "candidate",
+            Self::Skipped => "skipped",
+            Self::Error => "error",
+            Self::Failure => "failure",
+            Self::Entrypoint => "entrypoint",
+            Self::MatrixCell => "matrix_cell",
+            Self::NotReady => "not_ready",
+            Self::Blocker => "blocker",
+            Self::Scenario => "scenario",
+            Self::Matrix => "matrix",
+        }
+    }
+
+    /// The kind this token names, or `None` — never a kind made of the token.
+    pub(crate) fn parse(token: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.as_str() == token)
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Item {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub kind: Option<String>,
+    pub kind: Option<ItemKind>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -192,7 +272,7 @@ impl Report {
         self.details
             .items
             .iter()
-            .find(|item| item.kind.as_deref() == Some("failure"))
+            .find(|item| item.kind == Some(ItemKind::Failure))
             .and_then(|item| item.name.as_deref())
     }
 
@@ -287,5 +367,35 @@ mod tests {
             value["details"]["items"][0]["message"],
             plain["details"]["items"][0]["message"]
         );
+    }
+
+    /// A token outside the set is not a kind.
+    ///
+    /// `scan`'s human output is re-read to build the structured report, and the
+    /// first tab-separated field used to become the kind whatever it said. The
+    /// set is closed now, so a token it does not name has to be refused rather
+    /// than turned into a kind nobody can branch over.
+    #[test]
+    fn an_item_kind_is_one_of_a_closed_set_and_survives_the_wire() {
+        for kind in ItemKind::ALL {
+            assert_eq!(ItemKind::parse(kind.as_str()), Some(kind));
+            let item = Item {
+                kind: Some(kind),
+                ..Item::default()
+            };
+            let text = serde_json::to_string(&item).unwrap();
+            assert_eq!(text, format!(r#"{{"kind":"{}"}}"#, kind.as_str()));
+            assert_eq!(serde_json::from_str::<Item>(&text).unwrap(), item);
+        }
+        let names = ItemKind::ALL.map(ItemKind::as_str);
+        let mut unique = names.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), names.len(), "{names:?}");
+
+        for token in ["", "SHELL_FILE", "shell file", "shell_files", "future_kind"] {
+            assert_eq!(ItemKind::parse(token), None, "{token}");
+            assert!(serde_json::from_str::<Item>(&format!(r#"{{"kind":"{token}"}}"#)).is_err());
+        }
     }
 }

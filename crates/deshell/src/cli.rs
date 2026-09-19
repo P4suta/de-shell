@@ -1210,7 +1210,7 @@ fn command_report(parts: CommandReportArgs<'_>) -> crate::report::Report {
     }
     if let Some(failure) = failure {
         report.details.items.push(crate::report::Item {
-            kind: Some("failure".into()),
+            kind: Some(crate::report::ItemKind::Failure),
             name: Some(failure.code.into()),
             message: Some(failure.message.clone()),
             ..crate::report::Item::default()
@@ -1247,7 +1247,7 @@ fn command_report(parts: CommandReportArgs<'_>) -> crate::report::Report {
             report.details.paths.push(path.to_owned());
         } else if let Some(entrypoint) = line.strip_prefix("entrypoint ") {
             report.details.items.push(crate::report::Item {
-                kind: Some("entrypoint".into()),
+                kind: Some(crate::report::ItemKind::Entrypoint),
                 path: Some(entrypoint.into()),
                 ..crate::report::Item::default()
             });
@@ -1263,20 +1263,20 @@ fn command_report(parts: CommandReportArgs<'_>) -> crate::report::Report {
             report.details.values.insert("reason".into(), reason.into());
         } else if let Some(cell) = line.strip_prefix("required cell ") {
             report.details.items.push(crate::report::Item {
-                kind: Some("matrix_cell".into()),
+                kind: Some(crate::report::ItemKind::MatrixCell),
                 name: Some(cell.into()),
                 ..crate::report::Item::default()
             });
         } else if let Some(reason) = line.strip_prefix("not-ready: ") {
             report.details.items.push(crate::report::Item {
-                kind: Some("not_ready".into()),
+                kind: Some(crate::report::ItemKind::NotReady),
                 message: Some(reason.into()),
                 ..crate::report::Item::default()
             });
         } else if let Some(blocker) = line.strip_prefix("blocker ") {
             let (name, message) = blocker.split_once(' ').unwrap_or((blocker, ""));
             report.details.items.push(crate::report::Item {
-                kind: Some("blocker".into()),
+                kind: Some(crate::report::ItemKind::Blocker),
                 name: Some(name.into()),
                 message: (!message.is_empty()).then(|| message.into()),
                 ..crate::report::Item::default()
@@ -1286,19 +1286,35 @@ fn command_report(parts: CommandReportArgs<'_>) -> crate::report::Report {
             if fields.len() >= 2 {
                 let item = match fields[0] {
                     "error" => crate::report::Item {
-                        kind: Some("error".into()),
+                        kind: Some(crate::report::ItemKind::Error),
                         path: Some(fields[1].into()),
                         name: fields.get(2).map(|stage| (*stage).into()),
                         message: fields.get(3).map(|message| (*message).into()),
                         ..crate::report::Item::default()
                     },
                     "skipped" => crate::report::Item {
-                        kind: Some("skipped".into()),
+                        kind: Some(crate::report::ItemKind::Skipped),
                         path: Some(fields[1].into()),
                         message: fields.get(2).map(|reason| (*reason).into()),
                         ..crate::report::Item::default()
                     },
-                    kind => {
+                    // The line came from this process a moment ago, so an
+                    // unmodelled token here is `scan` printing a kind the
+                    // report does not carry. It is reported as a scan error
+                    // rather than passed on as a kind made of the token — a
+                    // consumer branching on `kind` cannot tell those apart.
+                    token if crate::report::ItemKind::parse(token).is_none() => {
+                        crate::report::Item {
+                            kind: Some(crate::report::ItemKind::Error),
+                            path: Some(fields[1].into()),
+                            name: Some("report".into()),
+                            message: Some(format!(
+                                "scan printed the unmodelled location kind '{token}'"
+                            )),
+                            ..crate::report::Item::default()
+                        }
+                    }
+                    token => {
                         let span = fields
                             .get(5)
                             .and_then(|span| span.split_once(".."))
@@ -1306,7 +1322,7 @@ fn command_report(parts: CommandReportArgs<'_>) -> crate::report::Report {
                                 Some((start.parse().ok()?, end.parse().ok()?))
                             });
                         crate::report::Item {
-                            kind: Some(kind.into()),
+                            kind: crate::report::ItemKind::parse(token),
                             path: Some(fields[1].into()),
                             name: fields.get(2).map(|interpreter| (*interpreter).into()),
                             status: fields.get(3).map(|confidence| (*confidence).into()),
@@ -1322,11 +1338,16 @@ fn command_report(parts: CommandReportArgs<'_>) -> crate::report::Report {
                 };
                 report.details.items.push(item);
             }
-        } else if matches!(spec.command, "scenario" | "matrix") && line.contains('\t') {
+        } else if let Some(row) = match spec.command {
+            "scenario" => Some(crate::report::ItemKind::Scenario),
+            "matrix" => Some(crate::report::ItemKind::Matrix),
+            _ => None,
+        } && line.contains('\t')
+        {
             let fields = line.split('\t').collect::<Vec<_>>();
             if fields.len() >= 3 {
                 report.details.items.push(crate::report::Item {
-                    kind: Some(spec.command.into()),
+                    kind: Some(row),
                     name: Some(fields[0].into()),
                     status: Some(fields[1].into()),
                     digest: Some(fields[2].into()),
@@ -1427,7 +1448,7 @@ fn scan_details(inventory: &crate::scanner::Inventory) -> crate::report::Details
     let mut details = crate::report::Details::default();
     for finding in &inventory.findings {
         details.items.push(crate::report::Item {
-            kind: Some(finding_kind(&finding.kind).into()),
+            kind: Some(finding_kind(&finding.kind)),
             path: Some(finding.path.clone()),
             name: Some(
                 finding
@@ -1445,7 +1466,7 @@ fn scan_details(inventory: &crate::scanner::Inventory) -> crate::report::Details
     }
     for skipped in &inventory.skipped {
         details.items.push(crate::report::Item {
-            kind: Some("skipped".into()),
+            kind: Some(crate::report::ItemKind::Skipped),
             path: Some(skipped.path.clone()),
             message: Some(skipped.reason.clone()),
             ..crate::report::Item::default()
@@ -1453,7 +1474,7 @@ fn scan_details(inventory: &crate::scanner::Inventory) -> crate::report::Details
     }
     for error in &inventory.errors {
         details.items.push(crate::report::Item {
-            kind: Some("error".into()),
+            kind: Some(crate::report::ItemKind::Error),
             path: Some(error.path.clone().unwrap_or_else(|| "<root>".into())),
             name: Some(error.stage.clone()),
             message: Some(error.message.clone()),
@@ -1606,7 +1627,7 @@ fn dispatch(parts: DispatchArgs<'_>) -> Result<i32, Failure> {
                             stdout,
                             format_args!(
                                 "{}\t{}\t{}\t{}\t{}\t{}..{}",
-                                finding_kind(&finding.kind),
+                                finding_kind(&finding.kind).as_str(),
                                 finding.path,
                                 finding.interpreter.as_deref().unwrap_or("unknown"),
                                 interpreter_confidence(&finding.interpreter_confidence),
@@ -2249,11 +2270,11 @@ fn is_io_message(message: &str) -> bool {
     .any(|marker| message.contains(marker))
 }
 
-fn finding_kind(kind: &crate::scanner::FindingKind) -> &'static str {
+fn finding_kind(kind: &crate::scanner::FindingKind) -> crate::report::ItemKind {
     match kind {
-        crate::scanner::FindingKind::ShellFile => "shell_file",
-        crate::scanner::FindingKind::EmbeddedShell => "embedded_shell",
-        crate::scanner::FindingKind::Candidate => "candidate",
+        crate::scanner::FindingKind::ShellFile => crate::report::ItemKind::ShellFile,
+        crate::scanner::FindingKind::EmbeddedShell => crate::report::ItemKind::EmbeddedShell,
+        crate::scanner::FindingKind::Candidate => crate::report::ItemKind::Candidate,
     }
 }
 
@@ -2413,7 +2434,9 @@ fn shell_reintroduced_failure(inventory: &crate::scanner::Inventory, declared: u
     let mut by_kind: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
     let mut by_path: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
     for finding in &inventory.findings {
-        *by_kind.entry(finding_kind(&finding.kind)).or_default() += 1;
+        *by_kind
+            .entry(finding_kind(&finding.kind).as_str())
+            .or_default() += 1;
         *by_path.entry(finding.path.as_str()).or_default() += 1;
     }
     let shape = by_kind
@@ -2428,7 +2451,7 @@ fn shell_reintroduced_failure(inventory: &crate::scanner::Inventory, declared: u
         .map(|finding| {
             format!(
                 "{}:{}@{}..{}",
-                finding_kind(&finding.kind),
+                finding_kind(&finding.kind).as_str(),
                 finding.path,
                 finding.span.start_byte,
                 finding.span.end_byte
@@ -5154,6 +5177,58 @@ mod tests {
     use super::*;
     use crate::config::ProjectConfig;
     use std::path::Path;
+
+    /// A `scan` line naming a kind the report does not model becomes a scan
+    /// error, not a kind.
+    ///
+    /// The structured report is built by re-reading the command's human
+    /// output, and the first tab-separated field used to be taken as the kind
+    /// verbatim. A reader branching on `kind` — the corpus audit does — would
+    /// have counted whatever that said as a location to migrate.
+    #[test]
+    fn a_scan_line_naming_an_unmodelled_kind_is_reported_rather_than_carried() {
+        let spec = ReportSpec {
+            command: "scan",
+            format: OutputFormat::Json,
+            root: std::env::current_dir().unwrap(),
+            next_actions: Vec::new(),
+        };
+        let stdout = concat!(
+            "shell_file\tscripts/build.sh\tsh\thigh\t-\t0..12\n",
+            "future_kind\tsrc/odd.bin\tsh\thigh\t-\t0..4\n",
+            "skipped\tvendor/blob\tbinary\n",
+        );
+        let report = command_report(CommandReportArgs {
+            spec: &spec,
+            code: 0,
+            failure: None,
+            stdout: stdout.as_bytes(),
+            stderr: b"",
+            supplied: None,
+        });
+        let kinds = report
+            .details
+            .items
+            .iter()
+            .map(|item| item.kind)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            vec![
+                Some(crate::report::ItemKind::ShellFile),
+                Some(crate::report::ItemKind::Error),
+                Some(crate::report::ItemKind::Skipped),
+            ],
+            "{:#?}",
+            report.details.items
+        );
+        let reported = &report.details.items[1];
+        assert_eq!(reported.path.as_deref(), Some("src/odd.bin"));
+        assert_eq!(
+            reported.message.as_deref(),
+            Some("scan printed the unmodelled location kind 'future_kind'")
+        );
+    }
 
     fn invoke(args: &[&str]) -> (i32, Vec<u8>, Vec<u8>) {
         let mut stdout = Vec::new();

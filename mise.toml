@@ -38,6 +38,7 @@ description = "Lint Rust, repository metadata, and GitHub Actions"
 run = [
   "cargo run --locked -p xtask -- enum-equality",
   "cargo run --locked -p xtask -- lint-expectations",
+  "cargo run --locked -p xtask -- report-item-kinds",
   "cargo clippy --locked --workspace --all-targets -- -D warnings",
   "mise run repository:guardrails",
   "actionlint .github/workflows/ci.yml .github/workflows/release.yml .github/workflows/nightly.yml .github/workflows/dependency-review.yml .github/workflows/scorecard.yml",
