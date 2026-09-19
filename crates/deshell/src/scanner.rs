@@ -1047,6 +1047,41 @@ fn finding(parts: FindingParts<'_>) -> Finding {
 /// The fallback is the span of the line at `from` rather than the whole file.
 /// A span covering every byte of a file is not a location, and a rewrite
 /// reading one would replace the file with a single block.
+/// Where a string value sits in the document that holds it, when the document
+/// says so unambiguously.
+///
+/// A parsed value carries no position, and searching the source for its decoded
+/// text finds nothing whenever the document escaped anything — `"printf 'a\\nb'"`
+/// in JSON holds the two characters `\\` and `n`, and the decoded value holds a
+/// newline. Every such value fell to the whole-file fallback, so seven blockers
+/// on one golden corpus all read `contracts/golden/posix-sh-divergence-v1.json@0..1`
+/// and no reader could tell which value each was about.
+///
+/// Searching for the *encoded* form is what the document actually contains. It
+/// is required to occur exactly once: a second occurrence means the document
+/// cannot tell the two apart from text alone, and a first-occurrence guess there
+/// is how repeated `run:` lines came to share a span.
+///
+/// `None` means the bytes are not identifiable from text, and the caller falls
+/// back to the span of the first line. That span is imprecise and the finding is
+/// not: `locator` carries the path within the document — `tasks[3].command` —
+/// which is what names it. These are low-confidence candidates that block a
+/// migration rather than being rewritten, so no byte range is ever applied from
+/// one. A parser that reports positions would remove the fallback; nothing here
+/// has one.
+fn span_of_encoded_string(source: &str, value: &str) -> Option<ByteSpan> {
+    let encoded = serde_json::Value::String(value.to_owned()).to_string();
+    let inner = encoded.get(1..encoded.len() - 1)?;
+    let first = source.find(inner)?;
+    if source[first + inner.len()..].contains(inner) {
+        return None;
+    }
+    Some(ByteSpan {
+        start_byte: first as u64,
+        end_byte: (first + inner.len()) as u64,
+    })
+}
+
 fn span_of(source: &str, from: usize, value: &str) -> ByteSpan {
     let from = from.min(source.len());
     match source.get(from..).and_then(|rest| rest.find(value)) {
@@ -1661,7 +1696,12 @@ fn collect_json_candidates(parts: CollectJsonCandidatesArgs<'_>) {
                 interpreter: None,
                 interpreter_confidence: InterpreterConfidence::Low,
                 locator: Some(locator.into()),
-                span: span_of(source, 0, command),
+                // A parsed value has no position; this is the closest the
+                // document can get to giving it one. See
+                // `span_of_encoded_string` for why it is the encoded form and
+                // why one occurrence is required.
+                span: span_of_encoded_string(source, command)
+                    .unwrap_or_else(|| span_of(source, 0, command)),
                 source: command.as_bytes().to_vec(),
             })),
         _ => {}
@@ -1740,7 +1780,9 @@ fn collect_toml_candidates(parts: CollectTomlCandidatesArgs<'_>) {
                 interpreter: None,
                 interpreter_confidence: InterpreterConfidence::Low,
                 locator: Some(locator.into()),
-                span: span_of(source, 0, command),
+                // See the JSON walker above.
+                span: span_of_encoded_string(source, command)
+                    .unwrap_or_else(|| span_of(source, 0, command)),
                 source: command.as_bytes().to_vec(),
             }));
         }
@@ -2925,6 +2967,61 @@ spawn(dynamicProgram, dynamicArguments);
                 );
             }
         }
+    }
+
+    /// A candidate in a parsed document gets the bytes the document holds, not
+    /// the bytes the value decodes to.
+    ///
+    /// A parsed value carries no position, and searching the source for its
+    /// decoded text finds nothing the moment the document escaped anything.
+    /// Every such candidate fell to the fallback, so running de-shell on its own
+    /// repository produced seven blockers on one golden corpus that all read
+    /// `@0..1` — one byte, the opening brace — and nothing told a reader which
+    /// value each was about.
+    #[test]
+    fn a_candidate_in_a_parsed_document_is_located_by_what_the_document_holds() {
+        let directory = tempfile::tempdir().unwrap();
+        // Two shell commands with an escape in them, and a third that repeats
+        // the first: the document cannot tell the repeats apart from text, so
+        // that one is not claimed to be anywhere in particular.
+        let source = br#"{"tasks": [
+  {"command": "printf 'a\nb'"},
+  {"command": "printf 'c\td'"},
+  {"command": "printf 'e\nf'"},
+  {"command": "printf 'e\nf'"}
+]}"#;
+        write(directory.path(), ".vscode/tasks.json", source);
+
+        let inventory = scan(directory.path()).unwrap();
+        assert!(inventory.errors.is_empty(), "{:#?}", inventory.errors);
+        let located: Vec<_> = inventory
+            .findings
+            .iter()
+            .map(|finding| {
+                let start = finding.span.start_byte as usize;
+                let end = finding.span.end_byte as usize;
+                std::str::from_utf8(&source[start..end]).unwrap()
+            })
+            .collect();
+        assert!(
+            located.contains(&r"printf 'a\nb'"),
+            "the escaped command was not located: {located:?}"
+        );
+        assert!(
+            located.contains(&r"printf 'c\td'"),
+            "the escaped command was not located: {located:?}"
+        );
+        // The repeated one is ambiguous from text alone, so it takes the
+        // fallback rather than a first-occurrence guess that would put two
+        // findings on one span.
+        assert_eq!(
+            located
+                .iter()
+                .filter(|text| **text == r"printf 'e\nf'")
+                .count(),
+            0,
+            "an ambiguous value was placed anyway: {located:?}"
+        );
     }
 
     /// A value the scanner cannot find in the source gets the line it was on,

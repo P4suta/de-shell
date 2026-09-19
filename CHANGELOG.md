@@ -112,6 +112,12 @@ All notable changes are documented here. No compatibility contract predates
   `verified`, so a check whose run could not be made was reported as a verified
   plan with exit 0.
 
+- Located a shell candidate in a parsed JSON or TOML document by the bytes the
+  document holds rather than the bytes the value decodes to. Searching for the
+  decoded text finds nothing whenever the document escaped anything, so every
+  such candidate fell to the whole-file fallback: running de-shell on its own
+  repository produced seven blockers on one golden corpus that all read `@0..1`.
+
 ### Removed
 
 - Pre-v1 Effect IR and lock migration promises.
