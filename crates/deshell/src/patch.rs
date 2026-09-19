@@ -363,6 +363,31 @@ pub(crate) fn apply_all(proposals: &[Proposal]) -> Result<(), String> {
     apply_all_inner(proposals, None)
 }
 
+/// Persist a staged file without replacing a writer that reached the target.
+fn persist_without_clobber(
+    temporary: tempfile::NamedTempFile,
+    target: &Path,
+) -> Result<(), std::io::Error> {
+    #[cfg(not(miri))]
+    {
+        temporary
+            .persist_noclobber(target)
+            .map(|_persisted| ())
+            .map_err(|error| error.error)
+    }
+
+    #[cfg(miri)]
+    {
+        // tempfile first asks Linux for renameat2(RENAME_NOREPLACE), which
+        // Miri does not implement. Its own fallback is the same hard-link then
+        // unlink sequence used here. Keep this compatibility branch confined
+        // to the interpreter so production retains tempfile's native fast path.
+        std::fs::hard_link(temporary.path(), target)?;
+        let _cleanup_result = temporary.close();
+        Ok(())
+    }
+}
+
 fn apply_all_inner(
     proposals: &[Proposal],
     fail_after_commits: Option<usize>,
@@ -452,8 +477,8 @@ fn apply_all_inner(
             sync_parent(&item.canonical).err()
         } else {
             match temporary {
-                Some(temporary) => match temporary.persist_noclobber(&item.canonical) {
-                    Ok(_) => {
+                Some(temporary) => match persist_without_clobber(temporary, &item.canonical) {
+                    Ok(()) => {
                         let digest = crate::digest::sha256(&item.proposal.replacement);
                         crate::trace::record(|| crate::trace::Event::FileCommit {
                             path: crate::trace::path_name(&item.canonical),
@@ -484,13 +509,11 @@ fn apply_all_inner(
                                 }
                                 Err(validation_error) => Some(format!(
                                     "{}; cannot verify concurrent content-addressed target: {validation_error}",
-                                    error.error
+                                    error
                                 )),
                             }
                         }
-                        Expectation::Existing(_) | Expectation::Missing => {
-                            Some(error.error.to_string())
-                        }
+                        Expectation::Existing(_) | Expectation::Missing => Some(error.to_string()),
                     },
                 },
                 None => Some(format!(

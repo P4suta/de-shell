@@ -1763,18 +1763,22 @@ fn case_end(source: &str, statements: &[Range], start: usize) -> Option<usize> {
 /// these as an ordinary expansion is a silent substitution, and it was being
 /// claimed as native.
 ///
-/// The union across bash, `/bin/sh`, zsh and dash, for the same reason the
-/// builtin table is a union: delegating a name this shell does not supply costs
-/// a delegation, while lowering one it does supply reads the wrong thing.
+/// The conservative union across supported versions of bash, `/bin/sh`, zsh
+/// and dash, for the same reason the builtin table is a union: delegating a
+/// name this shell does not supply costs a delegation, while lowering one it
+/// does supply reads the wrong thing.
 /// `contracts/golden/shell-variable-inventory-v1.json` holds the measurement
 /// and `cargo xtask shell-variables` re-runs it.
 const SHELL_SUPPLIED_VARIABLES: &[&str] = &[
     "BASH",
+    "BASHPID",
     "BASH_COMMAND",
     "BASH_SUBSHELL",
     "BASH_VERSION",
     "COLUMNS",
     "DIRSTACK",
+    "EPOCHREALTIME",
+    "EPOCHSECONDS",
     "EUID",
     "GROUPS",
     "HOSTNAME",
@@ -1793,6 +1797,7 @@ const SHELL_SUPPLIED_VARIABLES: &[&str] = &[
     "PS4",
     "RANDOM",
     "SECONDS",
+    "SRANDOM",
     "UID",
 ];
 

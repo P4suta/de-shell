@@ -196,10 +196,10 @@ an unmutated baseline:
 | file | mutants | caught | unviable | missed | timeout |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | `approval.rs` | 119 | 102 | 17 | 0 | 0 |
-| `patch.rs` | 97 | 89 | 8 | 0 | 0 |
+| `patch.rs` | 98 | 90 | 8 | 0 | 0 |
 | `host.rs` | 16 | 12 | 4 | 0 | 0 |
 | `trace.rs` | 12 | 12 | 0 | 0 | 0 |
-| **total** | **244** | **215** | **29** | **0** | **0** |
+| **total** | **245** | **216** | **29** | **0** | **0** |
 
 Replacing the trace writer trait object with the closed `Sink` enum exposed
 five additional mutation points. Direct tests for file/stderr selection, flush
@@ -212,17 +212,28 @@ production build; public APIs, schemas and CLI output did not change.
 
 The final portability pass added two approval-directory inspection mutations.
 A NUL-bearing component observes the cross-platform non-`NotFound` error path,
-so both are caught. The patch count stayed at 97 after replacing overwrite-by-
-rename with an exhaustive `Expectation` match and `persist_noclobber`; the
-idempotent winner is explicitly proved to remain outside a losing transaction's
-rollback set. Linux Miri now reaches scratch copies through buffered Read/Write
-instead of the unsupported `copy_file_range` specialization.
+so both are caught. The patch count is 98 after replacing overwrite-by-rename
+with an exhaustive `Expectation` match and a tested no-clobber persistence
+boundary; the idempotent winner is explicitly proved to remain outside a losing
+transaction's rollback set. Linux Miri reaches scratch copies through buffered
+Read/Write instead of the unsupported `copy_file_range` specialization, and
+uses the persistence crate's hard-link fallback instead of its unsupported
+`renameat2` fast path.
+
+The live shell inventory is deliberately one-directional. Its table is the
+conservative union across supported interpreter versions: a runner supplying an
+unprotected name is fatal, while an older version lacking a protected name is
+reported as drift. Ubuntu's modern Bash added `BASHPID`, `EPOCHREALTIME`,
+`EPOCHSECONDS` and `SRANDOM`; all four now force delegation instead of being
+silently lowered as missing environment variables. Test repositories also
+discard ambient system/global Git configuration, so a developer's signing or
+hook policy cannot change fixture behavior.
 
 The mutation task now also names `migration.rs` and `frontend.rs`. A
 reproducible `cargo mutants --list` reports **2,931** mutations in those two
-files and **3,175** across all six configured files. The new 2,931 are listed
+files and **3,176** across all six configured files. The new 2,931 are listed
 scope only: they have not been executed in this increment, so any survivors
-they reveal are the next measured backlog rather than part of the clean 244.
+they reveal are the next measured backlog rather than part of the clean 245.
 
 Reproduce only in a trusted disposable git worktree. `cargo-mutants --in-place`
 edits source while it runs, and a mutant can leave approval artifacts outside
@@ -240,8 +251,8 @@ that shared collection step, so CI and release cannot accidentally measure a
 smaller test surface.
 
 The trusted clean run on 2026-09-20 passed all 522 workspace tests (482
-`deshell`, 40 `xtask`) and finished at **90.36% line coverage**: 54,329 lines,
-5,235 missed. `cargo llvm-cov` enforced `--fail-under-lines 90` on the result.
+`deshell`, 40 `xtask`) and finished at **90.35% line coverage**: 54,408 lines,
+5,249 missed. `cargo llvm-cov` enforced `--fail-under-lines 90` on the result.
 
 ## Next, in the order I would take it
 

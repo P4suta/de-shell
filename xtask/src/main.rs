@@ -212,21 +212,21 @@ enum ObservationEffect {
     Report,
 }
 
-/// A column in the case-pattern recording.
+/// A named shell column in a checked-in recording.
 ///
 /// `sh` deliberately remains distinct from `dash`: the former names an
 /// implementation-selected family while the latter names the interpreter that
 /// produced its column. Only an executable with that same identity can
 /// invalidate an interpreter-specific recording.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-enum CaseShellColumn {
+enum RecordedShellColumn {
     Bash,
     Sh,
     Zsh,
     Dash,
 }
 
-impl CaseShellColumn {
+impl RecordedShellColumn {
     const ALL: [Self; 4] = [Self::Bash, Self::Sh, Self::Zsh, Self::Dash];
 
     const fn name(self) -> &'static str {
@@ -248,11 +248,67 @@ impl CaseShellColumn {
         }
     }
 
-    const fn observation_effect(self) -> ObservationEffect {
+    const fn case_pattern_effect(self) -> ObservationEffect {
         match self {
             Self::Sh => ObservationEffect::Report,
             Self::Bash | Self::Zsh | Self::Dash => ObservationEffect::Enforce,
         }
+    }
+}
+
+/// Require a recording to name every supported shell column exactly once.
+fn recorded_shell_columns(
+    corpus: &serde_json::Value,
+    label: &str,
+) -> Result<Vec<RecordedShellColumn>, Vec<String>> {
+    let values = corpus["shells"]
+        .as_array()
+        .ok_or_else(|| vec![format!("{label} corpus has no shells array")])?;
+    let mut shells = Vec::with_capacity(values.len());
+    for value in values {
+        let name = value
+            .as_str()
+            .ok_or_else(|| vec![format!("{label} shell name is not a string")])?;
+        let shell = RecordedShellColumn::parse(name)
+            .ok_or_else(|| vec![format!("{label} corpus names unknown shell {name:?}")])?;
+        if shells.contains(&shell) {
+            return Err(vec![format!("{label} corpus repeats shell {name:?}")]);
+        }
+        shells.push(shell);
+    }
+    let recorded = shells
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let expected = RecordedShellColumn::ALL.into_iter().collect();
+    if recorded != expected {
+        return Err(vec![format!(
+            "{label} corpus shell set is {recorded:?}, expected {expected:?}"
+        )]);
+    }
+    Ok(shells)
+}
+
+/// Where a variable value came from during a shell inventory observation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VariableOrigin {
+    Absent,
+    Inherited,
+    Shell,
+}
+
+impl VariableOrigin {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "ABSENT" => Some(Self::Absent),
+            "INHERITED" => Some(Self::Inherited),
+            "SHELL" => Some(Self::Shell),
+            _ => None,
+        }
+    }
+
+    const fn is_shell_supplied(self) -> bool {
+        matches!(self, Self::Shell)
     }
 }
 
@@ -1158,31 +1214,7 @@ fn run_case_patterns(root: &Path) -> Result<(), Vec<String>> {
         .map_err(|error| vec![format!("cannot read {}: {error}", path.display())])?;
     let corpus: serde_json::Value =
         serde_json::from_str(&raw).map_err(|error| vec![format!("malformed corpus: {error}")])?;
-    let shell_values = corpus["shells"]
-        .as_array()
-        .ok_or_else(|| vec!["corpus has no shells array".to_owned()])?;
-    let mut shells = Vec::with_capacity(shell_values.len());
-    for value in shell_values {
-        let name = value
-            .as_str()
-            .ok_or_else(|| vec!["case-pattern shell name is not a string".to_owned()])?;
-        let shell = CaseShellColumn::parse(name)
-            .ok_or_else(|| vec![format!("case-pattern corpus names unknown shell {name:?}")])?;
-        if shells.contains(&shell) {
-            return Err(vec![format!("case-pattern corpus repeats shell {name:?}")]);
-        }
-        shells.push(shell);
-    }
-    let recorded = shells
-        .iter()
-        .copied()
-        .collect::<std::collections::BTreeSet<_>>();
-    let expected = CaseShellColumn::ALL.into_iter().collect();
-    if recorded != expected {
-        return Err(vec![format!(
-            "case-pattern corpus shell set is {recorded:?}, expected {expected:?}"
-        )]);
-    }
+    let shells = recorded_shell_columns(&corpus, "case-pattern")?;
     let cases = corpus["cases"]
         .as_array()
         .ok_or_else(|| vec!["corpus has no cases array".to_owned()])?;
@@ -1231,7 +1263,7 @@ fn run_case_patterns(root: &Path) -> Result<(), Vec<String>> {
             if observed != recorded {
                 let difference =
                     format!("{id}/{shell_name}: recorded {recorded}, observed {observed}");
-                match shell.observation_effect() {
+                match shell.case_pattern_effect() {
                     ObservationEffect::Enforce => errors.push(difference),
                     ObservationEffect::Report => {
                         reported_differences += 1;
@@ -1286,21 +1318,18 @@ fn decode_base64(encoded: &str) -> Option<Vec<u8>> {
 ///
 /// A generated program resolves a name through the process environment, so a
 /// name the shell supplies is one the program would read as empty. The
-/// measurement is what the frontend's table has to keep up with: a shell that
-/// starts supplying a name the recording calls absent is a name that has
-/// quietly become unlowerable.
+/// conservative union is what the frontend's table has to keep up with: if any
+/// supported version supplies a name, every frontend must delegate it. A newer
+/// shell supplying a name outside that union is fatal. An older version not
+/// supplying a protected name is useful drift evidence, but cannot make the
+/// frontend unsafe and is therefore reported rather than rejected.
 fn run_shell_variables(root: &Path) -> Result<(), Vec<String>> {
     let path = root.join("contracts/golden/shell-variable-inventory-v1.json");
     let raw = std::fs::read_to_string(&path)
         .map_err(|error| vec![format!("cannot read {}: {error}", path.display())])?;
     let corpus: serde_json::Value =
         serde_json::from_str(&raw).map_err(|error| vec![format!("malformed corpus: {error}")])?;
-    let shells: Vec<&str> = corpus["shells"]
-        .as_array()
-        .ok_or_else(|| vec!["corpus has no shells array".to_owned()])?
-        .iter()
-        .filter_map(|value| value.as_str())
-        .collect();
+    let shells = recorded_shell_columns(&corpus, "shell-variable")?;
     let names = corpus["names"]
         .as_object()
         .ok_or_else(|| vec!["corpus has no names object".to_owned()])?;
@@ -1309,47 +1338,91 @@ fn run_shell_variables(root: &Path) -> Result<(), Vec<String>> {
     }
     let mut errors = Vec::new();
     let mut checked = 0_usize;
+    let mut reported_differences = 0_usize;
     for (name, recorded) in names {
-        for shell in &shells {
-            let Some(expected) = recorded[*shell].as_str() else {
-                errors.push(format!("{name} has no {shell} column"));
+        let mut recorded_origins = std::collections::BTreeMap::new();
+        for shell in RecordedShellColumn::ALL {
+            let shell_name = shell.name();
+            let Some(value) = recorded[shell_name].as_str() else {
+                errors.push(format!("{name} has no {shell_name} column"));
                 continue;
             };
+            let Some(origin) = VariableOrigin::parse(value) else {
+                errors.push(format!(
+                    "{name}/{shell_name} has unknown variable origin {value:?}"
+                ));
+                continue;
+            };
+            recorded_origins.insert(shell, origin);
+        }
+        if recorded_origins.len() != shells.len() {
+            continue;
+        }
+        let protected = recorded_origins
+            .values()
+            .copied()
+            .any(VariableOrigin::is_shell_supplied);
+        for shell in &shells {
+            let shell_name = shell.name();
+            let expected = recorded_origins[shell];
             let script = format!(
                 "if env | grep -q \"^{name}=\"; then printf INHERITED; \
                  elif [ -n \"${{{name}+x}}\" ]; then printf SHELL; else printf ABSENT; fi"
             );
-            let Ok(output) = std::process::Command::new(shell)
+            let output = std::process::Command::new(shell_name)
                 .arg("-c")
                 .arg(&script)
-                .output()
-            else {
-                println!("skipped  {name}/{shell}: not on this runner");
+                .output();
+            let output = match output {
+                Ok(output) if output.status.success() => output,
+                Ok(output) => {
+                    errors.push(format!(
+                        "{name}/{shell_name}: inventory command exited {:?}",
+                        output.status.code()
+                    ));
+                    continue;
+                }
+                Err(error) => {
+                    println!("skipped  {name}/{shell_name}: {error}");
+                    continue;
+                }
+            };
+            let raw_observed = String::from_utf8_lossy(&output.stdout);
+            let Some(observed) = VariableOrigin::parse(&raw_observed) else {
+                errors.push(format!(
+                    "{name}/{shell_name}: inventory command returned {raw_observed:?}"
+                ));
                 continue;
             };
-            let observed = String::from_utf8_lossy(&output.stdout).into_owned();
-            let observed = if observed.is_empty() {
-                "ABSENT".to_owned()
-            } else {
-                observed
-            };
             checked += 1;
-            // `INHERITED` says the environment this ran in carried the name,
-            // which is a property of the runner and not of the shell. Only a
-            // move into or out of `SHELL` is a change the frontend cares about.
-            let supplied = |state: &str| state == "SHELL";
-            if supplied(&observed) != supplied(expected) {
+            if observed.is_shell_supplied() && !protected {
                 errors.push(format!(
-                    "{name}/{shell}: recorded {expected}, observed {observed}"
+                    "{name}/{shell_name}: this shell supplies the name, but the conservative frontend table does not protect it"
                 ));
+                continue;
+            }
+            // `INHERITED` versus `ABSENT` belongs to the runner environment.
+            // Only a move into or out of `SHELL` is interpreter drift.
+            if observed.is_shell_supplied() != expected.is_shell_supplied() {
+                reported_differences += 1;
+                println!(
+                    "differs  {name}/{shell_name}: recorded {expected:?}, observed {observed:?}"
+                );
             }
         }
     }
     if errors.is_empty() {
-        println!(
-            "{} variable name(s) match the recording across {checked} shell observation(s)",
-            names.len()
-        );
+        if reported_differences == 0 {
+            println!(
+                "{} variable name(s) match the conservative recording across {checked} shell observation(s)",
+                names.len()
+            );
+        } else {
+            println!(
+                "{} variable name(s) protect every observed shell-supplied name across {checked} shell observation(s); {reported_differences} version or alias observation(s) differ",
+                names.len()
+            );
+        }
         return Ok(());
     }
     Err(errors)
@@ -4286,7 +4359,7 @@ mod tests {
             [ObservationEffect::Report; 3]
         );
         assert_eq!(
-            CaseShellColumn::ALL.map(CaseShellColumn::observation_effect),
+            RecordedShellColumn::ALL.map(RecordedShellColumn::case_pattern_effect),
             [
                 ObservationEffect::Enforce,
                 ObservationEffect::Report,
@@ -4295,7 +4368,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            CaseShellColumn::ALL.map(CaseShellColumn::name),
+            RecordedShellColumn::ALL.map(RecordedShellColumn::name),
             ["bash", "sh", "zsh", "dash"]
         );
     }
@@ -4352,10 +4425,21 @@ mod tests {
             let status = std::process::Command::new("git")
                 .arg("-C")
                 .arg(root)
+                // Test repositories must not inherit the developer's signing,
+                // hooks, aliases or other machine-global policy. The local
+                // repository remains real; only ambient configuration is
+                // removed from the fixture.
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", root.join("unused-global-config"))
                 .args(args)
                 .output()
                 .expect("git");
-            assert!(status.status.success(), "git {args:?}");
+            assert!(
+                status.status.success(),
+                "git {args:?}\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&status.stdout),
+                String::from_utf8_lossy(&status.stderr)
+            );
         };
         git(&["init", "-q"]);
         std::fs::write(root.join("small.txt"), b"x").unwrap();
@@ -4371,14 +4455,32 @@ mod tests {
         ]);
         run_repository_guardrails(root).expect("a clean repository passes");
 
-        // A path over the limit.
+        // A path over the limit. Add the empty blob directly to the index:
+        // constructing a worktree path longer than 240 characters would make
+        // this repository policy test depend on the host's absolute temp-path
+        // length and Windows long-path configuration.
         let deep = format!("{}{}.txt", "d/".repeat(110), "x".repeat(60));
-        let deep_path = root.join(&deep);
-        std::fs::create_dir_all(deep_path.parent().unwrap()).unwrap();
-        std::fs::write(&deep_path, b"x").unwrap();
+        let empty_blob = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", root.join("unused-global-config"))
+            .args(["hash-object", "-w", "--stdin"])
+            .output()
+            .unwrap();
+        assert!(empty_blob.status.success());
+        let empty_blob = String::from_utf8(empty_blob.stdout).unwrap();
+        git(&[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            "100644",
+            empty_blob.trim(),
+            &deep,
+        ]);
         // A file over the limit.
         std::fs::write(root.join("big.bin"), vec![0_u8; 11 * 1024 * 1024]).unwrap();
-        git(&["add", "-A"]);
+        git(&["add", "big.bin"]);
         git(&[
             "-c",
             "user.email=a@b",
