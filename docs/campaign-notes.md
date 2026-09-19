@@ -152,41 +152,93 @@ existing `.deshell/` (approvals and declared shell already in place). A fresh
 Retiring a PowerShell script into `xtask` removes one `DYNAMIC_CANDIDATE` (its
 `mise.toml` invocation) and one `UNIMPLEMENTED_SEMANTIC` (the script) each.
 
-## In flight
+## The mutation run, and what it left
 
-A `cargo mutants` run over `approval.rs`, `patch.rs`, `host.rs` and `trace.rs`
-in the git worktree `/tmp/mutants-wt`, writing to `/tmp/mutants-out`. Check it
-with:
+`cargo mutants` over `approval.rs`, `patch.rs`, `host.rs` and `trace.rs`:
+**239 mutants in two hours — 170 caught, 40 missed, 29 unviable**, a score of
+81%. `host.rs` has no survivors.
 
-    for f in caught missed timeout unviable; do
-      echo "$f: $(wc -l < /tmp/mutants-out/mutants.out/$f.txt)"
-    done
+It ran in a git worktree at `bf67b8c`, so the five `Approval::validate` and
+`declared_shell_name` survivors it reports were fixed afterwards in `bcd6877`
+and are not in the list below. **35 remain, and they are the next task.**
 
-At the time of writing: 41 caught, 10 missed, 6 unviable, still running.
+Reproduce with `mise run test:mutation`, but read this first:
 
-**It must run in a worktree, not in place in this tree, and not in
+**It must run in a git worktree, not in place in this tree and not in
 cargo-mutants' own temporary copy.** The copy is untrusted by `mise`, so the
-shims refuse to resolve `pwsh` and `nu` and four tests fail in an unmutated
-tree before any mutant is tested. A worktree with `mise trust` run in it works.
+shims refuse to resolve `pwsh` and `nu`, and four tests fail in an unmutated
+tree before a single mutant is tested. A worktree with `mise trust` run inside
+it works. Budget two hours.
 
-The five survivors found first are fixed (`bcd6877`). Five more have appeared
-since and are the immediate next task:
+A mutation run leaves files behind: this one wrote
+`approvals/sha256/<digest>.json` into the worktree root, from a mutant that
+replaced a path function with an empty string. The real tree does not do this.
+Clear the worktree rather than reading the leftovers as a defect.
 
-    approval.rs:317:20  replace && with || in scenario_approval
-    approval.rs:331:20  replace && with || in matrix_approval
-    approval.rs:349:9   replace Subject::kind -> &'static str with ""
-    approval.rs:349:9   replace Subject::kind -> &'static str with "xyzzy"
-    approval.rs:359:9   replace ReviewStatus::name -> &'static str with ""
+    approval.rs:317:20: replace && with || in scenario_approval
+    approval.rs:331:20: replace && with || in matrix_approval
+    approval.rs:349:9: replace Subject::kind -> &'static str with ""
+    approval.rs:349:9: replace Subject::kind -> &'static str with "xyzzy"
+    approval.rs:359:9: replace ReviewStatus::name -> &'static str with ""
+    approval.rs:359:9: replace ReviewStatus::name -> &'static str with "xyzzy"
+    approval.rs:474:46: replace || with && in load_scenarios
+    approval.rs:496:23: replace match guard error.kind() == std::io::ErrorKind::NotFound with true in load_approvals
+    approval.rs:500:42: replace || with && in load_approvals
+    approval.rs:523:46: replace || with && in load_approvals
+    approval.rs:597:42: replace || with && in canonical_root
+    approval.rs:611:42: replace || with && in safe_existing_directory
+    approval.rs:634:5: replace portable_id -> bool with true
+    approval.rs:636:9: replace && with || in portable_id
+    approval.rs:635:9: replace && with || in portable_id
+    approval.rs:637:57: replace && with || in portable_id
+    patch.rs:44:42: replace || with && in prepare
+    patch.rs:72:42: replace || with && in prepare_expected
+    patch.rs:160:9: replace scratch::set_permissions -> std::io::Result<()> with Ok(())
+    patch.rs:213:23: replace match guard error.kind() == std::io::ErrorKind::AlreadyExists with true in ensure_directory
+    patch.rs:242:23: replace match guard error.kind() == std::io::ErrorKind::AlreadyExists with true in create_new_directory
+    patch.rs:242:23: replace match guard error.kind() == std::io::ErrorKind::AlreadyExists with false in create_new_directory
+    patch.rs:242:36: replace == with != in create_new_directory
+    patch.rs:295:42: replace || with && in prepare_delete
+    patch.rs:532:24: replace match guard metadata.file_type().is_file() && !metadata.file_type().is_symlink() with true in validate_proposal
+    patch.rs:551:31: replace match guard error.kind() == std::io::ErrorKind::NotFound with true in validate_proposal
+    patch.rs:532:55: replace && with || in validate_proposal
+    patch.rs:594:32: replace match guard current == item.proposal.replacement with true in validate_current
+    patch.rs:601:31: replace match guard error.kind() == std::io::ErrorKind::NotFound with true in validate_current
+    patch.rs:659:46: replace || with && in remove_committed
+    patch.rs:716:35: replace & with | in file_permissions
+    patch.rs:721:5: replace file_permissions -> u32 with 0
+    patch.rs:721:5: replace file_permissions -> u32 with 1
+    trace.rs:218:5: replace path_name -> String with String::new()
+    trace.rs:218:5: replace path_name -> String with "xyzzy".into()
 
-The last three are the trace labels added in `bf67b8c` — a test that reads an
-`approval_decision` event and asserts its `subject` and `status` would kill all
-three. The first two are real approval logic and deserve the same treatment as
-`Approval::validate` got: a case per refusal, each checked by reintroducing the
-mutation by hand.
+They fall into four groups, and each group wants one kind of test.
 
-**Method that worked:** write the tests, then edit the source to reintroduce
-each mutation one at a time and confirm the suite fails. A test that does not
-fail on the mutation has not covered it, whatever its name says.
+- **The trace labels** (`Subject::kind`, `ReviewStatus::name`, `path_name`) —
+  added in `bf67b8c` and `f8f0606` and never read back by a test. One test that
+  reads an `approval_decision` event and asserts its `subject` and `status`
+  kills four of them; one that asserts a `file_commit` path kills the other two.
+  Cheapest of the lot.
+- **`||` that could be `&&`** — sixteen of them, in `load_approvals`,
+  `canonical_root`, `safe_existing_directory`, `portable_id`, `prepare`,
+  `prepare_expected`, `prepare_delete`, `validate_proposal`, `remove_committed`.
+  Each is a pair of refusals where only one side is ever exercised. A case per
+  side, the way `Approval::validate` got.
+- **`ErrorKind` match guards** — `NotFound` and `AlreadyExists` in
+  `load_approvals`, `ensure_directory`, `create_new_directory`,
+  `validate_proposal` and `validate_current`. These are the race-tolerance
+  paths: the guard is what separates "somebody got there first, which is fine"
+  from "something is wrong". `ebee244` settled those races and no test
+  distinguishes the two answers. Needs a test that creates the racing condition,
+  not one that mocks it.
+- **`file_permissions`** — three survivors including `& with |`. Permissions
+  are part of a staged proposal and applied before the commit rename, so a
+  wrong mask is a wrong file mode on disk. Assert the mode after `apply_all`.
+
+**Method that worked on the first five:** write the tests, then edit the source
+to reintroduce each mutation one at a time and confirm the suite fails. A test
+that does not fail on the mutation has not covered it, whatever its name says.
+
+Once these are clean, extend the run to `migration.rs` and `frontend.rs`.
 
 ## Next, in the order I would take it
 
