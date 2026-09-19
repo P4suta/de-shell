@@ -2827,8 +2827,11 @@ fn javascript_steps(
                 assigned.insert(name.clone());
             }
             HostStep::Write(contents) => {
-                let contents =
-                    serde_json::to_string(contents).map_err(|error| error.to_string())?;
+                let contents = contents
+                    .iter()
+                    .map(|word| javascript_word(word, assigned))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .join(" + ");
                 body.push_str(&format!(
                     "{indent}process.stdout.write({contents});\n{indent}deshellStatus = 0;\n"
                 ));
@@ -3171,7 +3174,10 @@ enum HostStep {
     },
     Run(Vec<HostWord>),
     /// Bytes on standard output, which is what a modelled `echo` is.
-    Write(String),
+    ///
+    /// A list rather than one string, because a step writes
+    /// `"the result was: $RESULT"` far more often than it writes a constant.
+    Write(Vec<HostWord>),
     /// The step ends with this status.
     Exit(i32),
     /// `if TEST; then BODY; fi`, with no else branch.
@@ -3266,11 +3272,11 @@ fn literal_exec_sequence(
             "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: {context} is empty"
         ));
     }
-    if !steps.iter().any(|step| matches!(step, HostStep::Run(_))) {
-        return Err(format!(
-            "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: {context} runs nothing"
-        ));
-    }
+    // No requirement that a step start a process. A step that only writes and
+    // ends is a program, and the generated action is started as `node index.js`
+    // either way — the guard that was here refused
+    // `if [ ... ]; then echo ...; exit 1; fi`, which is the commonest shape a
+    // workflow has.
     Ok((steps, on_failure))
 }
 
@@ -3331,7 +3337,7 @@ fn flatten_literal_commands(
             Ok(())
         }
         crate::ir::Operation::WriteStdout { contents } => {
-            steps.push(HostStep::Write(literal_text_expression(contents)?));
+            steps.push(HostStep::Write(host_words(contents, context)?));
             Ok(())
         }
         crate::ir::Operation::Exit {
@@ -3431,6 +3437,30 @@ fn host_test(predicate: &crate::ir::TestPredicate, context: &str) -> Result<Host
             "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: {context} asks string tests and this one is a pattern"
         )),
     }
+}
+
+/// The pieces of a text expression, each a literal or a name to read.
+///
+/// A whole argument that is one variable is the `host_word` case; this is the
+/// one where literal text and a name are joined, which is what `echo "a: $b"`
+/// is. A positional argument is refused: a generated action is started with
+/// none.
+fn host_words(
+    expression: &crate::ir::TextExpression,
+    context: &str,
+) -> Result<Vec<HostWord>, String> {
+    expression
+        .parts
+        .iter()
+        .map(|part| match part {
+            crate::ir::TextPart::Literal { value } => Ok(HostWord::Literal(value.clone())),
+            crate::ir::TextPart::Variable { name } => Ok(HostWord::Variable(name.clone())),
+            crate::ir::TextPart::Argument { name: _ }
+            | crate::ir::TextPart::DefaultValue { .. } => Err(format!(
+                "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: {context} joins literal text and names, and this holds neither"
+            )),
+        })
+        .collect()
 }
 
 /// One word of a command, as a literal or a name to read.
@@ -11442,6 +11472,48 @@ mod tests {
             recorded.trim_end(),
             produced,
             "the IR verifier's coverage changed; re-record with DESHELL_UPDATE_GOLDEN=1 and say why in the commit"
+        );
+    }
+
+    /// A step that only writes and ends is a program.
+    ///
+    /// The generator required a step to start at least one process, so
+    /// `if [ "$r" != "success" ]; then echo "..."; exit 1; fi` — the commonest
+    /// shape a workflow gate has, and the one this repository's own `ci.yml`
+    /// ends with — was refused as "runs nothing". The generated action is
+    /// started as `node index.js` either way.
+    ///
+    /// The written text joins literal pieces and names, because a step writes
+    /// `"the result was: $RESULT"` far more often than it writes a constant.
+    #[test]
+    fn a_step_that_only_writes_and_ends_is_a_program() {
+        let plan =
+            crate::frontend::lower_with_interpreter(crate::frontend::LowerWithInterpreterArgs {
+                path: ".github/workflows/ci.yml",
+                source:
+                    b"if [ \"$R\" != \"success\" ]; then\necho \"result was: $R\"\nexit 1\nfi\n",
+                unknown_policy: crate::config::UnknownInterpreter::Reject,
+                configured: "bash",
+                host: crate::frontend::HostShell::default(),
+            })
+            .unwrap();
+        let (steps, _) = literal_exec_sequence(&plan, "test").unwrap();
+        let [HostStep::When { test: _, body }] = steps.as_slice() else {
+            panic!("one branch: {steps:#?}");
+        };
+        let [HostStep::Write(written), HostStep::Exit(status)] = body.as_slice() else {
+            panic!("a write and an exit: {body:#?}");
+        };
+        assert_eq!(*status, 1);
+        assert!(
+            written.contains(&HostWord::Variable("R".to_owned())),
+            "the written text lost the name it interpolates: {written:#?}"
+        );
+        assert!(
+            written.iter().any(
+                |word| matches!(word, HostWord::Literal(value) if value.contains("result was"))
+            ),
+            "{written:#?}"
         );
     }
 

@@ -232,6 +232,11 @@ All notable changes are documented here. No compatibility contract predates
   must not run; an `&&` chain still flattens, because a failure there ends the
   step.
 
+- Wrote a `echo "the result was: $R"` as the pieces it is, so a step that
+  interpolates a name into its output can be generated.
+- Stopped requiring a generated step to start a process. `if [ ... ]; then echo
+  ...; exit 1; fi` is a program, and it is the shape a workflow gate has.
+
 ### Removed
 
 - Pre-v1 Effect IR and lock migration promises.
