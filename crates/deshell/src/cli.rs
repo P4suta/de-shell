@@ -1055,12 +1055,14 @@ where
         command.force_human_report_source();
         let mut captured_stdout = Vec::new();
         let mut captured_stderr = Vec::new();
-        let outcome = dispatch(
+        let mut supplied_details = None;
+        let outcome = dispatch(DispatchArgs {
             command,
             diagnostic_mode,
-            &mut captured_stdout,
-            &mut captured_stderr,
-        );
+            stdout: &mut captured_stdout,
+            stderr: &mut captured_stderr,
+            details: &mut supplied_details,
+        });
         let (code, completed_failure) = match outcome {
             Ok(code) => (code, None),
             Err(failure) if completed_report_failure(&failure) => (failure.exit, Some(failure)),
@@ -1080,6 +1082,7 @@ where
             failure: completed_failure.as_ref(),
             stdout: &captured_stdout,
             stderr: &captured_stderr,
+            supplied: supplied_details,
         });
         if report.next_actions.is_empty() {
             report.next_actions = spec.next_actions;
@@ -1099,7 +1102,14 @@ where
         }
         return code;
     }
-    match dispatch(command, diagnostic_mode, stdout, stderr) {
+    // Nothing reads a report on this path, so nothing is asked to build one.
+    match dispatch(DispatchArgs {
+        command,
+        diagnostic_mode,
+        stdout,
+        stderr,
+        details: &mut None,
+    }) {
         Ok(code) => code,
         Err(failure) => {
             let exit = failure.exit;
@@ -1144,6 +1154,8 @@ struct CommandReportArgs<'a> {
     failure: Option<&'a Failure>,
     stdout: &'a [u8],
     stderr: &'a [u8],
+    /// What the command said about itself, when it says it. See [`dispatch`].
+    supplied: Option<crate::report::Details>,
 }
 
 fn command_report(parts: CommandReportArgs<'_>) -> crate::report::Report {
@@ -1154,6 +1166,7 @@ fn command_report(parts: CommandReportArgs<'_>) -> crate::report::Report {
         failure,
         stdout,
         stderr,
+        supplied,
     } = parts;
     let stdout = String::from_utf8_lossy(stdout);
     let stderr = String::from_utf8_lossy(stderr);
@@ -1188,6 +1201,13 @@ fn command_report(parts: CommandReportArgs<'_>) -> crate::report::Report {
             crate::report::Status::Failed => format!("{} failed", spec.command),
         });
     let mut report = crate::report::Report::new(spec.command, status, summary);
+    // A command that built its own items keeps them; the loop below still reads
+    // the prose for counts, values, paths and next actions, which are about the
+    // run rather than about a location.
+    let supplied_items = supplied.is_some();
+    if let Some(details) = supplied {
+        report.details.items = details.items;
+    }
     if let Some(failure) = failure {
         report.details.items.push(crate::report::Item {
             kind: Some("failure".into()),
@@ -1261,7 +1281,7 @@ fn command_report(parts: CommandReportArgs<'_>) -> crate::report::Report {
                 message: (!message.is_empty()).then(|| message.into()),
                 ..crate::report::Item::default()
             });
-        } else if spec.command == "scan" && line.contains('\t') {
+        } else if spec.command == "scan" && line.contains('\t') && !supplied_items {
             let fields = line.split('\t').collect::<Vec<_>>();
             if fields.len() >= 2 {
                 let item = match fields[0] {
@@ -1296,12 +1316,6 @@ fn command_report(parts: CommandReportArgs<'_>) -> crate::report::Report {
                                 .map(|locator| (*locator).into()),
                             start_byte: span.map(|(start, _)| start),
                             end_byte: span.map(|(_, end)| end),
-                            // The digest of the bytes, which is what lets a
-                            // reader check that the file still holds what was
-                            // scanned. The corpus auditor needs it and the
-                            // report could not carry it, because the report is
-                            // read back out of this line.
-                            digest: fields.get(6).map(|digest| (*digest).into()),
                             ..crate::report::Item::default()
                         }
                     }
@@ -1396,12 +1410,76 @@ fn requested_diagnostic_mode(args: &[OsString]) -> crate::diagnostics::Mode {
     crate::diagnostics::Mode::Human
 }
 
-fn dispatch(
+/// Run a command.
+///
+/// `details` is how a command hands the structured report its own items instead
+/// of having them read back out of its prose. `command_report` reconstructs a
+/// report by parsing the human output, which is why a scanned location's byte
+/// span and content digest reached the machine-readable face only after the
+/// human line was made to print them. A command that fills this says what it
+/// found; one that leaves it empty is parsed as before.
+/// What `scan` found, as the structured report says it.
+///
+/// The one place the inventory becomes report items. `command_report` fills the
+/// counts and values from the summary lines, which are statements about the
+/// whole run rather than about a location.
+fn scan_details(inventory: &crate::scanner::Inventory) -> crate::report::Details {
+    let mut details = crate::report::Details::default();
+    for finding in &inventory.findings {
+        details.items.push(crate::report::Item {
+            kind: Some(finding_kind(&finding.kind).into()),
+            path: Some(finding.path.clone()),
+            name: Some(
+                finding
+                    .interpreter
+                    .clone()
+                    .unwrap_or_else(|| "unknown".into()),
+            ),
+            status: Some(interpreter_confidence(&finding.interpreter_confidence).into()),
+            message: finding.locator.clone(),
+            digest: Some(finding.content_digest.clone()),
+            start_byte: Some(finding.span.start_byte),
+            end_byte: Some(finding.span.end_byte),
+            ..crate::report::Item::default()
+        });
+    }
+    for skipped in &inventory.skipped {
+        details.items.push(crate::report::Item {
+            kind: Some("skipped".into()),
+            path: Some(skipped.path.clone()),
+            message: Some(skipped.reason.clone()),
+            ..crate::report::Item::default()
+        });
+    }
+    for error in &inventory.errors {
+        details.items.push(crate::report::Item {
+            kind: Some("error".into()),
+            path: Some(error.path.clone().unwrap_or_else(|| "<root>".into())),
+            name: Some(error.stage.clone()),
+            message: Some(error.message.clone()),
+            ..crate::report::Item::default()
+        });
+    }
+    details
+}
+
+struct DispatchArgs<'a> {
     command: Command,
     diagnostic_mode: crate::diagnostics::Mode,
-    stdout: &mut dyn Write,
-    stderr: &mut dyn Write,
-) -> Result<i32, Failure> {
+    stdout: &'a mut dyn Write,
+    stderr: &'a mut dyn Write,
+    details: &'a mut Option<crate::report::Details>,
+}
+
+fn dispatch(parts: DispatchArgs<'_>) -> Result<i32, Failure> {
+    // Destructured without `..`: see `DispatchArgs`.
+    let DispatchArgs {
+        command,
+        diagnostic_mode,
+        stdout,
+        stderr,
+        details,
+    } = parts;
     // Asked before the command runs, so the answer is "the project is not
     // initialized, run `deshell init`" rather than whatever read happened to
     // fail first.
@@ -1503,6 +1581,13 @@ fn dispatch(
         Command::Scan { root, format } => {
             let inventory = crate::project::scan(&root).map_err(Failure::io)?;
             let exit = if inventory.errors.is_empty() { 0 } else { 1 };
+            // Built from the inventory, not read back out of the lines printed
+            // below. The report used to be a parse of this command's prose, so
+            // it carried only what the prose carried: a location's byte span and
+            // content digest reached the machine-readable face only once the
+            // human line was made to print them, and a reader that cannot ask a
+            // follow-up question got a locator like `run:118` instead of bytes.
+            *details = Some(scan_details(&inventory));
             match format {
                 OutputFormat::Json => {
                     let value = serde_json::to_value(&inventory)
@@ -1520,7 +1605,7 @@ fn dispatch(
                         writeln_io(
                             stdout,
                             format_args!(
-                                "{}\t{}\t{}\t{}\t{}\t{}..{}\t{}",
+                                "{}\t{}\t{}\t{}\t{}\t{}..{}",
                                 finding_kind(&finding.kind),
                                 finding.path,
                                 finding.interpreter.as_deref().unwrap_or("unknown"),
@@ -1528,7 +1613,6 @@ fn dispatch(
                                 finding.locator.as_deref().unwrap_or("-"),
                                 finding.span.start_byte,
                                 finding.span.end_byte,
-                                finding.content_digest,
                             ),
                         )?;
                     }
@@ -6265,6 +6349,52 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("DESHELL_BLOCKER_INTERPRETER_CONFLICT")
+        );
+    }
+
+    /// The structured scan is built from the inventory, not read back out of
+    /// the printed lines.
+    ///
+    /// A Scan Report used to be a parse of this command's own prose, so it
+    /// could carry only what the prose carried — which is why a location's byte
+    /// span and content digest reached the machine-readable face only after the
+    /// human line was made to print them, one at a time, each after somebody
+    /// needed it.
+    ///
+    /// This checks the two faces are no longer the same sentence: the report
+    /// carries a digest that the human line does not print.
+    #[test]
+    fn the_structured_scan_carries_what_the_printed_line_does_not() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        configure(directory.path(), "build.sh", b"/usr/bin/printf hello\n");
+        let root = path(directory.path());
+        let human = invoke_owned(vec![
+            "deshell".into(),
+            "scan".into(),
+            "--root".into(),
+            root.clone(),
+        ]);
+        assert_eq!(human.0, 0, "{}", String::from_utf8_lossy(&human.2));
+        let printed = String::from_utf8(human.1).unwrap();
+
+        let structured = invoke_owned(vec![
+            "deshell".into(),
+            "scan".into(),
+            "--root".into(),
+            root,
+            "--format".into(),
+            "json".into(),
+        ]);
+        assert_eq!(structured.0, 0);
+        let report: serde_json::Value = crate::strict_json::parse(&structured.1).unwrap();
+        let items = report["details"]["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1, "{report}");
+        let digest = items[0]["digest"].as_str().expect("a content digest");
+        assert_eq!(digest.len(), 64, "{digest}");
+        assert!(
+            !printed.contains(digest),
+            "the report is still only what the prose says: {printed}"
         );
     }
 

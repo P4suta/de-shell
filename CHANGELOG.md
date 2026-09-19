@@ -189,6 +189,12 @@ All notable changes are documented here. No compatibility contract predates
   still refuses one where a failure would not stop the list, because there the
   two are different programs.
 
+- Built `scan`'s structured report from the inventory instead of re-reading the
+  command's own printed lines. The report could carry only what the prose
+  carried, which is why a location's byte span and content digest arrived one at
+  a time, each after somebody needed it. `dispatch` now lets a command hand the
+  report its own items.
+
 ### Removed
 
 - Pre-v1 Effect IR and lock migration promises.
