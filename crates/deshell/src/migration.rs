@@ -3073,6 +3073,11 @@ fn literal_exec_sequence(
             argv: _,
             environment: _,
             working_directory: _,
+        }
+        | crate::ir::Operation::Condition {
+            predicate: _,
+            if_true: _,
+            if_false: _,
         } => (vec![&task.body], crate::ir::SequenceFailure::Stop),
         crate::ir::Operation::Sequence { nodes, on_failure } => {
             (nodes.iter().collect(), *on_failure)
@@ -3086,32 +3091,7 @@ fn literal_exec_sequence(
     };
     let mut commands = Vec::new();
     for node in nodes {
-        let crate::ir::Operation::Exec {
-            argv,
-            environment,
-            working_directory,
-        } = &node.operation
-        else {
-            return Err(format!(
-                "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: {context} runs commands, and this step holds {}",
-                node.operation.name()
-            ));
-        };
-        if !environment.is_empty() || working_directory.is_some() {
-            return Err(format!(
-                "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: {context} cannot preserve per-command environment or cwd"
-            ));
-        }
-        let argv = argv
-            .iter()
-            .map(literal_text_expression)
-            .collect::<Result<Vec<_>, _>>()?;
-        if argv.is_empty() {
-            return Err(format!(
-                "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: {context} is empty"
-            ));
-        }
-        commands.push(argv);
+        flatten_literal_commands(node, on_failure, context, &mut commands)?;
     }
     if commands.is_empty() {
         return Err(format!(
@@ -3119,6 +3099,61 @@ fn literal_exec_sequence(
         ));
     }
     Ok((commands, on_failure))
+}
+
+/// Append the literal commands `node` runs, in order.
+///
+/// An `&&` chain lowers to a `Condition`, and a step of
+/// `sudo apt-get update && sudo apt-get install ...` was refused for being one.
+/// Under `Stop` it is the same program as the two commands in a list: if the
+/// left one fails the step ends with its status, and if it succeeds the right
+/// one runs and its status is the step's.
+///
+/// That equivalence is what `Stop` buys, and it is why this refuses under
+/// `Continue` — there, `a && b` followed by `c` still runs `c` when `a` fails,
+/// and a flat list with no stop would run `b` as well.
+fn flatten_literal_commands(
+    node: &crate::ir::Node,
+    on_failure: crate::ir::SequenceFailure,
+    context: &str,
+    commands: &mut Vec<Vec<String>>,
+) -> Result<(), String> {
+    match &node.operation {
+        crate::ir::Operation::Exec {
+            argv,
+            environment,
+            working_directory,
+        } => {
+            if !environment.is_empty() || working_directory.is_some() {
+                return Err(format!(
+                    "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: {context} cannot preserve per-command environment or cwd"
+                ));
+            }
+            let argv = argv
+                .iter()
+                .map(literal_text_expression)
+                .collect::<Result<Vec<_>, _>>()?;
+            if argv.is_empty() {
+                return Err(format!(
+                    "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: {context} is empty"
+                ));
+            }
+            commands.push(argv);
+            Ok(())
+        }
+        crate::ir::Operation::Condition {
+            predicate,
+            if_true,
+            if_false,
+        } if if_false.is_none() && on_failure == crate::ir::SequenceFailure::Stop => {
+            flatten_literal_commands(predicate, on_failure, context, commands)?;
+            flatten_literal_commands(if_true, on_failure, context, commands)
+        }
+        other => Err(format!(
+            "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: {context} runs commands, and this step holds {}",
+            other.name()
+        )),
+    }
 }
 
 fn literal_exec_argv(plan: &crate::ir::Plan, context: &str) -> Result<Vec<String>, String> {
@@ -11102,6 +11137,57 @@ mod tests {
 
         let (single, _) = step("/bin/echo only\n");
         assert_eq!(single.len(), 1);
+    }
+
+    /// An `&&` chain in a workflow step is the commands in order.
+    ///
+    /// It lowers to a `Condition`, and the generator refused one — two of this
+    /// repository's own blockers were
+    /// `sudo apt-get update && sudo apt-get install ...`. Under `Stop` the two
+    /// are the same program: a failing left side ends the step with its status,
+    /// and a succeeding one runs the right side whose status is the step's.
+    ///
+    /// Under `Continue` they are not, which is what the second half of this
+    /// checks: `a && b` followed by `c` still runs `c` when `a` fails, and a
+    /// flat list with no stop would run `b` as well.
+    #[test]
+    fn an_and_chain_in_a_step_is_the_commands_in_order() {
+        let step = |source: &str| {
+            let plan = crate::frontend::lower(
+                ".github/workflows/ci.yml.deshell.sh",
+                source.as_bytes(),
+                crate::config::UnknownInterpreter::Reject,
+            )
+            .unwrap();
+            literal_exec_sequence(&plan, "test")
+        };
+        let (commands, on_failure) = step("/bin/echo one && /bin/echo two\n").unwrap();
+        assert_eq!(
+            commands,
+            vec![
+                vec!["/bin/echo".to_owned(), "one".to_owned()],
+                vec!["/bin/echo".to_owned(), "two".to_owned()],
+            ]
+        );
+        assert_eq!(on_failure, crate::ir::SequenceFailure::Stop);
+
+        // A chain the host does not run under `set -e` is not this program.
+        let mut commands = Vec::new();
+        let condition = node(crate::ir::Operation::Condition {
+            predicate: Box::new(exec(vec![crate::ir::TextExpression::literal("/bin/true")])),
+            if_true: Box::new(exec(vec![crate::ir::TextExpression::literal("/bin/true")])),
+            if_false: None,
+        });
+        assert!(
+            flatten_literal_commands(
+                &condition,
+                crate::ir::SequenceFailure::Continue,
+                "test",
+                &mut commands
+            )
+            .is_err(),
+            "a chain was flattened where a failure would not stop the list"
+        );
     }
 
     /// Several shell blocks in one workflow retire together.

@@ -183,6 +183,12 @@ All notable changes are documented here. No compatibility contract predates
   `contracts/golden/powershell-invocation-semantics-v1.json` records it and
   `cargo xtask powershell-invocation` re-measures it on every runner.
 
+- Generated a workflow step that is an `&&` chain. Under the `set -e` the
+  runner applies, `a && b` is the two commands in a list that stops on failure —
+  the same program, so the generator no longer refuses a `Condition` there. It
+  still refuses one where a failure would not stop the list, because there the
+  two are different programs.
+
 ### Removed
 
 - Pre-v1 Effect IR and lock migration promises.
