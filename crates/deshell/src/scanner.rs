@@ -1112,8 +1112,22 @@ fn span_of_encoded_string(source: &str, value: &str) -> Option<ByteSpan> {
     })
 }
 
-fn span_of(source: &str, from: usize, value: &str) -> ByteSpan {
-    let from = from.min(source.len());
+pub(crate) fn span_of(source: &str, from: usize, value: &str) -> ByteSpan {
+    // `from` is an unchecked byte offset, and an offset can land inside a
+    // multi-byte character. The search below asks `get` and survives that; the
+    // arm for "not found" indexed with `[from..]` and did not, so the function
+    // answered safely or panicked depending on which branch it took.
+    //
+    // Every caller today passes a boundary — a `find` result, or a line start
+    // — so this was a precondition nothing stated and nothing checked rather
+    // than a crash anybody had seen. The property test reaches it directly.
+    //
+    // Moving down to the character that contains the offset keeps the span
+    // sliceable and keeps the position it names.
+    let mut from = from.min(source.len());
+    while !source.is_char_boundary(from) {
+        from -= 1;
+    }
     match source.get(from..).and_then(|rest| rest.find(value)) {
         Some(offset) => ByteSpan {
             start_byte: (from + offset) as u64,

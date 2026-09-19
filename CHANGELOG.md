@@ -114,6 +114,15 @@ All notable changes are documented here. No compatibility contract predates
   the real clock would never reach it, which is the same as not testing the
   window. The day can be moved across the boundary now, and is.
 
+- Made `span_of` state and keep its own precondition. It took an unchecked byte
+  offset, and an offset can land inside a multi-byte character: the search asked
+  `get` and survived that, while the arm for "not found" indexed with `[from..]`
+  and did not, so the function answered safely or panicked depending on which
+  branch it took. Every caller passes a boundary today, so this was a
+  precondition nothing stated rather than a crash anybody had seen — the new
+  property test reaches it directly. A span now always names bytes a reader can
+  slice: both ends inside the source, in order, and on character boundaries.
+
 - Read a process launch for its program and the command it hands over, rather
   than for whether every argument is a literal. Those are different questions,
   and the second answered the first wrongly in both directions:
