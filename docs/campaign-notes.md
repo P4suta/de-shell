@@ -216,9 +216,11 @@ so both are caught. The patch count is 98 after replacing overwrite-by-rename
 with an exhaustive `Expectation` match and a tested no-clobber persistence
 boundary; the idempotent winner is explicitly proved to remain outside a losing
 transaction's rollback set. Linux Miri reaches scratch copies through buffered
-Read/Write instead of the unsupported `copy_file_range` specialization, and
-uses the persistence crate's hard-link fallback instead of its unsupported
-`renameat2` fast path.
+Read/Write driven by an explicit `fill_buf`/`write_all` loop instead of the
+unsupported `copy_file_range` specialization, and uses the persistence crate's
+hard-link fallback instead of its unsupported `renameat2` fast path. The final
+`patch.rs` remeasurement kept the same 98-mutant result: 90 caught, 8 unviable,
+no misses and no timeouts.
 
 The live shell inventory is deliberately one-directional. Its table is the
 conservative union across supported interpreter versions: a runner supplying an
@@ -228,6 +230,14 @@ reported as drift. Ubuntu's modern Bash added `BASHPID`, `EPOCHREALTIME`,
 silently lowered as missing environment variables. Test repositories also
 discard ambient system/global Git configuration, so a developer's signing or
 hook policy cannot change fixture behavior.
+
+Windows resolves executables in system directories before `PATH`, where
+`System32\bash.exe` is the WSL launcher rather than the Git Bash already running
+the workflow. All POSIX-shell observations now resolve their interpreter once
+through Git/MSYS `sh`, then launch that native absolute path. A cross-platform
+test requires the selected executable to expose `BASH_VERSION` and requires
+unknown or absent names to fail closed; no observation can silently fall back
+to the colliding Windows command.
 
 The mutation task now also names `migration.rs` and `frontend.rs`. A
 reproducible `cargo mutants --list` reports **2,931** mutations in those two
@@ -250,9 +260,9 @@ PowerShell/Go and Nushell/Rust migration paths. `coverage` reports only after
 that shared collection step, so CI and release cannot accidentally measure a
 smaller test surface.
 
-The trusted clean run on 2026-09-20 passed all 522 workspace tests (482
-`deshell`, 40 `xtask`) and finished at **90.35% line coverage**: 54,408 lines,
-5,249 missed. `cargo llvm-cov` enforced `--fail-under-lines 90` on the result.
+The trusted clean run on 2026-09-20 passed all 523 workspace tests (482
+`deshell`, 41 `xtask`) and finished at **90.29% line coverage**: 54,510 lines,
+5,294 missed. `cargo llvm-cov` enforced `--fail-under-lines 90` on the result.
 
 ## Next, in the order I would take it
 
