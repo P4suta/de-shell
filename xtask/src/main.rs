@@ -109,43 +109,47 @@ fn repository_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..")
 }
 
-/// Programs that implement the POSIX-shell names used by an observation.
+/// POSIX programs used by an observation.
 ///
 /// Windows searches its system directories before `PATH`. Consequently, a
 /// bare `bash` launched through `std::process::Command` resolves to the WSL
 /// launcher in `System32` even when the calling workflow is already running in
-/// Git Bash. Git Bash's `sh`, however, resolves POSIX program names inside the
-/// MSYS installation. Ask it for the native absolute path once, then launch
-/// that path directly for every observation. Other hosts keep normal `PATH`
-/// lookup, including its ordinary not-found error.
+/// Git Bash. Git Bash's `sh`, however, resolves POSIX program names and paths
+/// inside the MSYS installation. Ask it for the native absolute path once,
+/// then launch that path directly for every observation. Other hosts retain
+/// the supplied name or path, including its ordinary not-found error.
 #[derive(Debug)]
-struct ShellPrograms {
+struct PosixPrograms {
     programs: BTreeMap<String, Result<PathBuf, String>>,
 }
 
-impl ShellPrograms {
+impl PosixPrograms {
     fn discover<'a>(names: impl IntoIterator<Item = &'a str>) -> Self {
         let mut programs = BTreeMap::new();
         for name in names {
             let _resolution = programs
                 .entry(name.to_owned())
-                .or_insert_with(|| resolve_shell_program(name).map_err(|error| error.to_string()));
+                .or_insert_with(|| resolve_posix_program(name).map_err(|error| error.to_string()));
         }
         Self { programs }
     }
 
-    fn command(&self, name: &str) -> std::io::Result<std::process::Command> {
+    fn path(&self, name: &str) -> std::io::Result<&Path> {
         match self.programs.get(name) {
-            Some(Ok(program)) => Ok(std::process::Command::new(program)),
+            Some(Ok(program)) => Ok(program),
             Some(Err(error)) => Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 error.clone(),
             )),
             None => Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                format!("shell {name:?} was not discovered"),
+                format!("POSIX program {name:?} was not discovered"),
             )),
         }
+    }
+
+    fn command(&self, name: &str) -> std::io::Result<std::process::Command> {
+        Ok(std::process::Command::new(self.path(name)?))
     }
 
     fn output(&self, name: &str, script: &str) -> std::io::Result<std::process::Output> {
@@ -157,7 +161,7 @@ impl ShellPrograms {
     }
 }
 
-fn resolve_shell_program(name: &str) -> std::io::Result<PathBuf> {
+fn resolve_posix_program(name: &str) -> std::io::Result<PathBuf> {
     if !cfg!(windows) {
         return Ok(PathBuf::from(name));
     }
@@ -175,7 +179,7 @@ fn resolve_shell_program(name: &str) -> std::io::Result<PathBuf> {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             format!(
-                "cannot resolve POSIX shell {name:?} through Git/MSYS sh (exit {:?}): {stderr}",
+                "cannot resolve POSIX program {name:?} through Git/MSYS sh (exit {:?}): {stderr}",
                 resolution.status.code()
             ),
         ));
@@ -183,17 +187,67 @@ fn resolve_shell_program(name: &str) -> std::io::Result<PathBuf> {
     let stdout = String::from_utf8(resolution.stdout).map_err(|error| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("native path for POSIX shell {name:?} is not UTF-8: {error}"),
+            format!("native path for POSIX program {name:?} is not UTF-8: {error}"),
         )
     })?;
     let path = stdout.trim_end_matches(['\r', '\n']);
     if path.is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            format!("Git/MSYS sh returned no native path for POSIX shell {name:?}"),
+            format!("Git/MSYS sh returned no native path for POSIX program {name:?}"),
         ));
     }
     Ok(PathBuf::from(path))
+}
+
+const POWERSHELL_POSIX_PROGRAMS: [(&str, &str); 4] = [
+    ("__DESHELL_POSIX_ECHO__", "/bin/echo"),
+    ("__DESHELL_POSIX_FALSE__", "/usr/bin/false"),
+    ("__DESHELL_POSIX_SH__", "/bin/sh"),
+    ("__DESHELL_POSIX_TRUE__", "/usr/bin/true"),
+];
+
+/// Replace the deliberately host-neutral program markers in a PowerShell
+/// observation with paths PowerShell can launch on this host.
+///
+/// The corpus is about PowerShell's treatment of native commands, not about
+/// whether a Unix filesystem happens to be mounted at `/bin`. Keeping the
+/// markers outside quotes also forces every path through this one escaping
+/// rule. Any marker the harness does not know is an invalid corpus rather than
+/// a command PowerShell may interpret in a surprising way.
+fn render_powershell_posix_template(
+    template: &str,
+    programs: &PosixPrograms,
+) -> Result<String, String> {
+    let mut rendered = template.to_owned();
+    for (marker, name) in POWERSHELL_POSIX_PROGRAMS {
+        if !rendered.contains(marker) {
+            continue;
+        }
+        let path = programs
+            .path(name)
+            .map_err(|error| format!("cannot resolve {marker}: {error}"))?;
+        let literal = powershell_path_literal(path)
+            .map_err(|error| format!("cannot render {marker}: {error}"))?;
+        rendered = rendered.replace(marker, &literal);
+    }
+    if rendered.contains("__DESHELL_POSIX_") {
+        return Err(format!(
+            "PowerShell observation contains an unknown POSIX program marker: {rendered:?}"
+        ));
+    }
+    Ok(rendered)
+}
+
+fn powershell_path_literal(path: &Path) -> Result<String, String> {
+    let path = path
+        .to_str()
+        .ok_or_else(|| format!("path is not Unicode: {}", path.display()))?;
+    Ok(format!("'{}'", path.replace('\'', "''")))
+}
+
+fn powershell_posix_programs() -> PosixPrograms {
+    PosixPrograms::discover(POWERSHELL_POSIX_PROGRAMS.map(|(_, name)| name))
 }
 
 /// Measure what the host's shell actually does with `set -e`, `set -u` and
@@ -221,7 +275,7 @@ fn run_bash_semantics(root: &Path) -> Result<(), Vec<String>> {
         return Err(vec!["corpus is empty".to_owned()]);
     }
 
-    let shells = ShellPrograms::discover(["bash"]);
+    let shells = PosixPrograms::discover(["bash"]);
     let version = shells
         .command("bash")
         .map_err(|error| vec![format!("cannot resolve bash: {error}")])?
@@ -447,7 +501,7 @@ fn run_echo_semantics(root: &Path) -> Result<(), Vec<String>> {
     if cases.is_empty() {
         return Err(vec!["corpus is empty".to_owned()]);
     }
-    let shells = ShellPrograms::discover(ShellColumn::ALL.iter().copied().map(ShellColumn::name));
+    let shells = PosixPrograms::discover(ShellColumn::ALL.iter().copied().map(ShellColumn::name));
     let mut errors = Vec::new();
     let mut checked = 0_usize;
     let mut reported_differences = 0_usize;
@@ -578,6 +632,7 @@ fn run_powershell_preference(root: &Path) -> Result<(), Vec<String>> {
     if cases.is_empty() {
         return Err(vec!["corpus is empty".to_owned()]);
     }
+    let programs = powershell_posix_programs();
     let directory = root.join(format!("target/deshell-pwsh-pref-{}", std::process::id()));
     std::fs::create_dir_all(&directory)
         .map_err(|error| vec![format!("cannot create {}: {error}", directory.display())])?;
@@ -585,9 +640,16 @@ fn run_powershell_preference(root: &Path) -> Result<(), Vec<String>> {
     let mut checked = 0_usize;
     for case in cases {
         let name = case["name"].as_str().unwrap_or("<unnamed>");
-        let Some(body) = case["body"].as_str() else {
-            errors.push(format!("{name} has no body"));
+        let Some(body_template) = case["body_template"].as_str() else {
+            errors.push(format!("{name} has no body_template"));
             continue;
+        };
+        let body = match render_powershell_posix_template(body_template, &programs) {
+            Ok(body) => body,
+            Err(error) => {
+                errors.push(format!("{name} has an invalid body_template: {error}"));
+                continue;
+            }
         };
         for (form, preamble) in [
             ("with_stop", "$ErrorActionPreference = 'Stop'\n"),
@@ -653,6 +715,12 @@ fn run_powershell_variables(root: &Path) -> Result<(), Vec<String>> {
         .map_err(|error| vec![format!("cannot read {}: {error}", path.display())])?;
     let corpus: serde_json::Value =
         serde_json::from_str(&raw).map_err(|error| vec![format!("malformed corpus: {error}")])?;
+    let conditions = corpus["conditions"]
+        .as_array()
+        .ok_or_else(|| vec!["corpus has no conditions array".to_owned()])?;
+    if conditions.is_empty() {
+        return Err(vec!["corpus has no observation conditions".to_owned()]);
+    }
     let recorded = corpus["names"]
         .as_array()
         .ok_or_else(|| vec!["corpus has no names array".to_owned()])?
@@ -662,21 +730,27 @@ fn run_powershell_variables(root: &Path) -> Result<(), Vec<String>> {
     if recorded.is_empty() {
         return Err(vec!["corpus is empty".to_owned()]);
     }
+    let programs = powershell_posix_programs();
     // Two conditions, because one of them is not a detail: `LASTEXITCODE` does
     // not exist until a native command sets it, and a list measured only at
     // startup let `$LASTEXITCODE = '0'` through as an ordinary assignment.
     let mut observed = Vec::new();
-    for command in [
-        "Get-Variable | Select-Object -ExpandProperty Name | Sort-Object",
-        "& '/usr/bin/true'; Get-Variable | Select-Object -ExpandProperty Name | Sort-Object",
-    ] {
+    let mut errors = Vec::new();
+    for condition in conditions {
+        let name = condition["name"].as_str().unwrap_or("<unnamed>");
+        let Some(command_template) = condition["command_template"].as_str() else {
+            errors.push(format!("{name} has no command_template"));
+            continue;
+        };
+        let command = render_powershell_posix_template(command_template, &programs)
+            .map_err(|error| vec![format!("invalid {name} observation: {error}")])?;
         let run = std::process::Command::new("pwsh")
             .args([
                 "-NoLogo",
                 "-NoProfile",
                 "-NonInteractive",
                 "-Command",
-                command,
+                &command,
             ])
             .output();
         let run = match run {
@@ -686,14 +760,28 @@ fn run_powershell_variables(root: &Path) -> Result<(), Vec<String>> {
                 return Ok(());
             }
         };
+        let mut condition_observed = Vec::new();
         for line in String::from_utf8_lossy(&run.stdout).lines() {
             let line = line.trim_end_matches('\r').trim().to_owned();
-            if !line.is_empty() && !observed.contains(&line) {
-                observed.push(line);
+            if !line.is_empty() && !condition_observed.contains(&line) {
+                condition_observed.push(line);
+            }
+        }
+        let recorded_count = condition["count"]
+            .as_u64()
+            .and_then(|count| usize::try_from(count).ok());
+        if recorded_count != Some(condition_observed.len()) {
+            errors.push(format!(
+                "{name}/count: recorded {recorded_count:?}, observed {}",
+                condition_observed.len()
+            ));
+        }
+        for name in condition_observed {
+            if !observed.contains(&name) {
+                observed.push(name);
             }
         }
     }
-    let mut errors = Vec::new();
     for name in &observed {
         if !recorded.contains(name) {
             errors.push(format!(
@@ -730,6 +818,7 @@ fn run_powershell_step_invocation(root: &Path) -> Result<(), Vec<String>> {
     if cases.is_empty() {
         return Err(vec!["corpus is empty".to_owned()]);
     }
+    let programs = powershell_posix_programs();
     // Under `target/` and not the system temporary root: a version-manager shim
     // resolves its version from the configuration nearest the working directory.
     let directory = root.join(format!("target/deshell-pwsh-step-{}", std::process::id()));
@@ -739,9 +828,16 @@ fn run_powershell_step_invocation(root: &Path) -> Result<(), Vec<String>> {
     let mut checked = 0_usize;
     for case in cases {
         let name = case["name"].as_str().unwrap_or("<unnamed>");
-        let Some(step) = case["step"].as_str() else {
-            errors.push(format!("{name} has no step"));
+        let Some(step_template) = case["step_template"].as_str() else {
+            errors.push(format!("{name} has no step_template"));
             continue;
+        };
+        let step = match render_powershell_posix_template(step_template, &programs) {
+            Ok(step) => step,
+            Err(error) => {
+                errors.push(format!("{name} has an invalid step_template: {error}"));
+                continue;
+            }
         };
         let file = directory.join("step.ps1");
         if let Err(error) = std::fs::write(
@@ -753,10 +849,16 @@ fn run_powershell_step_invocation(root: &Path) -> Result<(), Vec<String>> {
             errors.push(format!("cannot write the step for {name}: {error}"));
             continue;
         }
-        let quoted = file.to_string_lossy().into_owned();
+        let quoted = match powershell_path_literal(&file) {
+            Ok(quoted) => quoted,
+            Err(error) => {
+                errors.push(format!("cannot quote the step path for {name}: {error}"));
+                continue;
+            }
+        };
         for (form, argument) in [
-            ("command_form", step.to_owned()),
-            ("runner_form", format!(". '{quoted}'")),
+            ("command_form", step),
+            ("runner_form", format!(". {quoted}")),
         ] {
             let observed = std::process::Command::new("pwsh")
                 .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
@@ -909,7 +1011,7 @@ fn run_exit_semantics(root: &Path) -> Result<(), Vec<String>> {
     if cases.is_empty() {
         return Err(vec!["corpus is empty".to_owned()]);
     }
-    let shells = ShellPrograms::discover(ShellColumn::ALL.iter().copied().map(ShellColumn::name));
+    let shells = PosixPrograms::discover(ShellColumn::ALL.iter().copied().map(ShellColumn::name));
     let mut errors = Vec::new();
     let mut checked = 0_usize;
     let mut reported_differences = 0_usize;
@@ -1015,7 +1117,7 @@ fn run_builtin_table(root: &Path) -> Result<(), Vec<String>> {
     if treatments.is_empty() {
         return Err(vec!["corpus answers for no builtin".to_owned()]);
     }
-    let shells = ShellPrograms::discover(["bash", "sh", "zsh"]);
+    let shells = PosixPrograms::discover(["bash", "sh", "zsh"]);
     let mut errors = Vec::new();
     let mut observed_total = 0_usize;
     for (shell, argument) in [
@@ -1110,7 +1212,7 @@ fn run_posix_divergence(root: &Path) -> Result<(), Vec<String>> {
         return Err(vec!["corpus is empty".to_owned()]);
     }
     let shell_programs =
-        ShellPrograms::discover(shells.iter().copied().chain(std::iter::once("/bin/sh")));
+        PosixPrograms::discover(shells.iter().copied().chain(std::iter::once("/bin/sh")));
 
     let observe = |shell: &str, script: &str| -> Option<(String, i64)> {
         let output = shell_programs.output(shell, script).ok()?;
@@ -1232,7 +1334,7 @@ fn run_printf_semantics(root: &Path) -> Result<(), Vec<String>> {
     if cases.is_empty() || shells.is_empty() {
         return Err(vec!["corpus is empty".to_owned()]);
     }
-    let shell_programs = ShellPrograms::discover(shells.iter().copied());
+    let shell_programs = PosixPrograms::discover(shells.iter().copied());
     let mut errors = Vec::new();
     let mut checked = 0_usize;
     for case in cases {
@@ -1304,7 +1406,7 @@ fn run_case_patterns(root: &Path) -> Result<(), Vec<String>> {
         return Err(vec!["corpus is empty".to_owned()]);
     }
     let shell_programs =
-        ShellPrograms::discover(shells.iter().copied().map(RecordedShellColumn::name));
+        PosixPrograms::discover(shells.iter().copied().map(RecordedShellColumn::name));
     let mut errors = Vec::new();
     let mut checked = 0_usize;
     let mut reported_differences = 0_usize;
@@ -1423,7 +1525,7 @@ fn run_shell_variables(root: &Path) -> Result<(), Vec<String>> {
         return Err(vec!["corpus is empty".to_owned()]);
     }
     let shell_programs =
-        ShellPrograms::discover(shells.iter().copied().map(RecordedShellColumn::name));
+        PosixPrograms::discover(shells.iter().copied().map(RecordedShellColumn::name));
     let mut errors = Vec::new();
     let mut checked = 0_usize;
     let mut reported_differences = 0_usize;
@@ -2952,7 +3054,7 @@ fn run_test_semantics(root: &Path) -> Result<(), Vec<String>> {
     if cases.is_empty() {
         return Err(vec!["corpus is empty".to_owned()]);
     }
-    let shells = ShellPrograms::discover(["bash"]);
+    let shells = PosixPrograms::discover(["bash"]);
     let mut differences = 0_usize;
     for case in cases {
         let name = case["name"]
@@ -4417,9 +4519,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn posix_shell_resolution_runs_bash_and_refuses_unresolved_names() {
-        let shells = ShellPrograms::discover(["bash"]);
-        let output = shells
+    fn posix_program_resolution_runs_named_and_absolute_programs_fail_closed() {
+        let programs = PosixPrograms::discover(["bash", "/bin/echo"]);
+        let output = programs
             .output("bash", "printf 'deshell-bash:%s' \"$BASH_VERSION\"")
             .expect("the Bash used by the build must resolve");
         assert!(output.status.success(), "{output:#?}");
@@ -4430,16 +4532,60 @@ mod tests {
             "the executable must be Bash, not a platform command sharing its name"
         );
 
-        let error = shells
+        let output = programs
+            .command("/bin/echo")
+            .expect("the POSIX path must resolve to a native executable")
+            .arg("deshell-posix-path")
+            .output()
+            .expect("the resolved echo executable must run");
+        assert!(output.status.success(), "{output:#?}");
+        assert_eq!(
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .replace("\r\n", "\n"),
+            "deshell-posix-path\n"
+        );
+
+        let error = programs
             .command("a-shell-that-was-not-discovered")
             .expect_err("an unregistered name must not fall back to PATH");
         assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
 
-        let missing = ShellPrograms::discover(["deshell-shell-that-does-not-exist"]);
+        let missing = PosixPrograms::discover(["deshell-shell-that-does-not-exist"]);
         let error = missing
             .output("deshell-shell-that-does-not-exist", "exit 0")
             .expect_err("a missing executable must remain missing");
         assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn powershell_posix_templates_quote_paths_and_reject_unknown_markers() {
+        let programs = PosixPrograms {
+            programs: BTreeMap::from([(
+                "/bin/echo".to_owned(),
+                Ok(PathBuf::from(r"C:\Program Files\O'Brien\echo.exe")),
+            )]),
+        };
+        assert_eq!(
+            render_powershell_posix_template(
+                "& __DESHELL_POSIX_ECHO__ one\n& __DESHELL_POSIX_ECHO__ two\n",
+                &programs,
+            )
+            .unwrap(),
+            "& 'C:\\Program Files\\O''Brien\\echo.exe' one\n& 'C:\\Program Files\\O''Brien\\echo.exe' two\n"
+        );
+        assert_eq!(
+            render_powershell_posix_template("Write-Output before", &programs).unwrap(),
+            "Write-Output before"
+        );
+
+        let error =
+            render_powershell_posix_template("& __DESHELL_POSIX_UNKNOWN__", &programs).unwrap_err();
+        assert!(error.contains("unknown POSIX program marker"), "{error}");
+
+        let error =
+            render_powershell_posix_template("& __DESHELL_POSIX_TRUE__", &programs).unwrap_err();
+        assert!(error.contains("was not discovered"), "{error}");
     }
 
     #[test]

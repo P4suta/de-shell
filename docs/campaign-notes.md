@@ -233,11 +233,15 @@ hook policy cannot change fixture behavior.
 
 Windows resolves executables in system directories before `PATH`, where
 `System32\bash.exe` is the WSL launcher rather than the Git Bash already running
-the workflow. All POSIX-shell observations now resolve their interpreter once
-through Git/MSYS `sh`, then launch that native absolute path. A cross-platform
-test requires the selected executable to expose `BASH_VERSION` and requires
-unknown or absent names to fail closed; no observation can silently fall back
-to the colliding Windows command.
+the workflow. All POSIX observations now resolve each interpreter or utility
+once through Git/MSYS `sh`, then launch that native absolute path. PowerShell
+corpora carry host-neutral executable markers; the harness replaces them with
+single-quoted native paths, rejects unknown markers, and escapes apostrophes.
+Cross-platform tests require the selected Bash to expose `BASH_VERSION`, run an
+absolute `/bin/echo` through the same resolver, and require unknown or absent
+names to fail closed. Neither a shell observation nor a PowerShell native-command
+observation can silently fall back to an unrelated Windows command or a missing
+Unix mount.
 
 The mutation task now also names `migration.rs` and `frontend.rs`. A
 reproducible `cargo mutants --list` reports **2,931** mutations in those two
@@ -260,9 +264,9 @@ PowerShell/Go and Nushell/Rust migration paths. `coverage` reports only after
 that shared collection step, so CI and release cannot accidentally measure a
 smaller test surface.
 
-The trusted clean run on 2026-09-20 passed all 523 workspace tests (482
-`deshell`, 41 `xtask`) and finished at **90.29% line coverage**: 54,510 lines,
-5,294 missed. `cargo llvm-cov` enforced `--fail-under-lines 90` on the result.
+The trusted clean run on 2026-09-20 passed all 524 workspace tests (482
+`deshell`, 42 `xtask`) and finished at **90.27% line coverage**: 54,622 lines,
+5,315 missed. `cargo llvm-cov` enforced `--fail-under-lines 90` on the result.
 
 ## Next, in the order I would take it
 

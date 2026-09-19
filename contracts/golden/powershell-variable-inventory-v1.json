@@ -2,16 +2,16 @@
   "schema_version": 1,
   "contract": "powershell-variable-inventory-v1",
   "purpose": "Pin the names PowerShell answers itself, so the frontend refuses to model an assignment to one of them as a plain variable.",
-  "note": "Measured with `Get-Variable` in the PowerShell pinned in deshell.lock, with no profile, under two conditions: at startup, and after one native command has run. The second condition is not a detail — `LASTEXITCODE` does not exist until a native command sets it, and a list measured only at startup would have let `$LASTEXITCODE = '0'` through as an ordinary assignment. Assigning it changes what a later `exit` reports; assigning `$ErrorActionPreference` changes how the script handles errors. Neither is a value the IR can carry as text. A name absent here is the script's own.",
+  "note": "Measured with `Get-Variable` in the PowerShell pinned in deshell.lock, with no profile, under two conditions: at startup, and after one native command has run. The second condition is not a detail — `LASTEXITCODE` does not exist until a native command sets it, and a list measured only at startup would have let `$LASTEXITCODE = '0'` through as an ordinary assignment. Assigning it changes what a later `exit` reports; assigning `$ErrorActionPreference` changes how the script handles errors. Neither is a value the IR can carry as text. A name absent here is the script's own. `__DESHELL_POSIX_TRUE__` is replaced with a single-quoted path to the same POSIX utility on each host; on Windows that is its native Git/MSYS path, because native PowerShell has no `/usr/bin` mount.",
   "conditions": [
     {
       "name": "at-startup",
-      "command": "Get-Variable",
+      "command_template": "Get-Variable | Select-Object -ExpandProperty Name | Sort-Object",
       "count": 52
     },
     {
       "name": "after-a-native-command",
-      "command": "& '/usr/bin/true'; Get-Variable",
+      "command_template": "& __DESHELL_POSIX_TRUE__; Get-Variable | Select-Object -ExpandProperty Name | Sort-Object",
       "count": 53
     }
   ],
