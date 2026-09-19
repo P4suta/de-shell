@@ -222,11 +222,17 @@ Nushell), with both official Rust and Go generators where applicable.
   | --- | --- | --- |
   | 37 | `DUPLICATE_TARGET` | 27 `run:` blocks in one `ci.yml` all want to be a target in one host file |
   | 36 | `DYNAMIC_CANDIDATE` | shell text inside `contracts/golden/*.json`, which records measured shell behaviour rather than executing it |
-  | 21 | `UNIMPLEMENTED_SEMANTIC` | the PowerShell scripts, which use control syntax outside the modelled subset |
+  | 18 | `UNIMPLEMENTED_SEMANTIC` | the PowerShell scripts, which use control syntax outside the modelled subset |
   | 18 | `UNRESOLVED_CALL_SITE` | `run: ./scripts/install-nushell.ps1`, whose target is one of those scripts |
-  | 3 | `PARSE_ERROR` | `run:` blocks holding `${{ matrix.target }}`, which is not shell and which GitHub substitutes before a shell sees it |
+  | 6 | `RESIDUAL_SOURCE` | `run:` blocks holding `${{ matrix.target }}`, which GitHub substitutes before a shell sees it |
   | 2 | `SCENARIO_INPUT_COVERAGE` | |
   | 1 | `GENERATOR_UNSUPPORTED` | |
+
+  The last row moved. Three of those six read `PARSE_ERROR` and three read
+  `UNIMPLEMENTED_SEMANTIC`, because `tree-sitter-bash` happened to reject some
+  of the shapes and the PowerShell frontend happened to reject the others. The
+  shapes nothing rejected were lowered `native` — see 00536a4. The count is the
+  same and the classification is no longer an accident of two grammars.
 
   None of these is a wrong answer. Each names work: multiple targets per host
   file, a GitHub-expression model that treats `${{ }}` as an input rather than
