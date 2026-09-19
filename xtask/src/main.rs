@@ -220,10 +220,18 @@ const fn echo_observation_effect(shell: ShellColumn, modelled: bool) -> Observat
     }
 }
 
-const fn exit_observation_effect(modelled: bool) -> ObservationEffect {
-    match modelled {
-        true => ObservationEffect::Enforce,
-        false => ObservationEffect::Report,
+/// Decide whether an ambient executable can invalidate the recorded claim.
+///
+/// `bash` and `zsh` identify the recording's interpreter families for the
+/// modelled numeric domain. `sh` is an alias for several implementations; its
+/// live result is useful drift evidence, but is not the identity of the shell
+/// recorded in the contract. The contract's cross-shell reduction is checked
+/// separately and remains fatal.
+const fn exit_observation_effect(shell: ShellColumn, modelled: bool) -> ObservationEffect {
+    match (shell, modelled) {
+        (ShellColumn::Bash | ShellColumn::Zsh, true) => ObservationEffect::Enforce,
+        (ShellColumn::Bash | ShellColumn::Sh | ShellColumn::Zsh, false)
+        | (ShellColumn::Sh, true) => ObservationEffect::Report,
     }
 }
 
@@ -749,7 +757,7 @@ fn run_exit_semantics(root: &Path) -> Result<(), Vec<String>> {
             checked += 1;
             if code != recorded {
                 let difference = format!("{name}/{shell}: recorded {recorded}, observed {code}");
-                match exit_observation_effect(modelled) {
+                match exit_observation_effect(shell_column, modelled) {
                     ObservationEffect::Enforce => errors.push(difference),
                     ObservationEffect::Report => {
                         reported_differences += 1;
@@ -3899,7 +3907,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn live_shell_drift_is_enforced_only_where_the_frontend_makes_a_native_claim() {
+    fn live_shell_drift_enforces_only_applicable_recorded_claims() {
         assert_eq!(
             ShellColumn::ALL.map(|shell| echo_observation_effect(shell, true)),
             [
@@ -3912,8 +3920,18 @@ mod tests {
             ShellColumn::ALL.map(|shell| echo_observation_effect(shell, false)),
             [ObservationEffect::Report; 3]
         );
-        assert_eq!(exit_observation_effect(true), ObservationEffect::Enforce);
-        assert_eq!(exit_observation_effect(false), ObservationEffect::Report);
+        assert_eq!(
+            ShellColumn::ALL.map(|shell| exit_observation_effect(shell, true)),
+            [
+                ObservationEffect::Enforce,
+                ObservationEffect::Report,
+                ObservationEffect::Enforce,
+            ]
+        );
+        assert_eq!(
+            ShellColumn::ALL.map(|shell| exit_observation_effect(shell, false)),
+            [ObservationEffect::Report; 3]
+        );
     }
 
     #[test]

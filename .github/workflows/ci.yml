@@ -74,10 +74,11 @@ jobs:
 
       - name: Measure the test, echo and exit builtins against their recordings
         # Unlike the `set` corpus above, a disagreement inside a native claim is
-        # fatal: the frontend lowers `[` and Bash `echo`, plus numeric `exit`
-        # for every supported shell. Observations outside those claims are
-        # reported without pretending that an ambient `/bin/sh` alias or an
-        # explicitly delegated edge case changes the recorded semantic model.
+        # fatal when the executable identifies the measured shell: the frontend
+        # lowers `[`, Bash `echo`, and numeric `exit`. `sh` names a family rather
+        # than one implementation, so ambient `/bin/sh` drift is reported; the
+        # checked-in cross-shell reduction remains strict. Explicitly delegated
+        # edge cases are likewise observations, not native claims.
         shell: bash
         run: |
           cargo run --locked -p xtask -- test-semantics
