@@ -239,9 +239,11 @@ corpora carry host-neutral executable markers; the harness replaces them with
 single-quoted native paths, rejects unknown markers, and escapes apostrophes.
 Recorded POSIX programs arrive on standard input as exact bytes instead of
 crossing the Windows native argv parser after `-c`. Positional data is rendered
-by one NUL-rejecting POSIX-word encoder into that same byte stream, so embedded
-newlines, carriage returns, apostrophes, dollars and backslashes never cross the
-native argv boundary either. The corpus that specifically measures `bash -c`
+as fixed-width octal by one NUL-rejecting encoder, reconstructed inside the
+shell, and protected by a removable sentinel from command substitution's
+trailing-newline deletion. Embedded newlines, carriage returns, Unicode,
+apostrophes, dollars and backslashes therefore never cross the native argv or
+raw source boundary. The corpus that specifically measures `bash -c`
 uses a fixed `. /dev/stdin` wrapper, preserving command-string exit semantics
 without putting corpus bytes in argv. Tests cover every one of those boundary
 characters and doubled backslashes. Cross-platform tests also require the
@@ -279,8 +281,8 @@ that shared collection step, so CI and release cannot accidentally measure a
 smaller test surface.
 
 The trusted clean run on 2026-09-20 passed all 525 workspace tests (482
-`deshell`, 43 `xtask`) and finished at **90.22% line coverage**: 54,862 lines,
-5,366 missed. `cargo llvm-cov` enforced `--fail-under-lines 90` on the result.
+`deshell`, 43 `xtask`) and finished at **90.23% line coverage**: 54,876 lines,
+5,364 missed. `cargo llvm-cov` enforced `--fail-under-lines 90` on the result.
 
 ## Next, in the order I would take it
 

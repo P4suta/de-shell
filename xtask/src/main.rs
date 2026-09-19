@@ -206,12 +206,36 @@ impl PosixPrograms {
         script: &str,
         arguments: &[&str],
     ) -> std::io::Result<std::process::Output> {
-        let mut input = String::from("set --");
-        for argument in arguments {
-            input.push(' ');
-            input.push_str(&quote_posix_shell_word(argument)?);
+        let mut input = String::new();
+        let mut variables = Vec::with_capacity(arguments.len());
+        for (index, argument) in arguments.iter().enumerate() {
+            let variable = format!("__deshell_xtask_argument_{index}");
+            let encoded = encode_posix_shell_argument(argument)?;
+            input.push_str(&variable);
+            input.push_str("=$(printf '");
+            input.push_str(&encoded);
+            input.push_str("')\n");
+            input.push_str(&variable);
+            input.push_str("=${");
+            input.push_str(&variable);
+            input.push_str("%x}\n");
+            variables.push(variable);
+        }
+        input.push_str("set --");
+        for variable in &variables {
+            input.push_str(" \"${");
+            input.push_str(variable);
+            input.push_str("}\"");
         }
         input.push('\n');
+        if !variables.is_empty() {
+            input.push_str("unset");
+            for variable in &variables {
+                input.push(' ');
+                input.push_str(variable);
+            }
+            input.push('\n');
+        }
         input.push_str(script);
         self.output(name, &input)
     }
@@ -269,15 +293,26 @@ fn write_posix_script(child: &mut std::process::Child, script: &str) -> std::io:
     Ok(())
 }
 
-/// Quote one POSIX shell word for an exact script transported on stdin.
-fn quote_posix_shell_word(value: &str) -> std::io::Result<String> {
+/// Encode one non-NUL shell argument without placing its raw bytes in source.
+///
+/// The final `x` survives command substitution even when the value ends in a
+/// newline. The generated prelude removes that sentinel after `printf` has
+/// reconstructed every original UTF-8 byte from fixed-width octal escapes.
+fn encode_posix_shell_argument(value: &str) -> std::io::Result<String> {
     if value.contains('\0') {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "a POSIX shell word cannot contain NUL",
         ));
     }
-    Ok(format!("'{}'", value.replace('\'', "'\\''")))
+    let mut encoded = String::with_capacity((value.len() + 1) * 4);
+    for byte in value.bytes().chain(std::iter::once(b'x')) {
+        encoded.push('\\');
+        encoded.push(char::from(b'0' + ((byte >> 6) & 0b11)));
+        encoded.push(char::from(b'0' + ((byte >> 3) & 0b111)));
+        encoded.push(char::from(b'0' + (byte & 0b111)));
+    }
+    Ok(encoded)
 }
 
 fn resolve_posix_program(name: &str) -> std::io::Result<PathBuf> {
@@ -630,12 +665,7 @@ fn run_echo_semantics(root: &Path) -> Result<(), Vec<String>> {
             .iter()
             .map(|value| value.as_str().unwrap_or_default().to_owned())
             .collect::<Vec<_>>();
-        let quoted = arguments
-            .iter()
-            .map(|argument| quote_posix_shell_word(argument))
-            .collect::<std::io::Result<Vec<_>>>()
-            .map_err(|error| vec![format!("cannot quote {name} arguments: {error}")])?
-            .join(" ");
+        let argument_refs = arguments.iter().map(String::as_str).collect::<Vec<_>>();
         // Bash is the only shell the frontend models, so its absence is fatal
         // rather than a column to skip.
         for shell_column in ShellColumn::ALL {
@@ -644,7 +674,8 @@ fn run_echo_semantics(root: &Path) -> Result<(), Vec<String>> {
                 errors.push(format!("{name} has no {shell} column"));
                 continue;
             };
-            let output = shells.output(shell, &format!("echo {quoted}"));
+            let output =
+                shells.output_with_positional_arguments(shell, "echo \"$@\"", &argument_refs);
             let output = match output {
                 Ok(output) => output,
                 Err(error) if shell != "bash" => {
@@ -1600,18 +1631,17 @@ fn run_printf_semantics(root: &Path) -> Result<(), Vec<String>> {
             .iter()
             .map(|value| value.as_str().unwrap_or_default().to_owned())
             .collect();
-        let quoted = arguments
-            .iter()
-            .map(|argument| quote_posix_shell_word(argument))
-            .collect::<std::io::Result<Vec<_>>>()
-            .map_err(|error| vec![format!("cannot quote {name} arguments: {error}")])?
-            .join(" ");
+        let argument_refs = arguments.iter().map(String::as_str).collect::<Vec<_>>();
         for shell in &shells {
             let Some(recorded) = case[*shell].as_str() else {
                 errors.push(format!("{name} has no {shell} column"));
                 continue;
             };
-            let output = shell_programs.output(shell, &format!("printf {quoted}"));
+            let output = shell_programs.output_with_positional_arguments(
+                shell,
+                "printf \"$@\"",
+                &argument_refs,
+            );
             let output = match output {
                 Ok(output) => output,
                 Err(error) => {
@@ -3332,20 +3362,15 @@ fn run_test_semantics(root: &Path) -> Result<(), Vec<String>> {
             .iter()
             .map(|value| value.as_str().unwrap_or_default().to_owned())
             .collect::<Vec<_>>();
-        let quoted = operands
-            .iter()
-            .map(|operand| quote_posix_shell_word(operand))
-            .collect::<std::io::Result<Vec<_>>>()
-            .map_err(|error| vec![format!("cannot quote {name} operands: {error}")])?
-            .join(" ");
+        let operand_refs = operands.iter().map(String::as_str).collect::<Vec<_>>();
         let builtin = shells
-            .status("bash", &format!("[ {quoted} ]"))
+            .output_with_positional_arguments("bash", "[ \"$@\" ]", &operand_refs)
             .map_err(|error| vec![format!("cannot run bash for {name}: {error}")])?;
         let external = std::process::Command::new("test")
             .args(&operands)
             .status()
             .map_err(|error| vec![format!("cannot run test for {name}: {error}")])?;
-        let builtin_code = i64::from(builtin.code().unwrap_or(-1));
+        let builtin_code = i64::from(builtin.status.code().unwrap_or(-1));
         let external_code = i64::from(external.code().unwrap_or(-1));
         if builtin_code == expected && external_code == expected {
             continue;
@@ -4802,7 +4827,7 @@ mod tests {
         assert!(output.status.success(), "{output:#?}");
         assert_eq!(output.stdout, b"a\\b");
 
-        let argument = "line one\nline two\rc\\d'$`\"";
+        let argument = "line one\nline two\rc\\d'$`\"é\n";
         let output = programs
             .output_with_positional_arguments("bash", "printf '%s' \"$1\"", &[argument])
             .expect("positional data must cross the native process boundary unchanged");
