@@ -805,18 +805,32 @@ fn synthesized_initial_scenarios(
             finding: None,
         })
         .collect::<Vec<_>>();
+    // Every shell location, not only the embedded ones.
+    //
+    // A shell file that is not a declared entrypoint got no scenario at all,
+    // and the plan requires one for every source it holds — so `deshell init`
+    // produced a project whose own plan it could not satisfy:
+    // `approved scenarios do not cover environment GITHUB_PATH required by
+    // scripts/install-nushell.ps1`, for a script no scenario had been written
+    // for. A shell file keys on its path so it dedups against an entrypoint of
+    // the same path rather than becoming a second scenario for one file.
     sources.extend(
         inventory
             .findings
             .iter()
-            .filter(|finding| finding.kind == crate::scanner::FindingKind::EmbeddedShell)
+            .filter(|finding| !finding.kind.is_a_candidate())
             .map(|finding| {
-                let location = finding.locator.clone().unwrap_or_else(|| {
-                    format!("{}-{}", finding.span.start_byte, finding.span.end_byte)
-                });
+                let key = if finding.kind.is_a_shell_file() {
+                    finding.path.clone()
+                } else {
+                    let location = finding.locator.clone().unwrap_or_else(|| {
+                        format!("{}-{}", finding.span.start_byte, finding.span.end_byte)
+                    });
+                    format!("{}#{location}", finding.path)
+                };
                 Source {
                     path: finding.path.clone(),
-                    key: format!("{}#{location}", finding.path),
+                    key,
                     finding: Some(finding),
                 }
             }),
@@ -842,7 +856,7 @@ fn synthesized_initial_scenarios(
     for (source, stem) in sources.into_iter().zip(stems) {
         let mut arguments = std::collections::BTreeSet::new();
         let mut environment = std::collections::BTreeSet::new();
-        if let Some(finding) = source.finding {
+        if let Some(finding) = source.finding.filter(|finding| finding.kind.is_embedded()) {
             if let Some(interpreter) = finding.interpreter.as_deref()
                 && let Ok(plan) = crate::frontend::lower_with_interpreter(
                     crate::frontend::LowerWithInterpreterArgs {
@@ -860,7 +874,11 @@ fn synthesized_initial_scenarios(
                 arguments.extend(task.inputs.iter().map(|input| input.name.clone()));
                 environment.extend(task.environment.iter().cloned());
             }
-        } else if entrypoints.contains(&source.path) {
+        } else if entrypoints.contains(&source.path)
+            || source
+                .finding
+                .is_some_and(|finding| finding.kind.is_a_shell_file())
+        {
             let (_, path) = resolve_entry(root, &source.path)?;
             let bytes = std::fs::read(&path)
                 .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
@@ -1650,6 +1668,78 @@ mod tests {
             std::fs::create_dir_all(parent).unwrap();
         }
         std::fs::write(path, bytes).unwrap();
+    }
+
+    /// Every shell location gets a scenario, and it names the environment the
+    /// source reads.
+    ///
+    /// A shell file that was not a declared entrypoint got none, and the plan
+    /// requires one for every source it holds. So `deshell init` produced a
+    /// project whose own plan it could not satisfy:
+    /// `approved scenarios do not cover environment GITHUB_PATH required by
+    /// scripts/install-nushell.ps1`, for a script no scenario had been written
+    /// for.
+    #[test]
+    fn every_shell_location_gets_a_scenario_that_names_what_it_reads() {
+        let directory = tempfile::tempdir().unwrap();
+        init(directory.path()).unwrap();
+        write(
+            directory.path(),
+            "entry.sh",
+            b"/bin/echo \"${ENTRY_NAME}\"\n",
+        );
+        write(
+            directory.path(),
+            "other.sh",
+            b"/bin/echo \"${OTHER_NAME}\"\n",
+        );
+        let config_path = directory.path().join(".deshell/project.toml");
+        let config = std::fs::read_to_string(&config_path)
+            .unwrap()
+            .replace("entrypoints = []", "entrypoints = [\"entry.sh\"]");
+        std::fs::write(&config_path, config).unwrap();
+
+        let inventory = scan(directory.path()).unwrap();
+        let scenarios = synthesized_initial_scenarios(
+            directory.path(),
+            &["entry.sh".to_owned()],
+            &inventory,
+            crate::config::ResourceLimits {
+                timeout_ms: 30_000,
+                memory_bytes: 1 << 30,
+                processes: 512,
+                stdout_bytes: 16 << 20,
+                stderr_bytes: 16 << 20,
+            },
+        )
+        .unwrap();
+        let named = |name: &str| {
+            scenarios
+                .iter()
+                .find(|(key, _)| key == name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "no scenario for {name}: {:?}",
+                        scenarios.iter().map(|(key, _)| key).collect::<Vec<_>>()
+                    )
+                })
+                .1
+                .environment
+                .iter()
+                .map(|value| value.name.clone())
+                .collect::<Vec<_>>()
+        };
+        // The entrypoint, and the shell file that is not one.
+        assert_eq!(named("synthesized-entry"), vec!["ENTRY_NAME".to_owned()]);
+        assert_eq!(named("synthesized-other"), vec!["OTHER_NAME".to_owned()]);
+        // One scenario per file, not two for the entrypoint.
+        assert_eq!(
+            scenarios
+                .iter()
+                .filter(|(key, _)| key.starts_with("synthesized-entry"))
+                .count(),
+            1
+        );
     }
 
     fn configured_project(source: &[u8]) -> tempfile::TempDir {

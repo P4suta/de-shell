@@ -237,6 +237,11 @@ All notable changes are documented here. No compatibility contract predates
 - Stopped requiring a generated step to start a process. `if [ ... ]; then echo
   ...; exit 1; fi` is a program, and it is the shape a workflow gate has.
 
+- Synthesized a scenario for every shell location, not only for entrypoints and
+  embedded blocks. A shell file that was not a declared entrypoint got none, and
+  the plan requires one for every source it holds — so `deshell init` produced a
+  project whose own plan it could not satisfy.
+
 ### Removed
 
 - Pre-v1 Effect IR and lock migration promises.
