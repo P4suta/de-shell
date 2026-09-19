@@ -243,6 +243,11 @@ All notable changes are documented here. No compatibility contract predates
   project whose own plan it could not satisfy.
 
 ### Removed
+- `scripts/repository-guardrails.ps1`, rewritten as
+  `cargo xtask repository-guardrails`. de-shell refuses that file — it reads
+  .NET types and formats with `-f` — so the answer is the one the tool exists to
+  prompt: write it in the project's own language.
+
 
 - Pre-v1 Effect IR and lock migration promises.
 - Public OCaml library/runtime/install artifacts and legacy executable-name

@@ -1357,6 +1357,85 @@ fn run_enum_equality(root: &Path) -> Result<(), Vec<String>> {
 /// provider check with no caller — and the blanket covered it along with
 /// everything else, so nothing could say how much it was hiding or when that
 /// grew.
+/// No tracked file is larger than the limit, and no tracked path is longer.
+///
+/// This was `scripts/repository-guardrails.ps1`, 57 lines of PowerShell that
+/// de-shell refuses: it reads `.NET` types, uses `Set-StrictMode`, and formats
+/// its output with `-f`. de-shell's answer to a file like that is
+/// `DESHELL_BLOCKER_UNIMPLEMENTED_SEMANTIC` — it cannot be migrated — and the
+/// answer to that is to write it in the project's own language, which is what
+/// the tool exists to prompt.
+///
+/// Measured against the script it replaces before it replaced it: same count,
+/// same limits, same sentence.
+fn run_repository_guardrails(root: &Path) -> Result<(), Vec<String>> {
+    const MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
+    const MAX_PATH_CHARACTERS: usize = 240;
+
+    let tracked = std::process::Command::new("git")
+        .args(["-C"])
+        .arg(root)
+        .args(["ls-files", "-z"])
+        .output()
+        .map_err(|error| vec![format!("cannot run git: {error}")])?;
+    if !tracked.status.success() {
+        return Err(vec![format!(
+            "unable to enumerate tracked repository files: {}",
+            String::from_utf8_lossy(&tracked.stderr).trim()
+        )]);
+    }
+    // `-z` rather than lines: a tracked path may hold a newline, and splitting
+    // on one would read a single file as two that are each short enough.
+    let paths = tracked
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| String::from_utf8_lossy(entry).into_owned())
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        return Err(vec!["the repository tracks no files".to_owned()]);
+    }
+    let mut violations = Vec::new();
+    for path in &paths {
+        // Characters, not bytes: the limit is about what a filesystem and a
+        // checkout can carry, and the script this replaces counted `.Length` of
+        // a .NET string.
+        let characters = path.chars().count();
+        if characters > MAX_PATH_CHARACTERS {
+            violations.push(format!(
+                "{path} has {characters} characters; maximum is {MAX_PATH_CHARACTERS}"
+            ));
+        }
+        let absolute = root.join(path);
+        // A tracked path whose file is not there is not a size violation. The
+        // scanner learned the same thing: `git ls-files` names a path the tree
+        // no longer holds during a retirement.
+        let Ok(metadata) = absolute.symlink_metadata() else {
+            continue;
+        };
+        if !metadata.file_type().is_file() {
+            continue;
+        }
+        let size = metadata.len();
+        if size > MAX_FILE_BYTES {
+            violations.push(format!(
+                "{path} is {size} bytes; maximum is {MAX_FILE_BYTES} bytes"
+            ));
+        }
+    }
+    if !violations.is_empty() {
+        let mut errors = vec!["repository push guardrails failed".to_owned()];
+        errors.extend(violations);
+        return Err(errors);
+    }
+    println!(
+        "Repository guardrails passed for {} tracked files (max {} MiB, {MAX_PATH_CHARACTERS} characters).",
+        paths.len(),
+        MAX_FILE_BYTES / (1024 * 1024)
+    );
+    Ok(())
+}
+
 fn run_lint_expectations(root: &Path) -> Result<(), Vec<String>> {
     let mut failures = Vec::new();
     for entry in walk_rust_sources(root)? {
@@ -2565,6 +2644,7 @@ fn dispatch(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Vec<Str
         Some("shell-variables") => run_shell_variables(root),
         Some("enum-equality") => run_enum_equality(root),
         Some("lint-expectations") => run_lint_expectations(root),
+        Some("repository-guardrails") => run_repository_guardrails(root),
         Some("validate-contracts") => validate_contract_tree(root).map(|_| ()),
         Some("performance") => {
             let binary = arguments
@@ -2614,6 +2694,52 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The guardrails see a long path and a large file, and say which.
+    ///
+    /// The PowerShell script this replaces was refused by de-shell, so the
+    /// replacement is checked against what the script did rather than against
+    /// the sentence in its name: the same two limits, one violation each, and a
+    /// clean repository passing.
+    #[test]
+    fn the_repository_guardrails_name_a_long_path_and_a_large_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output()
+                .expect("git");
+            assert!(status.status.success(), "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(root.join("small.txt"), b"x").unwrap();
+        git(&["add", "-A"]);
+        git(&["-c", "user.email=a@b", "-c", "user.name=a", "commit", "-qm", "i"]);
+        run_repository_guardrails(root).expect("a clean repository passes");
+
+        // A path over the limit.
+        let deep = "d/".repeat(110) + &"x".repeat(60) + ".txt";
+        let deep_path = root.join(&deep);
+        std::fs::create_dir_all(deep_path.parent().unwrap()).unwrap();
+        std::fs::write(&deep_path, b"x").unwrap();
+        // A file over the limit.
+        std::fs::write(root.join("big.bin"), vec![0_u8; 11 * 1024 * 1024]).unwrap();
+        git(&["add", "-A"]);
+        git(&["-c", "user.email=a@b", "-c", "user.name=a", "commit", "-qm", "two"]);
+
+        let errors = run_repository_guardrails(root).expect_err("two violations");
+        assert!(
+            errors.iter().any(|error| error.contains("characters; maximum is 240")),
+            "{errors:#?}"
+        );
+        assert!(
+            errors.iter().any(|error| error.contains("bytes; maximum is 10485760 bytes")),
+            "{errors:#?}"
+        );
+    }
 
     fn compile_fake_deshell(path: &Path) {
         let source = path.with_extension("rs");

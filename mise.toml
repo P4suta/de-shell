@@ -45,7 +45,7 @@ run = [
 
 [tasks."repository:guardrails"]
 description = "Reject tracked files over 10 MiB or paths over 240 characters"
-run = "pwsh -NoLogo -NoProfile -File scripts/repository-guardrails.ps1"
+run = "cargo run --locked -p xtask -- repository-guardrails"
 
 [tasks."github:apply"]
 description = "Apply the canonical GitHub repository settings and Rulesets"
