@@ -2796,6 +2796,109 @@ fn github_run_replacement(
     ))
 }
 
+/// The generated body for a list of steps.
+///
+/// Recursive because a branch keeps its own steps: one that is not taken must
+/// not run. `indent` is only how it reads.
+fn javascript_steps(
+    steps: &[HostStep],
+    on_failure: crate::ir::SequenceFailure,
+    assigned: &mut BTreeSet<String>,
+    indent: &str,
+) -> Result<String, String> {
+    let mut body = String::new();
+    // `stop` is `set -e`: the step ends at the first command that fails.
+    // `continue` runs them all and reports the last one, which is what a shell
+    // without the option does. The last command has nothing after it either way,
+    // so the check is written only where something follows.
+    let runs = steps
+        .iter()
+        .filter(|step| matches!(step, HostStep::Run(_)))
+        .count();
+    let mut written = 0_usize;
+    for step in steps {
+        match step {
+            HostStep::Assign { name, value } => {
+                let value = serde_json::to_string(value).map_err(|error| error.to_string())?;
+                body.push_str(&format!(
+                    "{indent}const {} = {value};\n",
+                    javascript_variable(name)
+                ));
+                assigned.insert(name.clone());
+            }
+            HostStep::Write(contents) => {
+                let contents =
+                    serde_json::to_string(contents).map_err(|error| error.to_string())?;
+                body.push_str(&format!(
+                    "{indent}process.stdout.write({contents});\n{indent}deshellStatus = 0;\n"
+                ));
+            }
+            HostStep::Exit(status) => {
+                body.push_str(&format!(
+                    "{indent}deshellStatus = {status};\n{indent}break deshell;\n"
+                ));
+            }
+            HostStep::When { test, body: arm } => {
+                let arm = javascript_steps(arm, on_failure, assigned, &format!("{indent}  "))?;
+                body.push_str(&format!(
+                    "{indent}if ({}) {{\n{arm}{indent}}}\n",
+                    javascript_test(test, assigned)?
+                ));
+            }
+            HostStep::Run(argv) => {
+                let program = javascript_word(&argv[0], assigned)?;
+                let arguments = argv[1..]
+                    .iter()
+                    .map(|word| javascript_word(word, assigned))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .join(", ");
+                body.push_str(&format!(
+                    concat!(
+                        "{indent}{{\n",
+                        "{indent}  const result = spawnSync({program}, [{arguments}], {{ stdio: \"inherit\", shell: false }});\n",
+                        "{indent}  if (result.error) throw result.error;\n",
+                        "{indent}  if (result.signal) process.kill(process.pid, result.signal);\n",
+                        "{indent}  deshellStatus = result.status === null ? 1 : result.status;\n",
+                        "{indent}}}\n",
+                    ),
+                    indent = indent,
+                    program = program,
+                    arguments = arguments,
+                ));
+                written += 1;
+                if on_failure == crate::ir::SequenceFailure::Stop && written < runs {
+                    body.push_str(&format!(
+                        "{indent}if (deshellStatus !== 0) break deshell;\n"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(body)
+}
+
+/// A modelled `test`, as JavaScript.
+///
+/// `===` and `!==` rather than `==`: the words are strings on both sides, and
+/// the loose comparison would answer a different question for a value that looks
+/// like a number.
+fn javascript_test(test: &HostTest, assigned: &BTreeSet<String>) -> Result<String, String> {
+    Ok(match test {
+        HostTest::Equal(left, right) => format!(
+            "{} === {}",
+            javascript_word(left, assigned)?,
+            javascript_word(right, assigned)?
+        ),
+        HostTest::NotEqual(left, right) => format!(
+            "{} !== {}",
+            javascript_word(left, assigned)?,
+            javascript_word(right, assigned)?
+        ),
+        HostTest::Empty(value) => format!("{} === \"\"", javascript_word(value, assigned)?),
+        HostTest::NonEmpty(value) => format!("{} !== \"\"", javascript_word(value, assigned)?),
+    })
+}
+
 /// A JavaScript name for a shell variable.
 ///
 /// Prefixed so a script's `$status` cannot collide with the generated program's
@@ -2874,53 +2977,8 @@ fn generate_github_action_host(
     // de-shell's own scanner reads `spawnSync(program, ...)` as a dynamic
     // candidate — correctly. The generated program would have failed the
     // shell-free gate it exists to satisfy, which is how this was found.
-    let mut body = String::new();
     let mut assigned: BTreeSet<String> = BTreeSet::new();
-    let run_steps = commands
-        .iter()
-        .filter(|step| matches!(step, HostStep::Run(_)))
-        .count();
-    let mut written = 0_usize;
-    for step in &commands {
-        match step {
-            HostStep::Assign { name, value } => {
-                let value = serde_json::to_string(value).map_err(|error| error.to_string())?;
-                body.push_str(&format!(
-                    "  const {} = {value};\n",
-                    javascript_variable(name)
-                ));
-                assigned.insert(name.clone());
-            }
-            HostStep::Run(argv) => {
-                let program = javascript_word(&argv[0], &assigned)?;
-                let arguments = argv[1..]
-                    .iter()
-                    .map(|word| javascript_word(word, &assigned))
-                    .collect::<Result<Vec<_>, _>>()?
-                    .join(", ");
-                body.push_str(&format!(
-                    concat!(
-                        "  {{\n",
-                        "    const result = spawnSync({program}, [{arguments}], {{ stdio: \"inherit\", shell: false }});\n",
-                        "    if (result.error) throw result.error;\n",
-                        "    if (result.signal) process.kill(process.pid, result.signal);\n",
-                        "    deshellStatus = result.status === null ? 1 : result.status;\n",
-                        "  }}\n",
-                    ),
-                    program = program,
-                    arguments = arguments,
-                ));
-                written += 1;
-                // `stop` is `set -e`: the step ends at the first command that
-                // fails. `continue` runs them all and reports the last one,
-                // which is what a shell without the option does. The last
-                // command has nothing after it either way.
-                if on_failure == crate::ir::SequenceFailure::Stop && written < run_steps {
-                    body.push_str("  if (deshellStatus !== 0) break deshell;\n");
-                }
-            }
-        }
-    }
+    let body = javascript_steps(&commands, on_failure, &mut assigned, "  ")?;
     let javascript = format!(
         concat!(
             "// Generated by de-shell; project-native code with no de-shell runtime.\n",
@@ -3107,8 +3165,34 @@ fn generate_python_host(
 /// program run them in the order the step does.
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum HostStep {
-    Assign { name: String, value: String },
+    Assign {
+        name: String,
+        value: String,
+    },
     Run(Vec<HostWord>),
+    /// Bytes on standard output, which is what a modelled `echo` is.
+    Write(String),
+    /// The step ends with this status.
+    Exit(i32),
+    /// `if TEST; then BODY; fi`, with no else branch.
+    ///
+    /// The branch is kept as its own steps rather than flattened, because a
+    /// branch that is not taken must not run and a flat list has no way to skip
+    /// one. That is the difference from an `&&` chain, which flattens because a
+    /// failure there ends the step.
+    When {
+        test: HostTest,
+        body: Vec<HostStep>,
+    },
+}
+
+/// A modelled `test`, as the generated program asks it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum HostTest {
+    Equal(HostWord, HostWord),
+    NotEqual(HostWord, HostWord),
+    Empty(HostWord),
+    NonEmpty(HostWord),
 }
 
 /// One word of a generated command.
@@ -3246,6 +3330,59 @@ fn flatten_literal_commands(
             });
             Ok(())
         }
+        crate::ir::Operation::WriteStdout { contents } => {
+            steps.push(HostStep::Write(literal_text_expression(contents)?));
+            Ok(())
+        }
+        crate::ir::Operation::Exit {
+            status,
+            non_numeric: _,
+        } => {
+            let status = literal_text_expression(status)?;
+            let status = status.trim().parse::<i64>().map_err(|_| {
+                format!("DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: {context} ends with a status that is not an integer")
+            })?;
+            // Measured and recorded in
+            // `contracts/golden/exit-builtin-semantics-v1.json`: every shell
+            // reduces the status modulo 256, negatives and values above 255
+            // alike.
+            let status = i32::try_from(status.rem_euclid(256)).map_err(|error| {
+                format!("DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: {context} status is out of range: {error}")
+            })?;
+            steps.push(HostStep::Exit(status));
+            Ok(())
+        }
+        crate::ir::Operation::Sequence {
+            nodes,
+            on_failure: nested,
+        } if *nested == on_failure => {
+            for node in nodes {
+                flatten_literal_commands(node, on_failure, context, steps)?;
+            }
+            Ok(())
+        }
+        // `if TEST; then BODY; fi`. The branch keeps its own steps: one that is
+        // not taken must not run, and a flat list has no way to skip it. An `&&`
+        // chain is the other case and does flatten, because a failure there ends
+        // the step.
+        crate::ir::Operation::Condition {
+            predicate,
+            if_true,
+            if_false,
+        } if if_false.is_none()
+            && matches!(predicate.operation, crate::ir::Operation::Test { .. }) =>
+        {
+            let crate::ir::Operation::Test { predicate } = &predicate.operation else {
+                unreachable!("shape checked above")
+            };
+            let mut body = Vec::new();
+            flatten_literal_commands(if_true, on_failure, context, &mut body)?;
+            steps.push(HostStep::When {
+                test: host_test(predicate, context)?,
+                body,
+            });
+            Ok(())
+        }
         crate::ir::Operation::Condition {
             predicate,
             if_true,
@@ -3257,6 +3394,41 @@ fn flatten_literal_commands(
         other => Err(format!(
             "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: {context} runs commands, and this step holds {}",
             other.name()
+        )),
+    }
+}
+
+/// A modelled `test`, as the generated program asks it.
+///
+/// Only the four shapes the IR carries for a string. A predicate this does not
+/// name is refused rather than approximated, because a neighbouring rule answers
+/// a different question.
+fn host_test(predicate: &crate::ir::TestPredicate, context: &str) -> Result<HostTest, String> {
+    match predicate {
+        crate::ir::TestPredicate::StringEqual { left, right } => Ok(HostTest::Equal(
+            host_word(left, context)?,
+            host_word(right, context)?,
+        )),
+        crate::ir::TestPredicate::StringNotEqual { left, right } => Ok(HostTest::NotEqual(
+            host_word(left, context)?,
+            host_word(right, context)?,
+        )),
+        crate::ir::TestPredicate::Empty { value } => {
+            Ok(HostTest::Empty(host_word(value, context)?))
+        }
+        crate::ir::TestPredicate::NonEmpty { value } => {
+            Ok(HostTest::NonEmpty(host_word(value, context)?))
+        }
+        crate::ir::TestPredicate::StartsWith {
+            value: _,
+            prefix: _,
+        }
+        | crate::ir::TestPredicate::EndsWith {
+            value: _,
+            suffix: _,
+        }
+        | crate::ir::TestPredicate::Contains { value: _, infix: _ } => Err(format!(
+            "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: {context} asks string tests and this one is a pattern"
         )),
     }
 }
@@ -11271,6 +11443,42 @@ mod tests {
             produced,
             "the IR verifier's coverage changed; re-record with DESHELL_UPDATE_GOLDEN=1 and say why in the commit"
         );
+    }
+
+    /// A branch keeps its own steps, and an `&&` chain does not.
+    ///
+    /// `if TEST; then BODY; fi` and `a && b` both lower to a `Condition`, and
+    /// they are not the same program. A branch that is not taken must not run,
+    /// so its steps stay nested; an `&&` chain under `set -e` is the two
+    /// commands in a list that stops on failure, so it flattens. Reading either
+    /// as the other would run something the step does not.
+    #[test]
+    fn a_branch_keeps_its_steps_and_a_chain_flattens() {
+        let step = |source: &str| {
+            let plan = crate::frontend::lower_with_interpreter(
+                crate::frontend::LowerWithInterpreterArgs {
+                    path: ".github/workflows/ci.yml",
+                    source: source.as_bytes(),
+                    unknown_policy: crate::config::UnknownInterpreter::Reject,
+                    configured: "bash",
+                    host: crate::frontend::HostShell::default(),
+                },
+            )
+            .unwrap();
+            literal_exec_sequence(&plan, "test").unwrap().0
+        };
+
+        let branch = step("if [ \"$A\" != \"b\" ]; then\necho no\nfi\n/bin/echo done\n");
+        let [HostStep::When { test, body }, HostStep::Run(_)] = branch.as_slice() else {
+            panic!("a branch and a command: {branch:#?}");
+        };
+        assert!(matches!(test, HostTest::NotEqual(..)));
+        assert_eq!(body.len(), 1, "the branch keeps its own step: {body:#?}");
+        assert!(matches!(body[0], HostStep::Write(_)));
+
+        let chain = step("/bin/echo one && /bin/echo two\n");
+        assert_eq!(chain.len(), 2, "a chain flattens: {chain:#?}");
+        assert!(chain.iter().all(|step| matches!(step, HostStep::Run(_))));
     }
 
     /// A workflow step with several commands becomes a program that runs them

@@ -222,6 +222,16 @@ All notable changes are documented here. No compatibility contract predates
   recorded in `contracts/golden/powershell-preference-semantics-v1.json` and
   held by a test that every cmdlet is still refused.
 
+- Read `!=` as an operator rather than as the negation reserved word. The
+  statement splitter refused `[ "$a" != "b" ]`, and with it every
+  `if [ "$a" != "b" ]` in this repository's own workflows, while
+  `TestPredicate::StringNotEqual` and the `string-not-equal` corpus case sat
+  unreached.
+- Generated a workflow step that branches: `if TEST; then BODY; fi` with `echo`
+  and `exit` in it. A branch keeps its own steps, because one that is not taken
+  must not run; an `&&` chain still flattens, because a failure there ends the
+  step.
+
 ### Removed
 
 - Pre-v1 Effect IR and lock migration promises.

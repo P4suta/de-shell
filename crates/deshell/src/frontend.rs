@@ -3139,10 +3139,24 @@ fn top_level_controls(source: &str, range: Range) -> Result<Vec<(usize, &'static
             index += 2;
             continue;
         }
-        if byte == b'!' && !token_started && index > range.start {
+        if byte == b'!'
+            && !token_started
+            && index > range.start
+            && bytes
+                .get(index + 1)
+                .is_none_or(|next| next.is_ascii_whitespace())
+        {
             // A `!` that opens the statement is handled by the caller as a
             // prefix; one appearing mid-statement is history expansion or an
             // operator this does not model.
+            //
+            // The reserved word is a complete token, so a `!` with a character
+            // after it is part of a word instead. That is what `!=` is, and
+            // reading it as a negation refused every `if [ "$a" != "b" ]` in
+            // this repository's own workflows — the `!=` case has been in
+            // `contracts/golden/test-builtin-semantics-v1.json` and modelled as
+            // `TestPredicate::StringNotEqual` the whole time, and nothing
+            // reached it.
             return Err("POSIX negation remains delegated".into());
         }
         if byte == b'&' {
@@ -6166,6 +6180,68 @@ mod tests {
             Err(crate::agent_process::AgentError::TimedOut)
         ));
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    /// `!=` is an operator, not the negation reserved word.
+    ///
+    /// The statement splitter read any `!` starting a token as the reserved
+    /// word, so `[ "$a" != "b" ]` was refused as "POSIX negation remains
+    /// delegated" — and with it every `if [ "$a" != "b" ]` in this repository's
+    /// own workflows. `TestPredicate::StringNotEqual` has been in the IR and
+    /// `string-not-equal` in
+    /// `contracts/golden/test-builtin-semantics-v1.json` the whole time, and
+    /// nothing reached them.
+    ///
+    /// The reserved word is a complete token, so a `!` with a character after
+    /// it is part of a word. `[ ! -f x ]` is still refused, because there the
+    /// `!` is a complete token and an argument to `[` rather than a pipeline
+    /// negation.
+    #[test]
+    fn a_bang_followed_by_a_character_is_part_of_a_word() {
+        let predicate = |source: &str| {
+            let lowered = lower_posix(
+                ".github/workflows/ci.yml.deshell.sh",
+                source,
+                &Interpreter::Bash,
+                HostShell::default(),
+            )?;
+            let Operation::Condition { predicate, .. } = lowered.body.operation else {
+                panic!("an if is a condition");
+            };
+            let Operation::Test { predicate } = predicate.operation else {
+                panic!("a bracket test is a test");
+            };
+            Ok::<crate::ir::TestPredicate, String>(predicate)
+        };
+        assert!(matches!(
+            predicate("if [ \"$A\" != \"b\" ]; then\n/bin/echo no\nfi\n").unwrap(),
+            crate::ir::TestPredicate::StringNotEqual { .. }
+        ));
+        assert!(matches!(
+            predicate("if [ \"$A\" = \"b\" ]; then\n/bin/echo no\nfi\n").unwrap(),
+            crate::ir::TestPredicate::StringEqual { .. }
+        ));
+        // A `!` that is a complete token is the reserved word, and a mid-statement
+        // one is still refused.
+        assert!(
+            lower_posix(
+                "build.sh",
+                "/bin/echo one ! /bin/echo two\n",
+                &Interpreter::Bash,
+                HostShell::default(),
+            )
+            .is_err()
+        );
+        // One that opens the statement is the prefix the caller handles.
+        assert!(
+            lower_posix(
+                "build.sh",
+                "! /usr/bin/false\n",
+                &Interpreter::Bash,
+                HostShell::default(),
+            )
+            .is_ok()
+        );
     }
 
     /// A declaration runs nothing, and `$ErrorActionPreference` reaches nothing
