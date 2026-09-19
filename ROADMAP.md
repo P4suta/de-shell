@@ -199,6 +199,40 @@ Nushell), with both official Rust and Go generators where applicable.
   the exporter gate, neither of which this machine can stand in for.
 - [x] Enforce measured line coverage at 90% overall and at least 90% in scanner,
   frontend, runner, protocol, lab, and patch as a 0.1.0 release gate.
+- [ ] Retire de-shell's own shell. The nearest repository was the last one it
+  was pointed at, and pointing it here found three defects that the corpus had
+  not: `deshell init` could not run on this repository at all
+  (`DESHELL_IO: duplicate exact location override`, 3793187), every candidate in
+  a parsed JSON document reported `@0..1` (233dc5a), and the PowerShell and
+  Nushell parsers could not use an interpreter installed through a version
+  manager (331bb8e).
+
+  It runs now. The baseline, measured on 2026-09-19:
+
+  | | |
+  | --- | --- |
+  | shell locations | 101 — 46 embedded bash, 12 embedded PowerShell, 7 shell files, 36 candidates |
+  | sources in the plan | 65 |
+  | blockers | 118 |
+  | retired | 0 |
+
+  The blockers, by code:
+
+  | count | code | what it is |
+  | --- | --- | --- |
+  | 37 | `DUPLICATE_TARGET` | 27 `run:` blocks in one `ci.yml` all want to be a target in one host file |
+  | 36 | `DYNAMIC_CANDIDATE` | shell text inside `contracts/golden/*.json`, which records measured shell behaviour rather than executing it |
+  | 21 | `UNIMPLEMENTED_SEMANTIC` | the PowerShell scripts, which use control syntax outside the modelled subset |
+  | 18 | `UNRESOLVED_CALL_SITE` | `run: ./scripts/install-nushell.ps1`, whose target is one of those scripts |
+  | 3 | `PARSE_ERROR` | `run:` blocks holding `${{ matrix.target }}`, which is not shell and which GitHub substitutes before a shell sees it |
+  | 2 | `SCENARIO_INPUT_COVERAGE` | |
+  | 1 | `GENERATOR_UNSUPPORTED` | |
+
+  None of these is a wrong answer. Each names work: multiple targets per host
+  file, a GitHub-expression model that treats `${{ }}` as an input rather than
+  as shell, and a wider PowerShell subset. The number to drive down is 118, and
+  it is the honest measure of how far the oracle reaches on real code — this
+  repository's own.
 - [ ] Run the fixed 2026-08-25 48-repository audit selection through both
   deterministic implementations and record zero scanner errors/skips,
   unclassified files, residual executable coverage, nondeterminism, or
