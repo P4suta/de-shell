@@ -675,40 +675,48 @@ fn configure_unix_limits(command: &mut std::process::Command, limits: Limits) {
     // RLIMIT_NPROC or a production-sized RLIMIT_AS there produces false
     // `cannot fork` failures. Ordinary builds still exercise these limits, and
     // disposable providers enforce their own memory and PID boundaries.
+    let apply_limits = move || {
+        let memory_limit = libc::rlimit {
+            rlim_cur: limits.memory_bytes as libc::rlim_t,
+            rlim_max: limits.memory_bytes as libc::rlim_t,
+        };
+        // SAFETY: the pointer names a fully initialized `rlimit` that remains
+        // alive for the duration of this async-signal-safe system call.
+        let memory_result = unsafe { libc::setrlimit(libc::RLIMIT_AS, &raw const memory_limit) };
+        if memory_result != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let process_limit = libc::rlimit {
+            rlim_cur: limits.processes as libc::rlim_t,
+            rlim_max: limits.processes as libc::rlim_t,
+        };
+        // SAFETY: the pointer names a fully initialized `rlimit` that remains
+        // alive for the duration of this async-signal-safe system call.
+        let process_result =
+            unsafe { libc::setrlimit(libc::RLIMIT_NPROC, &raw const process_limit) };
+        if process_result != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    };
     #[cfg(any(
         target_os = "macos",
         coverage,
         deshell_sanitizer_address,
         deshell_sanitizer_undefined
     ))]
-    let _unused_limits = limits;
-
+    let _unused_apply_limits = apply_limits;
     #[cfg(all(
         not(target_os = "macos"),
         not(coverage),
         not(deshell_sanitizer_address),
         not(deshell_sanitizer_undefined)
     ))]
-    // SAFETY: `pre_exec` installs only async-signal-safe `setrlimit` calls. The
-    // closure allocates nothing and touches no shared Rust state after `fork`.
+    // SAFETY: `pre_exec` installs only the async-signal-safe `setrlimit` calls
+    // above. The closure allocates nothing and touches no shared Rust state
+    // after `fork`.
     unsafe {
-        command.pre_exec(move || {
-            let memory_limit = libc::rlimit {
-                rlim_cur: limits.memory_bytes as libc::rlim_t,
-                rlim_max: limits.memory_bytes as libc::rlim_t,
-            };
-            if libc::setrlimit(libc::RLIMIT_AS, &memory_limit) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            let process_limit = libc::rlimit {
-                rlim_cur: limits.processes as libc::rlim_t,
-                rlim_max: limits.processes as libc::rlim_t,
-            };
-            if libc::setrlimit(libc::RLIMIT_NPROC, &process_limit) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
+        command.pre_exec(apply_limits);
     }
 }
 
