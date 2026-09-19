@@ -128,13 +128,13 @@ description = "Check the pure logic and the transactional layer for undefined be
 # filesystem that is not there would check nothing.
 env = { MIRIFLAGS = "-Zmiri-disable-isolation" }
 run = [
-  "cargo +nightly miri test -p deshell canonical_json::",
-  "cargo +nightly miri test -p deshell strict_json::",
-  "cargo +nightly miri test -p deshell ir::",
-  "cargo +nightly miri test -p deshell digest::",
-  "cargo +nightly miri test -p deshell report::",
-  "cargo +nightly miri test -p deshell trace::",
-  "cargo +nightly miri test -p deshell patch::",
+  "cargo +nightly-2026-08-21 miri test -p deshell canonical_json::",
+  "cargo +nightly-2026-08-21 miri test -p deshell strict_json::",
+  "cargo +nightly-2026-08-21 miri test -p deshell ir::",
+  "cargo +nightly-2026-08-21 miri test -p deshell digest::",
+  "cargo +nightly-2026-08-21 miri test -p deshell report::",
+  "cargo +nightly-2026-08-21 miri test -p deshell trace::",
+  "cargo +nightly-2026-08-21 miri test -p deshell patch::",
 ]
 
 [tasks."test:mutation"]

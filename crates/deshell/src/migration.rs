@@ -13387,25 +13387,21 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
             }
         }
 
-        // Outside it: the status is the one the pinned interpreter ends with,
-        // so a caller reading `$?` sees what it would have seen. The message is
-        // the part that cannot be reproduced — bash's names its own path and a
-        // line number — so the program names the value instead.
-        let shell = std::process::Command::new("bash")
-            .arg("end.sh")
-            .env("DESHELL_TEST_CODE", "not-a-number")
-            .current_dir(directory.path())
-            .output()
-            .unwrap();
-        assert_eq!(shell.status.code(), Some(255));
+        // Outside it: the generated status is the one recorded for the pinned
+        // interpreter in `exit-builtin-semantics-v1.json`. Do not ask the CI
+        // runner's ambient bash for this value: bash 3.2 exits 255 while newer
+        // Linux builds exit 2, and that host accident is not this plan's
+        // declared semantic model. The message is the part that cannot be
+        // reproduced — bash names its own path and a line number — so the
+        // program names the value instead.
         for program in ["./end-rust", "./end-go"] {
             let ran = std::process::Command::new(program)
                 .env("DESHELL_TEST_CODE", "not-a-number")
                 .current_dir(directory.path())
                 .output()
                 .unwrap();
-            assert_eq!(ran.status.code(), shell.status.code(), "{program}");
-            assert_eq!(ran.stdout, shell.stdout, "{program}");
+            assert_eq!(ran.status.code(), Some(255), "{program}");
+            assert!(ran.stdout.is_empty(), "{program}");
             let stderr = String::from_utf8_lossy(&ran.stderr);
             assert!(stderr.contains("not-a-number"), "{program}: {stderr}");
         }

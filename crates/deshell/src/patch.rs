@@ -147,9 +147,15 @@ pub(crate) mod scratch {
         std::fs::write(path, bytes)
     }
 
-    /// Copy a file into a scratch tree.
+    /// Copy a file's bytes into a scratch tree.
+    ///
+    /// Callers set the destination permissions explicitly. Keeping that policy
+    /// separate also avoids platform-specific clone syscalls here, so the same
+    /// byte-copying path is exercised under Miri on every host.
     pub(crate) fn copy(from: &Path, to: &Path) -> std::io::Result<u64> {
-        std::fs::copy(from, to)
+        let mut source = std::fs::File::open(from)?;
+        let mut destination = std::fs::File::create(to)?;
+        std::io::copy(&mut source, &mut destination)
     }
 
     /// Set permissions on a path inside a scratch tree.

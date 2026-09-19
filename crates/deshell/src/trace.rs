@@ -373,12 +373,13 @@ mod tests {
     #[test]
     fn a_file_sink_receives_records() {
         serialized(|| {
-            let destination = tempfile::NamedTempFile::new().unwrap();
-            start_file(destination.reopen().unwrap());
+            let directory = tempfile::tempdir().unwrap();
+            let destination = directory.path().join("trace.jsonl");
+            start_file(std::fs::File::create(&destination).unwrap());
             record(|| Event::ClockRead);
             stop();
 
-            let text = std::fs::read_to_string(destination.path()).unwrap();
+            let text = std::fs::read_to_string(destination).unwrap();
             let events = super::testing::events(&text);
             assert_eq!(events.len(), 1);
             assert_eq!(events[0]["event"], "clock_read");
