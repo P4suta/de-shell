@@ -275,6 +275,28 @@ Nushell), with both official Rust and Go generators where applicable.
   deterministic implementations and record zero scanner errors/skips,
   unclassified files, residual executable coverage, nondeterminism, or
   unexplained differences in inventory, IR, diagnostics, patches, and exports.
+
+  The auditor had never run against the Rust implementation. It read
+  `$report.findings` from a Scan Report v1, which has `details.items`; a missing
+  property is `$null` in PowerShell and `@($null)` is an array of one null, so
+  every repository produced one finding with every field empty and the run died
+  on the first. A gate that has only ever run against the implementation being
+  replaced is a gate about the wrong thing. Fixed in 3cbc8e1, along with the
+  report not carrying a location's content digest and `init` not being told a
+  target for an isolated single-file copy.
+
+  It runs now, and `docs/corpus-audit.md` records the result: 14 repositories,
+  1,006 locations, 98 shell files, zero analysis failures, 98 of 98 fully
+  non-residual, validated against `corpus-audit-v1.schema.json`.
+
+  **The declared selection is still not reproducible from this repository.** The
+  2026-08-25 run named 48 repositories and wrote down only two of their file
+  paths and a table of totals; the report format can carry the list and no
+  report was committed. So the item as written can be executed only by somebody
+  who already has that machine's directory. Either the 48 names go into the
+  repository, or the gate's subject becomes a selection that is recorded — the
+  2026-09-19 run names its fourteen, which is the first selection anybody else
+  could reproduce.
 - [ ] Pass the self-hosted rootless-Linux, Windows Sandbox/Hyper-V, and signed
   macOS Virtualization.framework execution gates with no local fallback.
 - [ ] Add and pass saved-corpus/PR fuzz smoke, nightly scanner/parser/protocol/
