@@ -776,7 +776,8 @@ fn set_permissions(path: &Path, mode: u32) -> Result<(), String> {
     }
     #[cfg(not(unix))]
     {
-        let _ = (path, mode);
+        let _path = path;
+        let _mode = mode;
     }
     Ok(())
 }

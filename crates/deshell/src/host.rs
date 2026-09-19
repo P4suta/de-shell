@@ -287,6 +287,36 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn status_records_the_exact_windows_program_arguments_and_exit_code() {
+        let text = crate::trace::testing::recorded(|| {
+            let code =
+                status(std::process::Command::new("cmd").args(["/D", "/S", "/C", "exit /b 7"]))
+                    .unwrap()
+                    .code();
+            assert_eq!(code, Some(7));
+        });
+        let events = crate::trace::testing::events(&text)
+            .into_iter()
+            .filter(|value| {
+                value["event"]
+                    .as_str()
+                    .is_some_and(|event| event.starts_with("process_"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["event"], "process_start");
+        assert_eq!(events[0]["program"], "cmd");
+        assert_eq!(
+            events[0]["argv"],
+            serde_json::json!(["/D", "/S", "/C", "exit /b 7"])
+        );
+        assert_eq!(events[1]["event"], "process_exit");
+        assert_eq!(events[1]["program"], "cmd");
+        assert_eq!(events[1]["code"], 7);
+    }
+
     /// A panic inside the scope still restores what was there before.
     #[test]
     fn a_panic_inside_a_fixed_environment_restores_the_previous_one() {

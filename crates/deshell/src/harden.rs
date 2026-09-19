@@ -811,7 +811,7 @@ fn file_permissions(path: &Path) -> Result<u32, String> {
     }
     #[cfg(not(unix))]
     {
-        let _ = metadata;
+        let _metadata = metadata;
         Ok(0o644)
     }
 }
