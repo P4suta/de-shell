@@ -131,10 +131,10 @@ pub(crate) fn handle_message(kind: AgentKind, input: &[u8]) -> Vec<u8> {
     }
 }
 
-pub(crate) fn serve(
+pub(crate) fn serve<R: BufRead, W: Write>(
     kind: AgentKind,
-    input: &mut dyn BufRead,
-    output: &mut dyn Write,
+    input: &mut R,
+    output: &mut W,
 ) -> Result<i32, String> {
     loop {
         match read_frame(input)? {
@@ -161,7 +161,7 @@ pub(crate) fn serve(
     }
 }
 
-pub(crate) fn serve_stdio(kind: AgentKind, output: &mut dyn Write) -> Result<i32, String> {
+pub(crate) fn serve_stdio<W: Write>(kind: AgentKind, output: &mut W) -> Result<i32, String> {
     let stdin = std::io::stdin();
     serve(kind, &mut stdin.lock(), output)
 }
@@ -527,24 +527,35 @@ fn run_plan_process_at(
     let environment = request.environment.into_iter().collect();
     let result = crate::runner::run_plan_with_io(
         &backend,
-        crate::runner::Policy {
-            allow_file_read: matches!(
-                config.policy.file_read,
-                crate::config::FileReadPolicy::Project
+        crate::runner::Policy::default()
+            .allow_if(
+                crate::runner::Capability::FileRead,
+                matches!(
+                    config.policy.file_read,
+                    crate::config::FileReadPolicy::Project
+                ),
+            )
+            .allow_if(
+                crate::runner::Capability::FileWrite,
+                matches!(
+                    config.policy.file_write,
+                    crate::config::FileWritePolicy::Sandbox
+                ),
+            )
+            .allow_if(
+                crate::runner::Capability::Network,
+                matches!(
+                    config.policy.network,
+                    crate::config::NetworkPolicy::RecordReplay
+                ),
+            )
+            .allow_if(
+                crate::runner::Capability::Delegation,
+                matches!(
+                    config.policy.delegation,
+                    crate::config::DelegationPolicy::Pinned
+                ),
             ),
-            allow_file_write: matches!(
-                config.policy.file_write,
-                crate::config::FileWritePolicy::Sandbox
-            ),
-            allow_network: matches!(
-                config.policy.network,
-                crate::config::NetworkPolicy::RecordReplay
-            ),
-            allow_delegation: matches!(
-                config.policy.delegation,
-                crate::config::DelegationPolicy::Pinned
-            ),
-        },
         &plan,
         crate::runner::RunInputs {
             host_environment: &environment,
@@ -654,7 +665,33 @@ fn select_plan_node(mut plan: crate::ir::Plan, id: &str) -> Result<crate::ir::Pl
             crate::ir::Operation::TryFinally { body, finalizer } => {
                 children.extend([body.as_ref(), finalizer.as_ref()]);
             }
-            _ => {}
+            crate::ir::Operation::Exec { .. }
+            | crate::ir::Operation::ExpandWords { .. }
+            | crate::ir::Operation::Redirect { .. }
+            | crate::ir::Operation::WriteStdout { .. }
+            | crate::ir::Operation::Exit { .. }
+            | crate::ir::Operation::NoOp
+            | crate::ir::Operation::Test { .. }
+            | crate::ir::Operation::While { .. }
+            | crate::ir::Operation::Not { .. }
+            | crate::ir::Operation::Scope { .. }
+            | crate::ir::Operation::TaskCall { .. }
+            | crate::ir::Operation::SetVariable { .. }
+            | crate::ir::Operation::SetEnvironment { .. }
+            | crate::ir::Operation::SetWorkingDirectory { .. }
+            | crate::ir::Operation::Spawn { .. }
+            | crate::ir::Operation::Wait { .. }
+            | crate::ir::Operation::SendSignal { .. }
+            | crate::ir::Operation::FileRead { .. }
+            | crate::ir::Operation::FileWrite { .. }
+            | crate::ir::Operation::FileRemove { .. }
+            | crate::ir::Operation::FileMetadata { .. }
+            | crate::ir::Operation::FileSetMetadata { .. }
+            | crate::ir::Operation::NetworkRequest { .. }
+            | crate::ir::Operation::ClockRead { .. }
+            | crate::ir::Operation::RandomBytes { .. }
+            | crate::ir::Operation::InterpreterCall { .. }
+            | crate::ir::Operation::OpaqueCapsule { .. } => {}
         }
         children.into_iter().find_map(|child| find(child, id))
     }
@@ -692,7 +729,7 @@ fn fixture_params(value: &serde_json::Value) -> Result<Vec<crate::config::Fixtur
                 .ok_or_else(|| invalid("fixture.contents_base64 must be a string"))?;
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(contents)
-                .map_err(|_| invalid("fixture.contents_base64 is invalid"))?;
+                .map_err(|_error| invalid("fixture.contents_base64 is invalid"))?;
             if base64::engine::general_purpose::STANDARD.encode(&bytes) != contents {
                 return Err(invalid("fixture.contents_base64 must be canonical"));
             }
@@ -792,7 +829,7 @@ fn process_request(
         .ok_or_else(|| invalid("params.stdin_base64 must be a string"))?;
     let stdin = base64::engine::general_purpose::STANDARD
         .decode(encoded)
-        .map_err(|_| invalid("params.stdin_base64 is invalid"))?;
+        .map_err(|_error| invalid("params.stdin_base64 is invalid"))?;
     if base64::engine::general_purpose::STANDARD.encode(&stdin) != encoded {
         return Err(invalid(
             "params.stdin_base64 must use canonical padded base64",
@@ -869,7 +906,7 @@ fn lower_nushell(
                 .ok_or_else(|| invalid("base64 source requires base64"))?;
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(encoded)
-                .map_err(|_| invalid("source base64 is invalid"))?;
+                .map_err(|_error| invalid("source base64 is invalid"))?;
             if base64::engine::general_purpose::STANDARD.encode(&bytes) != encoded {
                 return Err(invalid("source base64 must be canonical"));
             }
@@ -900,7 +937,7 @@ enum Frame {
     Oversized,
 }
 
-fn read_frame(input: &mut dyn BufRead) -> Result<Option<Frame>, String> {
+fn read_frame<R: BufRead>(input: &mut R) -> Result<Option<Frame>, String> {
     let mut message = Vec::new();
     let mut oversized = false;
     loop {
@@ -1568,9 +1605,79 @@ mod tests {
         let selected_id = match &plan.tasks[0].body.operation {
             Operation::Condition { if_true, .. } => match &if_true.operation {
                 Operation::Sequence { nodes, .. } => nodes[1].id.clone(),
-                _ => unreachable!(),
+                other @ Operation::Exec { .. }
+                | other @ Operation::ExpandWords { .. }
+                | other @ Operation::Redirect { .. }
+                | other @ Operation::Pipeline { .. }
+                | other @ Operation::Parallel { .. }
+                | other @ Operation::WriteStdout { .. }
+                | other @ Operation::Exit { .. }
+                | other @ Operation::NoOp
+                | other @ Operation::Condition { .. }
+                | other @ Operation::Test { .. }
+                | other @ Operation::While { .. }
+                | other @ Operation::Not { .. }
+                | other @ Operation::Match { .. }
+                | other @ Operation::Foreach { .. }
+                | other @ Operation::Scope { .. }
+                | other @ Operation::TryFinally { .. }
+                | other @ Operation::TaskCall { .. }
+                | other @ Operation::SetVariable { .. }
+                | other @ Operation::SetEnvironment { .. }
+                | other @ Operation::SetWorkingDirectory { .. }
+                | other @ Operation::CaptureStdout { .. }
+                | other @ Operation::Spawn { .. }
+                | other @ Operation::Wait { .. }
+                | other @ Operation::SendSignal { .. }
+                | other @ Operation::FileRead { .. }
+                | other @ Operation::FileWrite { .. }
+                | other @ Operation::FileRemove { .. }
+                | other @ Operation::FileMetadata { .. }
+                | other @ Operation::FileSetMetadata { .. }
+                | other @ Operation::NetworkRequest { .. }
+                | other @ Operation::ClockRead { .. }
+                | other @ Operation::RandomBytes { .. }
+                | other @ Operation::InterpreterCall { .. }
+                | other @ Operation::OpaqueCapsule { .. } => {
+                    panic!("expected selected sequence, found {other:#?}")
+                }
             },
-            _ => unreachable!(),
+            other @ Operation::Exec { .. }
+            | other @ Operation::ExpandWords { .. }
+            | other @ Operation::Redirect { .. }
+            | other @ Operation::Pipeline { .. }
+            | other @ Operation::Sequence { .. }
+            | other @ Operation::Parallel { .. }
+            | other @ Operation::WriteStdout { .. }
+            | other @ Operation::Exit { .. }
+            | other @ Operation::NoOp
+            | other @ Operation::Test { .. }
+            | other @ Operation::While { .. }
+            | other @ Operation::Not { .. }
+            | other @ Operation::Match { .. }
+            | other @ Operation::Foreach { .. }
+            | other @ Operation::Scope { .. }
+            | other @ Operation::TryFinally { .. }
+            | other @ Operation::TaskCall { .. }
+            | other @ Operation::SetVariable { .. }
+            | other @ Operation::SetEnvironment { .. }
+            | other @ Operation::SetWorkingDirectory { .. }
+            | other @ Operation::CaptureStdout { .. }
+            | other @ Operation::Spawn { .. }
+            | other @ Operation::Wait { .. }
+            | other @ Operation::SendSignal { .. }
+            | other @ Operation::FileRead { .. }
+            | other @ Operation::FileWrite { .. }
+            | other @ Operation::FileRemove { .. }
+            | other @ Operation::FileMetadata { .. }
+            | other @ Operation::FileSetMetadata { .. }
+            | other @ Operation::NetworkRequest { .. }
+            | other @ Operation::ClockRead { .. }
+            | other @ Operation::RandomBytes { .. }
+            | other @ Operation::InterpreterCall { .. }
+            | other @ Operation::OpaqueCapsule { .. } => {
+                panic!("expected selected condition, found {other:#?}")
+            }
         };
         let selected = select_plan_node(plan.clone(), &selected_id).unwrap();
         assert_eq!(selected.tasks.len(), 1);
@@ -1699,7 +1806,7 @@ mod tests {
         assert_eq!(result["stdout_base64"], "b2JzZXJ2ZWQ=");
         assert_eq!(result["files"][0]["kind"], "created");
         assert_eq!(result["files"][0]["path"], "output.txt");
-        let mut mismatch = observe.clone();
+        let mut mismatch = observe;
         mismatch["expected_files"][0]["sha256"] = serde_json::json!("0".repeat(64));
         let mismatched = tempfile::tempdir().unwrap();
         assert_eq!(

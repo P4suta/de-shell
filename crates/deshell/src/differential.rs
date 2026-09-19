@@ -45,9 +45,9 @@ pub(crate) enum Outcome {
 /// a seven-argument function stays invisible to every call site that already
 /// compiles. [`evaluate`] takes this apart without `..`, so a field added here
 /// fails to compile until it is given a destination.
-pub(crate) struct Evaluation<'a> {
-    pub(crate) observer: &'a dyn Observer,
-    pub(crate) backend: &'a dyn Backend,
+pub(crate) struct Evaluation<'a, O: Observer, B: Backend> {
+    pub(crate) observer: &'a O,
+    pub(crate) backend: &'a B,
     pub(crate) policy: Policy,
     pub(crate) plan: &'a Plan,
     pub(crate) scenario: &'a Scenario,
@@ -55,7 +55,9 @@ pub(crate) struct Evaluation<'a> {
     pub(crate) evidence: &'a mut Evidence,
 }
 
-pub(crate) fn evaluate(parts: Evaluation<'_>) -> Result<Outcome, String> {
+pub(crate) fn evaluate<O: Observer, B: Backend>(
+    parts: Evaluation<'_, O, B>,
+) -> Result<Outcome, String> {
     // Destructured without `..`: see `Evaluation`.
 
     let Evaluation {
@@ -173,7 +175,10 @@ pub(crate) fn evaluate(parts: Evaluation<'_>) -> Result<Outcome, String> {
     Ok(match status {
         crate::evidence::ObservationStatus::Nondeterministic => Outcome::Nondeterministic,
         _ if comparison.equivalent => Outcome::Verified,
-        _ => Outcome::Different,
+        crate::evidence::ObservationStatus::Verified
+        | crate::evidence::ObservationStatus::Different
+        | crate::evidence::ObservationStatus::Unavailable
+        | crate::evidence::ObservationStatus::Failed => Outcome::Different,
     })
 }
 
@@ -229,19 +234,19 @@ mod tests {
             &self,
             _request: InterpreterRequest,
         ) -> Result<ProcessResult, String> {
-            unreachable!()
+            panic!("mock interpreter execution was not expected")
         }
         fn read_file(&self, _path: &str) -> Result<Vec<u8>, String> {
-            unreachable!()
+            panic!("mock file read was not expected")
         }
         fn write_file(&self, _path: &str, _contents: &[u8], _append: bool) -> Result<(), String> {
-            unreachable!()
+            panic!("mock file write was not expected")
         }
         fn remove_file(&self, _path: &str) -> Result<(), String> {
-            unreachable!()
+            panic!("mock file removal was not expected")
         }
         fn network_request(&self, _method: &str, _uri: &str) -> Result<Vec<u8>, String> {
-            unreachable!()
+            panic!("mock network request was not expected")
         }
     }
 

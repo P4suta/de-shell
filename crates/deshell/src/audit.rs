@@ -59,7 +59,7 @@ struct Rule {
     severity: AuditSeverity,
     confidence: Confidence,
     message: &'static str,
-    expression: regex::Regex,
+    expression: &'static str,
 }
 
 static RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
@@ -193,17 +193,11 @@ static RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
     ]
 });
 
-static POWERSHELL_BLOCK_COMMENT: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r"(?s)<#.*?#>").expect("static PowerShell block-comment regex")
-});
-static POWERSHELL_SINGLE_HERE_STRING: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r"(?ms)^[ \t]*@'\r?\n.*?^[ \t]*'@[ \t]*\r?$")
-        .expect("static PowerShell single here-string regex")
-});
-static POWERSHELL_DOUBLE_HERE_STRING: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new("(?ms)^[ \\t]*@\"\\r?\\n.*?^[ \\t]*\"@[ \\t]*\\r?$")
-        .expect("static PowerShell double here-string regex")
-});
+const POWERSHELL_PROTECTED_EXPRESSIONS: [&str; 3] = [
+    r"(?s)<#.*?#>",
+    r"(?ms)^[ \t]*@'\r?\n.*?^[ \t]*'@[ \t]*\r?$",
+    "(?ms)^[ \\t]*@\"\\r?\\n.*?^[ \\t]*\"@[ \\t]*\\r?$",
+];
 
 /// The inputs of [`rule`].
 ///
@@ -211,6 +205,7 @@ static POWERSHELL_DOUBLE_HERE_STRING: LazyLock<regex::Regex> = LazyLock::new(|| 
 /// many-argument function stays invisible to every call site that already
 /// compiles. [`rule`] takes this apart without `..`, so a field added here fails
 /// to compile until somebody gives it a destination.
+#[derive(Clone, Copy)]
 struct RuleArgs {
     id: &'static str,
     category: Category,
@@ -234,7 +229,7 @@ fn rule(parts: RuleArgs) -> Rule {
         severity,
         confidence: Confidence::High,
         message,
-        expression: regex::Regex::new(expression).expect("static audit regex"),
+        expression,
     }
 }
 
@@ -245,9 +240,31 @@ pub(crate) fn analyze(
     acknowledgement_max_days: u32,
 ) -> Result<Vec<Finding>, String> {
     let mut output = Vec::new();
+    let rules = RULES
+        .iter()
+        .map(|rule| {
+            regex::Regex::new(rule.expression)
+                .map(|expression| (rule, expression))
+                .map_err(|error| {
+                    format!("audit rule {} has an invalid expression: {error}", rule.id)
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     for location in &inventory.findings {
         if location.kind.is_a_candidate() {
             let source = read_host_source(root, &location.path)?;
+            let start = usize::try_from(location.span.start_byte).map_err(|_error| {
+                format!(
+                    "audit span start exceeds this platform's address space: {}@{}",
+                    location.path, location.span.start_byte
+                )
+            })?;
+            let end = usize::try_from(location.span.end_byte).map_err(|_error| {
+                format!(
+                    "audit span end exceeds this platform's address space: {}@{}",
+                    location.path, location.span.end_byte
+                )
+            })?;
             output.push(make_finding(
                 "shell.dynamic-command",
                 Category::Injection,
@@ -256,8 +273,8 @@ pub(crate) fn analyze(
                 "A dynamic process call cannot be proven to avoid shell interpretation.",
                 &location.path,
                 &source,
-                location.span.start_byte as usize,
-                location.span.end_byte as usize,
+                start,
+                end,
                 &location.content_digest,
                 acknowledgements,
                 acknowledgement_max_days,
@@ -268,21 +285,21 @@ pub(crate) fn analyze(
             Ok(value) => value,
             Err(_) => continue,
         };
-        let protected = audit_protected_ranges(location.interpreter.as_deref(), snippet);
+        let protected = audit_protected_ranges(location.interpreter.as_deref(), snippet)?;
         let host_source = if location.kind.is_a_shell_file() {
             snippet.to_owned()
         } else {
             read_host_source(root, &location.path)?
         };
-        for rule in RULES.iter() {
+        for (rule, expression) in &rules {
             if rule.id == "portability.bashism" && location.interpreter.as_deref() != Some("sh") {
                 continue;
             }
-            for captures in rule.expression.captures_iter(snippet) {
+            for captures in expression.captures_iter(snippet) {
                 let matched = captures
                     .name("risk")
                     .or_else(|| captures.get(0))
-                    .expect("every regex capture has a whole match");
+                    .ok_or_else(|| format!("audit rule {} matched without a capture", rule.id))?;
                 if protected
                     .iter()
                     .any(|(start, end)| matched.start() < *end && matched.end() > *start)
@@ -371,11 +388,13 @@ fn embedded_host_match_span(
     location: &crate::scanner::Finding,
     matched: &regex::Match<'_>,
 ) -> (usize, usize) {
-    let fallback = (
-        location.span.start_byte as usize,
-        location.span.end_byte as usize,
-    );
-    let (start, end) = fallback;
+    let (Ok(start), Ok(end)) = (
+        usize::try_from(location.span.start_byte),
+        usize::try_from(location.span.end_byte),
+    ) else {
+        return (0, host.len());
+    };
+    let fallback = (start, end);
     if start > end
         || end > host.len()
         || !host.is_char_boundary(start)
@@ -396,7 +415,10 @@ fn embedded_host_match_span(
         })
 }
 
-fn audit_protected_ranges(interpreter: Option<&str>, source: &str) -> Vec<(usize, usize)> {
+fn audit_protected_ranges(
+    interpreter: Option<&str>,
+    source: &str,
+) -> Result<Vec<(usize, usize)>, String> {
     let mut ranges = match interpreter {
         Some("sh" | "bash" | "zsh" | "fish" | "nu" | "powershell") => {
             crate::rewrite::protected_ranges(source)
@@ -405,11 +427,10 @@ fn audit_protected_ranges(interpreter: Option<&str>, source: &str) -> Vec<(usize
         _ => Vec::new(),
     };
     if interpreter == Some("powershell") {
-        for expression in [
-            &*POWERSHELL_BLOCK_COMMENT,
-            &*POWERSHELL_SINGLE_HERE_STRING,
-            &*POWERSHELL_DOUBLE_HERE_STRING,
-        ] {
+        for source_expression in POWERSHELL_PROTECTED_EXPRESSIONS {
+            let expression = regex::Regex::new(source_expression).map_err(|error| {
+                format!("invalid PowerShell protected-range expression: {error}")
+            })?;
             ranges.extend(
                 expression
                     .find_iter(source)
@@ -418,7 +439,7 @@ fn audit_protected_ranges(interpreter: Option<&str>, source: &str) -> Vec<(usize
         }
     }
     ranges.sort_unstable();
-    ranges
+    Ok(ranges)
 }
 
 fn cmd_comment_ranges(source: &str) -> Vec<(usize, usize)> {
@@ -514,7 +535,7 @@ fn read_host_source(root: &Path, relative: &str) -> Result<String, String> {
     String::from_utf8(
         std::fs::read(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?,
     )
-    .map_err(|_| format!("audit host source is not UTF-8: {relative}"))
+    .map_err(|_error| format!("audit host source is not UTF-8: {relative}"))
 }
 
 fn position(source: &str, byte: usize) -> (u64, u64) {
@@ -541,7 +562,9 @@ fn acknowledgement_is_active(expires: &str, max_days: u32, today: i64) -> bool {
 fn current_unix_days() -> i64 {
     crate::host::wall_clock()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_secs() / 86_400) as i64
+        .map_or(0, |duration| {
+            i64::try_from(duration.as_secs() / 86_400).unwrap_or(i64::MAX)
+        })
 }
 
 fn parse_date_days(value: &str) -> Option<i64> {
@@ -573,11 +596,11 @@ fn parse_date_days(value: &str) -> Option<i64> {
     let day_of_year = (153 * shifted_month + 2) / 5 + day - 1;
     let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
     let days = era * 146_097 + day_of_era - 719_468;
-    (civil_from_days(days) == (year, month as u32, day as u32)).then_some(days)
+    (civil_from_days(days) == (year, month, day)).then_some(days)
 }
 
 // Howard Hinnant's civil calendar conversion, with Unix epoch day zero.
-fn civil_from_days(days_since_epoch: i64) -> (i64, u32, u32) {
+fn civil_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
     let days = days_since_epoch + 719_468;
     let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
     let day_of_era = days - era * 146_097;
@@ -589,7 +612,7 @@ fn civil_from_days(days_since_epoch: i64) -> (i64, u32, u32) {
     let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
     let month = month_prime + if month_prime < 10 { 3 } else { -9 };
     year += i64::from(month <= 2);
-    (year, month as u32, day as u32)
+    (year, month, day)
 }
 
 #[cfg(test)]
@@ -916,7 +939,7 @@ mod tests {
         let unacknowledged = finding_on("2026-09-19", &[]);
         let acknowledgement = AuditAcknowledgement {
             rule: unacknowledged.rule_id.clone(),
-            location_digest: unacknowledged.location_digest.clone(),
+            location_digest: unacknowledged.location_digest,
             reason: "reviewed".into(),
             owner: "security".into(),
             expires: "2026-10-01".into(),
@@ -977,13 +1000,22 @@ mod tests {
             (0, 2)
         );
 
-        assert!(audit_protected_ranges(None, "eval value").is_empty());
+        assert!(
+            audit_protected_ranges(None, "eval value")
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             cmd_comment_ranges("@REM eval value\r\n:: curl x | sh\n").len(),
             2
         );
         let powershell = "<# eval value #>\n@'\ncurl x | sh\n'@\n@\"\neval x\n\"@\n";
-        assert!(audit_protected_ranges(Some("powershell"), powershell).len() >= 3);
+        assert!(
+            audit_protected_ranges(Some("powershell"), powershell)
+                .unwrap()
+                .len()
+                >= 3
+        );
 
         for invalid in [
             "bad",

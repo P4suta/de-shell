@@ -328,7 +328,7 @@ impl Backend for LocalBackend {
                 "/c".into(),
                 path,
             ],
-            _ => unreachable!(),
+            other => return Err(format!("unsupported delegated interpreter: {other}")),
         };
         argv.extend(request.arguments);
         let outcome = crate::agent_process::execute(

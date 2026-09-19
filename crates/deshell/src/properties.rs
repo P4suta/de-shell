@@ -15,17 +15,22 @@ impl Generator {
     }
 
     fn bytes(&mut self, maximum: usize) -> Vec<u8> {
-        let length = (self.next() as usize) % (maximum + 1);
-        (0..length).map(|_| self.next() as u8).collect()
+        let modulus = u64::try_from(maximum + 1).unwrap();
+        let length = usize::try_from(self.next() % modulus).unwrap();
+        (0..length)
+            .map(|_| u8::try_from(self.next() & u64::from(u8::MAX)).unwrap())
+            .collect()
     }
 
     fn identifier(&mut self) -> String {
-        let length = 1 + (self.next() as usize % 24);
+        let length = 1 + usize::try_from(self.next() % 24).unwrap();
         let mut output = String::with_capacity(length);
-        output.push((b'a' + (self.next() % 26) as u8) as char);
+        output.push(char::from(b'a' + u8::try_from(self.next() % 26).unwrap()));
         for _ in 1..length {
             let alphabet = b"abcdefghijklmnopqrstuvwxyz0123456789_";
-            output.push(alphabet[self.next() as usize % alphabet.len()] as char);
+            let index =
+                usize::try_from(self.next() % u64::try_from(alphabet.len()).unwrap()).unwrap();
+            output.push(char::from(alphabet[index]));
         }
         output
     }
@@ -80,7 +85,7 @@ fn generated_expressions_never_reparse_expanded_dollar_text() {
             expression
                 .evaluate(&variables, &arguments, crate::ir::UnsetPolicy::Empty)
                 .unwrap(),
-            literal + &variable_value + &argument_value
+            format!("{literal}{variable_value}{argument_value}")
         );
     }
 }
@@ -203,10 +208,13 @@ fn a_span_always_names_sliceable_bytes_of_its_source() {
                     "{source:?} {from} {value:?}"
                 );
                 assert!(
-                    span.end_byte as usize <= source.len(),
+                    usize::try_from(span.end_byte).unwrap() <= source.len(),
                     "{source:?} {from} {value:?}"
                 );
-                let sliced = source.get(span.start_byte as usize..span.end_byte as usize);
+                let sliced = source.get(
+                    usize::try_from(span.start_byte).unwrap()
+                        ..usize::try_from(span.end_byte).unwrap(),
+                );
                 assert!(sliced.is_some(), "{source:?} {from} {value:?} {span:?}");
                 // When the value is there from `from` onward, the span is it.
                 if !value.is_empty()
@@ -222,7 +230,8 @@ fn a_span_always_names_sliceable_bytes_of_its_source() {
     // kind.
     for _ in 0..512 {
         let source = String::from_utf8_lossy(&generator.bytes(48)).into_owned();
-        let from = generator.next() as usize % (source.len() + 4);
+        let modulus = u64::try_from(source.len() + 4).unwrap();
+        let from = usize::try_from(generator.next() % modulus).unwrap();
         let value = String::from_utf8_lossy(&generator.bytes(4)).into_owned();
         let span = crate::scanner::span_of(&source, from, &value);
         assert!(
@@ -231,7 +240,10 @@ fn a_span_always_names_sliceable_bytes_of_its_source() {
         );
         assert!(
             source
-                .get(span.start_byte as usize..span.end_byte as usize)
+                .get(
+                    usize::try_from(span.start_byte).unwrap()
+                        ..usize::try_from(span.end_byte).unwrap(),
+                )
                 .is_some(),
             "{source:?} {from} {value:?} {span:?}"
         );

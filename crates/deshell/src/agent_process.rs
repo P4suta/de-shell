@@ -89,7 +89,7 @@ struct PollBackoff {
 }
 
 impl PollBackoff {
-    fn pause(&mut self, clock: &dyn Clock, deadline: Duration) {
+    fn pause<C: Clock>(&mut self, clock: &C, deadline: Duration) {
         if self.polls < POLL_YIELDS {
             self.polls += 1;
             clock.yield_now();
@@ -303,18 +303,18 @@ pub(crate) fn execute_pipeline(
     if let Some(writer) = stdin_writer {
         writer
             .join()
-            .map_err(|_| "pipeline stdin writer panicked".to_owned())??;
+            .map_err(|_error| "pipeline stdin writer panicked".to_owned())??;
     }
     let mut stdout = stdout_reader
         .ok_or("pipeline final stdout reader is unavailable")?
         .join()
-        .map_err(|_| "pipeline stdout reader panicked".to_owned())??;
+        .map_err(|_error| "pipeline stdout reader panicked".to_owned())??;
     let mut stderrs = Vec::with_capacity(count);
     for reader in stderr_readers {
         stderrs.push(
             reader
                 .join()
-                .map_err(|_| "pipeline stderr reader panicked".to_owned())??,
+                .map_err(|_error| "pipeline stderr reader panicked".to_owned())??,
         );
     }
     let limit_exceeded = match exceeded.load(std::sync::atomic::Ordering::Acquire) {
@@ -337,7 +337,7 @@ pub(crate) fn execute_pipeline(
                 } else if limit_exceeded.is_some() {
                     1
                 } else {
-                    exit_code(&status)
+                    exit_code(status)
                 },
                 stdout: if index + 1 == count {
                     std::mem::take(&mut stdout)
@@ -347,16 +347,16 @@ pub(crate) fn execute_pipeline(
                 stderr,
                 timed_out,
                 limit_exceeded: limit_exceeded.clone(),
-                signal: exit_signal(&status),
+                signal: exit_signal(status),
             })
         })
         .collect()
 }
 
-pub(crate) fn execute_with_clock(
+pub(crate) fn execute_with_clock<C: Clock>(
     root: &Path,
     request: Request,
-    clock: &dyn Clock,
+    clock: &C,
 ) -> Result<Outcome, String> {
     if request.argv.first().is_none_or(String::is_empty) {
         return Err("process agent argv must not be empty".into());
@@ -484,14 +484,14 @@ pub(crate) fn execute_with_clock(
     };
     stdin_writer
         .join()
-        .map_err(|_| "process stdin writer panicked".to_owned())??;
+        .map_err(|_error| "process stdin writer panicked".to_owned())??;
     let stdout = stdout_reader
         .join()
-        .map_err(|_| "process stdout reader panicked".to_owned())??;
+        .map_err(|_error| "process stdout reader panicked".to_owned())??;
     let stderr = stderr_reader
         .join()
-        .map_err(|_| "process stderr reader panicked".to_owned())??;
-    let signal = exit_signal(&status);
+        .map_err(|_error| "process stderr reader panicked".to_owned())??;
+    let signal = exit_signal(status);
     let limit_exceeded = match exceeded.load(std::sync::atomic::Ordering::Acquire) {
         1 => Some("stdout".into()),
         2 => Some("stderr".into()),
@@ -504,7 +504,7 @@ pub(crate) fn execute_with_clock(
         } else if output_limited || limit_exceeded.is_some() {
             1
         } else {
-            exit_code(&status)
+            exit_code(status)
         },
         stdout,
         stderr,
@@ -681,7 +681,7 @@ fn configure_unix_limits(command: &mut std::process::Command, limits: Limits) {
         deshell_sanitizer_address,
         deshell_sanitizer_undefined
     ))]
-    let _ = limits;
+    let _unused_limits = limits;
 
     #[cfg(all(
         not(target_os = "macos"),
@@ -689,6 +689,8 @@ fn configure_unix_limits(command: &mut std::process::Command, limits: Limits) {
         not(deshell_sanitizer_address),
         not(deshell_sanitizer_undefined)
     ))]
+    // SAFETY: `pre_exec` installs only async-signal-safe `setrlimit` calls. The
+    // closure allocates nothing and touches no shared Rust state after `fork`.
     unsafe {
         command.pre_exec(move || {
             let memory_limit = libc::rlimit {
@@ -748,10 +750,11 @@ fn read_pipe<R: std::io::Read>(parts: ReadPipeArgs<'_, R>) -> Result<Vec<u8>, St
         if count == 0 {
             break;
         }
-        let remaining = limit.saturating_sub(output.len() as u64) as usize;
+        let written = u64::try_from(output.len()).unwrap_or(u64::MAX);
+        let remaining = usize::try_from(limit.saturating_sub(written)).unwrap_or(usize::MAX);
         output.extend_from_slice(&buffer[..count.min(remaining)]);
         if count > remaining {
-            let _ = exceeded.compare_exchange(
+            let _first_exceeded_stream = exceeded.compare_exchange(
                 0,
                 code,
                 std::sync::atomic::Ordering::AcqRel,
@@ -797,11 +800,12 @@ fn read_pipe_shared<R: std::io::Read>(parts: ReadPipeSharedArgs<'_, R>) -> Resul
         if count == 0 {
             break;
         }
-        let previous = total.fetch_add(count as u64, std::sync::atomic::Ordering::AcqRel);
-        let remaining = limit.saturating_sub(previous) as usize;
+        let count_u64 = u64::try_from(count).unwrap_or(u64::MAX);
+        let previous = total.fetch_add(count_u64, std::sync::atomic::Ordering::AcqRel);
+        let remaining = usize::try_from(limit.saturating_sub(previous)).unwrap_or(usize::MAX);
         output.extend_from_slice(&buffer[..count.min(remaining)]);
         if count > remaining {
-            let _ = exceeded.compare_exchange(
+            let _first_exceeded_stream = exceeded.compare_exchange(
                 0,
                 code,
                 std::sync::atomic::Ordering::AcqRel,
@@ -818,14 +822,18 @@ fn kill_process_tree(child: &mut std::process::Child) {
     {
         // The child starts in its own process group, so a negative PID kills
         // descendants as well as the direct child.
-        unsafe {
-            libc::kill(-(child.id() as i32), libc::SIGKILL);
+        if let Ok(group_leader) = libc::pid_t::try_from(child.id()) {
+            // SAFETY: `group_leader` came from a live OS child, is representable
+            // as `pid_t`, and `kill` does not retain pointers.
+            unsafe {
+                libc::kill(-group_leader, libc::SIGKILL);
+            }
         }
     }
-    let _ = child.kill();
+    let _direct_kill_result = child.kill();
 }
 
-fn exit_code(status: &std::process::ExitStatus) -> i32 {
+fn exit_code(status: std::process::ExitStatus) -> i32 {
     if let Some(code) = status.code() {
         return code;
     }
@@ -840,7 +848,7 @@ fn exit_code(status: &std::process::ExitStatus) -> i32 {
     }
 }
 
-fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
+fn exit_signal(status: std::process::ExitStatus) -> Option<i32> {
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt as _;
@@ -848,7 +856,7 @@ fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
     }
     #[cfg(not(unix))]
     {
-        let _ = status;
+        let _status = status;
         None
     }
 }
@@ -927,7 +935,7 @@ impl Agent {
                         }
                     }
                     Err(error) => {
-                        let _ = sender.send(Err(error));
+                        let _send_result = sender.send(Err(error));
                         break;
                     }
                 }
@@ -995,8 +1003,8 @@ impl Drop for Agent {
     fn drop(&mut self) {
         // Closing stdin is how the adapter's read loop ends. Killing follows in
         // case it does not, so a dropped agent never outlives the run.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _kill_result = self.child.kill();
+        let _wait_result = self.child.wait();
     }
 }
 

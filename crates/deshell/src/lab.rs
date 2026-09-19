@@ -106,7 +106,7 @@ pub(crate) fn execution_connected(provider: Provider) -> bool {
     matches!(provider, Provider::Podman | Provider::DockerRootless)
 }
 
-pub(crate) fn select(platform: Platform, probe: &dyn Probe) -> Result<Provider, String> {
+pub(crate) fn select<P: Probe>(platform: Platform, probe: &P) -> Result<Provider, String> {
     let chosen = choose(platform, probe);
     // What the probe saw is what decided this, and a run that ends in exit 6
     // says only that nothing was available. The record says which platform was
@@ -121,7 +121,7 @@ pub(crate) fn select(platform: Platform, probe: &dyn Probe) -> Result<Provider, 
     chosen
 }
 
-fn choose(platform: Platform, probe: &dyn Probe) -> Result<Provider, String> {
+fn choose<P: Probe>(platform: Platform, probe: &P) -> Result<Provider, String> {
     match platform {
         // The signed helper is preferred on macOS because it observes macOS as
         // macOS. A container observes Linux, which is the right answer for a step
@@ -175,9 +175,9 @@ fn choose(platform: Platform, probe: &dyn Probe) -> Result<Provider, String> {
         reason = "no command names a provider — `select` picks one — so this validates a request nothing makes yet; the tests keep it from drifting away from `select`"
     )
 )]
-pub(crate) fn validate_provider(
+pub(crate) fn validate_provider<P: Probe>(
     platform: Platform,
-    probe: &dyn Probe,
+    probe: &P,
     provider: Provider,
 ) -> Result<(), String> {
     match (platform, provider) {
@@ -291,7 +291,10 @@ fn execute_with(
         message,
     })?;
     let LaunchSpec::Process(specification) = specification else {
-        unreachable!("connected providers always use the supervised process transport")
+        return Err(ExecutionFailure {
+            kind: ExecutionFailureKind::Unavailable,
+            message: "connected provider did not produce a supervised process launch".into(),
+        });
     };
     let root = Path::new(&request.workspace);
     let outer_stdout = request
@@ -910,7 +913,7 @@ mod tests {
     fn selecting_a_provider_records_the_platform_and_the_answer() {
         let recorded = |platform: Platform, probe: &FakeProbe| {
             let text = crate::trace::testing::recorded(|| {
-                let _ = select(platform, probe);
+                drop(select(platform, probe));
             });
             crate::trace::testing::events(&text)
                 .into_iter()
@@ -1442,7 +1445,7 @@ mod tests {
             executable: false,
         }];
         cases.push(value);
-        let mut value = valid_plan.clone();
+        let mut value = valid_plan;
         value.network = Network::Replay {
             proxy: "".into(),
             tape: "tape".into(),

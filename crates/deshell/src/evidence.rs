@@ -58,7 +58,7 @@ pub(crate) enum ObservationStatus {
 impl ObservationStatus {
     /// Whether the observation says the two behaved differently, as opposed to
     /// saying nothing because the run could not be made.
-    pub(crate) fn is_a_difference(&self) -> bool {
+    pub(crate) fn is_a_difference(self) -> bool {
         match self {
             Self::Different => true,
             Self::Verified | Self::Unavailable | Self::Failed | Self::Nondeterministic => false,
@@ -210,7 +210,9 @@ impl Evidence {
                 Guarantee::Residual { reason } if reason.trim().is_empty() => {
                     errors.push("evidence residual reason must not be empty".into());
                 }
-                _ => {}
+                Guarantee::Native { .. }
+                | Guarantee::Delegated { .. }
+                | Guarantee::Residual { .. } => {}
             }
         }
         for observation in &self.observations {
@@ -620,7 +622,7 @@ mod tests {
         );
         assert_eq!(evidence.observations.len(), 1);
 
-        let mut invalid_plan = plan.clone();
+        let mut invalid_plan = plan;
         invalid_plan.generator.clear();
         evidence.nodes.clear();
         let errors = evidence

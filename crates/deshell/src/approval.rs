@@ -47,7 +47,7 @@ impl ReviewStatus {
     /// A method rather than `== ReviewStatus::Approved` at each site: `==` is
     /// outside the exhaustiveness check a `match` gets, so a status added later
     /// compiles everywhere and answers "no" everywhere.
-    pub(crate) fn is_current(&self) -> bool {
+    pub(crate) fn is_current(self) -> bool {
         match self {
             Self::Approved => true,
             Self::Draft | Self::Stale => false,
@@ -426,7 +426,7 @@ fn persist_approval(
     let raw_digest = approval
         .approval_digest
         .strip_prefix("sha256:")
-        .expect("validated pinned digest");
+        .ok_or("approval digest lost its validated sha256 prefix")?;
     let root = canonical_root(root)?;
     let deshell = safe_existing_directory(&root.join(".deshell"))?;
     let approvals = ensure_child_directory(&deshell, "approvals")?;
@@ -480,7 +480,7 @@ fn load_scenarios(root: &Path) -> Result<Vec<(String, crate::config::Scenario)>,
             crate::config::Scenario::decode(&input).map_err(|errors| errors.join("; "))?;
         let relative = path
             .strip_prefix(&root)
-            .map_err(|_| "scenario escaped project root".to_owned())?
+            .map_err(|_error| "scenario escaped project root".to_owned())?
             .to_str()
             .ok_or("scenario path is not UTF-8")?
             .replace('\\', "/");
@@ -528,13 +528,11 @@ fn load_approvals(root: &Path) -> Result<Vec<Approval>, String> {
                 .map_err(|error| format!("cannot read {}: {error}", path.display()))?,
         )?;
         approval.validate()?;
-        let expected = format!(
-            "{}.json",
-            approval
-                .approval_digest
-                .strip_prefix("sha256:")
-                .expect("validated approval digest")
-        );
+        let raw_digest = approval
+            .approval_digest
+            .strip_prefix("sha256:")
+            .ok_or("approval digest lost its validated sha256 prefix")?;
+        let expected = format!("{}.json", raw_digest);
         if path.file_name().and_then(|value| value.to_str()) != Some(expected.as_str()) {
             return Err(format!(
                 "approval filename does not match digest: {}",
@@ -825,6 +823,219 @@ mod tests {
     }
 
     #[test]
+    fn draft_inline_reviews_do_not_become_current_without_an_artifact() {
+        let directory = initialized_project();
+        let root = directory.path();
+
+        let (path, scenario) = load_scenarios(root).unwrap().remove(0);
+        assert_eq!(scenario.approval, crate::config::ScenarioApproval::Draft);
+        assert_eq!(scenario_approval(root, &path, &scenario).unwrap(), None);
+
+        let config = crate::project::load_config(root).unwrap();
+        let cell = config.platform_cells.first().unwrap();
+        assert_eq!(cell.approval, crate::config::Approval::Draft);
+        assert_eq!(matrix_approval(root, cell).unwrap(), None);
+
+        let mut location = crate::config::DeclaredShell {
+            path: "scripts/build.sh".into(),
+            start_byte: 10,
+            end_byte: 20,
+            reason: "fixture".into(),
+            approval: crate::config::Approval::Draft,
+        };
+        assert_eq!(declared_shell_approval(root, &location).unwrap(), None);
+
+        location.approval = crate::config::Approval::Approved;
+        let subject = Subject::DeclaredShell {
+            path: location.path.clone(),
+            start_byte: location.start_byte,
+            end_byte: location.end_byte,
+        };
+        let expected = signed_approval(subject, declared_shell_review_digest(&location).unwrap())
+            .unwrap()
+            .approval_digest;
+        assert_eq!(
+            declared_shell_approval(root, &location).unwrap(),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn review_status_and_declared_shell_helpers_name_every_current_state() {
+        assert!(!ReviewStatus::Draft.is_current());
+        assert!(ReviewStatus::Approved.is_current());
+        assert!(!ReviewStatus::Stale.is_current());
+
+        let directory = initialized_project();
+        let root = directory.path();
+        let config_path = root.join(".deshell/project.toml");
+        let mut config = std::fs::read_to_string(&config_path).unwrap();
+        config.push_str(
+            "\n[[declared_shell]]\npath = \"build.sh\"\nstart_byte = 0\nend_byte = 4\nreason = \"fixture\"\napproval = \"draft\"\n",
+        );
+        std::fs::write(config_path, config).unwrap();
+
+        let reviews = declared_shell_reviews(root).unwrap();
+        assert_eq!(reviews.len(), 1);
+        let review = &reviews[0];
+        assert_eq!(review.kind, "declared");
+        assert_eq!(review.name, "build.sh@0..4");
+        assert_eq!(review.path.as_deref(), Some("build.sh"));
+        assert_eq!(review.status, ReviewStatus::Draft);
+        assert_eq!(review.approval_digest, None);
+
+        let approval = approve_declared_shell(root, &review.name, &review.digest).unwrap();
+        assert_eq!(
+            approval.subject,
+            Subject::DeclaredShell {
+                path: "build.sh".into(),
+                start_byte: 0,
+                end_byte: 4,
+            }
+        );
+        let approved = declared_shell_reviews(root).unwrap();
+        assert_eq!(approved.len(), 1);
+        assert_eq!(approved[0].status, ReviewStatus::Approved);
+        assert_eq!(
+            approved[0].approval_digest.as_deref(),
+            Some(approval.approval_digest.as_str())
+        );
+    }
+
+    #[test]
+    fn approval_decision_trace_names_every_subject_and_status() {
+        let scenario = Subject::Scenario {
+            name: "scenario".into(),
+            path: ".deshell/scenarios/scenario.toml".into(),
+        };
+        let matrix = Subject::Matrix {
+            id: "linux-x86_64-native".into(),
+        };
+        let declared = Subject::DeclaredShell {
+            path: "scripts/build.sh".into(),
+            start_byte: 10,
+            end_byte: 20,
+        };
+        let current_digest = format!("sha256:{}", "a".repeat(64));
+        let changed_digest = format!("sha256:{}", "b".repeat(64));
+        let approvals = vec![
+            signed_approval(matrix.clone(), current_digest.clone()).unwrap(),
+            signed_approval(declared.clone(), current_digest.clone()).unwrap(),
+        ];
+
+        let trace = crate::trace::testing::recorded(|| {
+            assert_eq!(
+                review_state(&approvals, &scenario, &current_digest, false)
+                    .unwrap()
+                    .0,
+                ReviewStatus::Draft
+            );
+            assert_eq!(
+                review_state(&approvals, &matrix, &current_digest, false)
+                    .unwrap()
+                    .0,
+                ReviewStatus::Approved
+            );
+            assert_eq!(
+                review_state(&approvals, &declared, &changed_digest, false)
+                    .unwrap()
+                    .0,
+                ReviewStatus::Stale
+            );
+        });
+        let decisions = crate::trace::testing::events(&trace)
+            .into_iter()
+            .filter(|event| event["event"] == "approval_decision")
+            .map(|event| {
+                (
+                    event["subject"].as_str().unwrap().to_owned(),
+                    event["digest"].as_str().unwrap().to_owned(),
+                    event["status"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            decisions,
+            vec![
+                ("scenario".into(), current_digest.clone(), "draft".into()),
+                ("matrix".into(), current_digest, "approved".into()),
+                ("declared_shell".into(), changed_digest, "stale".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn approval_loaders_refuse_each_unsafe_filesystem_shape() {
+        let missing = tempfile::tempdir().unwrap();
+        assert!(load_approvals(missing.path()).unwrap().is_empty());
+
+        let scenarios = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(scenarios.path().join(".deshell/scenarios/bad.toml")).unwrap();
+        let error = load_scenarios(scenarios.path()).unwrap_err();
+        assert!(error.contains("unsafe scenario file"), "{error}");
+
+        let broken_parent = tempfile::tempdir().unwrap();
+        std::fs::create_dir(broken_parent.path().join(".deshell")).unwrap();
+        std::fs::write(
+            broken_parent.path().join(".deshell/approvals"),
+            b"not a directory",
+        )
+        .unwrap();
+        let error = load_approvals(broken_parent.path()).unwrap_err();
+        assert!(error.contains("cannot inspect"), "{error}");
+
+        let unsafe_directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(unsafe_directory.path().join(".deshell/approvals")).unwrap();
+        std::fs::write(
+            unsafe_directory.path().join(".deshell/approvals/sha256"),
+            b"not a directory",
+        )
+        .unwrap();
+        let error = load_approvals(unsafe_directory.path()).unwrap_err();
+        assert!(error.contains("approval directory is unsafe"), "{error}");
+
+        let unsafe_artifact = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(
+            unsafe_artifact
+                .path()
+                .join(".deshell/approvals/sha256/not-an-artifact.json"),
+        )
+        .unwrap();
+        let error = load_approvals(unsafe_artifact.path()).unwrap_err();
+        assert!(error.contains("approval artifact is unsafe"), "{error}");
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let error = canonical_root(file.path()).unwrap_err();
+        assert!(
+            error.contains("project root is not a regular non-symlink directory"),
+            "{error}"
+        );
+        let error = safe_existing_directory(file.path()).unwrap_err();
+        assert!(error.contains("path is not a safe directory"), "{error}");
+    }
+
+    #[test]
+    fn portable_ids_cover_every_boundary() {
+        for valid in ["a", "a.b_c-d9"] {
+            assert!(portable_id(valid), "{valid}");
+        }
+        assert!(portable_id(&"a".repeat(128)));
+
+        for invalid in [
+            String::new(),
+            "a".repeat(129),
+            "-leading".into(),
+            ".leading".into(),
+            "_leading".into(),
+            "a/slash".into(),
+            "a space".into(),
+            "non-ascii-é".into(),
+        ] {
+            assert!(!portable_id(&invalid), "{invalid:?}");
+        }
+    }
+
+    #[test]
     fn approval_requires_the_displayed_digest_and_becomes_stale_after_change() {
         let directory = initialized_project();
         let review = scenario_reviews(directory.path()).unwrap().remove(0);
@@ -837,6 +1048,11 @@ mod tests {
         assert!(!directory.path().join(".deshell/approvals").exists());
 
         let approval = approve_scenario(directory.path(), &review.name, &review.digest).unwrap();
+        let (scenario_path, scenario) = load_scenarios(directory.path()).unwrap().remove(0);
+        assert_eq!(
+            scenario_approval(directory.path(), &scenario_path, &scenario).unwrap(),
+            Some(approval.approval_digest.clone())
+        );
         assert_eq!(
             scenario_reviews(directory.path()).unwrap()[0].status,
             ReviewStatus::Approved
@@ -863,10 +1079,16 @@ mod tests {
         );
 
         let matrix = matrix_reviews(directory.path()).unwrap().remove(0);
-        approve_matrix(directory.path(), &matrix.name, &matrix.digest).unwrap();
+        let matrix_approval_record =
+            approve_matrix(directory.path(), &matrix.name, &matrix.digest).unwrap();
         assert_eq!(
             matrix_reviews(directory.path()).unwrap()[0].status,
             ReviewStatus::Approved
+        );
+        let config = crate::project::load_config(directory.path()).unwrap();
+        assert_eq!(
+            matrix_approval(directory.path(), &config.platform_cells[0]).unwrap(),
+            Some(matrix_approval_record.approval_digest)
         );
         let config_path = directory.path().join(".deshell/project.toml");
         let changed = std::fs::read_to_string(&config_path)
@@ -876,6 +1098,11 @@ mod tests {
         assert_eq!(
             matrix_reviews(directory.path()).unwrap()[0].status,
             ReviewStatus::Stale
+        );
+        let config = crate::project::load_config(directory.path()).unwrap();
+        assert_eq!(
+            matrix_approval(directory.path(), &config.platform_cells[0]).unwrap(),
+            None
         );
     }
 

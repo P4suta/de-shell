@@ -221,7 +221,7 @@ impl Report {
     /// Emitted beside the canonical values rather than instead of them: a
     /// consumer that already knows the shape reads the same fields it always
     /// did.
-    pub(crate) fn emit_agent(&self, root: &Path, writer: &mut dyn Write) -> Result<(), String> {
+    pub(crate) fn emit_agent<W: Write>(&self, root: &Path, writer: &mut W) -> Result<(), String> {
         let mut value = serde_json::to_value(self).map_err(|error| error.to_string())?;
         let object = value
             .as_object_mut()
@@ -260,7 +260,7 @@ impl Report {
             .map_err(|error| error.to_string())
     }
 
-    pub(crate) fn emit_json(&self, writer: &mut dyn Write) -> Result<(), String> {
+    pub(crate) fn emit_json<W: Write>(&self, writer: &mut W) -> Result<(), String> {
         let value = serde_json::to_value(self).map_err(|error| error.to_string())?;
         writer
             .write_all(&crate::canonical_json::pretty_bytes(&value)?)
@@ -276,7 +276,7 @@ impl Report {
             .and_then(|item| item.name.as_deref())
     }
 
-    pub(crate) fn emit_human(&self, writer: &mut dyn Write) -> std::io::Result<()> {
+    pub(crate) fn emit_human<W: Write>(&self, writer: &mut W) -> std::io::Result<()> {
         // A failed command names its code once, on the line that says what
         // happened. The code used to arrive as a second output line repeating
         // the summary verbatim.

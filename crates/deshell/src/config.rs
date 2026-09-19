@@ -286,7 +286,7 @@ pub(crate) enum DelegationPolicy {
     Pinned,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum UnknownInterpreter {
     TraceOnly,
@@ -1394,7 +1394,8 @@ mod tests {
         );
         assert_eq!(config.limits, ResourceLimits::DEFAULT);
         assert!(!config.sandbox.allow_local);
-        assert!(ProjectConfig::decode(&(text + "future = true\n")).is_err());
+        let extended = format!("{text}future = true\n");
+        assert!(ProjectConfig::decode(&extended).is_err());
     }
 
     #[test]
@@ -1518,7 +1519,8 @@ mod tests {
             assert!(parser.starts_with("sha256:"));
         }
         assert!(Lockfile::decode(&text.replacen("version = 1", "version = 2", 1)).is_err());
-        assert!(Lockfile::decode(&(text.clone() + "migrated_from = 0\n")).is_err());
+        let migrated = format!("{text}migrated_from = 0\n");
+        assert!(Lockfile::decode(&migrated).is_err());
         let stale_parser =
             text.replacen(&lock.parsers.bash, &format!("sha256:{}", "a".repeat(64)), 1);
         assert!(
@@ -1587,11 +1589,15 @@ mod tests {
 
     #[test]
     fn scenario_rejects_fixture_traversal_and_bad_digest() {
-        let traversal = Scenario::default_text()
-            + "\n[[fixtures]]\npath = \"../outside\"\ncontents = { utf8 = \"bad\" }\n";
+        let traversal = format!(
+            "{}\n[[fixtures]]\npath = \"../outside\"\ncontents = {{ utf8 = \"bad\" }}\n",
+            Scenario::default_text()
+        );
         assert!(Scenario::decode(&traversal).is_err());
-        let digest =
-            Scenario::default_text() + "\n[[expect.files]]\npath = \"out.txt\"\nsha256 = \"abc\"\n";
+        let digest = format!(
+            "{}\n[[expect.files]]\npath = \"out.txt\"\nsha256 = \"abc\"\n",
+            Scenario::default_text()
+        );
         assert!(Scenario::decode(&digest).is_err());
     }
 

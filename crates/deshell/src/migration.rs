@@ -195,7 +195,7 @@ impl EvidenceStatus {
     /// A method rather than `== EvidenceStatus::Verified`: a status added later
     /// is not verification, and `==` would let it pass as "not verified"
     /// without anybody deciding that it should.
-    pub(crate) fn is_verified(&self) -> bool {
+    pub(crate) fn is_verified(self) -> bool {
         match self {
             Self::Verified => true,
             Self::Different | Self::Unavailable | Self::Failed | Self::Nondeterministic => false,
@@ -644,7 +644,7 @@ pub(crate) fn create_plan(root: &Path) -> Result<PlanOutput, String> {
         let kind = match finding.kind {
             crate::scanner::FindingKind::ShellFile => SourceKind::ShellFile,
             crate::scanner::FindingKind::EmbeddedShell => SourceKind::EmbeddedShell,
-            crate::scanner::FindingKind::Candidate => unreachable!(),
+            crate::scanner::FindingKind::Candidate => continue,
         };
         let wrapper_target = wrapper_targets.get(&location);
         if finding.interpreter.as_deref() == Some("package-shell") && wrapper_target.is_none() {
@@ -659,7 +659,7 @@ pub(crate) fn create_plan(root: &Path) -> Result<PlanOutput, String> {
             continue;
         }
         let source_interpreter = resolved_finding_interpreter(finding)?;
-        let plan = lower_finding(finding, config.policy.unknown_interpreter.clone())?;
+        let plan = lower_finding(finding, config.policy.unknown_interpreter)?;
         add_scenario_input_coverage_blockers(
             &plan,
             &approved_scenario_values,
@@ -1246,7 +1246,9 @@ fn build_request_and_proposal(
             host_additional_files = host.additional_files;
             host.bytes
         }
-        crate::config::MigrationTarget::Agent => unreachable!(),
+        crate::config::MigrationTarget::Agent => {
+            return Err("DESHELL_BLOCKER_GENERATOR_POLICY: agent target requires a digest-pinned external generator".into());
+        }
     };
     // Checked after generating, not before, because two proposals writing one
     // path are only a conflict when they write different bytes.
@@ -1281,7 +1283,9 @@ fn build_request_and_proposal(
             host_build_argv.ok_or("host generator omitted exact build argv")?,
             host_run_argv.ok_or("host generator omitted exact run argv")?,
         ),
-        crate::config::MigrationTarget::Agent => unreachable!(),
+        crate::config::MigrationTarget::Agent => {
+            return Err("DESHELL_BLOCKER_GENERATOR_POLICY: agent target requires a digest-pinned external generator".into());
+        }
     };
     let generator_digest = official_generator_digest();
     let mut node_ids = Vec::new();
@@ -1355,6 +1359,7 @@ fn build_request_and_proposal(
 /// many-argument function stays invisible to every call site that already
 /// compiles. [`official_call_site_patches`] takes this apart without `..`, so a field added here fails
 /// to compile until somebody gives it a destination.
+#[derive(Clone, Copy)]
 struct OfficialCallSitePatchesArgs<'a> {
     root: &'a Path,
     config: &'a crate::config::ProjectConfig,
@@ -1461,9 +1466,9 @@ fn official_call_site_patches(
                 continue;
             }
             let start = usize::try_from(location.start_byte)
-                .map_err(|_| "DESHELL_BLOCKER_UNSUPPORTED_CALL_SITE: span is too large")?;
+                .map_err(|_error| "DESHELL_BLOCKER_UNSUPPORTED_CALL_SITE: span is too large")?;
             let end = usize::try_from(location.end_byte)
-                .map_err(|_| "DESHELL_BLOCKER_UNSUPPORTED_CALL_SITE: span is too large")?;
+                .map_err(|_error| "DESHELL_BLOCKER_UNSUPPORTED_CALL_SITE: span is too large")?;
             let fragment = contents.get(start..end).ok_or_else(|| {
                 format!(
                     "DESHELL_BLOCKER_UNSUPPORTED_CALL_SITE: {} span is outside its host file",
@@ -1488,11 +1493,12 @@ fn official_call_site_patches(
 }
 
 fn require_regular_project_file(root: &Path, path: &str, context: &str) -> Result<(), String> {
-    let absolute = crate::project::project_file_path(root, path)
-        .map_err(|_| format!("DESHELL_BLOCKER_UNSUPPORTED_CALL_SITE: {context} requires {path}"))?;
-    let metadata = absolute
-        .symlink_metadata()
-        .map_err(|_| format!("DESHELL_BLOCKER_UNSUPPORTED_CALL_SITE: {context} requires {path}"))?;
+    let absolute = crate::project::project_file_path(root, path).map_err(|_error| {
+        format!("DESHELL_BLOCKER_UNSUPPORTED_CALL_SITE: {context} requires {path}")
+    })?;
+    let metadata = absolute.symlink_metadata().map_err(|_error| {
+        format!("DESHELL_BLOCKER_UNSUPPORTED_CALL_SITE: {context} requires {path}")
+    })?;
     if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
         return Err(format!(
             "DESHELL_BLOCKER_UNSUPPORTED_CALL_SITE: {context} requires a regular {path}"
@@ -1508,7 +1514,7 @@ fn rewrite_static_process_call(
     replacement_argv: &[String],
 ) -> Result<Vec<u8>, String> {
     let text = std::str::from_utf8(fragment)
-        .map_err(|_| format!("DESHELL_BLOCKER_UNSUPPORTED_CALL_SITE: {path} is not UTF-8"))?;
+        .map_err(|_error| format!("DESHELL_BLOCKER_UNSUPPORTED_CALL_SITE: {path} is not UTF-8"))?;
     let lower = path.to_ascii_lowercase();
     if lower.ends_with(".py") {
         rewrite_static_python_call(path, text, retiring_source, replacement_argv)
@@ -1535,6 +1541,7 @@ fn rewrite_static_process_call(
 /// many-argument function stays invisible to every call site that already
 /// compiles. [`rewrite_github_run_call_site`] takes this apart without `..`, so a field added here fails
 /// to compile until somebody gives it a destination.
+#[derive(Clone, Copy)]
 struct RewriteGithubRunCallSiteArgs<'a> {
     path: &'a str,
     contents: &'a [u8],
@@ -1555,9 +1562,9 @@ fn rewrite_github_run_call_site(
         replacement_argv,
     } = parts;
     let start = usize::try_from(location.start_byte)
-        .map_err(|_| "DESHELL_BLOCKER_UNSUPPORTED_CALL_SITE: span is too large")?;
+        .map_err(|_error| "DESHELL_BLOCKER_UNSUPPORTED_CALL_SITE: span is too large")?;
     let end = usize::try_from(location.end_byte)
-        .map_err(|_| "DESHELL_BLOCKER_UNSUPPORTED_CALL_SITE: span is too large")?;
+        .map_err(|_error| "DESHELL_BLOCKER_UNSUPPORTED_CALL_SITE: span is too large")?;
     let fragment = contents.get(start..end).ok_or_else(|| {
         format!("DESHELL_BLOCKER_UNSUPPORTED_CALL_SITE: {path} span is outside its host file")
     })?;
@@ -1570,9 +1577,10 @@ fn rewrite_github_run_call_site(
         .iter()
         .position(|byte| *byte == b'\n')
         .map_or(contents.len(), |index| line_start + index);
-    let first_line = std::str::from_utf8(&contents[line_start..first_line_end]).map_err(|_| {
-        format!("DESHELL_BLOCKER_UNSUPPORTED_CALL_SITE: {path} run line is not UTF-8")
-    })?;
+    let first_line =
+        std::str::from_utf8(&contents[line_start..first_line_end]).map_err(|_error| {
+            format!("DESHELL_BLOCKER_UNSUPPORTED_CALL_SITE: {path} run line is not UTF-8")
+        })?;
     let search_end = if start == line_start {
         first_line.len()
     } else {
@@ -1591,7 +1599,7 @@ fn rewrite_github_run_call_site(
             ));
         }
         let indentation = first_line.len() - first_line.trim_start().len();
-        let body = std::str::from_utf8(&contents[first_line_end + 1..end]).map_err(|_| {
+        let body = std::str::from_utf8(&contents[first_line_end + 1..end]).map_err(|_error| {
             format!("DESHELL_BLOCKER_UNSUPPORTED_CALL_SITE: {path} block scalar is not UTF-8")
         })?;
         if body.lines().any(|line| {
@@ -1609,8 +1617,9 @@ fn rewrite_github_run_call_site(
             lines.join("\n")
         }
     } else {
-        let command = std::str::from_utf8(fragment)
-            .map_err(|_| format!("DESHELL_BLOCKER_UNSUPPORTED_CALL_SITE: {path} is not UTF-8"))?;
+        let command = std::str::from_utf8(fragment).map_err(|_error| {
+            format!("DESHELL_BLOCKER_UNSUPPORTED_CALL_SITE: {path} is not UTF-8")
+        })?;
         let value_start = start - line_start;
         if first_line_end < end
             || !first_line.as_bytes()[key_end..value_start]
@@ -2127,13 +2136,16 @@ fn invoke_external_generator(parts: InvokeExternalGeneratorArgs<'_>) -> Result<P
             "validation": validation
         }
     });
+    let frame_limit = usize::try_from(handshake.max_frame_bytes).map_err(|_error| {
+        "external generator frame limit exceeds this platform's address space".to_owned()
+    })?;
     let proposal_result = execute_external_rpc(ExecuteExternalRpcArgs {
         root: isolated.path(),
         executable: &copied,
         request: &propose_request,
         id: &serde_json::json!("proposal"),
         project_limits: config.limits,
-        frame_limit: handshake.max_frame_bytes as usize,
+        frame_limit,
     });
     ensure_isolated_tree_unchanged(isolated.path(), &baseline)?;
     ensure_guarded_project_tree_unchanged(root, &project_baseline)?;
@@ -2193,6 +2205,7 @@ fn validate_external_handshake(
 /// many-argument function stays invisible to every call site that already
 /// compiles. [`execute_external_rpc`] takes this apart without `..`, so a field added here fails
 /// to compile until somebody gives it a destination.
+#[derive(Clone, Copy)]
 struct ExecuteExternalRpcArgs<'a> {
     root: &'a Path,
     executable: &'a Path,
@@ -2267,6 +2280,7 @@ fn execute_external_rpc(parts: ExecuteExternalRpcArgs<'_>) -> Result<serde_json:
 /// many-argument function stays invisible to every call site that already
 /// compiles. [`validate_external_proposal`] takes this apart without `..`, so a field added here fails
 /// to compile until somebody gives it a destination.
+#[derive(Clone, Copy)]
 struct ValidateExternalProposalArgs<'a> {
     root: &'a Path,
     registration: &'a crate::config::ExternalGenerator,
@@ -2350,7 +2364,7 @@ fn isolated_tree_digest(root: &Path) -> Result<String, String> {
         let relative = entry
             .path()
             .strip_prefix(root)
-            .map_err(|_| "generator isolation path escaped its root")?
+            .map_err(|_error| "generator isolation path escaped its root")?
             .to_str()
             .ok_or("generator isolation path is not UTF-8")?
             .replace('\\', "/");
@@ -2424,7 +2438,7 @@ fn guarded_project_tree_digest(root: &Path) -> Result<String, String> {
         let relative = entry
             .path()
             .strip_prefix(&root)
-            .map_err(|_| "guarded project path escaped its root")?
+            .map_err(|_error| "guarded project path escaped its root")?
             .to_str()
             .ok_or("guarded project path is not UTF-8")?
             .replace('\\', "/");
@@ -2541,7 +2555,7 @@ pub(crate) fn generator_propose(
         crate::config::MigrationTarget::Rust => generate_rust(&plan)?,
         crate::config::MigrationTarget::Go => generate_go(&plan)?,
         crate::config::MigrationTarget::Host | crate::config::MigrationTarget::Agent => {
-            unreachable!()
+            return Err("official generator RPC currently accepts Rust or Go requests".into());
         }
     };
     let verification_output = verification_binary_path(&stem, std::env::consts::OS);
@@ -2562,7 +2576,7 @@ pub(crate) fn generator_propose(
             vec![verification_output],
         ),
         crate::config::MigrationTarget::Host | crate::config::MigrationTarget::Agent => {
-            unreachable!()
+            return Err("official generator RPC currently accepts Rust or Go requests".into());
         }
     };
     let mut node_ids = Vec::new();
@@ -2755,7 +2769,7 @@ fn github_run_replacement(
         .position(|byte| *byte == b'\n')
         .map_or(host.len(), |index| line_start + index);
     let first_line = std::str::from_utf8(&host[line_start..first_line_end])
-        .map_err(|_| "GitHub workflow run line is not UTF-8")?;
+        .map_err(|_error| "GitHub workflow run line is not UTF-8")?;
     let key = first_line
         .rfind("run:")
         .ok_or("DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: GitHub shell span is not a run step")?;
@@ -2966,7 +2980,7 @@ fn generate_github_action_host(
                 .into(),
         );
     }
-    let mut bytes = host.clone();
+    let mut bytes = host;
     for (start, end, uses) in &replacements {
         let mut rewritten = Vec::with_capacity(bytes.len() - (end - start) + uses.len());
         rewritten.extend_from_slice(&bytes[..*start]);
@@ -3256,7 +3270,37 @@ fn literal_exec_sequence(
         crate::ir::Operation::Sequence { nodes, on_failure } => {
             (nodes.iter().collect(), *on_failure)
         }
-        other => {
+        other @ crate::ir::Operation::ExpandWords { .. }
+        | other @ crate::ir::Operation::Redirect { .. }
+        | other @ crate::ir::Operation::Pipeline { .. }
+        | other @ crate::ir::Operation::Parallel { .. }
+        | other @ crate::ir::Operation::WriteStdout { .. }
+        | other @ crate::ir::Operation::Exit { .. }
+        | other @ crate::ir::Operation::NoOp
+        | other @ crate::ir::Operation::Test { .. }
+        | other @ crate::ir::Operation::While { .. }
+        | other @ crate::ir::Operation::Not { .. }
+        | other @ crate::ir::Operation::Match { .. }
+        | other @ crate::ir::Operation::Foreach { .. }
+        | other @ crate::ir::Operation::Scope { .. }
+        | other @ crate::ir::Operation::TryFinally { .. }
+        | other @ crate::ir::Operation::TaskCall { .. }
+        | other @ crate::ir::Operation::SetEnvironment { .. }
+        | other @ crate::ir::Operation::SetWorkingDirectory { .. }
+        | other @ crate::ir::Operation::CaptureStdout { .. }
+        | other @ crate::ir::Operation::Spawn { .. }
+        | other @ crate::ir::Operation::Wait { .. }
+        | other @ crate::ir::Operation::SendSignal { .. }
+        | other @ crate::ir::Operation::FileRead { .. }
+        | other @ crate::ir::Operation::FileWrite { .. }
+        | other @ crate::ir::Operation::FileRemove { .. }
+        | other @ crate::ir::Operation::FileMetadata { .. }
+        | other @ crate::ir::Operation::FileSetMetadata { .. }
+        | other @ crate::ir::Operation::NetworkRequest { .. }
+        | other @ crate::ir::Operation::ClockRead { .. }
+        | other @ crate::ir::Operation::RandomBytes { .. }
+        | other @ crate::ir::Operation::InterpreterCall { .. }
+        | other @ crate::ir::Operation::OpaqueCapsule { .. } => {
             return Err(format!(
                 "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: {context} runs commands in order, and this is {}",
                 other.name()
@@ -3345,7 +3389,7 @@ fn flatten_literal_commands(
             non_numeric: _,
         } => {
             let status = literal_text_expression(status)?;
-            let status = status.trim().parse::<i64>().map_err(|_| {
+            let status = status.trim().parse::<i64>().map_err(|_error| {
                 format!("DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: {context} ends with a status that is not an integer")
             })?;
             // Measured and recorded in
@@ -3379,7 +3423,9 @@ fn flatten_literal_commands(
             && matches!(predicate.operation, crate::ir::Operation::Test { .. }) =>
         {
             let crate::ir::Operation::Test { predicate } = &predicate.operation else {
-                unreachable!("shape checked above")
+                return Err(format!(
+                    "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: {context} condition changed shape while generating"
+                ));
             };
             let mut body = Vec::new();
             flatten_literal_commands(if_true, on_failure, context, &mut body)?;
@@ -3397,7 +3443,37 @@ fn flatten_literal_commands(
             flatten_literal_commands(predicate, on_failure, context, steps)?;
             flatten_literal_commands(if_true, on_failure, context, steps)
         }
-        other => Err(format!(
+        other @ crate::ir::Operation::ExpandWords { .. }
+        | other @ crate::ir::Operation::Redirect { .. }
+        | other @ crate::ir::Operation::Pipeline { .. }
+        | other @ crate::ir::Operation::Sequence { .. }
+        | other @ crate::ir::Operation::Parallel { .. }
+        | other @ crate::ir::Operation::NoOp
+        | other @ crate::ir::Operation::Condition { .. }
+        | other @ crate::ir::Operation::Test { .. }
+        | other @ crate::ir::Operation::While { .. }
+        | other @ crate::ir::Operation::Not { .. }
+        | other @ crate::ir::Operation::Match { .. }
+        | other @ crate::ir::Operation::Foreach { .. }
+        | other @ crate::ir::Operation::Scope { .. }
+        | other @ crate::ir::Operation::TryFinally { .. }
+        | other @ crate::ir::Operation::TaskCall { .. }
+        | other @ crate::ir::Operation::SetEnvironment { .. }
+        | other @ crate::ir::Operation::SetWorkingDirectory { .. }
+        | other @ crate::ir::Operation::CaptureStdout { .. }
+        | other @ crate::ir::Operation::Spawn { .. }
+        | other @ crate::ir::Operation::Wait { .. }
+        | other @ crate::ir::Operation::SendSignal { .. }
+        | other @ crate::ir::Operation::FileRead { .. }
+        | other @ crate::ir::Operation::FileWrite { .. }
+        | other @ crate::ir::Operation::FileRemove { .. }
+        | other @ crate::ir::Operation::FileMetadata { .. }
+        | other @ crate::ir::Operation::FileSetMetadata { .. }
+        | other @ crate::ir::Operation::NetworkRequest { .. }
+        | other @ crate::ir::Operation::ClockRead { .. }
+        | other @ crate::ir::Operation::RandomBytes { .. }
+        | other @ crate::ir::Operation::InterpreterCall { .. }
+        | other @ crate::ir::Operation::OpaqueCapsule { .. } => Err(format!(
             "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: {context} runs commands, and this step holds {}",
             other.name()
         )),
@@ -3468,7 +3544,7 @@ fn host_word(word: &crate::ir::TextExpression, context: &str) -> Result<HostWord
     match word.parts.as_slice() {
         [crate::ir::TextPart::Variable { name }] => Ok(HostWord::Variable(name.clone())),
         _ => Ok(HostWord::Literal(literal_text_expression(word).map_err(
-            |_| {
+            |_error| {
                 format!(
                     "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: {context} carries literal words and whole variables"
                 )
@@ -3515,14 +3591,14 @@ fn structured_host_span<'a>(
     finding: &crate::scanner::Finding,
 ) -> Result<(usize, usize, &'a str), String> {
     let start = usize::try_from(finding.span.start_byte)
-        .map_err(|_| "structured host start offset is too large")?;
+        .map_err(|_error| "structured host start offset is too large")?;
     let end = usize::try_from(finding.span.end_byte)
-        .map_err(|_| "structured host end offset is too large")?;
+        .map_err(|_error| "structured host end offset is too large")?;
     if start > end || end > host.len() {
         return Err("structured host source span is outside the document".into());
     }
     let original = std::str::from_utf8(&host[start..end])
-        .map_err(|_| "structured host source span is not UTF-8")?;
+        .map_err(|_error| "structured host source span is not UTF-8")?;
     Ok((start, end, original))
 }
 
@@ -3532,6 +3608,7 @@ fn structured_host_span<'a>(
 /// many-argument function stays invisible to every call site that already
 /// compiles. [`replace_structured_host_span`] takes this apart without `..`, so a field added here fails
 /// to compile until somebody gives it a destination.
+#[derive(Clone, Copy)]
 struct ReplaceStructuredHostSpanArgs<'a> {
     host: &'a [u8],
     finding: &'a crate::scanner::Finding,
@@ -3597,14 +3674,14 @@ fn generate_docker_host(
     let host = std::fs::read(&path)
         .map_err(|error| format!("cannot read structured host {}: {error}", finding.path))?;
     let start = usize::try_from(finding.span.start_byte)
-        .map_err(|_| "structured host start offset is too large")?;
+        .map_err(|_error| "structured host start offset is too large")?;
     let end = usize::try_from(finding.span.end_byte)
-        .map_err(|_| "structured host end offset is too large")?;
+        .map_err(|_error| "structured host end offset is too large")?;
     if start > end || end > host.len() {
         return Err("structured host source span is outside the document".into());
     }
     let original = std::str::from_utf8(&host[start..end])
-        .map_err(|_| "structured host source span is not UTF-8")?;
+        .map_err(|_error| "structured host source span is not UTF-8")?;
     let indentation = &original[..original.len() - original.trim_start().len()];
     let json = serde_json::to_string(&argv).map_err(|error| error.to_string())?;
     let replacement = format!("{indentation}RUN {json}");
@@ -3663,7 +3740,7 @@ fn resolved_finding_interpreter(finding: &crate::scanner::Finding) -> Result<Str
     })?;
     if configured == "package-shell" {
         let command = std::str::from_utf8(&finding.source).map_err(
-            |_| "DESHELL_BLOCKER_UNIMPLEMENTED_HOST_INTERFACE: package script is not UTF-8",
+            |_error| "DESHELL_BLOCKER_UNIMPLEMENTED_HOST_INTERFACE: package script is not UTF-8",
         )?;
         let argv = static_shell_words(command).map_err(|message| {
             format!("DESHELL_BLOCKER_UNIMPLEMENTED_HOST_INTERFACE: package script {message}")
@@ -3791,7 +3868,7 @@ fn classify_coverage(plan: &crate::ir::Plan, source_bytes: usize) -> Coverage {
             1 => coverage.native_bytes += 1,
             2 => coverage.delegated_bytes += 1,
             3 => coverage.residual_bytes += 1,
-            _ => unreachable!(),
+            _ => coverage.residual_bytes += 1,
         }
     }
     coverage
@@ -3960,7 +4037,7 @@ struct ReplayRequest {
 
 fn load_network_replay(root: &Path) -> Result<(crate::replay::ReplayStore, String), String> {
     let path = crate::project::project_file_path(root, ".deshell/replay.json")
-        .map_err(|_| ".deshell/replay.json is missing or unsafe".to_owned())?;
+        .map_err(|_error| ".deshell/replay.json is missing or unsafe".to_owned())?;
     let metadata = path
         .symlink_metadata()
         .map_err(|error| format!("cannot inspect network replay: {error}"))?;
@@ -4033,7 +4110,39 @@ fn network_replay_requests(plan: &crate::ir::Plan) -> Result<Vec<ReplayRequest>,
                     return Err(format!("network replay does not support {name}"));
                 }
             }
-            _ => {}
+            crate::ir::Operation::ExpandWords { .. }
+            | crate::ir::Operation::Redirect { .. }
+            | crate::ir::Operation::Pipeline { .. }
+            | crate::ir::Operation::Sequence { .. }
+            | crate::ir::Operation::Parallel { .. }
+            | crate::ir::Operation::WriteStdout { .. }
+            | crate::ir::Operation::Exit { .. }
+            | crate::ir::Operation::NoOp
+            | crate::ir::Operation::Condition { .. }
+            | crate::ir::Operation::Test { .. }
+            | crate::ir::Operation::While { .. }
+            | crate::ir::Operation::Not { .. }
+            | crate::ir::Operation::Match { .. }
+            | crate::ir::Operation::Foreach { .. }
+            | crate::ir::Operation::Scope { .. }
+            | crate::ir::Operation::TryFinally { .. }
+            | crate::ir::Operation::TaskCall { .. }
+            | crate::ir::Operation::SetVariable { .. }
+            | crate::ir::Operation::SetEnvironment { .. }
+            | crate::ir::Operation::SetWorkingDirectory { .. }
+            | crate::ir::Operation::CaptureStdout { .. }
+            | crate::ir::Operation::Spawn { .. }
+            | crate::ir::Operation::Wait { .. }
+            | crate::ir::Operation::SendSignal { .. }
+            | crate::ir::Operation::FileRead { .. }
+            | crate::ir::Operation::FileWrite { .. }
+            | crate::ir::Operation::FileRemove { .. }
+            | crate::ir::Operation::FileMetadata { .. }
+            | crate::ir::Operation::FileSetMetadata { .. }
+            | crate::ir::Operation::ClockRead { .. }
+            | crate::ir::Operation::RandomBytes { .. }
+            | crate::ir::Operation::InterpreterCall { .. }
+            | crate::ir::Operation::OpaqueCapsule { .. } => {}
         }
         let mut error = None;
         visit_node(node, |child| {
@@ -4127,7 +4236,39 @@ fn network_effects(plan: &crate::ir::Plan) -> Vec<(String, Option<Location>)> {
                     .contains(&name.as_str())
                     .then_some(name)
                 }),
-            _ => None,
+            crate::ir::Operation::ExpandWords { .. }
+            | crate::ir::Operation::Redirect { .. }
+            | crate::ir::Operation::Pipeline { .. }
+            | crate::ir::Operation::Sequence { .. }
+            | crate::ir::Operation::Parallel { .. }
+            | crate::ir::Operation::WriteStdout { .. }
+            | crate::ir::Operation::Exit { .. }
+            | crate::ir::Operation::NoOp
+            | crate::ir::Operation::Condition { .. }
+            | crate::ir::Operation::Test { .. }
+            | crate::ir::Operation::While { .. }
+            | crate::ir::Operation::Not { .. }
+            | crate::ir::Operation::Match { .. }
+            | crate::ir::Operation::Foreach { .. }
+            | crate::ir::Operation::Scope { .. }
+            | crate::ir::Operation::TryFinally { .. }
+            | crate::ir::Operation::TaskCall { .. }
+            | crate::ir::Operation::SetVariable { .. }
+            | crate::ir::Operation::SetEnvironment { .. }
+            | crate::ir::Operation::SetWorkingDirectory { .. }
+            | crate::ir::Operation::CaptureStdout { .. }
+            | crate::ir::Operation::Spawn { .. }
+            | crate::ir::Operation::Wait { .. }
+            | crate::ir::Operation::SendSignal { .. }
+            | crate::ir::Operation::FileRead { .. }
+            | crate::ir::Operation::FileWrite { .. }
+            | crate::ir::Operation::FileRemove { .. }
+            | crate::ir::Operation::FileMetadata { .. }
+            | crate::ir::Operation::FileSetMetadata { .. }
+            | crate::ir::Operation::ClockRead { .. }
+            | crate::ir::Operation::RandomBytes { .. }
+            | crate::ir::Operation::InterpreterCall { .. }
+            | crate::ir::Operation::OpaqueCapsule { .. } => None,
         };
         if let Some(effect) = effect {
             output.insert((
@@ -4206,8 +4347,6 @@ fn generate_rust(plan: &crate::ir::Plan) -> Result<Vec<u8>, String> {
     // not to define.
     let locals = Locals::of(plan);
     let bodies: Vec<&crate::ir::Node> = plan.tasks.iter().map(|task| &task.body).collect();
-    let any =
-        |predicate: &dyn Fn(&crate::ir::Node) -> bool| bodies.iter().any(|body| predicate(body));
     let mut functions = String::new();
     for other in plan.tasks.iter().filter(|other| other.name != task.name) {
         if !rust_function_name(&other.name) {
@@ -4356,12 +4495,12 @@ fn generate_rust(plan: &crate::ir::Plan) -> Result<Vec<u8>, String> {
     // is not good enough. `deshell_lookup` is written in terms of
     // `deshell_lookup_opt`, so a plain expansion needs both and a default
     // expansion needs only the second.
-    let uses_plain_expansion = any(&|body| {
+    let uses_plain_expansion = bodies.iter().any(|body| {
         node_has_expression_part(body, &|part| {
             matches!(part, crate::ir::TextPart::Variable { .. })
         })
     });
-    let uses_default_expansion = any(&|body| {
+    let uses_default_expansion = bodies.iter().any(|body| {
         node_has_expression_part(body, &|part| {
             matches!(part, crate::ir::TextPart::DefaultValue { .. })
         })
@@ -4955,7 +5094,7 @@ fn emit_rust_node(
             // status and comparing that to zero is the same answer written
             // twice — `if !(a == b) == 0` where the script said `if a = b`.
             if let crate::ir::Operation::Test { predicate } = &predicate.operation
-                && if_false.is_some()
+                && let Some(if_false) = if_false
             {
                 output.push_str(&format!(
                     "{indent}if {} {{\n",
@@ -4963,7 +5102,6 @@ fn emit_rust_node(
                 ));
                 emit_rust_node(if_true, output, depth + 1, locals)?;
                 output.push_str(&format!("\n{indent}}} else {{\n"));
-                let if_false = if_false.as_ref().expect("checked above");
                 emit_rust_node(if_false, output, depth + 1, locals)?;
                 output.push_str(&format!("\n{indent}}}"));
                 return Ok(());
@@ -5038,7 +5176,7 @@ fn emit_rust_node(
                 name = name
             ));
         }
-        other => {
+        other @ crate::ir::Operation::ExpandWords { .. } | other @ crate::ir::Operation::Parallel { .. } | other @ crate::ir::Operation::Foreach { .. } | other @ crate::ir::Operation::Scope { .. } | other @ crate::ir::Operation::TryFinally { .. } | other @ crate::ir::Operation::SetEnvironment { .. } | other @ crate::ir::Operation::SetWorkingDirectory { .. } | other @ crate::ir::Operation::Spawn { .. } | other @ crate::ir::Operation::Wait { .. } | other @ crate::ir::Operation::SendSignal { .. } | other @ crate::ir::Operation::FileRead { .. } | other @ crate::ir::Operation::FileWrite { .. } | other @ crate::ir::Operation::FileRemove { .. } | other @ crate::ir::Operation::FileMetadata { .. } | other @ crate::ir::Operation::FileSetMetadata { .. } | other @ crate::ir::Operation::NetworkRequest { .. } | other @ crate::ir::Operation::ClockRead { .. } | other @ crate::ir::Operation::RandomBytes { .. } | other @ crate::ir::Operation::InterpreterCall { .. } | other @ crate::ir::Operation::OpaqueCapsule { .. } => {
             return Err(format!(
                 "generator cannot preserve {} semantics yet",
                 other.name()
@@ -5674,9 +5812,9 @@ fn rust_node_uses_arguments(node: &crate::ir::Node) -> bool {
 }
 
 /// Whether any expression under `node` has a part the predicate accepts.
-fn node_has_expression_part(
+fn node_has_expression_part<F: Fn(&crate::ir::TextPart) -> bool>(
     node: &crate::ir::Node,
-    wanted: &dyn Fn(&crate::ir::TextPart) -> bool,
+    wanted: &F,
 ) -> bool {
     let expression = |value: &crate::ir::TextExpression| value.parts.iter().any(wanted);
     match &node.operation {
@@ -6690,7 +6828,26 @@ fn emit_go_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> Re
                 name = go_string(name)?
             ));
         }
-        other => {
+        other @ crate::ir::Operation::ExpandWords { .. }
+        | other @ crate::ir::Operation::Parallel { .. }
+        | other @ crate::ir::Operation::Foreach { .. }
+        | other @ crate::ir::Operation::Scope { .. }
+        | other @ crate::ir::Operation::TryFinally { .. }
+        | other @ crate::ir::Operation::SetEnvironment { .. }
+        | other @ crate::ir::Operation::SetWorkingDirectory { .. }
+        | other @ crate::ir::Operation::Spawn { .. }
+        | other @ crate::ir::Operation::Wait { .. }
+        | other @ crate::ir::Operation::SendSignal { .. }
+        | other @ crate::ir::Operation::FileRead { .. }
+        | other @ crate::ir::Operation::FileWrite { .. }
+        | other @ crate::ir::Operation::FileRemove { .. }
+        | other @ crate::ir::Operation::FileMetadata { .. }
+        | other @ crate::ir::Operation::FileSetMetadata { .. }
+        | other @ crate::ir::Operation::NetworkRequest { .. }
+        | other @ crate::ir::Operation::ClockRead { .. }
+        | other @ crate::ir::Operation::RandomBytes { .. }
+        | other @ crate::ir::Operation::InterpreterCall { .. }
+        | other @ crate::ir::Operation::OpaqueCapsule { .. } => {
             return Err(format!(
                 "generator cannot preserve {} semantics yet",
                 other.name()
@@ -6827,7 +6984,7 @@ fn proposal_diff(proposals: &[Proposal]) -> Result<String, String> {
         for patch in &proposal.patches {
             let contents = patch.contents()?;
             let text = std::str::from_utf8(&contents)
-                .map_err(|_| format!("generated patch is not UTF-8: {}", patch.path))?;
+                .map_err(|_error| format!("generated patch is not UTF-8: {}", patch.path))?;
             match patch.operation {
                 PatchOperation::Create => {
                     output.push_str(&format!("--- /dev/null\n+++ b/{}\n", patch.path));
@@ -6871,8 +7028,7 @@ fn persist_plan(
     let request_directory = ensure_child_directory(&directory, "requests")?;
     let ir_directory = ensure_child_directory(&directory, "ir")?;
     let proposal_directory = ensure_child_directory(&directory, "proposals")?;
-    let evidence_directory = ensure_child_directory(&directory, "evidence")?;
-    let _ = evidence_directory;
+    ensure_child_directory(&directory, "evidence")?;
     for request in &artifacts.requests {
         persist_immutable(
             &request_directory.join(format!("{}.json", request.request_id)),
@@ -7988,7 +8144,7 @@ fn embedded_original_invocation(
     snippet: Vec<u8>,
 ) -> Result<EmbeddedOriginalInvocation, String> {
     let snippet = String::from_utf8(snippet)
-        .map_err(|_| "embedded shell verification requires UTF-8 source")?;
+        .map_err(|_error| "embedded shell verification requires UTF-8 source")?;
     if is_github_workflow_path(host) && interpreter == "powershell" {
         // The runner does not hand a pwsh step to `-Command` as text. It writes
         // the step to a file with `$ErrorActionPreference = 'stop'` before it and
@@ -8874,7 +9030,7 @@ impl IrVerifier<'_> {
                 non_numeric: _,
             } => {
                 let text = self.text(status)?;
-                let parsed = text.trim().parse::<i64>().map_err(|_| {
+                let parsed = text.trim().parse::<i64>().map_err(|_error| {
                     // The shells disagree here — bash exits 255 with a message
                     // naming itself, zsh exits 0 in silence — so there is no
                     // status to report that is not one shell impersonating
@@ -9425,8 +9581,12 @@ fn verify_validation_commands(
         return Ok(Vec::new());
     }
     let workspace = crate::workspace::private_snapshot(root)?;
-    let _ = ensure_retirement_directories(workspace.path())?;
-    let _ = ensure_plan_patch_directories(workspace.path(), directory, plan)?;
+    drop(ensure_retirement_directories(workspace.path())?);
+    drop(ensure_plan_patch_directories(
+        workspace.path(),
+        directory,
+        plan,
+    )?);
     let retirement = prepare_retirement(workspace.path(), directory, plan)?;
     crate::patch::apply_all(&retirement)?;
     require_shell_free_tree(workspace.path(), "validation")?;
@@ -9793,8 +9953,12 @@ pub(crate) fn apply(root: &Path, digest: &str) -> Result<(), String> {
     // live tree. The scanner sees generated project-native code but ignores
     // the content-addressed non-execution archive under .deshell.
     let staged = crate::workspace::private_snapshot(root)?;
-    let _ = ensure_retirement_directories(staged.path())?;
-    let _ = ensure_plan_patch_directories(staged.path(), &directory, &plan)?;
+    drop(ensure_retirement_directories(staged.path())?);
+    drop(ensure_plan_patch_directories(
+        staged.path(),
+        &directory,
+        &plan,
+    )?);
     let staged_proposals = prepare_retirement(staged.path(), &directory, &plan)?;
     crate::patch::apply_all(&staged_proposals)?;
     require_shell_free_tree(staged.path(), "staged")?;
@@ -10167,7 +10331,7 @@ fn prepare_retirement(
     }
 
     let mut archive = load_archive_manifest(&root, &plan.plan_digest)?;
-    archive.plan_digest = plan.plan_digest.clone();
+    archive.plan_digest.clone_from(&plan.plan_digest);
     let mut retired_paths = BTreeSet::new();
     let mut retired_locations = BTreeSet::new();
     let mut scheduled_archive_blobs = BTreeSet::new();
@@ -10739,7 +10903,7 @@ pub(crate) fn status(root: &Path) -> Result<Status, String> {
             "shell-free".into(),
         ]
     } else if status.active_state == ActiveState::Blocked && pending_approval_argv.is_some() {
-        pending_approval_argv.expect("checked pending approval argv")
+        pending_approval_argv.ok_or("blocked migration lost its pending approval command")?
     } else {
         match status.active_state {
             ActiveState::Blocked
@@ -11759,12 +11923,11 @@ mod tests {
         assert_eq!(steps.len(), 3, "{inventory:#?}");
 
         let host = std::fs::read(path.join("ci.yml")).unwrap();
-        let rewrite = |step: &crate::scanner::Finding| {
+        let rewrite = |_step: &crate::scanner::Finding| {
             let mut replacements = Vec::new();
             for each in &steps {
                 replacements.push(github_run_replacement(&host, each).unwrap());
             }
-            let _ = step;
             replacements.sort_by_key(|(start, _, _)| std::cmp::Reverse(*start));
             let mut bytes = host.clone();
             for (start, end, uses) in &replacements {
@@ -12887,7 +13050,7 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
                 .contains("only Exec stages")
         );
 
-        let mut metadata = plan.clone();
+        let mut metadata = plan;
         metadata.tasks[0].outputs.push(crate::ir::Binding {
             name: "result".into(),
             value_type: crate::ir::ValueType::Primitive(crate::ir::PrimitiveType::Text),

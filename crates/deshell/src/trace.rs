@@ -109,7 +109,7 @@ impl Event {
 }
 
 struct Recorder {
-    sink: Box<dyn Write + Send>,
+    sink: Sink,
     started: crate::host::Stopwatch,
     /// The thread that installed this recorder.
     ///
@@ -125,6 +125,33 @@ struct Recorder {
     owner: std::thread::ThreadId,
 }
 
+enum Sink {
+    File(std::fs::File),
+    StandardError(std::io::Stderr),
+    #[cfg(test)]
+    Shared(testing::Shared),
+}
+
+impl Write for Sink {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::File(file) => file.write(bytes),
+            Self::StandardError(stderr) => stderr.write(bytes),
+            #[cfg(test)]
+            Self::Shared(shared) => shared.write(bytes),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::File(file) => file.flush(),
+            Self::StandardError(stderr) => stderr.flush(),
+            #[cfg(test)]
+            Self::Shared(shared) => shared.flush(),
+        }
+    }
+}
+
 static RECORDER: Mutex<Option<Recorder>> = Mutex::new(None);
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// Whether anything is recording.
@@ -134,11 +161,7 @@ static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// digest or collect an argv.
 static RECORDING: AtomicBool = AtomicBool::new(false);
 
-/// Begin recording to `sink`.
-///
-/// Replaces any recorder already installed, so a test that installs one gets
-/// its own sequence and cannot read another's events.
-pub(crate) fn start(sink: Box<dyn Write + Send>) {
+fn start(sink: Sink) {
     SEQUENCE.store(0, Ordering::SeqCst);
     let recorder = Recorder {
         sink,
@@ -152,12 +175,27 @@ pub(crate) fn start(sink: Box<dyn Write + Send>) {
     }
 }
 
+/// Begin recording to a file selected by the caller.
+pub(crate) fn start_file(file: std::fs::File) {
+    start(Sink::File(file));
+}
+
+/// Begin recording to standard error, leaving standard output unchanged.
+pub(crate) fn start_standard_error() {
+    start(Sink::StandardError(std::io::stderr()));
+}
+
+#[cfg(test)]
+fn start_shared(shared: testing::Shared) {
+    start(Sink::Shared(shared));
+}
+
 /// Stop recording and release the sink, flushing what is held.
 pub(crate) fn stop() {
     if let Ok(mut held) = RECORDER.lock() {
         RECORDING.store(false, Ordering::SeqCst);
         if let Some(mut recorder) = held.take() {
-            let _ = recorder.sink.flush();
+            let _flush_result = recorder.sink.flush();
         }
     }
 }
@@ -205,7 +243,7 @@ pub(crate) fn record(event: impl FnOnce() -> Event) {
         return;
     };
     line.push(b'\n');
-    let _ = recorder.sink.write_all(&line);
+    let _write_result = recorder.sink.write_all(&line);
 }
 
 /// A path as the trace names it.
@@ -229,25 +267,36 @@ pub(crate) fn path_name(path: &std::path::Path) -> String {
 /// rather than each inventing its own lock and missing the others.
 #[cfg(test)]
 pub(crate) mod testing {
-    use super::{Mutex, start, stop};
+    use super::{Mutex, start_shared, stop};
     use std::io::Write;
     use std::sync::Arc;
 
     static TURN: Mutex<()> = Mutex::new(());
 
+    #[derive(Default)]
+    struct SharedState {
+        bytes: Vec<u8>,
+        flushes: usize,
+    }
+
     #[derive(Clone, Default)]
-    pub(crate) struct Shared(Arc<Mutex<Vec<u8>>>);
+    pub(crate) struct Shared(Arc<Mutex<SharedState>>);
 
     impl Write for Shared {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
             self.0
                 .lock()
                 .unwrap_or_else(|held| held.into_inner())
+                .bytes
                 .extend_from_slice(bytes);
             Ok(bytes.len())
         }
 
         fn flush(&mut self) -> std::io::Result<()> {
+            self.0
+                .lock()
+                .unwrap_or_else(|held| held.into_inner())
+                .flushes += 1;
             Ok(())
         }
     }
@@ -258,10 +307,24 @@ pub(crate) mod testing {
                 self.0
                     .lock()
                     .unwrap_or_else(|held| held.into_inner())
+                    .bytes
                     .clone(),
             )
             .expect("a trace is UTF-8")
         }
+
+        pub(crate) fn flushes(&self) -> usize {
+            self.0
+                .lock()
+                .unwrap_or_else(|held| held.into_inner())
+                .flushes
+        }
+    }
+
+    /// Run work while no other tracing test can replace the process recorder.
+    pub(crate) fn serialized<T>(body: impl FnOnce() -> T) -> T {
+        let _turn = TURN.lock().unwrap_or_else(|held| held.into_inner());
+        body()
     }
 
     /// Run `body` with a recorder installed, and return what it wrote.
@@ -273,12 +336,13 @@ pub(crate) mod testing {
     pub(crate) fn held<T>(body: impl FnOnce() -> T) -> (T, String) {
         // A test that fails while holding the lock poisons it, and the other
         // tracing tests would then fail for a reason that is not theirs.
-        let _turn = TURN.lock().unwrap_or_else(|held| held.into_inner());
-        let sink = Shared::default();
-        start(Box::new(sink.clone()));
-        let answer = body();
-        stop();
-        (answer, sink.text())
+        serialized(|| {
+            let sink = Shared::default();
+            start_shared(sink.clone());
+            let answer = body();
+            stop();
+            (answer, sink.text())
+        })
     }
 
     /// Every record the trace holds, in order.
@@ -293,7 +357,60 @@ pub(crate) mod testing {
 mod tests {
     use super::*;
 
-    use super::testing::{Shared, recorded};
+    use super::testing::{Shared, recorded, serialized};
+
+    #[test]
+    fn stopping_flushes_the_selected_sink() {
+        serialized(|| {
+            let sink = Shared::default();
+            start_shared(sink.clone());
+            assert_eq!(sink.flushes(), 0);
+            stop();
+            assert_eq!(sink.flushes(), 1);
+        });
+    }
+
+    #[test]
+    fn a_file_sink_receives_records() {
+        serialized(|| {
+            let destination = tempfile::NamedTempFile::new().unwrap();
+            start_file(destination.reopen().unwrap());
+            record(|| Event::ClockRead);
+            stop();
+
+            let text = std::fs::read_to_string(destination.path()).unwrap();
+            let events = super::testing::events(&text);
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0]["event"], "clock_read");
+        });
+    }
+
+    #[test]
+    fn standard_error_is_the_selected_sink() {
+        serialized(|| {
+            stop();
+            start_standard_error();
+            let selected = RECORDER
+                .lock()
+                .unwrap_or_else(|held| held.into_inner())
+                .as_ref()
+                .is_some_and(|recorder| matches!(&recorder.sink, Sink::StandardError(_)));
+            stop();
+            assert!(selected);
+        });
+    }
+
+    #[test]
+    fn path_names_canonicalize_existing_paths_and_preserve_missing_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        assert_eq!(
+            path_name(directory.path()),
+            directory.path().canonicalize().unwrap().to_string_lossy()
+        );
+
+        let missing = directory.path().join("not-created");
+        assert_eq!(path_name(&missing), missing.to_string_lossy());
+    }
 
     /// Every event round-trips as one line, and the vocabulary is the one the
     /// enum declares.
@@ -374,7 +491,7 @@ mod tests {
         assert!(before.is_empty(), "{before}");
         // Recording ends with the run, and an event after it is dropped rather
         // than held for whoever records next.
-        start(Box::new(sink.clone()));
+        start_shared(sink.clone());
         stop();
         record(|| Event::ClockRead);
         assert!(sink.text().is_empty(), "{}", sink.text());

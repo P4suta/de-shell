@@ -41,10 +41,10 @@ pub(crate) trait Backend: Sync {
         let mut stdin = Vec::new();
         for (index, mut request) in requests.into_iter().enumerate() {
             if index > 0 {
-                request.stdin = stdin;
+                request.stdin = std::mem::take(&mut stdin);
             }
             let result = self.execute(request)?;
-            stdin = result.stdout.clone();
+            stdin.clone_from(&result.stdout);
             results.push(result);
         }
         Ok(results)
@@ -56,12 +56,47 @@ pub(crate) trait Backend: Sync {
     fn network_request(&self, method: &str, uri: &str) -> Result<Vec<u8>, String>;
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Capability {
+    FileRead,
+    FileWrite,
+    Network,
+    Delegation,
+}
+
+impl Capability {
+    const fn mask(self) -> u8 {
+        match self {
+            Self::FileRead => 1,
+            Self::FileWrite => 1 << 1,
+            Self::Network => 1 << 2,
+            Self::Delegation => 1 << 3,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct Policy {
-    pub allow_file_read: bool,
-    pub allow_file_write: bool,
-    pub allow_network: bool,
-    pub allow_delegation: bool,
+    allowed: u8,
+}
+
+impl Policy {
+    pub(crate) const fn allow(mut self, capability: Capability) -> Self {
+        self.allowed |= capability.mask();
+        self
+    }
+
+    pub(crate) const fn allow_if(self, capability: Capability, condition: bool) -> Self {
+        if condition {
+            self.allow(capability)
+        } else {
+            self
+        }
+    }
+
+    const fn allows(self, capability: Capability) -> bool {
+        self.allowed & capability.mask() != 0
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -159,8 +194,9 @@ pub(crate) struct RunInputs<'a> {
 /// many-argument function stays invisible to every call site that already
 /// compiles. [`run_plan`] takes this apart without `..`, so a field added here fails
 /// to compile until somebody gives it a destination.
-pub(crate) struct RunPlanArgs<'a> {
-    pub(crate) backend: &'a dyn Backend,
+#[derive(Clone, Copy)]
+pub(crate) struct RunPlanArgs<'a, B: Backend> {
+    pub(crate) backend: &'a B,
     pub(crate) policy: Policy,
     pub(crate) plan: &'a Plan,
     pub(crate) host_environment: &'a BTreeMap<String, String>,
@@ -168,7 +204,7 @@ pub(crate) struct RunPlanArgs<'a> {
     pub(crate) arguments: &'a [String],
 }
 
-pub(crate) fn run_plan(parts: RunPlanArgs<'_>) -> Result<RunResult, RunError> {
+pub(crate) fn run_plan<B: Backend>(parts: RunPlanArgs<'_, B>) -> Result<RunResult, RunError> {
     // Destructured without `..`: see `RunPlanArgs`.
     let RunPlanArgs {
         backend,
@@ -192,8 +228,8 @@ pub(crate) fn run_plan(parts: RunPlanArgs<'_>) -> Result<RunResult, RunError> {
     )
 }
 
-pub(crate) fn run_plan_with_io(
-    backend: &dyn Backend,
+pub(crate) fn run_plan_with_io<B: Backend>(
+    backend: &B,
     policy: Policy,
     plan: &Plan,
     inputs: RunInputs<'_>,
@@ -239,8 +275,8 @@ struct Context {
     unset: crate::ir::UnsetPolicy,
 }
 
-struct Executor<'a> {
-    backend: &'a dyn Backend,
+struct Executor<'a, B: Backend> {
+    backend: &'a B,
     policy: Policy,
     tasks: BTreeMap<&'a str, &'a Task>,
     host_environment: &'a BTreeMap<String, String>,
@@ -288,7 +324,7 @@ struct RunTaskArgs<'a> {
     stack: &'a [String],
 }
 
-impl Executor<'_> {
+impl<B: Backend> Executor<'_, B> {
     /// Run a task, and say whether it ended the whole run.
     ///
     /// The flow travels out because `exit` inside a called task ends the script
@@ -444,7 +480,7 @@ impl Executor<'_> {
                     } = self.run_node(RunNodeArgs {
                         node: body,
                         context: next,
-                        stdin: input,
+                        stdin: std::mem::take(&mut input),
                         stack,
                     })?;
                     input = Vec::new();
@@ -502,7 +538,7 @@ impl Executor<'_> {
                 non_numeric: _,
             } => {
                 let text = evaluate(status, &context)?;
-                let parsed = text.trim().parse::<i64>().map_err(|_| {
+                let parsed = text.trim().parse::<i64>().map_err(|_error| {
                     // The shells disagree here — bash exits 255 with a message
                     // naming itself, zsh exits 0 in silence — so there is no
                     // status to report that is not one shell impersonating
@@ -634,7 +670,9 @@ impl Executor<'_> {
                             working_directory,
                         } = &child.operation
                         else {
-                            unreachable!("pipeline shape checked above")
+                            return Err(invalid(
+                                "pipeline changed shape after executable-stage validation",
+                            ));
                         };
                         let argv = evaluate_list(argv, &context)?;
                         if argv.first().is_none_or(String::is_empty) {
@@ -693,7 +731,8 @@ impl Executor<'_> {
                             crate::ir::PipelineStatus::Pipefail if result.exit_code != 0 => {
                                 pipeline_exit = result.exit_code;
                             }
-                            _ => {}
+                            crate::ir::PipelineStatus::Last
+                            | crate::ir::PipelineStatus::Pipefail => {}
                         }
                         trace.push(TraceEvent::Process {
                             argv: trace_argv[index].clone(),
@@ -727,10 +766,10 @@ impl Executor<'_> {
                     } = self.run_node(RunNodeArgs {
                         node: child,
                         context: context.clone(),
-                        stdin: input,
+                        stdin: std::mem::take(&mut input),
                         stack,
                     })?;
-                    input = result.stdout.clone();
+                    input.clone_from(&result.stdout);
                     stdout = result.stdout;
                     stderr.extend(result.stderr);
                     trace.extend(result.trace);
@@ -1062,7 +1101,7 @@ impl Executor<'_> {
                 Ok(Step::next(captured, context))
             }
             Operation::FileRead { path } => {
-                if !self.policy.allow_file_read {
+                if !self.policy.allows(Capability::FileRead) {
                     return Err(policy("file read denied by policy"));
                 }
                 let path = evaluate(path, &context)?;
@@ -1088,7 +1127,7 @@ impl Executor<'_> {
                 contents,
                 append,
             } => {
-                if !self.policy.allow_file_write {
+                if !self.policy.allows(Capability::FileWrite) {
                     return Err(policy("file write denied by policy"));
                 }
                 let path = evaluate(path, &context)?;
@@ -1110,7 +1149,7 @@ impl Executor<'_> {
                 ))
             }
             Operation::FileRemove { path } => {
-                if !self.policy.allow_file_write {
+                if !self.policy.allows(Capability::FileWrite) {
                     return Err(policy("file remove denied by policy"));
                 }
                 let path = evaluate(path, &context)?;
@@ -1131,7 +1170,7 @@ impl Executor<'_> {
                 ))
             }
             Operation::NetworkRequest { method, uri } => {
-                if !self.policy.allow_network {
+                if !self.policy.allows(Capability::Network) {
                     return Err(policy("network request denied by policy"));
                 }
                 let method = evaluate(method, &context)?;
@@ -1175,7 +1214,7 @@ impl Executor<'_> {
                 capabilities,
                 ..
             } => {
-                if !self.policy.allow_delegation {
+                if !self.policy.allows(Capability::Delegation) {
                     return Err(policy("pinned interpreter delegation denied by policy"));
                 }
                 if !matches!(node.guarantee, Guarantee::Delegated { .. }) {
@@ -1208,15 +1247,12 @@ impl Executor<'_> {
                 ))
             }
             Operation::OpaqueCapsule {
-                interpreter,
-                source,
-                ..
-            } => {
-                let _ = (interpreter, source, stdin);
-                Err(policy(
-                    "opaque capsule is residual-only and cannot be executed",
-                ))
-            }
+                interpreter: _interpreter,
+                source: _source,
+                path: _path,
+            } => Err(policy(
+                "opaque capsule is residual-only and cannot be executed",
+            )),
         }
     }
 
@@ -1272,7 +1308,7 @@ impl Executor<'_> {
         let mut aggregate = RunResult::empty();
         for result in results
             .into_inner()
-            .map_err(|_| execution("parallel result lock poisoned"))?
+            .map_err(|_error| execution("parallel result lock poisoned"))?
         {
             // Each branch runs in its own process, so an `exit` inside one
             // ends that branch and leaves its status behind.
@@ -1375,7 +1411,10 @@ fn bind_powershell_arguments(
     provided: &BTreeMap<String, String>,
     positional: &[String],
 ) -> Result<BTreeMap<String, String>, RunError> {
-    let invocation = task.invocation.as_ref().expect("checked by caller");
+    let invocation = task
+        .invocation
+        .as_ref()
+        .ok_or_else(|| invalid("PowerShell argument binding requires invocation metadata"))?;
     let mut output = BTreeMap::new();
     for (name, value) in provided {
         let parameter = invocation
@@ -1548,7 +1587,7 @@ fn normalize_value(name: &str, value_type: &ValueType, value: &str) -> Result<St
             let parsed = value
                 .trim()
                 .parse::<i64>()
-                .map_err(|_| format!("{name} must be a signed 64-bit integer"))?;
+                .map_err(|_error| format!("{name} must be a signed 64-bit integer"))?;
             Ok(parsed.to_string())
         }
         ValueType::Primitive(PrimitiveType::Path) => {
@@ -1562,7 +1601,7 @@ fn normalize_value(name: &str, value_type: &ValueType, value: &str) -> Result<St
         ValueType::Primitive(PrimitiveType::Bytes) => {
             let decoded = base64::engine::general_purpose::STANDARD
                 .decode(value)
-                .map_err(|_| format!("{name} must be canonical base64 bytes"))?;
+                .map_err(|_error| format!("{name} must be canonical base64 bytes"))?;
             if base64::engine::general_purpose::STANDARD.encode(&decoded) != value {
                 return Err(format!("{name} must be canonical padded base64 bytes"));
             }
@@ -1573,7 +1612,7 @@ fn normalize_value(name: &str, value_type: &ValueType, value: &str) -> Result<St
                 .map_err(|error| format!("{name} must be strict JSON: {error}"))?;
             let normalized = normalize_typed_json(name, value_type, parsed)?;
             String::from_utf8(crate::canonical_json::canonical_bytes(&normalized)?)
-                .map_err(|_| format!("{name} canonical JSON was not UTF-8"))
+                .map_err(|_error| format!("{name} canonical JSON was not UTF-8"))
         }
         ValueType::Secret { secret } => normalize_value(name, secret, value),
     }
@@ -1599,7 +1638,7 @@ fn typed_value_as_json(value_type: &ValueType, value: &str) -> Result<serde_json
         ValueType::Primitive(PrimitiveType::Int) => value
             .parse::<i64>()
             .map(Into::into)
-            .map_err(|_| "invalid normalized integer".into()),
+            .map_err(|_error| "invalid normalized integer".into()),
         ValueType::List { .. } | ValueType::Record { .. } => {
             crate::strict_json::parse(value.as_bytes())
         }
@@ -2067,9 +2106,7 @@ mod tests {
         };
         let error = run_plan(RunPlanArgs {
             backend: &backend,
-            policy: Policy {
-                ..Policy::default()
-            },
+            policy: Policy::default(),
             plan: &plan(capsule),
             host_environment: &BTreeMap::new(),
             named_inputs: &BTreeMap::new(),
@@ -2204,12 +2241,10 @@ mod tests {
         });
         let result = run_plan_with_io(
             &backend,
-            Policy {
-                allow_file_read: true,
-                allow_file_write: true,
-                allow_network: true,
-                allow_delegation: false,
-            },
+            Policy::default()
+                .allow(Capability::FileRead)
+                .allow(Capability::FileWrite)
+                .allow(Capability::Network),
             &plan(body),
             RunInputs {
                 host_environment: &BTreeMap::new(),
@@ -2365,10 +2400,7 @@ mod tests {
         delegated.source = Some(delegated_span);
         let result = run_plan_with_io(
             &backend,
-            Policy {
-                allow_delegation: true,
-                ..Policy::default()
-            },
+            Policy::default().allow(Capability::Delegation),
             &plan(delegated),
             RunInputs {
                 host_environment: &BTreeMap::new(),
@@ -2420,11 +2452,9 @@ mod tests {
         ] {
             let error = run_plan(RunPlanArgs {
                 backend: &backend,
-                policy: Policy {
-                    allow_file_read: true,
-                    allow_file_write: true,
-                    ..Policy::default()
-                },
+                policy: Policy::default()
+                    .allow(Capability::FileRead)
+                    .allow(Capability::FileWrite),
                 plan: &plan(node(operation)),
                 host_environment: &BTreeMap::new(),
                 named_inputs: &BTreeMap::new(),
@@ -2452,12 +2482,10 @@ mod tests {
         ] {
             let error = run_plan(RunPlanArgs {
                 backend: &backend,
-                policy: Policy {
-                    allow_file_read: true,
-                    allow_file_write: true,
-                    allow_network: true,
-                    allow_delegation: false,
-                },
+                policy: Policy::default()
+                    .allow(Capability::FileRead)
+                    .allow(Capability::FileWrite)
+                    .allow(Capability::Network),
                 plan: &plan(node(operation)),
                 host_environment: &BTreeMap::new(),
                 named_inputs: &BTreeMap::new(),

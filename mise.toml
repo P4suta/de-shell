@@ -38,6 +38,7 @@ description = "Lint Rust, repository metadata, and GitHub Actions"
 run = [
   "cargo run --locked -p xtask -- enum-equality",
   "cargo run --locked -p xtask -- lint-expectations",
+  "cargo run --locked -p xtask -- rust-policy",
   "cargo run --locked -p xtask -- report-item-kinds",
   "cargo run --locked -p xtask -- trace-events",
   "cargo run --locked -p xtask -- fuzz-modules",
@@ -143,7 +144,7 @@ description = "Check that the tests fail when the code they cover is changed"
 # git worktree rather than in place, because cargo-mutants edits the tree it
 # tests and this one is being worked in.
 run = [
-  "cargo mutants --in-place --file crates/deshell/src/approval.rs --file crates/deshell/src/patch.rs --file crates/deshell/src/host.rs --file crates/deshell/src/trace.rs --timeout 300",
+  "cargo mutants --in-place --file crates/deshell/src/approval.rs --file crates/deshell/src/patch.rs --file crates/deshell/src/host.rs --file crates/deshell/src/trace.rs --file crates/deshell/src/migration.rs --file crates/deshell/src/frontend.rs --timeout 300",
 ]
 
 [tasks."test:supply-chain"]

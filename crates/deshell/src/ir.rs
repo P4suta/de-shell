@@ -985,6 +985,7 @@ impl Plan {
 /// many-argument function stays invisible to every call site that already
 /// compiles. [`node_id`] takes this apart without `..`, so a field added here fails
 /// to compile until somebody gives it a destination.
+#[derive(Clone, Copy)]
 pub(crate) struct NodeIdArgs<'a> {
     pub(crate) normalized_path: &'a str,
     pub(crate) start_byte: u64,
@@ -1361,7 +1362,39 @@ fn validate_node(parts: ValidateNodeArgs<'_>) {
                 node.operation.name()
             ));
         }
-        _ => {}
+        Operation::Exec { .. }
+        | Operation::ExpandWords { .. }
+        | Operation::Redirect { .. }
+        | Operation::Pipeline { .. }
+        | Operation::Sequence { .. }
+        | Operation::Parallel { .. }
+        | Operation::WriteStdout { .. }
+        | Operation::Exit { .. }
+        | Operation::NoOp
+        | Operation::Condition { .. }
+        | Operation::Test { .. }
+        | Operation::While { .. }
+        | Operation::Not { .. }
+        | Operation::Match { .. }
+        | Operation::Foreach { .. }
+        | Operation::Scope { .. }
+        | Operation::TryFinally { .. }
+        | Operation::TaskCall { .. }
+        | Operation::SetVariable { .. }
+        | Operation::SetEnvironment { .. }
+        | Operation::SetWorkingDirectory { .. }
+        | Operation::CaptureStdout { .. }
+        | Operation::Spawn { .. }
+        | Operation::Wait { .. }
+        | Operation::SendSignal { .. }
+        | Operation::FileRead { .. }
+        | Operation::FileWrite { .. }
+        | Operation::FileRemove { .. }
+        | Operation::FileMetadata { .. }
+        | Operation::FileSetMetadata { .. }
+        | Operation::NetworkRequest { .. }
+        | Operation::ClockRead { .. }
+        | Operation::RandomBytes { .. } => {}
     }
 
     let expression = |value: &TextExpression, errors: &mut Vec<String>| {
@@ -1398,7 +1431,7 @@ fn validate_node(parts: ValidateNodeArgs<'_>) {
             for value in argv {
                 expression(value, errors);
             }
-            let names = duplicate_strings(
+            duplicate_strings(
                 "Exec environment name",
                 environment.iter().map(|value| value.name.as_str()),
                 errors,
@@ -1409,7 +1442,6 @@ fn validate_node(parts: ValidateNodeArgs<'_>) {
                 }
                 expression(&value.value, errors);
             }
-            let _ = names;
             if let Some(directory) = working_directory {
                 expression(directory, errors);
             }
@@ -2325,13 +2357,13 @@ mod tests {
         assert_eq!(Plan::decode(&encoded).unwrap(), plan);
 
         let ValueType::Secret { secret } = &mut plan.tasks[0].inputs[0].value_type else {
-            unreachable!()
+            panic!("expected secret value type")
         };
         let ValueType::List { list } = secret.as_mut() else {
-            unreachable!()
+            panic!("expected list value type")
         };
         let ValueType::Record { record } = list.as_mut() else {
-            unreachable!()
+            panic!("expected record value type")
         };
         record.push(record[0].clone());
         assert!(
@@ -2832,7 +2864,7 @@ mod tests {
                 interpreter: "sh".into(),
                 interpreter_pin: format!("sha256:{}", "a".repeat(64)),
                 source: SourceBytes::from_bytes(b"true"),
-                source_span: source_span.clone(),
+                source_span,
                 capabilities: vec![],
                 reason: "pinned".into(),
             })
@@ -3107,7 +3139,7 @@ mod tests {
                 positional: vec![],
             }));
         } else {
-            unreachable!()
+            panic!("expected sequence body")
         }
         worker.body = exec();
         plan.tasks.push(worker);

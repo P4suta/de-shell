@@ -1030,10 +1030,12 @@ impl Failure {
     }
 }
 
-pub(crate) fn run_from<I, T>(args: I, stdout: &mut dyn Write, stderr: &mut dyn Write) -> i32
+pub(crate) fn run_from<I, T, Out, Err>(args: I, stdout: &mut Out, stderr: &mut Err) -> i32
 where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
+    Out: Write,
+    Err: Write,
 {
     let args: Vec<OsString> = args.into_iter().map(Into::into).collect();
     let fallback_mode = requested_diagnostic_mode(&args);
@@ -1054,8 +1056,11 @@ where
                 "DESHELL_USAGE",
                 error.to_string().trim().to_owned(),
             );
-            let _ = crate::diagnostics::emit(stderr, fallback_mode, &diagnostic);
-            return 2;
+            return if crate::diagnostics::emit(stderr, fallback_mode, &diagnostic).is_err() {
+                70
+            } else {
+                2
+            };
         }
     };
     let diagnostic_mode = cli.diagnostics;
@@ -1069,8 +1074,11 @@ where
             // one that stops: the absence of an event would read as the absence
             // of the work.
             let diagnostic = crate::diagnostics::Diagnostic::error("DESHELL_IO", message);
-            let _ = crate::diagnostics::emit(stderr, diagnostic_mode, &diagnostic);
-            return 1;
+            return if crate::diagnostics::emit(stderr, diagnostic_mode, &diagnostic).is_err() {
+                70
+            } else {
+                1
+            };
         }
     };
     let mut command = cli.command;
@@ -1120,8 +1128,11 @@ where
                 "DESHELL_IO",
                 format!("cannot write report: {message}"),
             );
-            let _ = crate::diagnostics::emit(stderr, diagnostic_mode, &diagnostic);
-            return 1;
+            return if crate::diagnostics::emit(stderr, diagnostic_mode, &diagnostic).is_err() {
+                70
+            } else {
+                1
+            };
         }
         return code;
     }
@@ -1173,15 +1184,16 @@ fn start_recording(mode: crate::trace::Mode, output: Option<&Path>) -> Result<Re
             }
         }
         crate::trace::Mode::Jsonl => {
-            let sink: Box<dyn std::io::Write + Send> = match output {
-                Some(path) => Box::new(std::fs::File::create(path).map_err(|error| {
-                    format!("cannot write the trace to {}: {error}", path.display())
-                })?),
+            match output {
+                Some(path) => {
+                    crate::trace::start_file(std::fs::File::create(path).map_err(|error| {
+                        format!("cannot write the trace to {}: {error}", path.display())
+                    })?)
+                }
                 // Standard error, because stdout carries the command's answer
                 // and a trace must never change those bytes.
-                None => Box::new(std::io::stderr()),
-            };
-            crate::trace::start(sink);
+                None => crate::trace::start_standard_error(),
+            }
         }
     }
     Ok(Recording(mode))
@@ -1548,15 +1560,15 @@ fn scan_details(inventory: &crate::scanner::Inventory) -> crate::report::Details
     details
 }
 
-struct DispatchArgs<'a> {
+struct DispatchArgs<'a, Out: Write, Err: Write> {
     command: Command,
     diagnostic_mode: crate::diagnostics::Mode,
-    stdout: &'a mut dyn Write,
-    stderr: &'a mut dyn Write,
+    stdout: &'a mut Out,
+    stderr: &'a mut Err,
     details: &'a mut Option<crate::report::Details>,
 }
 
-fn dispatch(parts: DispatchArgs<'_>) -> Result<i32, Failure> {
+fn dispatch<Out: Write, Err: Write>(parts: DispatchArgs<'_, Out, Err>) -> Result<i32, Failure> {
     // Destructured without `..`: see `DispatchArgs`.
     let DispatchArgs {
         command,
@@ -2351,7 +2363,7 @@ fn interpreter_confidence(confidence: &crate::scanner::InterpreterConfidence) ->
     }
 }
 
-fn shell_free_command(root: &Path, stdout: &mut dyn Write) -> Result<i32, Failure> {
+fn shell_free_command<W: Write>(root: &Path, stdout: &mut W) -> Result<i32, Failure> {
     let mut inventory = crate::project::scan(root).map_err(Failure::io)?;
     if !inventory.errors.is_empty() || !inventory.skipped.is_empty() {
         let blockers = inventory
@@ -2549,11 +2561,11 @@ fn shell_reintroduced_failure(inventory: &crate::scanner::Inventory, declared: u
     }
 }
 
-fn scenario_synthesize_command(
+fn scenario_synthesize_command<W: Write>(
     root: &Path,
     apply: bool,
     format: OutputFormat,
-    stdout: &mut dyn Write,
+    stdout: &mut W,
 ) -> Result<i32, Failure> {
     if format.is_structured() {
         let mut output = Vec::new();
@@ -2561,7 +2573,7 @@ fn scenario_synthesize_command(
         let value = serde_json::json!({
             "applied": apply,
             "output": String::from_utf8(output)
-                .map_err(|_| Failure::internal("scenario output was not UTF-8"))?,
+                .map_err(|_error| Failure::internal("scenario output was not UTF-8"))?,
         });
         write_io(
             stdout,
@@ -2572,10 +2584,10 @@ fn scenario_synthesize_command(
     scenario_synthesize_human(root, apply, stdout)
 }
 
-fn scenario_synthesize_human(
+fn scenario_synthesize_human<W: Write>(
     root: &Path,
     apply: bool,
-    stdout: &mut dyn Write,
+    stdout: &mut W,
 ) -> Result<i32, Failure> {
     let config = crate::project::load_config(root).map_err(classify_project_errors)?;
     if config.entrypoints.is_empty() {
@@ -2592,9 +2604,8 @@ fn scenario_synthesize_human(
             crate::project::resolve_entry(root, entry).map_err(classify_project_error)?;
         let source = std::fs::read(&path)
             .map_err(|error| Failure::io(format!("cannot read {}: {error}", path.display())))?;
-        let plan =
-            crate::frontend::lower(entry, &source, config.policy.unknown_interpreter.clone())
-                .map_err(classify_project_error)?;
+        let plan = crate::frontend::lower(entry, &source, config.policy.unknown_interpreter)
+            .map_err(classify_project_error)?;
         let task = plan
             .tasks
             .iter()
@@ -2685,11 +2696,11 @@ fn scenario_synthesize_human(
     Ok(0)
 }
 
-fn scenario_review_command(
+fn scenario_review_command<W: Write>(
     root: &Path,
     selected: Option<&str>,
     format: OutputFormat,
-    stdout: &mut dyn Write,
+    stdout: &mut W,
 ) -> Result<i32, Failure> {
     let mut reviews = crate::approval::scenario_reviews(root).map_err(classify_project_error)?;
     if let Some(name) = selected {
@@ -2760,15 +2771,17 @@ fn scenario_review_command(
 /// many-argument function stays invisible to every call site that already
 /// compiles. [`scenario_approve_command`] takes this apart without `..`, so a field added here fails
 /// to compile until somebody gives it a destination.
-struct ScenarioApproveCommandArgs<'a> {
+struct ScenarioApproveCommandArgs<'a, W: Write> {
     root: &'a Path,
     name: &'a str,
     digest: &'a str,
     format: OutputFormat,
-    stdout: &'a mut dyn Write,
+    stdout: &'a mut W,
 }
 
-fn scenario_approve_command(parts: ScenarioApproveCommandArgs<'_>) -> Result<i32, Failure> {
+fn scenario_approve_command<W: Write>(
+    parts: ScenarioApproveCommandArgs<'_, W>,
+) -> Result<i32, Failure> {
     // Destructured without `..`: see `ScenarioApproveCommandArgs`.
     let ScenarioApproveCommandArgs {
         root,
@@ -2804,10 +2817,10 @@ fn scenario_approve_command(parts: ScenarioApproveCommandArgs<'_>) -> Result<i32
     Ok(0)
 }
 
-fn matrix_review_command(
+fn matrix_review_command<W: Write>(
     root: &Path,
     format: OutputFormat,
-    stdout: &mut dyn Write,
+    stdout: &mut W,
 ) -> Result<i32, Failure> {
     let reviews = crate::approval::matrix_reviews(root).map_err(classify_project_error)?;
     match format {
@@ -2860,10 +2873,10 @@ fn matrix_review_command(
     Ok(0)
 }
 
-fn declared_review_command(
+fn declared_review_command<W: Write>(
     root: &Path,
     format: OutputFormat,
-    stdout: &mut dyn Write,
+    stdout: &mut W,
 ) -> Result<i32, Failure> {
     let reviews = crate::approval::declared_shell_reviews(root).map_err(classify_project_error)?;
     match format {
@@ -2922,15 +2935,17 @@ fn declared_review_command(
 /// a many-argument function stays invisible to every call site that already
 /// compiles. [`declared_approve_command`] takes this apart without `..`, so a
 /// field added here fails to compile until somebody gives it a destination.
-struct DeclaredApproveCommandArgs<'a> {
+struct DeclaredApproveCommandArgs<'a, W: Write> {
     root: &'a Path,
     location: &'a str,
     digest: &'a str,
     format: OutputFormat,
-    stdout: &'a mut dyn Write,
+    stdout: &'a mut W,
 }
 
-fn declared_approve_command(parts: DeclaredApproveCommandArgs<'_>) -> Result<i32, Failure> {
+fn declared_approve_command<W: Write>(
+    parts: DeclaredApproveCommandArgs<'_, W>,
+) -> Result<i32, Failure> {
     // Destructured without `..`: see `DeclaredApproveCommandArgs`.
     let DeclaredApproveCommandArgs {
         root,
@@ -2974,15 +2989,17 @@ fn declared_approve_command(parts: DeclaredApproveCommandArgs<'_>) -> Result<i32
 /// many-argument function stays invisible to every call site that already
 /// compiles. [`matrix_approve_command`] takes this apart without `..`, so a field added here fails
 /// to compile until somebody gives it a destination.
-struct MatrixApproveCommandArgs<'a> {
+struct MatrixApproveCommandArgs<'a, W: Write> {
     root: &'a Path,
     cell: &'a str,
     digest: &'a str,
     format: OutputFormat,
-    stdout: &'a mut dyn Write,
+    stdout: &'a mut W,
 }
 
-fn matrix_approve_command(parts: MatrixApproveCommandArgs<'_>) -> Result<i32, Failure> {
+fn matrix_approve_command<W: Write>(
+    parts: MatrixApproveCommandArgs<'_, W>,
+) -> Result<i32, Failure> {
     // Destructured without `..`: see `MatrixApproveCommandArgs`.
     let MatrixApproveCommandArgs {
         root,
@@ -3048,11 +3065,11 @@ fn scenario_stem(path: &str) -> String {
     }
 }
 
-fn audit_command(
+fn audit_command<W: Write>(
     root: &Path,
     format: AuditOutputFormat,
     _persona: AuditPersona,
-    stdout: &mut dyn Write,
+    stdout: &mut W,
 ) -> Result<i32, Failure> {
     let inventory = crate::project::scan(root).map_err(Failure::io)?;
     let config_path = root.join(".deshell/project.toml");
@@ -3239,7 +3256,7 @@ fn github_escape(value: &str) -> String {
         .replace(',', "%2C")
 }
 
-fn harden_command(command: HardenCommand, stdout: &mut dyn Write) -> Result<i32, Failure> {
+fn harden_command<W: Write>(command: HardenCommand, stdout: &mut W) -> Result<i32, Failure> {
     match command {
         HardenCommand::Plan { root, .. } => {
             let output = crate::harden::plan(&root).map_err(classify_harden_error)?;
@@ -3318,10 +3335,13 @@ fn bundle_export_runtime(
 ) -> Option<&str> {
     match target {
         crate::exporter::Target::Dagger => Some(&lock.targets.dagger_image),
-        _ => None,
+        crate::exporter::Target::Internal
+        | crate::exporter::Target::Nushell
+        | crate::exporter::Target::Cwl => None,
     }
 }
 
+#[derive(Clone, Copy)]
 struct RunOptions<'a> {
     root: &'a Path,
     entrypoint: Option<&'a str>,
@@ -3330,10 +3350,10 @@ struct RunOptions<'a> {
     arguments: &'a [String],
 }
 
-fn run_plan(
+fn run_plan<Out: Write, Err: Write>(
     options: RunOptions<'_>,
-    stdout: &mut dyn Write,
-    stderr: &mut dyn Write,
+    stdout: &mut Out,
+    stderr: &mut Err,
 ) -> Result<i32, Failure> {
     let project =
         crate::project::ValidatedProject::load(options.root).map_err(classify_project_errors)?;
@@ -3388,9 +3408,11 @@ fn run_plan(
         crate::runner::RunErrorKind::Policy => Failure::policy(error.message),
     })?;
     // Once execution returns, its status is the command status. Diagnostics mode
-    // never transforms the plan's raw stdout or stderr.
-    let _ = stdout.write_all(&result.stdout);
-    let _ = stderr.write_all(&result.stderr);
+    // never transforms the plan's raw stdout or stderr. Delivery is best effort:
+    // a closed consumer must not replace the status returned by the program that
+    // already ran.
+    let _stdout_delivery = stdout.write_all(&result.stdout);
+    let _stderr_delivery = stderr.write_all(&result.stderr);
     Ok(result.exit_code)
 }
 
@@ -3398,27 +3420,38 @@ fn policy_from_config(
     config: &crate::config::ProjectConfig,
     disposable: bool,
 ) -> crate::runner::Policy {
-    crate::runner::Policy {
-        allow_file_read: matches!(
-            config.policy.file_read,
-            crate::config::FileReadPolicy::Project
-        ),
-        allow_file_write: disposable
-            && matches!(
-                config.policy.file_write,
-                crate::config::FileWritePolicy::Sandbox
+    crate::runner::Policy::default()
+        .allow_if(
+            crate::runner::Capability::FileRead,
+            matches!(
+                config.policy.file_read,
+                crate::config::FileReadPolicy::Project
             ),
-        allow_network: disposable
-            && matches!(
-                config.policy.network,
-                crate::config::NetworkPolicy::RecordReplay
-            ),
-        allow_delegation: disposable
-            && matches!(
-                config.policy.delegation,
-                crate::config::DelegationPolicy::Pinned
-            ),
-    }
+        )
+        .allow_if(
+            crate::runner::Capability::FileWrite,
+            disposable
+                && matches!(
+                    config.policy.file_write,
+                    crate::config::FileWritePolicy::Sandbox
+                ),
+        )
+        .allow_if(
+            crate::runner::Capability::Network,
+            disposable
+                && matches!(
+                    config.policy.network,
+                    crate::config::NetworkPolicy::RecordReplay
+                ),
+        )
+        .allow_if(
+            crate::runner::Capability::Delegation,
+            disposable
+                && matches!(
+                    config.policy.delegation,
+                    crate::config::DelegationPolicy::Pinned
+                ),
+        )
 }
 
 fn disposable_provider(lock: &crate::config::Lockfile) -> Result<crate::lab::Provider, Failure> {
@@ -3449,16 +3482,18 @@ fn disposable_provider(lock: &crate::config::Lockfile) -> Result<crate::lab::Pro
 /// many-argument function stays invisible to every call site that already
 /// compiles. [`run_disposable`] takes this apart without `..`, so a field added here fails
 /// to compile until somebody gives it a destination.
-struct RunDisposableArgs<'a> {
+struct RunDisposableArgs<'a, Out: Write, Err: Write> {
     root: &'a Path,
     entrypoint: &'a str,
     node_id: Option<&'a str>,
     arguments: &'a [String],
-    stdout: &'a mut dyn Write,
-    stderr: &'a mut dyn Write,
+    stdout: &'a mut Out,
+    stderr: &'a mut Err,
 }
 
-fn run_disposable(parts: RunDisposableArgs<'_>) -> Result<i32, Failure> {
+fn run_disposable<Out: Write, Err: Write>(
+    parts: RunDisposableArgs<'_, Out, Err>,
+) -> Result<i32, Failure> {
     // Destructured without `..`: see `RunDisposableArgs`.
     let RunDisposableArgs {
         root,
@@ -3503,8 +3538,11 @@ fn run_disposable(parts: RunDisposableArgs<'_>) -> Result<i32, Failure> {
         image: project.lock.lab.image.clone(),
     };
     let result = crate::lab::execute(provider, &request).map_err(classify_lab_failure)?;
-    let _ = stdout.write_all(&result.stdout);
-    let _ = stderr.write_all(&result.stderr);
+    // Preserve the guest's completed status even when its output consumer has
+    // gone away. The named results make this deliberate best-effort boundary
+    // visible to the ignored-result lint and to reviewers.
+    let _stdout_delivery = stdout.write_all(&result.stdout);
+    let _stderr_delivery = stderr.write_all(&result.stderr);
     Ok(result.exit_code)
 }
 
@@ -3565,11 +3603,11 @@ fn observed_interpreter_builds() -> serde_json::Value {
     serde_json::Value::Object(builds)
 }
 
-fn doctor_command(
+fn doctor_command<W: Write>(
     root: &Path,
     format: OutputFormat,
     require: Option<DoctorRequirement>,
-    stdout: &mut dyn Write,
+    stdout: &mut W,
 ) -> Result<i32, Failure> {
     let binary = std::env::current_exe()
         .map_err(|error| Failure::io(format!("cannot resolve current executable: {error}")))?;
@@ -3779,11 +3817,11 @@ fn doctor_command(
     })
 }
 
-fn observe_command(
+fn observe_command<W: Write>(
     root: &Path,
     entry: Option<String>,
     selected_scenarios: &[String],
-    stdout: &mut dyn Write,
+    stdout: &mut W,
 ) -> Result<i32, Failure> {
     let base_workspace = crate::workspace::private_snapshot(root).map_err(Failure::io)?;
     let base = base_workspace.path();
@@ -4147,7 +4185,7 @@ fn bundle_request<'a>(
         let name = entry
             .file_name()
             .into_string()
-            .map_err(|_| Failure::invalid("scenario filename is not valid UTF-8"))?;
+            .map_err(|_error| Failure::invalid("scenario filename is not valid UTF-8"))?;
         if Path::new(&name)
             .extension()
             .is_some_and(|extension| extension == "toml")
@@ -4309,7 +4347,7 @@ fn safe_output_path(root: &Path, output: &Path) -> Result<PathBuf, Failure> {
         .ok_or_else(|| Failure::policy("export output has no project-relative parent"))?;
     let relative_parent = parent
         .strip_prefix(&root)
-        .map_err(|_| Failure::policy("export output escapes the project"))?;
+        .map_err(|_error| Failure::policy("export output escapes the project"))?;
     let mut current = root.clone();
     for component in relative_parent.components() {
         current.push(component);
@@ -4386,7 +4424,7 @@ fn select_node(
         }
     }
     let (owner, node) = selected.ok_or_else(|| format!("node not found: {node_id}"))?;
-    plan.entrypoint = plan.tasks[owner].name.clone();
+    plan.entrypoint.clone_from(&plan.tasks[owner].name);
     plan.tasks[owner].body = node;
     plan.assign_node_ids()?;
     plan.validate().map_err(|errors| errors.join("; "))?;
@@ -4419,11 +4457,37 @@ fn find_node<'a>(node: &'a crate::ir::Node, id: &str) -> Option<&'a crate::ir::N
         crate::ir::Operation::TryFinally { body, finalizer } => {
             find_node(body, id).or_else(|| find_node(finalizer, id))
         }
-        _ => None,
+        crate::ir::Operation::Exec { .. }
+        | crate::ir::Operation::ExpandWords { .. }
+        | crate::ir::Operation::Redirect { .. }
+        | crate::ir::Operation::WriteStdout { .. }
+        | crate::ir::Operation::Exit { .. }
+        | crate::ir::Operation::NoOp
+        | crate::ir::Operation::Test { .. }
+        | crate::ir::Operation::While { .. }
+        | crate::ir::Operation::Not { .. }
+        | crate::ir::Operation::Scope { .. }
+        | crate::ir::Operation::TaskCall { .. }
+        | crate::ir::Operation::SetVariable { .. }
+        | crate::ir::Operation::SetEnvironment { .. }
+        | crate::ir::Operation::SetWorkingDirectory { .. }
+        | crate::ir::Operation::Spawn { .. }
+        | crate::ir::Operation::Wait { .. }
+        | crate::ir::Operation::SendSignal { .. }
+        | crate::ir::Operation::FileRead { .. }
+        | crate::ir::Operation::FileWrite { .. }
+        | crate::ir::Operation::FileRemove { .. }
+        | crate::ir::Operation::FileMetadata { .. }
+        | crate::ir::Operation::FileSetMetadata { .. }
+        | crate::ir::Operation::NetworkRequest { .. }
+        | crate::ir::Operation::ClockRead { .. }
+        | crate::ir::Operation::RandomBytes { .. }
+        | crate::ir::Operation::InterpreterCall { .. }
+        | crate::ir::Operation::OpaqueCapsule { .. } => None,
     }
 }
 
-fn explain(root: &Path, node_id: Option<&str>, stdout: &mut dyn Write) -> Result<i32, Failure> {
+fn explain<W: Write>(root: &Path, node_id: Option<&str>, stdout: &mut W) -> Result<i32, Failure> {
     let (plan, _) = crate::project::load_artifacts(root).map_err(classify_project_errors)?;
     let nodes: Vec<_> = plan
         .tasks
@@ -4492,7 +4556,33 @@ fn collect_nodes<'a>(node: &'a crate::ir::Node, values: &mut Vec<&'a crate::ir::
             collect_nodes(body, values);
             collect_nodes(finalizer, values);
         }
-        _ => {}
+        crate::ir::Operation::Exec { .. }
+        | crate::ir::Operation::ExpandWords { .. }
+        | crate::ir::Operation::Redirect { .. }
+        | crate::ir::Operation::WriteStdout { .. }
+        | crate::ir::Operation::Exit { .. }
+        | crate::ir::Operation::NoOp
+        | crate::ir::Operation::Test { .. }
+        | crate::ir::Operation::While { .. }
+        | crate::ir::Operation::Not { .. }
+        | crate::ir::Operation::Scope { .. }
+        | crate::ir::Operation::TaskCall { .. }
+        | crate::ir::Operation::SetVariable { .. }
+        | crate::ir::Operation::SetEnvironment { .. }
+        | crate::ir::Operation::SetWorkingDirectory { .. }
+        | crate::ir::Operation::Spawn { .. }
+        | crate::ir::Operation::Wait { .. }
+        | crate::ir::Operation::SendSignal { .. }
+        | crate::ir::Operation::FileRead { .. }
+        | crate::ir::Operation::FileWrite { .. }
+        | crate::ir::Operation::FileRemove { .. }
+        | crate::ir::Operation::FileMetadata { .. }
+        | crate::ir::Operation::FileSetMetadata { .. }
+        | crate::ir::Operation::NetworkRequest { .. }
+        | crate::ir::Operation::ClockRead { .. }
+        | crate::ir::Operation::RandomBytes { .. }
+        | crate::ir::Operation::InterpreterCall { .. }
+        | crate::ir::Operation::OpaqueCapsule { .. } => {}
     }
 }
 
@@ -4502,15 +4592,15 @@ fn collect_nodes<'a>(node: &'a crate::ir::Node, values: &mut Vec<&'a crate::ir::
 /// many-argument function stays invisible to every call site that already
 /// compiles. [`rewrite_command`] takes this apart without `..`, so a field added here fails
 /// to compile until somebody gives it a destination.
-struct RewriteCommandArgs<'a> {
+struct RewriteCommandArgs<'a, W: Write> {
     root: &'a Path,
     entry: Option<String>,
     equivalent: bool,
     apply: bool,
-    stdout: &'a mut dyn Write,
+    stdout: &'a mut W,
 }
 
-fn rewrite_command(parts: RewriteCommandArgs<'_>) -> Result<i32, Failure> {
+fn rewrite_command<W: Write>(parts: RewriteCommandArgs<'_, W>) -> Result<i32, Failure> {
     // Destructured without `..`: see `RewriteCommandArgs`.
     let RewriteCommandArgs {
         root,
@@ -4526,8 +4616,9 @@ fn rewrite_command(parts: RewriteCommandArgs<'_>) -> Result<i32, Failure> {
     let (_, path) = crate::project::resolve_entry(root, &entry).map_err(classify_project_error)?;
     let source = std::fs::read(&path)
         .map_err(|error| Failure::io(format!("cannot read {}: {error}", path.display())))?;
-    let source = String::from_utf8(source)
-        .map_err(|_| Failure::invalid(format!("rewrite source is not valid UTF-8: {entry}")))?;
+    let source = String::from_utf8(source).map_err(|_error| {
+        Failure::invalid(format!("rewrite source is not valid UTF-8: {entry}"))
+    })?;
     let result = crate::rewrite::equivalent(&entry, &source);
     if result.edits.is_empty() {
         writeln_io(
@@ -4584,16 +4675,18 @@ fn rewrite_command(parts: RewriteCommandArgs<'_>) -> Result<i32, Failure> {
 /// many-argument function stays invisible to every call site that already
 /// compiles. [`modernize_command`] takes this apart without `..`, so a field added here fails
 /// to compile until somebody gives it a destination.
-struct ModernizeCommandArgs<'a> {
+struct ModernizeCommandArgs<'a, Out: Write, Err: Write> {
     root: &'a Path,
     profile: &'a str,
     apply: bool,
     diagnostic_mode: crate::diagnostics::Mode,
-    stdout: &'a mut dyn Write,
-    stderr: &'a mut dyn Write,
+    stdout: &'a mut Out,
+    stderr: &'a mut Err,
 }
 
-fn modernize_command(parts: ModernizeCommandArgs<'_>) -> Result<i32, Failure> {
+fn modernize_command<Out: Write, Err: Write>(
+    parts: ModernizeCommandArgs<'_, Out, Err>,
+) -> Result<i32, Failure> {
     // Destructured without `..`: see `ModernizeCommandArgs`.
     let ModernizeCommandArgs {
         root,
@@ -4685,7 +4778,7 @@ fn modernize_command(parts: ModernizeCommandArgs<'_>) -> Result<i32, Failure> {
                 let mut preflight = crate::frontend::lower(
                     entry,
                     output.as_bytes(),
-                    config.policy.unknown_interpreter.clone(),
+                    config.policy.unknown_interpreter,
                 )
                 .map_err(classify_project_error)?;
                 crate::frontend::bind_interpreter_pins(&mut preflight, &lock.interpreters)
@@ -4728,7 +4821,7 @@ fn modernize_command(parts: ModernizeCommandArgs<'_>) -> Result<i32, Failure> {
                                 crate::patch::prepare_expected(
                                     &manifest_path,
                                     &crate::digest::sha256(&manifest_current),
-                                    manifest_before.clone(),
+                                    manifest_before,
                                 )
                                 .map_err(Failure::io)?,
                             );
@@ -4786,7 +4879,7 @@ fn parse_profiles(value: &str) -> Result<Vec<crate::rewrite::Profile>, Failure> 
     }
 }
 
-fn migrate_plan_command(root: &Path, stdout: &mut dyn Write) -> Result<i32, Failure> {
+fn migrate_plan_command<W: Write>(root: &Path, stdout: &mut W) -> Result<i32, Failure> {
     let output = crate::migration::create_plan(root).map_err(classify_project_error)?;
     writeln_io(stdout, format_args!("plan {}", output.digest))?;
     writeln_io(stdout, format_args!("artifact {}", output.artifact_path))?;
@@ -4849,15 +4942,17 @@ fn migrate_plan_command(root: &Path, stdout: &mut dyn Write) -> Result<i32, Fail
 /// many-argument function stays invisible to every call site that already
 /// compiles. [`migrate_verify_command`] takes this apart without `..`, so a field added here fails
 /// to compile until somebody gives it a destination.
-struct MigrateVerifyCommandArgs<'a> {
+struct MigrateVerifyCommandArgs<'a, W: Write> {
     root: &'a Path,
     plan: &'a str,
     cell: &'a str,
     output: &'a Path,
-    stdout: &'a mut dyn Write,
+    stdout: &'a mut W,
 }
 
-fn migrate_verify_command(parts: MigrateVerifyCommandArgs<'_>) -> Result<i32, Failure> {
+fn migrate_verify_command<W: Write>(
+    parts: MigrateVerifyCommandArgs<'_, W>,
+) -> Result<i32, Failure> {
     // Destructured without `..`: see `MigrateVerifyCommandArgs`.
     let MigrateVerifyCommandArgs {
         root,
@@ -4923,11 +5018,11 @@ fn migrate_verify_command(parts: MigrateVerifyCommandArgs<'_>) -> Result<i32, Fa
     }
 }
 
-fn migrate_evidence_import_command(
+fn migrate_evidence_import_command<W: Write>(
     root: &Path,
     plan: &str,
     files: &[PathBuf],
-    stdout: &mut dyn Write,
+    stdout: &mut W,
 ) -> Result<i32, Failure> {
     let digests =
         crate::migration::import_evidence(root, plan, files).map_err(classify_project_error)?;
@@ -4961,7 +5056,11 @@ fn migrate_evidence_import_command(
     Ok(0)
 }
 
-fn migrate_apply_command(root: &Path, plan: &str, stdout: &mut dyn Write) -> Result<i32, Failure> {
+fn migrate_apply_command<W: Write>(
+    root: &Path,
+    plan: &str,
+    stdout: &mut W,
+) -> Result<i32, Failure> {
     crate::migration::apply(root, plan).map_err(Failure::policy)?;
     writeln_io(stdout, format_args!("retired migration plan {plan}"))?;
     writeln_io(
@@ -4990,10 +5089,10 @@ fn migrate_apply_command(root: &Path, plan: &str, stdout: &mut dyn Write) -> Res
     Ok(0)
 }
 
-fn migrate_status_command(
+fn migrate_status_command<W: Write>(
     root: &Path,
     format: OutputFormat,
-    stdout: &mut dyn Write,
+    stdout: &mut W,
 ) -> Result<i32, Failure> {
     let status = crate::migration::status(root).map_err(Failure::io)?;
     match format {
@@ -5217,13 +5316,13 @@ fn atomic_write(path: &Path, contents: Vec<u8>) -> Result<(), Failure> {
     crate::patch::apply_all(&[proposal]).map_err(Failure::io)
 }
 
-fn write_io(writer: &mut dyn Write, bytes: &[u8]) -> Result<(), Failure> {
+fn write_io<W: Write>(writer: &mut W, bytes: &[u8]) -> Result<(), Failure> {
     writer
         .write_all(bytes)
         .map_err(|error| Failure::io(error.to_string()))
 }
 
-fn writeln_io(writer: &mut dyn Write, arguments: std::fmt::Arguments<'_>) -> Result<(), Failure> {
+fn writeln_io<W: Write>(writer: &mut W, arguments: std::fmt::Arguments<'_>) -> Result<(), Failure> {
     writer
         .write_fmt(arguments)
         .and_then(|()| writer.write_all(b"\n"))
@@ -5968,8 +6067,8 @@ mod tests {
             assert_eq!(finding["schema_version"], 1);
             assert_eq!(finding["confidence"], "high");
             assert!(finding["url"].as_str().unwrap().starts_with("https://"));
-            let start = finding["span"]["start_byte"].as_u64().unwrap() as usize;
-            let end = finding["span"]["end_byte"].as_u64().unwrap() as usize;
+            let start = usize::try_from(finding["span"]["start_byte"].as_u64().unwrap()).unwrap();
+            let end = usize::try_from(finding["span"]["end_byte"].as_u64().unwrap()).unwrap();
             assert!(start < end);
             let selected = &source.as_bytes()[start..end];
             assert!(
@@ -6072,8 +6171,8 @@ mod tests {
             .collect::<Vec<serde_json::Value>>();
         assert_eq!(findings.len(), 1, "{findings:#?}");
         assert_eq!(findings[0]["rule_id"], "shell.dynamic-eval");
-        let start = findings[0]["span"]["start_byte"].as_u64().unwrap() as usize;
-        let end = findings[0]["span"]["end_byte"].as_u64().unwrap() as usize;
+        let start = usize::try_from(findings[0]["span"]["start_byte"].as_u64().unwrap()).unwrap();
+        let end = usize::try_from(findings[0]["span"]["end_byte"].as_u64().unwrap()).unwrap();
         assert_eq!(&workflow[start..end], "eval");
     }
 
@@ -6114,8 +6213,8 @@ mod tests {
                 .iter()
                 .find(|finding| finding["rule_id"] == rule)
                 .unwrap_or_else(|| panic!("missing {rule}: {findings:#?}"));
-            let start = finding["span"]["start_byte"].as_u64().unwrap() as usize;
-            let end = finding["span"]["end_byte"].as_u64().unwrap() as usize;
+            let start = usize::try_from(finding["span"]["start_byte"].as_u64().unwrap()).unwrap();
+            let end = usize::try_from(finding["span"]["end_byte"].as_u64().unwrap()).unwrap();
             assert_eq!(&source[start..end], selected, "{rule}");
         }
     }
@@ -7331,7 +7430,7 @@ mod tests {
         std::fs::write(&evidence_path, evidence.encode_pretty().unwrap()).unwrap();
         let replay_path = directory.path().join(".deshell/replay.json");
         let canonical_replay = replay.encode_pretty().unwrap();
-        let mut changed_replay = replay.clone();
+        let mut changed_replay = replay;
         changed_replay.entries[0].body = crate::ir::SourceBytes::from_bytes(b"changed\n");
         std::fs::write(&replay_path, changed_replay.encode_pretty().unwrap()).unwrap();
         let stale = crate::migration::import_evidence(
@@ -9153,9 +9252,9 @@ for line in sys.stdin:
             "evidence".into(),
             "import".into(),
             "--root".into(),
-            root.clone(),
+            root,
             "--plan".into(),
-            digest.clone(),
+            digest,
             path(&conflicting_path),
         ]);
         assert_eq!(imported.0, 4, "{}", String::from_utf8_lossy(&imported.2));

@@ -40,7 +40,7 @@ pub(crate) fn private_snapshot(source: &Path) -> Result<PrivateWorkspace, String
         let relative = entry
             .path()
             .strip_prefix(&source)
-            .map_err(|_| "workspace snapshot entry escaped its source root")?;
+            .map_err(|_error| "workspace snapshot entry escaped its source root")?;
         let target = root.join(relative);
         let kind = entry.file_type();
         if kind.is_symlink() {
@@ -182,7 +182,7 @@ pub(crate) fn capture(root: &Path) -> Result<Snapshot, String> {
         let relative = entry
             .path()
             .strip_prefix(&root)
-            .map_err(|_| "workspace entry escaped root")?;
+            .map_err(|_error| "workspace entry escaped root")?;
         let relative = relative
             .to_str()
             .ok_or_else(|| format!("workspace path is not valid UTF-8: {}", relative.display()))?
@@ -630,6 +630,8 @@ mod tests {
 
         let fifo = source.path().join("fifo");
         let fifo_bytes = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `fifo_bytes` is NUL-terminated, contains no interior NUL, and
+        // stays alive for the duration of the `mkfifo` call.
         assert_eq!(unsafe { libc::mkfifo(fifo_bytes.as_ptr(), 0o600) }, 0);
         assert!(snapshot_error(source.path()).contains("non-regular"));
         assert!(capture(source.path()).unwrap_err().contains("non-regular"));
@@ -723,7 +725,7 @@ mod tests {
                 },
                 ExpectedFile {
                     path: "wrong".into(),
-                    sha256: good_digest.clone(),
+                    sha256: good_digest,
                 },
             ],
         )

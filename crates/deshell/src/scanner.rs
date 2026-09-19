@@ -3,20 +3,36 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-static PYTHON_OS_SYSTEM: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r#"os\.system\s*\(\s*([^\)]*)\)"#).expect("static scanner regex")
+type CompiledRegex = Result<regex::Regex, String>;
+
+static PYTHON_OS_SYSTEM: LazyLock<CompiledRegex> =
+    LazyLock::new(|| compile_regex("Python os.system", r#"os\.system\s*\(\s*([^\)]*)\)"#));
+static PYTHON_SUBPROCESS_START: LazyLock<CompiledRegex> = LazyLock::new(|| {
+    compile_regex(
+        "Python subprocess",
+        r#"subprocess\.(?:run|call|Popen)\s*\("#,
+    )
 });
-static PYTHON_SUBPROCESS_START: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r#"subprocess\.(?:run|call|Popen)\s*\("#).expect("static scanner regex")
+static JAVASCRIPT_EXEC_START: LazyLock<CompiledRegex> = LazyLock::new(|| {
+    compile_regex(
+        "JavaScript shell execution",
+        r#"(?:child_process\.)?(?:exec|execSync)\s*\("#,
+    )
 });
-static JAVASCRIPT_EXEC_START: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r#"(?:child_process\.)?(?:exec|execSync)\s*\("#)
-        .expect("static scanner regex")
+static JAVASCRIPT_PROCESS_START: LazyLock<CompiledRegex> = LazyLock::new(|| {
+    compile_regex(
+        "JavaScript process launch",
+        r#"(?:child_process\.)?(?:spawn|spawnSync|execFile|execFileSync)\s*\("#,
+    )
 });
-static JAVASCRIPT_PROCESS_START: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r#"(?:child_process\.)?(?:spawn|spawnSync|execFile|execFileSync)\s*\("#)
-        .expect("static scanner regex")
-});
+
+fn compile_regex(name: &str, expression: &str) -> CompiledRegex {
+    regex::Regex::new(expression).map_err(|error| format!("invalid {name} scanner regex: {error}"))
+}
+
+fn compiled_regex(value: &LazyLock<CompiledRegex>) -> Result<&regex::Regex, String> {
+    value.as_ref().map_err(Clone::clone)
+}
 
 pub(crate) const INVENTORY_SCHEMA_VERSION: u32 = 1;
 
@@ -207,7 +223,7 @@ pub(crate) fn scan(_root: &Path) -> Result<Inventory, String> {
         });
         results
             .into_inner()
-            .map_err(|_| "scanner result lock poisoned".to_owned())?
+            .map_err(|_error| "scanner result lock poisoned".to_owned())?
     };
     let mut findings = Vec::new();
     let mut skipped = Vec::new();
@@ -397,10 +413,12 @@ pub(crate) fn static_script_references(
             append_docker_exec_references(&mut output, &relative, source, targets);
             continue;
         }
-        let syntax = syntax.expect("a non-Docker reference source has process syntax");
+        let Some(syntax) = syntax else {
+            continue;
+        };
         let start_regex = match syntax {
-            ProcessSyntax::Python => &*PYTHON_SUBPROCESS_START,
-            ProcessSyntax::Javascript => &*JAVASCRIPT_PROCESS_START,
+            ProcessSyntax::Python => compiled_regex(&PYTHON_SUBPROCESS_START)?,
+            ProcessSyntax::Javascript => compiled_regex(&JAVASCRIPT_PROCESS_START)?,
         };
         for start in start_regex.find_iter(source) {
             let Some((end, arguments)) = balanced_call_arguments(source, start.end()) else {
@@ -690,7 +708,7 @@ fn git_inventory(root: &Path) -> Result<Vec<(String, PathBuf)>, String> {
         .filter(|value| !value.is_empty())
     {
         let relative = std::str::from_utf8(raw)
-            .map_err(|_| "git inventory returned a non-UTF-8 path".to_owned())?
+            .map_err(|_error| "git inventory returned a non-UTF-8 path".to_owned())?
             .replace('\\', "/");
         if relative
             .split('/')
@@ -825,7 +843,10 @@ fn findings_for_file(relative: &str, absolute: &Path) -> FileScan {
             Err(message) => FileScan::error(relative, "parse_toml", message),
         };
     }
-    FileScan::findings(host_findings(relative, text, &lower))
+    match host_findings(relative, text, &lower) {
+        Ok(findings) => FileScan::findings(findings),
+        Err(message) => FileScan::error(relative, "scan_host", message),
+    }
 }
 
 fn ignored_structured_host(filename: &str) -> bool {
@@ -1762,7 +1783,10 @@ fn collect_json_candidates(parts: CollectJsonCandidatesArgs<'_>) {
                     .unwrap_or_else(|| span_of(source, 0, command)),
                 source: command.as_bytes().to_vec(),
             })),
-        _ => {}
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => {}
     }
 }
 
@@ -1845,11 +1869,15 @@ fn collect_toml_candidates(parts: CollectTomlCandidatesArgs<'_>) {
                 source: command.as_bytes().to_vec(),
             }));
         }
-        _ => {}
+        toml::Value::String(_)
+        | toml::Value::Integer(_)
+        | toml::Value::Float(_)
+        | toml::Value::Boolean(_)
+        | toml::Value::Datetime(_) => {}
     }
 }
 
-fn host_findings(path: &str, source: &str, lower: &str) -> Vec<Finding> {
+fn host_findings(path: &str, source: &str, lower: &str) -> Result<Vec<Finding>, String> {
     let offsets = line_offsets(source);
     let mut output = Vec::new();
     if lower.ends_with(".py") {
@@ -1858,41 +1886,47 @@ fn host_findings(path: &str, source: &str, lower: &str) -> Vec<Finding> {
             path,
             source,
             line_offsets: &offsets,
-            regex: &PYTHON_OS_SYSTEM,
+            regex: compiled_regex(&PYTHON_OS_SYSTEM)?,
             interpreter: "sh",
-        });
+        })?;
         append_process_reference_findings(AppendProcessReferenceFindingsArgs {
             output: &mut output,
             path,
             source,
             line_offsets: &offsets,
-            start_regex: &PYTHON_SUBPROCESS_START,
+            start_regex: compiled_regex(&PYTHON_SUBPROCESS_START)?,
             syntax: ProcessSyntax::Python,
         });
     } else if [".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx"]
         .iter()
         .any(|extension| lower.ends_with(extension))
     {
-        append_javascript_shell_findings(&mut output, path, source, &offsets);
+        append_javascript_shell_findings(
+            &mut output,
+            path,
+            source,
+            compiled_regex(&JAVASCRIPT_EXEC_START)?,
+        );
         append_process_reference_findings(AppendProcessReferenceFindingsArgs {
             output: &mut output,
             path,
             source,
             line_offsets: &offsets,
-            start_regex: &JAVASCRIPT_PROCESS_START,
+            start_regex: compiled_regex(&JAVASCRIPT_PROCESS_START)?,
             syntax: ProcessSyntax::Javascript,
         });
     }
-    output
+    Ok(output)
 }
 
 fn append_javascript_shell_findings(
     output: &mut Vec<Finding>,
     path: &str,
     source: &str,
-    line_offsets: &[usize],
+    start_regex: &regex::Regex,
 ) {
-    for start in JAVASCRIPT_EXEC_START.find_iter(source) {
+    let line_offsets = line_offsets(source);
+    for start in start_regex.find_iter(source) {
         let Some((end, arguments)) = balanced_call_arguments(source, start.end()) else {
             continue;
         };
@@ -2098,7 +2132,7 @@ fn append_process_reference_findings(parts: AppendProcessReferenceFindingsArgs<'
                     // says, and hands the rest of a sequence to it as `$0`,
                     // `$1` and so on — so the command is `args[0]` either way.
                     quoted_literal(first)
-                        .or_else(|| collection_program(first).flatten())
+                        .or_else(|| collection_program(first).literal())
                         .map_or(ProcessReading::Unreadable, |command| {
                             ProcessReading::Command {
                                 interpreter: "sh",
@@ -2116,10 +2150,8 @@ fn append_process_reference_findings(parts: AppendProcessReferenceFindingsArgs<'
                     }
                 } else {
                     let argv = static_argv_literals(first);
-                    read_process_launch(
-                        collection_program(first).flatten().as_deref(),
-                        argv.as_ref().map(|argv| &argv[1..]),
-                    )
+                    let program = collection_program(first).literal();
+                    read_process_launch(program.as_deref(), argv.as_ref().map(|argv| &argv[1..]))
                 }
             }
             ProcessSyntax::Javascript => {
@@ -2252,24 +2284,41 @@ pub(crate) fn split_top_level_arguments(arguments: &str) -> Vec<&str> {
 
 /// The program a sequence argument names, when the argument is a sequence.
 ///
-/// Three answers, not two: `None` is "not a sequence at all", `Some(None)` is
-/// "a sequence whose first element is not a literal", and `Some(Some(program))`
-/// is the program it runs. A caller that folded the first two together would
-/// have to guess which it was looking at.
-fn collection_program(value: &str) -> Option<Option<String>> {
+/// Three answers, not two: the value may not be a collection, its first element
+/// may be dynamic, or it may name a literal program. A caller that folds the
+/// first two together would have to guess which it was looking at.
+enum CollectionProgram {
+    NotCollection,
+    Dynamic,
+    Literal(String),
+}
+
+impl CollectionProgram {
+    fn literal(self) -> Option<String> {
+        match self {
+            Self::Literal(program) => Some(program),
+            Self::NotCollection | Self::Dynamic => None,
+        }
+    }
+}
+
+fn collection_program(value: &str) -> CollectionProgram {
     let value = value.trim();
-    let inner = if value.starts_with('[') && value.ends_with(']')
-        || value.starts_with('(') && value.ends_with(')')
-    {
-        &value[1..value.len() - 1]
-    } else {
-        return None;
+    let inner = match value
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .or_else(|| {
+            value
+                .strip_prefix('(')
+                .and_then(|value| value.strip_suffix(')'))
+        }) {
+        Some(inner) => inner,
+        None => return CollectionProgram::NotCollection,
     };
-    Some(
-        split_top_level_arguments(inner)
-            .first()
-            .and_then(|argument| quoted_literal(argument.trim())),
-    )
+    split_top_level_arguments(inner)
+        .first()
+        .and_then(|argument| quoted_literal(argument.trim()))
+        .map_or(CollectionProgram::Dynamic, CollectionProgram::Literal)
 }
 
 pub(crate) fn static_argv_literals(value: &str) -> Option<Vec<String>> {
@@ -2302,7 +2351,7 @@ struct AppendHostFindingsArgs<'a> {
     interpreter: &'a str,
 }
 
-fn append_host_findings(parts: AppendHostFindingsArgs<'_>) {
+fn append_host_findings(parts: AppendHostFindingsArgs<'_>) -> Result<(), String> {
     // Destructured without `..`: see `AppendHostFindingsArgs`.
     let AppendHostFindingsArgs {
         output,
@@ -2313,10 +2362,12 @@ fn append_host_findings(parts: AppendHostFindingsArgs<'_>) {
         interpreter,
     } = parts;
     for capture in regex.captures_iter(source) {
-        let whole = capture.get(0).expect("host regex has a whole match");
+        let whole = capture
+            .get(0)
+            .ok_or("host scanner regex matched without a whole capture")?;
         let argument = capture
             .get(1)
-            .expect("host regex has an argument capture")
+            .ok_or("host scanner regex matched without its argument capture")?
             .as_str()
             .trim();
         let quoted = quoted_literal(argument);
@@ -2348,6 +2399,7 @@ fn append_host_findings(parts: AppendHostFindingsArgs<'_>) {
             source: command.into_bytes(),
         }));
     }
+    Ok(())
 }
 
 pub(crate) fn quoted_literal(value: &str) -> Option<String> {
@@ -2959,7 +3011,8 @@ spawn(dynamicProgram, dynamicArguments);
         assert_eq!(finding.kind, FindingKind::EmbeddedShell);
         assert_eq!(finding.source, b"/usr/bin/printf javascript");
         assert_eq!(
-            &source[finding.span.start_byte as usize..finding.span.end_byte as usize],
+            &source[usize::try_from(finding.span.start_byte).unwrap()
+                ..usize::try_from(finding.span.end_byte).unwrap()],
             "child_process.execSync(\"/usr/bin/printf javascript\", {stdio: \"inherit\"})"
         );
     }
@@ -3329,8 +3382,8 @@ spawnSync(program, ["status"], { shell: false });
             let unique: std::collections::BTreeSet<_> = spans.iter().collect();
             assert_eq!(unique.len(), spans.len(), "{path} reused a span: {spans:?}");
             for (start, end) in spans {
-                let start = start as usize;
-                let end = end as usize;
+                let start = usize::try_from(start).unwrap();
+                let end = usize::try_from(end).unwrap();
                 assert!(start < end && end <= source.len(), "{path} {start}..{end}");
                 assert!(
                     source[start..end]
@@ -3374,8 +3427,8 @@ spawnSync(program, ["status"], { shell: false });
             .findings
             .iter()
             .map(|finding| {
-                let start = finding.span.start_byte as usize;
-                let end = finding.span.end_byte as usize;
+                let start = usize::try_from(finding.span.start_byte).unwrap();
+                let end = usize::try_from(finding.span.end_byte).unwrap();
                 std::str::from_utf8(&source[start..end]).unwrap()
             })
             .collect();
@@ -3429,8 +3482,8 @@ spawnSync(program, ["status"], { shell: false });
         assert!(inventory.skipped.is_empty());
         assert_eq!(inventory.findings.len(), 1);
         assert_eq!(inventory.findings[0].source, b"printf jsonc");
-        let start = inventory.findings[0].span.start_byte as usize;
-        let end = inventory.findings[0].span.end_byte as usize;
+        let start = usize::try_from(inventory.findings[0].span.start_byte).unwrap();
+        let end = usize::try_from(inventory.findings[0].span.end_byte).unwrap();
         assert_eq!(&source[start..end], b"printf jsonc");
     }
 

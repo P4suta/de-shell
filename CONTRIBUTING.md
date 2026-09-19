@@ -44,6 +44,55 @@ The OCaml tree is an unpublished reference implementation. Work on it is
 explicit through `mise run reference:build` and `mise run reference:test`; it
 must not become a dependency of the Rust CLI, CI default, or release archives.
 
+## Rust design policy
+
+The Rust implementation is deliberately stricter than idiomatic defaults. A
+review preference is not a policy: every rule below is enforced by rustc,
+Clippy, `clippy.toml`, or `cargo xtask rust-policy`, and `mise run lint` runs all
+of them.
+
+- Trait objects are forbidden, including `Box<dyn Trait>`, borrowed trait
+  objects, aliases, and `dyn` hidden in macro input. Use a generic when the set
+  of implementations is open and an exhaustive enum when it is closed. `Box`
+  remains appropriate solely to give recursive data a finite size.
+- Production code does not use `unwrap`, `expect`, `panic!`, `unreachable!`,
+  `todo!`, or `unimplemented!`. A fallible boundary returns a typed error; a
+  state claimed to be impossible is represented so that the compiler checks
+  it. Tests may panic because that is their assertion mechanism.
+- Enum matches name every variant. A wildcard arm makes a future variant
+  inherit behavior without review, so `wildcard_enum_match_arm` is denied.
+- Potentially truncating, wrapping, sign-losing, or precision-losing numeric
+  casts are denied. Use `From` for infallible conversions and `TryFrom` with an
+  explicit failure or saturation policy otherwise.
+- Ignored `Result` and other `must_use` values are named. A best-effort
+  boundary uses a purpose-specific name such as `_stdout_delivery`; anonymous
+  discards and `map_err(|_| ...)` are denied.
+- Nested `Option`, boolean bags, accidental double allocation, boxed
+  collections, boxed vector elements, and implicit or redundant clones are
+  denied. Model states with enums and make ownership changes visible.
+- Unsafe operations stay at the smallest OS boundary, one per block, with a
+  `SAFETY` invariant. Unsafe operations inside an unsafe function are still
+  forbidden unless placed in such a block.
+- Filesystem mutation goes through `patch`, ambient time and environment reads
+  go through `host`, and process launches go through `host`. The raw APIs are
+  mechanically unavailable everywhere else.
+- `#[allow]` is forbidden. A genuinely necessary exception uses the narrowest
+  `#[expect]` on the affected item with a reason that states the invariant; an
+  obsolete expectation then becomes a warning and fails CI.
+
+The complete Clippy `restriction` group is intentionally not enabled as a
+single switch. It contains mutually exclusive style rules and rules that are
+wrong for this security model—for example, replacing exclusive `create_dir`
+with recursive creation, or treating every non-directory filesystem object as
+a regular file. Rules are adopted individually only when their required
+rewrite preserves the contract on every supported platform.
+
+Test code has only the boundaries needed to test failure: it may unwrap,
+expect, panic, index fixtures, build large stack fixtures, and call raw
+filesystem APIs to construct races and corrupt shapes. Those exemptions are in
+`clippy.toml` or a reasoned test-module `expect`; they do not apply to product
+code.
+
 ## Pull requests and repository policy
 
 Pull requests use the repository template and must pass `Required gate`.

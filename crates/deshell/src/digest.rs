@@ -18,10 +18,18 @@ pub(crate) fn lowercase_hex(bytes: impl AsRef<[u8]>) -> String {
     let bytes = bytes.as_ref();
     let mut output = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
-        use std::fmt::Write as _;
-        write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
+        output.push(hex_digit(byte >> 4));
+        output.push(hex_digit(byte & 0x0f));
     }
     output
+}
+
+fn hex_digit(nibble: u8) -> char {
+    char::from(match nibble {
+        0..=9 => b'0' + nibble,
+        10..=15 => b'a' + (nibble - 10),
+        _ => b'?',
+    })
 }
 
 pub(crate) fn valid_sha256(value: &str) -> bool {
@@ -49,7 +57,7 @@ pub(crate) fn file_sha256(path: &Path) -> Result<(u64, String), String> {
         .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
     let mut digest = Sha256::new();
     let mut bytes = 0_u64;
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 64 * 1024];
     loop {
         let count = file
             .read(&mut buffer)

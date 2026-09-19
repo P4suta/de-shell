@@ -30,6 +30,7 @@ pub(crate) struct AuditReport {
     pub uncovered_bytes: usize,
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct AuditContext<'a> {
     pub source_path: &'a str,
     pub source_bytes: usize,
@@ -173,7 +174,7 @@ fn audit_coverage(
             1 => report.native_bytes += 1,
             2 => report.delegated_bytes += 1,
             3 => report.residual_bytes += 1,
-            _ => unreachable!(),
+            _ => report.residual_bytes += 1,
         }
     }
     Ok(())

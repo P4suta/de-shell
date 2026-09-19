@@ -105,8 +105,8 @@ impl Diagnostic {
     }
 }
 
-pub(crate) fn emit(
-    writer: &mut dyn Write,
+pub(crate) fn emit<W: Write>(
+    writer: &mut W,
     mode: Mode,
     diagnostic: &Diagnostic,
 ) -> std::io::Result<()> {

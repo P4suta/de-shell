@@ -93,7 +93,7 @@ impl ProjectReader {
 
     fn read_utf8(&self, relative: &str) -> Result<String, String> {
         String::from_utf8(self.read_file(relative)?)
-            .map_err(|_| format!("project file is not valid UTF-8: {relative}"))
+            .map_err(|_error| format!("project file is not valid UTF-8: {relative}"))
     }
 
     fn file_path(&self, relative: &str) -> Result<PathBuf, String> {
@@ -129,7 +129,7 @@ impl ProjectReader {
             .read_file("deshell.lock")
             .map_err(|error| vec![error])?;
         let input = std::str::from_utf8(&bytes)
-            .map_err(|_| vec!["project file is not valid UTF-8: deshell.lock".into()])?;
+            .map_err(|_error| vec!["project file is not valid UTF-8: deshell.lock".into()])?;
         let lock = Lockfile::decode(input)?;
         Ok((lock, crate::digest::sha256(&bytes)))
     }
@@ -273,15 +273,26 @@ impl ValidatedProject {
         if !errors.is_empty() {
             return Err(errors);
         }
-        let (lock, runtime_lock_digest) = lock_snapshot.expect("valid project has a lock");
+        let reader =
+            reader.ok_or_else(|| vec!["validated project has no canonical root".into()])?;
+        let config = config.ok_or_else(|| vec!["validated project has no configuration".into()])?;
+        let (lock, runtime_lock_digest) =
+            lock_snapshot.ok_or_else(|| vec!["validated project has no lock snapshot".into()])?;
+        let manifest = manifest.ok_or_else(|| vec!["validated project has no manifest".into()])?;
+        let entries = validated_entries
+            .ok_or_else(|| vec!["validated project has no analyzed entries".into()])?;
+        let scenarios =
+            scenarios.ok_or_else(|| vec!["validated project has no validated scenarios".into()])?;
+        let replay =
+            replay.ok_or_else(|| vec!["validated project has no replay snapshot".into()])?;
         Ok(Self {
-            canonical_root: reader.expect("valid project has a canonical root").root,
-            config: config.expect("valid project has a config"),
+            canonical_root: reader.root,
+            config,
             lock,
-            manifest: manifest.expect("valid project has a manifest"),
-            entries: validated_entries.expect("valid project has validated entries"),
-            scenarios: scenarios.expect("valid project has validated scenarios"),
-            replay: replay.expect("valid project has a replay snapshot"),
+            manifest,
+            entries,
+            scenarios,
+            replay,
             runtime_lock_digest,
         })
     }
@@ -626,7 +637,9 @@ pub(crate) fn init_cli(
         InitTarget::Rust => "src/bin",
         InitTarget::Go => "cmd",
         InitTarget::Host => ".deshell/host",
-        InitTarget::Auto => unreachable!(),
+        InitTarget::Auto => {
+            return Err("automatic target selection did not resolve a target".into());
+        }
     }
     .to_owned();
 
@@ -658,15 +671,17 @@ pub(crate) fn init_cli(
 
     let mut config = ProjectConfig::decode(&ProjectConfig::default_text())
         .map_err(|errors| errors.join("; "))?;
-    config.entrypoints = entrypoints.clone();
+    config.entrypoints.clone_from(&entrypoints);
     config.migration.target = match target {
         InitTarget::Rust => crate::config::MigrationTarget::Rust,
         InitTarget::Go => crate::config::MigrationTarget::Go,
         InitTarget::Host => crate::config::MigrationTarget::Host,
-        InitTarget::Auto => unreachable!(),
+        InitTarget::Auto => {
+            return Err("automatic target selection did not resolve a target".into());
+        }
     };
     config.migration.generator = target.as_str().into();
-    config.migration.module_root = module_root.clone();
+    config.migration.module_root.clone_from(&module_root);
     config.location_overrides = inventory
         .findings
         .iter()
@@ -1119,11 +1134,7 @@ pub(crate) fn analyze(root: &Path, entry: &str) -> Result<AnalysisResult, String
     let mut proposals = Vec::new();
     match plan_path.symlink_metadata() {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            proposals.push(crate::patch::prepare_create(
-                &plan_path,
-                plan_bytes.clone(),
-                0o644,
-            )?);
+            proposals.push(crate::patch::prepare_create(&plan_path, plan_bytes, 0o644)?);
         }
         Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {
             if std::fs::read(&plan_path).map_err(|error| error.to_string())? != plan_bytes {
@@ -1417,7 +1428,7 @@ fn read_utf8(path: &Path) -> Result<String, String> {
     }
     let bytes =
         std::fs::read(path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-    String::from_utf8(bytes).map_err(|_| format!("{} is not valid UTF-8", path.display()))
+    String::from_utf8(bytes).map_err(|_error| format!("{} is not valid UTF-8", path.display()))
 }
 
 pub(crate) fn load_lock(root: &Path) -> Result<Lockfile, Vec<String>> {
@@ -1428,7 +1439,7 @@ pub(crate) fn load_lock(root: &Path) -> Result<Lockfile, Vec<String>> {
 fn load_lock_snapshot(root: &Path) -> Result<(Lockfile, String), Vec<String>> {
     let bytes = read_project_file(root, "deshell.lock").map_err(|error| vec![error])?;
     let input = std::str::from_utf8(&bytes)
-        .map_err(|_| vec!["project file is not valid UTF-8: deshell.lock".into()])?;
+        .map_err(|_error| vec!["project file is not valid UTF-8: deshell.lock".into()])?;
     let lock = Lockfile::decode(input)?;
     let digest = crate::digest::sha256(&bytes);
     Ok((lock, digest))
@@ -1436,7 +1447,8 @@ fn load_lock_snapshot(root: &Path) -> Result<(Lockfile, String), Vec<String>> {
 
 fn read_project_utf8(root: &Path, relative: &str) -> Result<String, String> {
     let bytes = read_project_file(root, relative)?;
-    String::from_utf8(bytes).map_err(|_| format!("project file is not valid UTF-8: {relative}"))
+    String::from_utf8(bytes)
+        .map_err(|_error| format!("project file is not valid UTF-8: {relative}"))
 }
 
 fn read_project_file(root: &Path, relative: &str) -> Result<Vec<u8>, String> {

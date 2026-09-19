@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+use syn::spanned::Spanned as _;
+use syn::visit::Visit as _;
 
 const PERFORMANCE_WARMUPS: usize = 5;
 const PERFORMANCE_SAMPLES: usize = 20;
@@ -104,10 +106,7 @@ struct CliCase {
 }
 
 fn repository_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .canonicalize()
-        .expect("repository root")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("..")
 }
 
 /// Measure what the host's shell actually does with `set -e`, `set -u` and
@@ -392,7 +391,7 @@ fn run_powershell_preference(root: &Path) -> Result<(), Vec<String>> {
             ));
         }
     }
-    let _ = std::fs::remove_dir_all(&directory);
+    let _cleanup_result = std::fs::remove_dir_all(&directory);
     if checked == 0 {
         println!("skipped  no PowerShell runtime answered");
         return Ok(());
@@ -554,7 +553,7 @@ fn run_powershell_step_invocation(root: &Path) -> Result<(), Vec<String>> {
             ));
         }
     }
-    let _ = std::fs::remove_dir_all(&directory);
+    let _cleanup_result = std::fs::remove_dir_all(&directory);
     if checked == 0 {
         println!("skipped  no PowerShell runtime answered");
         return Ok(());
@@ -642,7 +641,7 @@ fn run_powershell_invocation(root: &Path) -> Result<(), Vec<String>> {
             }
         }
     }
-    let _ = std::fs::remove_dir_all(&directory);
+    let _cleanup_result = std::fs::remove_dir_all(&directory);
     if checked == 0 {
         println!("skipped  no PowerShell runtime answered");
         return Ok(());
@@ -2132,6 +2131,7 @@ fn audit_origin(kind: &str, locator: &str) -> String {
 }
 
 /// The inputs of [`audit_report`].
+#[derive(Clone, Copy)]
 struct AuditReportArgs<'a> {
     excluded_repositories: &'a [String],
     excluded_patterns: &'a [String],
@@ -2513,6 +2513,90 @@ fn run_lint_expectations(root: &Path) -> Result<(), Vec<String>> {
         return Ok(());
     }
     Err(failures)
+}
+
+/// Reject dynamic dispatch throughout the repository.
+///
+/// A trait object hides the concrete set of implementations, allocates or
+/// indirects at the call site, and lets a new implementation change runtime
+/// behaviour without making the caller's match exhaustive. This repository
+/// uses generics when the set is open and an enum when it is closed. The AST
+/// visitor catches ordinary Rust types; the token walk additionally closes the
+/// macro-token loophole, where `syn` deliberately treats a macro body as opaque.
+fn run_rust_policy(root: &Path) -> Result<(), Vec<String>> {
+    let mut failures = Vec::new();
+    let mut checked = 0_usize;
+    for entry in walk_rust_sources(root)? {
+        let source = std::fs::read_to_string(&entry)
+            .map_err(|error| vec![format!("cannot read {}: {error}", entry.display())])?;
+        let display = entry
+            .strip_prefix(root)
+            .unwrap_or(&entry)
+            .display()
+            .to_string();
+        let syntax = syn::parse_file(&source)
+            .map_err(|error| vec![format!("cannot parse {display}: {error}")])?;
+        let mut visitor = TraitObjectVisitor::default();
+        visitor.visit_file(&syntax);
+        for &line in &visitor.lines {
+            failures.push(format!(
+                "{display}:{line}: trait objects are forbidden; use a generic for an open implementation set or an exhaustive enum for a closed set"
+            ));
+        }
+
+        let tokens = source
+            .parse::<proc_macro2::TokenStream>()
+            .map_err(|error| {
+                vec![format!(
+                    "cannot tokenize {display} while checking macro bodies: {error}"
+                )]
+            })?;
+        let mut macro_lines = Vec::new();
+        collect_dyn_tokens(tokens, &mut macro_lines);
+        macro_lines.sort_unstable();
+        macro_lines.dedup();
+        for line in macro_lines {
+            if !visitor.lines.contains(&line) {
+                failures.push(format!(
+                    "{display}:{line}: `dyn` is forbidden, including inside macro input; use static dispatch or an exhaustive enum"
+                ));
+            }
+        }
+        checked += 1;
+    }
+    if failures.is_empty() {
+        println!(
+            "Rust policy passed for {checked} source file(s): no trait objects or hidden macro `dyn` tokens"
+        );
+        return Ok(());
+    }
+    Err(failures)
+}
+
+#[derive(Default)]
+struct TraitObjectVisitor {
+    lines: Vec<usize>,
+}
+
+impl<'ast> syn::visit::Visit<'ast> for TraitObjectVisitor {
+    fn visit_type_trait_object(&mut self, node: &'ast syn::TypeTraitObject) {
+        self.lines.push(node.span().start().line);
+        syn::visit::visit_type_trait_object(self, node);
+    }
+}
+
+fn collect_dyn_tokens(tokens: proc_macro2::TokenStream, lines: &mut Vec<usize>) {
+    for token in tokens {
+        match token {
+            proc_macro2::TokenTree::Group(group) => collect_dyn_tokens(group.stream(), lines),
+            proc_macro2::TokenTree::Ident(identifier) if identifier == "dyn" => {
+                lines.push(identifier.span().start().line);
+            }
+            proc_macro2::TokenTree::Ident(_)
+            | proc_macro2::TokenTree::Punct(_)
+            | proc_macro2::TokenTree::Literal(_) => {}
+        }
+    }
 }
 
 /// Every `.rs` file this repository owns.
@@ -3088,15 +3172,18 @@ fn measure_command(
     }
     samples.sort_unstable();
     let middle = samples.len() / 2;
-    let median_ns = (samples[middle - 1] as f64 + samples[middle] as f64) / 2.0;
     let p95_index = (samples.len() * 95).div_ceil(100) - 1;
     Ok(PerformanceMetric {
-        median_ms: median_ns / 1_000_000.0,
-        p95_ms: samples[p95_index] as f64 / 1_000_000.0,
+        median_ms: (samples[middle - 1].as_secs_f64() + samples[middle].as_secs_f64()) * 500.0,
+        p95_ms: samples[p95_index].as_secs_f64() * 1_000.0,
     })
 }
 
-fn timed_command(binary: &Path, arguments: &[String], label: &str) -> Result<u128, Vec<String>> {
+fn timed_command(
+    binary: &Path,
+    arguments: &[String],
+    label: &str,
+) -> Result<std::time::Duration, Vec<String>> {
     let start = Instant::now();
     let status = std::process::Command::new(binary)
         .args(arguments)
@@ -3104,7 +3191,7 @@ fn timed_command(binary: &Path, arguments: &[String], label: &str) -> Result<u12
         .stderr(std::process::Stdio::null())
         .status()
         .map_err(|error| vec![format!("cannot execute performance {label}: {error}")])?;
-    let elapsed = start.elapsed().as_nanos();
+    let elapsed = start.elapsed();
     if !status.success() {
         return Err(vec![format!(
             "performance {label} failed with status {status}"
@@ -3305,14 +3392,14 @@ fn powershell_runtime_path() -> Result<String, String> {
     }) else {
         return current
             .into_string()
-            .map_err(|_| "PATH is not valid Unicode".into());
+            .map_err(|_error| "PATH is not valid Unicode".into());
     };
     let runtime = paths.remove(index);
     paths.insert(0, runtime);
     std::env::join_paths(paths)
         .map_err(|error| format!("cannot construct PowerShell runtime PATH: {error}"))?
         .into_string()
-        .map_err(|_| "PowerShell runtime PATH is not valid Unicode".into())
+        .map_err(|_error| "PowerShell runtime PATH is not valid Unicode".into())
 }
 
 fn migration_interpreter_supported_on(interpreter: &str, operating_system: &str) -> bool {
@@ -3566,7 +3653,8 @@ fn run_migration_e2e(
             "{interpreter}/{generator} archive manifest did not contain exactly the shell file and embedded snippet"
         )]);
     }
-    let archive_path = embedded_entry.unwrap()["archive_path"]
+    let archive_path = embedded_entry
+        .ok_or_else(|| vec!["embedded archive entry disappeared".into()])?["archive_path"]
         .as_str()
         .ok_or_else(|| vec!["embedded archive entry omitted its path".into()])?;
     let archived = std::fs::read(directory.path().join(archive_path)).map_err(|error| {
@@ -3641,6 +3729,7 @@ fn dispatch(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Vec<Str
         Some("trace-events") => run_trace_events(root),
         Some("fuzz-modules") => run_fuzz_modules(root),
         Some("lint-expectations") => run_lint_expectations(root),
+        Some("rust-policy") => run_rust_policy(root),
         Some("repository-guardrails") => run_repository_guardrails(root),
         Some("corpus-audit") => {
             let option = |name: &str| {
@@ -3739,6 +3828,44 @@ fn main() {
 mod tests {
     use super::*;
 
+    #[test]
+    fn rust_policy_rejects_trait_objects_without_matching_comments_or_strings() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        for component in ["crates/example/src", "xtask/src"] {
+            std::fs::create_dir_all(root.join(component)).unwrap();
+        }
+        std::fs::write(
+            root.join("crates/example/src/lib.rs"),
+            r#"
+                // `dyn Trait` in documentation is not code.
+                const MESSAGE: &str = "Box<dyn Trait>";
+                fn static_dispatch<T: Send>(value: &T) { let _ = value; }
+            "#,
+        )
+        .unwrap();
+        std::fs::write(root.join("xtask/src/main.rs"), "fn main() {}\n").unwrap();
+        run_rust_policy(root).expect("comments, strings, and generics pass");
+
+        std::fs::write(
+            root.join("crates/example/src/lib.rs"),
+            "fn erased(value: &dyn Send) { let _ = value; }\n",
+        )
+        .unwrap();
+        let errors = run_rust_policy(root).expect_err("an ordinary trait object fails");
+        assert_eq!(errors.len(), 1, "{errors:#?}");
+        assert!(errors[0].contains("lib.rs:1: trait objects are forbidden"));
+
+        std::fs::write(
+            root.join("crates/example/src/lib.rs"),
+            "macro_rules! hidden { () => { type Erased = Box<dyn Send>; } }\n",
+        )
+        .unwrap();
+        let errors = run_rust_policy(root).expect_err("a macro cannot hide a trait object");
+        assert_eq!(errors.len(), 1, "{errors:#?}");
+        assert!(errors[0].contains("including inside macro input"));
+    }
+
     /// The guardrails see a long path and a large file, and say which.
     ///
     /// The PowerShell script this replaces was refused by de-shell, so the
@@ -3773,7 +3900,7 @@ mod tests {
         run_repository_guardrails(root).expect("a clean repository passes");
 
         // A path over the limit.
-        let deep = "d/".repeat(110) + &"x".repeat(60) + ".txt";
+        let deep = format!("{}{}.txt", "d/".repeat(110), "x".repeat(60));
         let deep_path = root.join(&deep);
         std::fs::create_dir_all(deep_path.parent().unwrap()).unwrap();
         std::fs::write(&deep_path, b"x").unwrap();

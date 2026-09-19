@@ -730,7 +730,12 @@ fn conservative_source_analysis(
         let (environment_prefix, argument_prefix, argument_suffix) = match interpreter {
             Interpreter::Powershell => ("$env:", "$args[", "]"),
             Interpreter::Nushell => ("$env.", "$args.", ""),
-            _ => unreachable!(),
+            Interpreter::Sh
+            | Interpreter::Bash
+            | Interpreter::Zsh
+            | Interpreter::Fish
+            | Interpreter::Cmd
+            | Interpreter::Unknown(_) => return analysis,
         };
         let lower = text.to_ascii_lowercase();
         let mut cursor = 0;
@@ -885,7 +890,7 @@ fn bind_node_pin(node: &mut Node, pins: &crate::config::InterpreterPins) -> Resu
             interpreter_pin,
             ..
         } => {
-            *interpreter_pin = match interpreter.to_ascii_lowercase().as_str() {
+            interpreter_pin.clone_from(match interpreter.to_ascii_lowercase().as_str() {
                 "sh" | "posix_sh" => &pins.posix_sh,
                 "bash" => &pins.bash,
                 "zsh" => &pins.zsh,
@@ -894,8 +899,7 @@ fn bind_node_pin(node: &mut Node, pins: &crate::config::InterpreterPins) -> Resu
                 "cmd" => &pins.cmd,
                 "nu" | "nushell" => &pins.nushell,
                 other => return Err(format!("no lock pin for delegated interpreter: {other}")),
-            }
-            .clone();
+            });
         }
         Operation::Pipeline { nodes, .. }
         | Operation::Sequence { nodes, .. }
@@ -1485,22 +1489,21 @@ fn start_powershell_parser() -> Result<PowershellParser, String> {
 /// Every failure drops the agent. A parser that stopped answering is not one to
 /// ask again, and a fresh one costs a single process start.
 fn ask_powershell_parser(request: &[u8]) -> Result<Vec<u8>, LoweringFailure> {
-    let mut held = POWERSHELL_PARSER
-        .lock()
-        .map_err(|_| LoweringFailure::Delegate("the PowerShell parser lock is poisoned".into()))?;
+    let mut held = POWERSHELL_PARSER.lock().map_err(|_error| {
+        LoweringFailure::Delegate("the PowerShell parser lock is poisoned".into())
+    })?;
     if held.is_none() {
         *held = Some(start_powershell_parser().map_err(LoweringFailure::Delegate)?);
     }
     let parser = held
         .as_mut()
         .ok_or_else(|| LoweringFailure::Delegate("the PowerShell parser is not running".into()))?;
-    match parser.agent.request(request, POWERSHELL_PARSE_BUDGET) {
-        Ok(line) => Ok(line),
-        Err(error) => {
-            *held = None;
-            Err(agent_failure(error))
-        }
+    let response = parser.agent.request(request, POWERSHELL_PARSE_BUDGET);
+    if response.is_err() {
+        *held = None;
     }
+    drop(held);
+    response.map_err(agent_failure)
 }
 
 /// What an agent's failure means for a lowering.
@@ -1674,7 +1677,7 @@ fn set_statement(statement: &str, current: ShellOptions) -> Option<ShellOptions>
         }
         saw_one = true;
     }
-    if saw_one { Some(options) } else { None }
+    saw_one.then_some(options)
 }
 
 /// Where a `while` ends, and where its `do` divides it.
@@ -3062,7 +3065,9 @@ fn lower_posix_control(parts: LowerPosixControlArgs<'_>) -> Result<Node, String>
         )),
         "&&" => {
             let mut iterator = nodes.into_iter();
-            let mut result = iterator.next().expect("pieces are non-empty");
+            let mut result = iterator
+                .next()
+                .ok_or("POSIX && lowering produced no operands")?;
             for next in iterator {
                 result = native_node(
                     Operation::Condition {
@@ -3244,7 +3249,10 @@ fn lower_posix_simple(parts: LowerPosixSimpleArgs<'_>) -> Result<Node, String> {
             ));
         }
         let operation = if rhs.starts_with("$(") && rhs.ends_with(')') {
-            let inner_start = range.start + raw.find("$(").unwrap() + 2;
+            let substitution = raw
+                .find("$(")
+                .ok_or("command substitution prefix disappeared during lowering")?;
+            let inner_start = range.start + substitution + 2;
             let inner_end = range.end - 1;
             let body = lower_posix_simple(LowerPosixSimpleArgs {
                 path,
@@ -3610,15 +3618,14 @@ fn double_bracket_predicate(
 ) -> Result<crate::ir::TestPredicate, String> {
     // Destructured without `..`: see `DoubleBracketArgs`.
     let DoubleBracketArgs {
-        path,
-        source,
-        offset,
+        path: _path,
+        source: _source,
+        offset: _offset,
         text,
         inputs,
         environment,
         locals,
     } = parts;
-    let _ = path;
     // The pattern operand is taken from the raw text rather than the tokenizer,
     // because `*` is exactly what the tokenizer refuses.
     let comparison = text
@@ -3656,10 +3663,8 @@ fn double_bracket_predicate(
             }
         });
     }
-    let operands = tokenize_posix(text, inputs, environment, locals).map_err(|_| {
-        let _ = (source, offset);
-        "double-bracket operands are outside the static subset".to_owned()
-    })?;
+    let operands = tokenize_posix(text, inputs, environment, locals)
+        .map_err(|_error| "double-bracket operands are outside the static subset".to_owned())?;
     test_predicate(&operands)
         .ok_or_else(|| "unmodelled test operator requires pinned interpreter delegation".into())
 }
@@ -3934,7 +3939,10 @@ fn infer_value_type(expression: &TextExpression) -> ValueType {
     };
     if value == "true" || value == "false" {
         ValueType::Primitive(PrimitiveType::Bool)
-    } else if value.parse::<i64>().is_ok() && value.parse::<i64>().unwrap().to_string() == value {
+    } else if value
+        .parse::<i64>()
+        .is_ok_and(|parsed| parsed.to_string() == value)
+    {
         ValueType::Primitive(PrimitiveType::Int)
     } else {
         ValueType::Primitive(PrimitiveType::Text)
@@ -3965,8 +3973,14 @@ fn lower_fish(path: &str, source: &str) -> Result<Lowered, String> {
     let body = if nodes.len() == 1 {
         nodes.remove(0)
     } else {
-        let first = nodes.first().unwrap().source.clone().unwrap();
-        let last = nodes.last().unwrap().source.clone().unwrap();
+        let first = required_node_source(
+            nodes.first().ok_or("fish lowering lost its first node")?,
+            "fish first node",
+        )?;
+        let last = required_node_source(
+            nodes.last().ok_or("fish lowering lost its last node")?,
+            "fish last node",
+        )?;
         native_node(
             Operation::Sequence {
                 nodes,
@@ -4051,7 +4065,9 @@ fn lower_fish_control(parts: LowerFishControlArgs<'_>) -> Result<Node, String> {
         })
         .collect::<Result<Vec<_>, _>>()?
         .into_iter();
-    let mut result = nodes.next().expect("fish && pieces are non-empty");
+    let mut result = nodes
+        .next()
+        .ok_or("fish && lowering produced no operands")?;
     for next in nodes {
         result = native_node(
             Operation::Condition {
@@ -4129,7 +4145,7 @@ fn tokenize_fish(
                     quote = None;
                     index += 1;
                 } else {
-                    let character = source[index..].chars().next().unwrap();
+                    let character = character_at(source, index)?;
                     literal.push(character);
                     index += character.len_utf8();
                 }
@@ -4154,7 +4170,7 @@ fn tokenize_fish(
                         "fish quoted escape or substitution is outside the static subset".into(),
                     );
                 }
-                let character = source[index..].chars().next().unwrap();
+                let character = character_at(source, index)?;
                 literal.push(character);
                 index += character.len_utf8();
                 started = true;
@@ -4195,7 +4211,7 @@ fn tokenize_fish(
                         "fish dynamic or control syntax is outside the static subset".into(),
                     );
                 }
-                let character = source[index..].chars().next().unwrap();
+                let character = character_at(source, index)?;
                 literal.push(character);
                 index += character.len_utf8();
                 started = true;
@@ -4286,13 +4302,22 @@ fn lower_cmd(path: &str, source: &str) -> Result<Lowered, String> {
     let body = if nodes.len() == 1 {
         let mut node = nodes.remove(0);
         if let Some(prologue) = prologue {
-            let command = node.source.clone().unwrap();
+            let command = required_node_source(&node, "cmd command")?;
             node.source = Some(cover_spans(prologue, command));
         }
         node
     } else {
-        let first = prologue.unwrap_or_else(|| nodes.first().unwrap().source.clone().unwrap());
-        let last = nodes.last().unwrap().source.clone().unwrap();
+        let first = match prologue {
+            Some(prologue) => prologue,
+            None => required_node_source(
+                nodes.first().ok_or("cmd lowering lost its first node")?,
+                "cmd first node",
+            )?,
+        };
+        let last = required_node_source(
+            nodes.last().ok_or("cmd lowering lost its last node")?,
+            "cmd last node",
+        )?;
         native_node(
             Operation::Sequence {
                 nodes,
@@ -4374,7 +4399,7 @@ fn lower_cmd_control(parts: LowerCmdControlArgs<'_>) -> Result<Node, String> {
         })
         .collect::<Result<Vec<_>, _>>()?
         .into_iter();
-    let mut result = nodes.next().expect("cmd && pieces are non-empty");
+    let mut result = nodes.next().ok_or("cmd && lowering produced no operands")?;
     for next in nodes {
         result = native_node(
             Operation::Condition {
@@ -4610,9 +4635,21 @@ fn lower_powershell(path: &str, source: &str) -> Result<Lowered, String> {
     let body = if nodes.len() == 1 && terminal_status_span.is_none() {
         nodes.remove(0)
     } else {
-        let first = nodes.first().unwrap().source.clone().unwrap();
-        let last =
-            terminal_status_span.unwrap_or_else(|| nodes.last().unwrap().source.clone().unwrap());
+        let first = required_node_source(
+            nodes
+                .first()
+                .ok_or("PowerShell lowering lost its first node")?,
+            "PowerShell first node",
+        )?;
+        let last = match terminal_status_span {
+            Some(span) => span,
+            None => required_node_source(
+                nodes
+                    .last()
+                    .ok_or("PowerShell lowering lost its last node")?,
+                "PowerShell last node",
+            )?,
+        };
         native_node(
             Operation::Sequence {
                 nodes,
@@ -4740,7 +4777,9 @@ fn lower_powershell_control(parts: LowerPowershellControlArgs<'_>) -> Result<Nod
         })
         .collect::<Result<Vec<_>, _>>()?
         .into_iter();
-    let mut result = nodes.next().expect("PowerShell && pieces are non-empty");
+    let mut result = nodes
+        .next()
+        .ok_or("PowerShell && lowering produced no operands")?;
     for next in nodes {
         result = native_node(
             Operation::Condition {
@@ -5025,7 +5064,7 @@ fn tokenize_powershell(
             {
                 let index = index
                     .parse::<usize>()
-                    .map_err(|_| "PowerShell args index must be a non-negative integer")?;
+                    .map_err(|_error| "PowerShell args index must be a non-negative integer")?;
                 let name = index
                     .checked_add(1)
                     .ok_or("PowerShell args index is too large")?
@@ -5139,8 +5178,8 @@ fn lower_nushell(path: &str, source: &str, interpreter: &Interpreter) -> Result<
         span_for_range(path, source, lines[2].0.start, lines[7].0.end)?,
     );
     let span = cover_spans(
-        first.source.clone().unwrap(),
-        condition.source.clone().unwrap(),
+        required_node_source(&first, "Nushell first node")?,
+        required_node_source(&condition, "Nushell condition")?,
     );
     Ok(Lowered {
         // Only the POSIX frontend reads a function definition.
@@ -5449,7 +5488,7 @@ fn split_redirections(source: &str) -> Result<(String, Vec<RawRedirection>), Str
         return Err("unterminated quote".into());
     }
     let command =
-        String::from_utf8(command).map_err(|_| "command is not valid UTF-8".to_owned())?;
+        String::from_utf8(command).map_err(|_error| "command is not valid UTF-8".to_owned())?;
     Ok((command, redirections))
 }
 
@@ -5473,10 +5512,7 @@ fn tokenize_posix(
                 if byte == b'\'' {
                     quote = None;
                 } else {
-                    let character = source[index..]
-                        .chars()
-                        .next()
-                        .expect("valid UTF-8 boundary");
+                    let character = character_at(source, index)?;
                     literal.push(character);
                     index += character.len_utf8();
                     token_started = true;
@@ -5529,7 +5565,7 @@ fn tokenize_posix(
                     token_started = true;
                     continue;
                 }
-                let character = source[index..].chars().next().unwrap();
+                let character = character_at(source, index)?;
                 literal.push(character);
                 index += character.len_utf8();
                 token_started = true;
@@ -5594,7 +5630,7 @@ fn tokenize_posix(
                             .into(),
                     );
                 }
-                let character = source[index..].chars().next().unwrap();
+                let character = character_at(source, index)?;
                 literal.push(character);
                 index += character.len_utf8();
                 token_started = true;
@@ -5647,7 +5683,10 @@ fn parse_posix_word(parts: ParsePosixWordArgs<'_>) -> Result<TextExpression, Str
     if words.len() != 1 {
         return Err("assignment value is not one static word".into());
     }
-    Ok(words.into_iter().next().unwrap())
+    words
+        .into_iter()
+        .next()
+        .ok_or_else(|| "assignment tokenizer returned no word".into())
 }
 
 /// The inputs of [`parse_expansion`].
@@ -5867,7 +5906,9 @@ fn lower_literal_family(
                 command[0] = executable;
                 command
             }
-            _ => return Err("not a literal frontend family".into()),
+            Interpreter::Sh | Interpreter::Bash | Interpreter::Zsh | Interpreter::Unknown(_) => {
+                return Err("not a literal frontend family".into());
+            }
         };
         let argv = command.into_iter().map(TextExpression::literal).collect();
         nodes.push(native_node(
@@ -5889,8 +5930,14 @@ fn lower_literal_family(
     let body = if nodes.len() == 1 {
         nodes.remove(0)
     } else {
-        let first = nodes.first().unwrap().source.clone().unwrap();
-        let last = nodes.last().unwrap().source.clone().unwrap();
+        let first = required_node_source(
+            nodes.first().ok_or("lowering lost its first node")?,
+            "first node",
+        )?;
+        let last = required_node_source(
+            nodes.last().ok_or("lowering lost its last node")?,
+            "last node",
+        )?;
         native_node(
             Operation::Sequence {
                 nodes,
@@ -5925,7 +5972,14 @@ fn validate_literal_family_source(source: &str, interpreter: &Interpreter) -> Re
         Interpreter::Fish | Interpreter::Nushell if source.contains('\\') => {
             Err("language-specific escape syntax requires pinned interpreter delegation".into())
         }
-        _ => Ok(()),
+        Interpreter::Sh
+        | Interpreter::Bash
+        | Interpreter::Zsh
+        | Interpreter::Fish
+        | Interpreter::Powershell
+        | Interpreter::Cmd
+        | Interpreter::Nushell
+        | Interpreter::Unknown(_) => Ok(()),
     }
 }
 
@@ -5959,7 +6013,7 @@ fn literal_words(source: &str, family: LiteralFamily) -> Result<Vec<String>, Str
             if byte == b'`' {
                 return Err("escape or substitution syntax is outside the literal subset".into());
             }
-            let character = source[index..].chars().next().unwrap();
+            let character = character_at(source, index)?;
             word.push(character);
             index += character.len_utf8();
             started = true;
@@ -6011,7 +6065,7 @@ fn literal_words(source: &str, family: LiteralFamily) -> Result<Vec<String>, Str
         if matches!(family, LiteralFamily::Cmd) && byte == b'^' {
             return Err("cmd escape syntax is outside the literal subset".into());
         }
-        let character = source[index..].chars().next().unwrap();
+        let character = character_at(source, index)?;
         word.push(character);
         index += character.len_utf8();
         started = true;
@@ -6075,6 +6129,19 @@ fn cover_spans(first: SourceSpan, last: SourceSpan) -> SourceSpan {
         end_column: last.end_column,
         end_byte: last.end_byte,
     }
+}
+
+fn required_node_source(node: &Node, context: &str) -> Result<SourceSpan, String> {
+    node.source
+        .clone()
+        .ok_or_else(|| format!("{context} has no source span"))
+}
+
+fn character_at(source: &str, byte: usize) -> Result<char, String> {
+    source
+        .get(byte..)
+        .and_then(|rest| rest.chars().next())
+        .ok_or_else(|| format!("source byte {byte} is not a character boundary"))
 }
 
 #[cfg(test)]
@@ -6750,7 +6817,11 @@ mod tests {
                                 .iter()
                                 .map(|part| match part {
                                     TextPart::Literal { value } => value.clone(),
-                                    other => panic!("{id} has a dynamic piece: {other:#?}"),
+                                    other @ TextPart::Variable { .. }
+                                    | other @ TextPart::Argument { .. }
+                                    | other @ TextPart::DefaultValue { .. } => {
+                                        panic!("{id} has a dynamic piece: {other:#?}")
+                                    }
                                 })
                                 .collect();
                             crate::ir::MatchPiece::Literal(text.into())
@@ -7012,7 +7083,11 @@ mod tests {
                 .iter()
                 .map(|part| match part {
                     TextPart::Literal { value } => value.clone(),
-                    other => panic!("{name} has a non-literal part: {other:#?}"),
+                    other @ TextPart::Variable { .. }
+                    | other @ TextPart::Argument { .. }
+                    | other @ TextPart::DefaultValue { .. } => {
+                        panic!("{name} has a non-literal part: {other:#?}")
+                    }
                 })
                 .collect();
             assert_eq!(
@@ -7180,7 +7255,11 @@ mod tests {
                 .iter()
                 .map(|part| match part {
                     TextPart::Literal { value } => value.clone(),
-                    other => panic!("{name} has a non-literal part: {other:#?}"),
+                    other @ TextPart::Variable { .. }
+                    | other @ TextPart::Argument { .. }
+                    | other @ TextPart::DefaultValue { .. } => {
+                        panic!("{name} has a non-literal part: {other:#?}")
+                    }
                 })
                 .collect();
             for shell in &shells {

@@ -454,7 +454,7 @@ mod tests {
                         external_references(value, output);
                     }
                 }
-                _ => {}
+                Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
             }
         }
 

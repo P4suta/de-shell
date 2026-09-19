@@ -168,7 +168,9 @@ Generated Rust is gated by rustfmt, rustc, and Clippy with `-D warnings`;
 generated Go by gofmt, build/test, and vet. Structured JavaScript and Python
 rewrites use the official `node --check` and `py_compile` syntax checks. Node
 and Python are pinned in the same mise toolchain; no third-party language lint
-dependency is required.
+dependency is required. The repository's stricter Rust rules—including the
+syntax-level ban on every trait object—are documented in
+[`CONTRIBUTING.md`](CONTRIBUTING.md#rust-design-policy).
 
 ```console
 mise trust
