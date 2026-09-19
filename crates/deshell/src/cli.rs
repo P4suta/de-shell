@@ -1296,6 +1296,12 @@ fn command_report(parts: CommandReportArgs<'_>) -> crate::report::Report {
                                 .map(|locator| (*locator).into()),
                             start_byte: span.map(|(start, _)| start),
                             end_byte: span.map(|(_, end)| end),
+                            // The digest of the bytes, which is what lets a
+                            // reader check that the file still holds what was
+                            // scanned. The corpus auditor needs it and the
+                            // report could not carry it, because the report is
+                            // read back out of this line.
+                            digest: fields.get(6).map(|digest| (*digest).into()),
                             ..crate::report::Item::default()
                         }
                     }
@@ -1514,7 +1520,7 @@ fn dispatch(
                         writeln_io(
                             stdout,
                             format_args!(
-                                "{}\t{}\t{}\t{}\t{}\t{}..{}",
+                                "{}\t{}\t{}\t{}\t{}\t{}..{}\t{}",
                                 finding_kind(&finding.kind),
                                 finding.path,
                                 finding.interpreter.as_deref().unwrap_or("unknown"),
@@ -1522,6 +1528,7 @@ fn dispatch(
                                 finding.locator.as_deref().unwrap_or("-"),
                                 finding.span.start_byte,
                                 finding.span.end_byte,
+                                finding.content_digest,
                             ),
                         )?;
                     }

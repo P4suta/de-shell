@@ -231,11 +231,40 @@ try {
     }
 
     try {
-      $inventory = $scan.Text | ConvertFrom-Json
-      if ([int]$inventory.schema_version -ne 1) {
-        throw "Inventory schema_version must be 1"
+      # `deshell scan --format json` emits a Scan Report v1, whose locations are
+      # `details.items`. This read `$report.findings`, which no report has: a
+      # missing property is `$null` in PowerShell and `@($null)` is an array of
+      # one null, so every repository produced a single finding whose every
+      # field was empty and the audit died on the first one with
+      # "Cannot bind argument to parameter 'Kind'".
+      #
+      # The auditor had never run against the Rust implementation — the
+      # 2026-08-25 baseline was produced by the OCaml one — so nothing noticed.
+      $report = $scan.Text | ConvertFrom-Json
+      if ([int]$report.schema_version -ne 1) {
+        throw "Scan Report schema_version must be 1"
       }
-      $repositoryFindings = @($inventory.findings)
+      if ($null -eq $report.details -or $null -eq $report.details.items) {
+        throw 'Scan Report has no details.items'
+      }
+      $repositoryFindings = @($report.details.items | Where-Object {
+        $_.kind -ne 'error' -and $_.kind -ne 'skipped'
+      } | ForEach-Object {
+        [pscustomobject]@{
+          path = $_.path
+          kind = $_.kind
+          interpreter = $_.name
+          locator = $_.message
+          content_digest = $_.digest
+        }
+      })
+      foreach ($finding in $repositoryFindings) {
+        if ([string]::IsNullOrEmpty([string]$finding.kind) -or
+            [string]::IsNullOrEmpty([string]$finding.path) -or
+            [string]::IsNullOrEmpty([string]$finding.content_digest)) {
+          throw 'Scan Report holds a location with no kind, path or digest'
+        }
+      }
     } catch {
       $failures.Add(
         "$($repository.Name): scan emitted invalid JSON: $($_.Exception.Message)"
@@ -251,14 +280,18 @@ try {
       )
       continue
     }
-    foreach ($scanError in @($inventory.errors)) {
+    # Errors and skips are `details.items` with their own kind, for the same
+    # reason locations are. `@($report.errors)` was an array of one null, so
+    # every repository reported an error with no path, stage or message — 29 of
+    # them, each saying nothing.
+    foreach ($item in @($report.details.items | Where-Object { $_.kind -eq 'error' })) {
       $failures.Add(
-        "$($repository.Name): scan $($scanError.stage) error at $($scanError.path): $($scanError.message)"
+        "$($repository.Name): scan $($item.name) error at $($item.path): $($item.message)"
       )
     }
-    foreach ($skipped in @($inventory.skipped)) {
+    foreach ($item in @($report.details.items | Where-Object { $_.kind -eq 'skipped' })) {
       $failures.Add(
-        "$($repository.Name): scan skipped $($skipped.path): $($skipped.reason)"
+        "$($repository.Name): scan skipped $($item.path): $($item.message)"
       )
     }
 
@@ -325,9 +358,14 @@ try {
     }
     Copy-Item -LiteralPath $sourcePath -Destination $destination
 
+    # The isolated copy holds one shell file and no project markers, so `init`
+    # cannot infer a migration target and refuses — correctly, since choosing one
+    # for somebody is how a repository ends up with a language it did not pick.
+    # The audit only lowers, and the target does not reach the IR, so it is named
+    # here rather than left to a default that would have to guess.
     $initialize = Invoke-Deshell `
       -Executable $deshell `
-      -Arguments @('init', '--root', $caseRoot)
+      -Arguments @('init', '--root', $caseRoot, '--target', 'rust')
     if ($initialize.ExitCode -ne 0) {
       $message = "$($file.Location): init failed: $($initialize.Text)"
       $failures.Add($message)

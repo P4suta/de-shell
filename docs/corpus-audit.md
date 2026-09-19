@@ -44,6 +44,55 @@ The auditor:
 - omits source bodies from the report and removes only a verified audit temp
   directory.
 
+## Rust implementation, 2026-09-19
+
+The first run of this auditor against the Rust implementation. It could not run
+before: `deshell scan --format json` emits a Scan Report v1 and the auditor read
+`$report.findings`, which no report has. A missing property is `$null` in
+PowerShell and `@($null)` is an array holding one null, so every repository
+produced one finding whose every field was empty and the run died on the first
+of them with `Cannot bind argument to parameter 'Kind'`. The same shape made
+`errors` and `skipped` report 29 failures that each said nothing. Nothing
+noticed, because the 2026-08-25 baseline was produced by the OCaml
+implementation on a different machine.
+
+The report could not carry a location's content digest either — the auditor
+verifies it after the scan — because a Scan Report is built by re-reading the
+command's human output, and that line did not print one. It does now.
+
+    mise run corpus:audit -- -CorpusRoot .. -ExcludeRepository 'de-shell,workflow-verifier' -DeshellExecutable target/debug/deshell -Format Human
+
+| Measure | Result |
+| --- | ---: |
+| Repositories scanned | 14 |
+| Inventory locations | 1,006 |
+| Shell files | 98 |
+| Embedded shell locations | 587 |
+| Conservative candidates | 321 |
+| Analysis failures | 0 |
+| Fully non-residual shell files | 98 / 98 |
+| IR nodes: native / delegated / residual | 20 / 94 / 0 |
+
+The selection, which the 2026-08-25 one never recorded anywhere a reader could
+reach:
+
+`ginary`, `gleam-mutants`, `go-mutants`, `goatest`, `http3`, `jlreq`, `mylist`,
+`njutest`, `njutest-assurance`, `release-glz`, `simple-blog`, `ssocks`,
+`storage-scout`, `swift-mutants`.
+
+`workflow-verifier` is excluded for the reason the baseline excluded it, and
+also because it vendors a third-party CircleCI configuration whose `release`
+jobs carry two `<<` merge keys in one mapping. YAML parsers do not agree on what
+a repeated merge key means, so the scanner refuses the document rather than
+picking one reading — which is the right answer and does make the repository
+unauditable under a rule that counts every scan error as a failure.
+
+Zero residual nodes across 98 shell files is not the same claim the 2026-08-25
+snapshot made with 2 of 47: that one counted the obsolete pre-v1 vocabulary, and
+94 of the 114 nodes here are `delegated`, which is a pinned interpreter running
+the exact bytes and not a translation. What it does say is that every file
+reached a guarantee rather than an unexamined remainder.
+
 ## Historical pre-cutover baseline: 2026-08-25
 
 This snapshot was produced under the obsolete pre-v1 guarantee vocabulary by
