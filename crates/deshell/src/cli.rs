@@ -5744,55 +5744,64 @@ mod tests {
         crate::config::Lockfile::decode(&lock_text).unwrap();
         std::fs::write(directory.path().join("deshell.lock"), lock_text).unwrap();
 
-        let mut json = Vec::new();
-        let code = doctor_command(directory.path(), OutputFormat::Json, None, &mut json).unwrap();
-        assert_eq!(code, 0);
-        let report: serde_json::Value = serde_json::from_slice(&json).unwrap();
-        assert_eq!(report["bundle"]["ready"], true);
-        assert_eq!(report["bundle"]["assets"].as_array().unwrap().len(), 2);
-        assert_eq!(report["capabilities"]["planning"], true);
-        assert_eq!(report["capabilities"]["local"], true);
-        assert_eq!(report["capabilities"]["bundle"], true);
-        assert_eq!(report["capabilities"]["dagger"], true);
+        crate::lab::with_test_execution(
+            crate::lab::Provider::VirtualizationFramework,
+            Vec::new(),
+            || {
+                let mut json = Vec::new();
+                let code =
+                    doctor_command(directory.path(), OutputFormat::Json, None, &mut json).unwrap();
+                assert_eq!(code, 0);
+                let report: serde_json::Value = serde_json::from_slice(&json).unwrap();
+                assert_eq!(report["bundle"]["ready"], true);
+                assert_eq!(report["bundle"]["assets"].as_array().unwrap().len(), 2);
+                assert_eq!(report["capabilities"]["planning"], true);
+                assert_eq!(report["capabilities"]["local"], true);
+                assert_eq!(report["capabilities"]["disposable"], false);
+                assert_eq!(report["capabilities"]["bundle"], true);
+                assert_eq!(report["capabilities"]["dagger"], true);
 
-        let mut human = Vec::new();
-        assert_eq!(
-            doctor_command(directory.path(), OutputFormat::Human, None, &mut human).unwrap(),
-            0
+                let mut human = Vec::new();
+                assert_eq!(
+                    doctor_command(directory.path(), OutputFormat::Human, None, &mut human)
+                        .unwrap(),
+                    0
+                );
+                let human = String::from_utf8(human).unwrap();
+                for expected in [
+                    "binary: ok",
+                    "config: ok",
+                    "lock: ok",
+                    "lab image: pinned",
+                    "Dagger target: pinned",
+                    "bundle assets: ready",
+                    "disposable execution:",
+                    "planning=true local=true",
+                ] {
+                    assert!(human.contains(expected), "missing {expected:?} in {human}");
+                }
+
+                for (requirement, expected) in [
+                    (DoctorRequirement::Planning, 0),
+                    (DoctorRequirement::Local, 0),
+                    (DoctorRequirement::Disposable, 6),
+                    (DoctorRequirement::Bundle, 0),
+                    (DoctorRequirement::Dagger, 0),
+                ] {
+                    assert_eq!(
+                        doctor_command(
+                            directory.path(),
+                            OutputFormat::Agent,
+                            Some(requirement),
+                            &mut Vec::new(),
+                        )
+                        .unwrap(),
+                        expected,
+                        "{requirement:?}"
+                    );
+                }
+            },
         );
-        let human = String::from_utf8(human).unwrap();
-        for expected in [
-            "binary: ok",
-            "config: ok",
-            "lock: ok",
-            "lab image: pinned",
-            "Dagger target: pinned",
-            "bundle assets: ready",
-            "disposable execution:",
-            "planning=true local=true",
-        ] {
-            assert!(human.contains(expected), "missing {expected:?} in {human}");
-        }
-
-        for (requirement, expected) in [
-            (DoctorRequirement::Planning, 0),
-            (DoctorRequirement::Local, 0),
-            (DoctorRequirement::Disposable, 6),
-            (DoctorRequirement::Bundle, 0),
-            (DoctorRequirement::Dagger, 0),
-        ] {
-            assert_eq!(
-                doctor_command(
-                    directory.path(),
-                    OutputFormat::Agent,
-                    Some(requirement),
-                    &mut Vec::new(),
-                )
-                .unwrap(),
-                expected,
-                "{requirement:?}"
-            );
-        }
     }
 
     /// A `scan` line naming a kind the report does not model becomes a scan
