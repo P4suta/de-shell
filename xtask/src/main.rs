@@ -109,6 +109,93 @@ fn repository_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..")
 }
 
+/// Programs that implement the POSIX-shell names used by an observation.
+///
+/// Windows searches its system directories before `PATH`. Consequently, a
+/// bare `bash` launched through `std::process::Command` resolves to the WSL
+/// launcher in `System32` even when the calling workflow is already running in
+/// Git Bash. Git Bash's `sh`, however, resolves POSIX program names inside the
+/// MSYS installation. Ask it for the native absolute path once, then launch
+/// that path directly for every observation. Other hosts keep normal `PATH`
+/// lookup, including its ordinary not-found error.
+#[derive(Debug)]
+struct ShellPrograms {
+    programs: BTreeMap<String, Result<PathBuf, String>>,
+}
+
+impl ShellPrograms {
+    fn discover<'a>(names: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut programs = BTreeMap::new();
+        for name in names {
+            let _resolution = programs
+                .entry(name.to_owned())
+                .or_insert_with(|| resolve_shell_program(name).map_err(|error| error.to_string()));
+        }
+        Self { programs }
+    }
+
+    fn command(&self, name: &str) -> std::io::Result<std::process::Command> {
+        match self.programs.get(name) {
+            Some(Ok(program)) => Ok(std::process::Command::new(program)),
+            Some(Err(error)) => Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                error.clone(),
+            )),
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("shell {name:?} was not discovered"),
+            )),
+        }
+    }
+
+    fn output(&self, name: &str, script: &str) -> std::io::Result<std::process::Output> {
+        self.command(name)?.arg("-c").arg(script).output()
+    }
+
+    fn status(&self, name: &str, script: &str) -> std::io::Result<std::process::ExitStatus> {
+        self.command(name)?.arg("-c").arg(script).status()
+    }
+}
+
+fn resolve_shell_program(name: &str) -> std::io::Result<PathBuf> {
+    if !cfg!(windows) {
+        return Ok(PathBuf::from(name));
+    }
+
+    let resolution = std::process::Command::new("sh")
+        .args([
+            "-c",
+            "candidate=$(command -v \"$1\") || exit 127; cygpath -w -- \"$candidate\"",
+            "deshell-shell-resolution",
+            name,
+        ])
+        .output()?;
+    if !resolution.status.success() {
+        let stderr = String::from_utf8_lossy(&resolution.stderr);
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "cannot resolve POSIX shell {name:?} through Git/MSYS sh (exit {:?}): {stderr}",
+                resolution.status.code()
+            ),
+        ));
+    }
+    let stdout = String::from_utf8(resolution.stdout).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("native path for POSIX shell {name:?} is not UTF-8: {error}"),
+        )
+    })?;
+    let path = stdout.trim_end_matches(['\r', '\n']);
+    if path.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("Git/MSYS sh returned no native path for POSIX shell {name:?}"),
+        ));
+    }
+    Ok(PathBuf::from(path))
+}
+
 /// Measure what the host's shell actually does with `set -e`, `set -u` and
 /// `set -o pipefail`, and print every case that disagrees with the recorded
 /// measurement.
@@ -134,7 +221,10 @@ fn run_bash_semantics(root: &Path) -> Result<(), Vec<String>> {
         return Err(vec!["corpus is empty".to_owned()]);
     }
 
-    let version = std::process::Command::new("bash")
+    let shells = ShellPrograms::discover(["bash"]);
+    let version = shells
+        .command("bash")
+        .map_err(|error| vec![format!("cannot resolve bash: {error}")])?
         .arg("--version")
         .output()
         .map_err(|error| vec![format!("cannot run bash: {error}")])?;
@@ -156,7 +246,9 @@ fn run_bash_semantics(root: &Path) -> Result<(), Vec<String>> {
         let expected = case["expected"]
             .as_i64()
             .ok_or_else(|| vec!["case has no expected".to_owned()])?;
-        let status = std::process::Command::new("bash")
+        let status = shells
+            .command("bash")
+            .map_err(|error| vec![format!("cannot resolve bash for {name}: {error}")])?
             .arg("-c")
             .arg(script)
             .stdout(std::process::Stdio::null())
@@ -355,6 +447,7 @@ fn run_echo_semantics(root: &Path) -> Result<(), Vec<String>> {
     if cases.is_empty() {
         return Err(vec!["corpus is empty".to_owned()]);
     }
+    let shells = ShellPrograms::discover(ShellColumn::ALL.iter().copied().map(ShellColumn::name));
     let mut errors = Vec::new();
     let mut checked = 0_usize;
     let mut reported_differences = 0_usize;
@@ -383,10 +476,7 @@ fn run_echo_semantics(root: &Path) -> Result<(), Vec<String>> {
                 errors.push(format!("{name} has no {shell} column"));
                 continue;
             };
-            let output = std::process::Command::new(shell)
-                .arg("-c")
-                .arg(format!("echo {quoted}"))
-                .output();
+            let output = shells.output(shell, &format!("echo {quoted}"));
             let output = match output {
                 Ok(output) => output,
                 Err(error) if shell != "bash" => {
@@ -819,6 +909,7 @@ fn run_exit_semantics(root: &Path) -> Result<(), Vec<String>> {
     if cases.is_empty() {
         return Err(vec!["corpus is empty".to_owned()]);
     }
+    let shells = ShellPrograms::discover(ShellColumn::ALL.iter().copied().map(ShellColumn::name));
     let mut errors = Vec::new();
     let mut checked = 0_usize;
     let mut reported_differences = 0_usize;
@@ -838,10 +929,7 @@ fn run_exit_semantics(root: &Path) -> Result<(), Vec<String>> {
                 errors.push(format!("{name} has no {shell} column"));
                 continue;
             };
-            let observed = std::process::Command::new(shell)
-                .arg("-c")
-                .arg(format!("exit {status}"))
-                .status();
+            let observed = shells.status(shell, &format!("exit {status}"));
             let observed = match observed {
                 Ok(observed) => observed,
                 Err(error) if shell != "bash" => {
@@ -927,6 +1015,7 @@ fn run_builtin_table(root: &Path) -> Result<(), Vec<String>> {
     if treatments.is_empty() {
         return Err(vec!["corpus answers for no builtin".to_owned()]);
     }
+    let shells = ShellPrograms::discover(["bash", "sh", "zsh"]);
     let mut errors = Vec::new();
     let mut observed_total = 0_usize;
     for (shell, argument) in [
@@ -934,10 +1023,7 @@ fn run_builtin_table(root: &Path) -> Result<(), Vec<String>> {
         ("sh", "compgen -b"),
         ("zsh", "print -l ${(k)builtins}"),
     ] {
-        let output = std::process::Command::new(shell)
-            .arg("-c")
-            .arg(argument)
-            .output();
+        let output = shells.output(shell, argument);
         let output = match output {
             Ok(output) if output.status.success() => output,
             Ok(output) => {
@@ -1023,13 +1109,11 @@ fn run_posix_divergence(root: &Path) -> Result<(), Vec<String>> {
     if cases.is_empty() || shells.is_empty() {
         return Err(vec!["corpus is empty".to_owned()]);
     }
+    let shell_programs =
+        ShellPrograms::discover(shells.iter().copied().chain(std::iter::once("/bin/sh")));
 
     let observe = |shell: &str, script: &str| -> Option<(String, i64)> {
-        let output = std::process::Command::new(shell)
-            .arg("-c")
-            .arg(script)
-            .output()
-            .ok()?;
+        let output = shell_programs.output(shell, script).ok()?;
         Some((
             String::from_utf8_lossy(&output.stdout).into_owned(),
             i64::from(output.status.code().unwrap_or(-1)),
@@ -1148,6 +1232,7 @@ fn run_printf_semantics(root: &Path) -> Result<(), Vec<String>> {
     if cases.is_empty() || shells.is_empty() {
         return Err(vec!["corpus is empty".to_owned()]);
     }
+    let shell_programs = ShellPrograms::discover(shells.iter().copied());
     let mut errors = Vec::new();
     let mut checked = 0_usize;
     for case in cases {
@@ -1168,10 +1253,7 @@ fn run_printf_semantics(root: &Path) -> Result<(), Vec<String>> {
                 errors.push(format!("{name} has no {shell} column"));
                 continue;
             };
-            let output = std::process::Command::new(shell)
-                .arg("-c")
-                .arg(format!("printf {quoted}"))
-                .output();
+            let output = shell_programs.output(shell, &format!("printf {quoted}"));
             let output = match output {
                 Ok(output) => output,
                 Err(error) => {
@@ -1221,6 +1303,8 @@ fn run_case_patterns(root: &Path) -> Result<(), Vec<String>> {
     if cases.is_empty() || shells.is_empty() {
         return Err(vec!["corpus is empty".to_owned()]);
     }
+    let shell_programs =
+        ShellPrograms::discover(shells.iter().copied().map(RecordedShellColumn::name));
     let mut errors = Vec::new();
     let mut checked = 0_usize;
     let mut reported_differences = 0_usize;
@@ -1245,12 +1329,14 @@ fn run_case_patterns(root: &Path) -> Result<(), Vec<String>> {
                 errors.push(format!("{id} has no {shell_name} column"));
                 continue;
             };
-            let output = std::process::Command::new(shell_name)
-                .arg("-c")
-                .arg(script)
-                .arg(shell_name)
-                .arg(&word)
-                .output();
+            let output = shell_programs.command(shell_name).and_then(|mut command| {
+                command
+                    .arg("-c")
+                    .arg(script)
+                    .arg(shell_name)
+                    .arg(&word)
+                    .output()
+            });
             let Ok(output) = output else {
                 println!("skipped  {id}/{shell_name}: not on this runner");
                 continue;
@@ -1336,6 +1422,8 @@ fn run_shell_variables(root: &Path) -> Result<(), Vec<String>> {
     if names.is_empty() || shells.is_empty() {
         return Err(vec!["corpus is empty".to_owned()]);
     }
+    let shell_programs =
+        ShellPrograms::discover(shells.iter().copied().map(RecordedShellColumn::name));
     let mut errors = Vec::new();
     let mut checked = 0_usize;
     let mut reported_differences = 0_usize;
@@ -1369,10 +1457,7 @@ fn run_shell_variables(root: &Path) -> Result<(), Vec<String>> {
                 "if env | grep -q \"^{name}=\"; then printf INHERITED; \
                  elif [ -n \"${{{name}+x}}\" ]; then printf SHELL; else printf ABSENT; fi"
             );
-            let output = std::process::Command::new(shell_name)
-                .arg("-c")
-                .arg(&script)
-                .output();
+            let output = shell_programs.output(shell_name, &script);
             let output = match output {
                 Ok(output) if output.status.success() => output,
                 Ok(output) => {
@@ -2867,6 +2952,7 @@ fn run_test_semantics(root: &Path) -> Result<(), Vec<String>> {
     if cases.is_empty() {
         return Err(vec!["corpus is empty".to_owned()]);
     }
+    let shells = ShellPrograms::discover(["bash"]);
     let mut differences = 0_usize;
     for case in cases {
         let name = case["name"]
@@ -2886,10 +2972,8 @@ fn run_test_semantics(root: &Path) -> Result<(), Vec<String>> {
             .map(|operand| format!("'{}'", operand.replace('\'', "'\\''")))
             .collect::<Vec<_>>()
             .join(" ");
-        let builtin = std::process::Command::new("bash")
-            .arg("-c")
-            .arg(format!("[ {quoted} ]"))
-            .status()
+        let builtin = shells
+            .status("bash", &format!("[ {quoted} ]"))
             .map_err(|error| vec![format!("cannot run bash for {name}: {error}")])?;
         let external = std::process::Command::new("test")
             .args(&operands)
@@ -4331,6 +4415,32 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn posix_shell_resolution_runs_bash_and_refuses_unresolved_names() {
+        let shells = ShellPrograms::discover(["bash"]);
+        let output = shells
+            .output("bash", "printf 'deshell-bash:%s' \"$BASH_VERSION\"")
+            .expect("the Bash used by the build must resolve");
+        assert!(output.status.success(), "{output:#?}");
+        assert!(
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .starts_with("deshell-bash:"),
+            "the executable must be Bash, not a platform command sharing its name"
+        );
+
+        let error = shells
+            .command("a-shell-that-was-not-discovered")
+            .expect_err("an unregistered name must not fall back to PATH");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+
+        let missing = ShellPrograms::discover(["deshell-shell-that-does-not-exist"]);
+        let error = missing
+            .output("deshell-shell-that-does-not-exist", "exit 0")
+            .expect_err("a missing executable must remain missing");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    }
 
     #[test]
     fn live_shell_drift_enforces_only_applicable_recorded_claims() {

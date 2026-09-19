@@ -140,7 +140,7 @@ pub(crate) fn remove_empty_directory(path: &Path) {
 /// keeps "this is outside the project" an assertion a reader can check, rather
 /// than something inferred from how the path was built several frames up.
 pub(crate) mod scratch {
-    use std::io::{BufReader, BufWriter, Write as _};
+    use std::io::{BufRead as _, BufReader, BufWriter, Write as _};
     use std::path::Path;
 
     /// Write `bytes` to a path inside a scratch tree.
@@ -154,13 +154,28 @@ pub(crate) mod scratch {
     /// separate also avoids platform-specific clone syscalls here, so the same
     /// byte-copying path is exercised under Miri on every host.
     pub(crate) fn copy(from: &Path, to: &Path) -> std::io::Result<u64> {
-        // `io::copy(File, File)` specializes to `copy_file_range` on Linux.
-        // Besides making the operation platform-dependent, that syscall is not
-        // available under Miri. Buffering both sides deliberately selects the
-        // ordinary Read/Write contract on every platform.
+        // `io::copy` sees through `BufReader<File>` on Linux and specializes to
+        // `copy_file_range`, a syscall Miri cannot interpret. Drive the buffered
+        // Read/Write contract explicitly so production and every Miri host take
+        // the same path instead of giving the interpreter a weaker substitute.
         let mut source = BufReader::new(std::fs::File::open(from)?);
         let mut destination = BufWriter::new(std::fs::File::create(to)?);
-        let copied = std::io::copy(&mut source, &mut destination)?;
+        let mut copied = 0_u64;
+        loop {
+            let available = source.fill_buf()?;
+            if available.is_empty() {
+                break;
+            }
+            destination.write_all(available)?;
+            let consumed = available.len();
+            let consumed_u64 = u64::try_from(consumed).map_err(|error| {
+                std::io::Error::other(format!("scratch copy length does not fit u64: {error}"))
+            })?;
+            copied = copied
+                .checked_add(consumed_u64)
+                .ok_or_else(|| std::io::Error::other("scratch copy length overflow"))?;
+            source.consume(consumed);
+        }
         destination.flush()?;
         Ok(copied)
     }
