@@ -290,6 +290,104 @@ fn run_echo_semantics(root: &Path) -> Result<(), Vec<String>> {
 /// A modelled status is one every shell reduces the same way, so unlike the
 /// `echo` gate this one requires the three columns to agree — and to agree with
 /// the reduction the runner and the generators perform.
+/// What each PowerShell command form actually invokes.
+///
+/// The frontend lowers `& 'path' args` and `./path args` to the same `Exec`, and
+/// a bare name to nothing. That is a claim about PowerShell, so it is measured
+/// here rather than read out of the documentation.
+///
+/// The harness writes each command into a wrapper script and runs `pwsh -File`,
+/// with `exit $LASTEXITCODE` after it. `pwsh -Command` reports 0 or 1 and not
+/// the status the script left — which is the same reason a workflow's pwsh step
+/// carries that line.
+fn run_powershell_invocation(root: &Path) -> Result<(), Vec<String>> {
+    let path = root.join("contracts/golden/powershell-invocation-semantics-v1.json");
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|error| vec![format!("cannot read {}: {error}", path.display())])?;
+    let corpus: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|error| vec![format!("malformed corpus: {error}")])?;
+    let subject = corpus["subject"]
+        .as_str()
+        .ok_or_else(|| vec!["corpus has no subject script".to_owned()])?;
+    let cases = corpus["cases"]
+        .as_array()
+        .ok_or_else(|| vec!["corpus has no cases array".to_owned()])?;
+    if cases.is_empty() {
+        return Err(vec!["corpus is empty".to_owned()]);
+    }
+    // Under `target/` and not the system temporary root. A version-manager
+    // shim resolves its version from the configuration nearest the working
+    // directory, and there is none above `/tmp` — the same thing that made
+    // de-shell unable to use a shimmed interpreter until 331bb8e. Writing this
+    // gate repeated it.
+    let directory = root.join(format!("target/deshell-powershell-{}", std::process::id()));
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| vec![format!("cannot create {}: {error}", directory.display())])?;
+    std::fs::write(directory.join("deshell-corpus.ps1"), subject)
+        .map_err(|error| vec![format!("cannot write the subject script: {error}")])?;
+    let mut errors = Vec::new();
+    let mut checked = 0_usize;
+    for case in cases {
+        let name = case["name"].as_str().unwrap_or("<unnamed>");
+        let Some(command) = case["command"].as_str() else {
+            errors.push(format!("{name} has no command"));
+            continue;
+        };
+        let wrapper = directory.join("deshell-wrapper.ps1");
+        if let Err(error) = std::fs::write(&wrapper, format!("{command}\nexit $LASTEXITCODE\n")) {
+            errors.push(format!("cannot write the wrapper for {name}: {error}"));
+            continue;
+        }
+        let observed = std::process::Command::new("pwsh")
+            .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-File"])
+            .arg("./deshell-wrapper.ps1")
+            .current_dir(&directory)
+            .output();
+        let observed = match observed {
+            Ok(observed) => observed,
+            Err(error) => {
+                println!("skipped  {name}: {error}");
+                continue;
+            }
+        };
+        checked += 1;
+        let stdout = String::from_utf8_lossy(&observed.stdout).replace("\r\n", "\n");
+        for (what, recorded, seen) in [
+            (
+                "stdout",
+                case["stdout"].as_str().unwrap_or("<missing>").to_owned(),
+                stdout,
+            ),
+            (
+                "exit",
+                case["exit"].as_i64().unwrap_or(-1).to_string(),
+                i64::from(observed.status.code().unwrap_or(-1)).to_string(),
+            ),
+            (
+                "stderr_empty",
+                case["stderr_empty"].as_bool().unwrap_or(false).to_string(),
+                observed.stderr.is_empty().to_string(),
+            ),
+        ] {
+            if recorded != seen {
+                errors.push(format!(
+                    "{name}/{what}: recorded {recorded:?}, observed {seen:?}"
+                ));
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&directory);
+    if checked == 0 {
+        println!("skipped  no PowerShell runtime answered");
+        return Ok(());
+    }
+    if errors.is_empty() {
+        println!("{checked} PowerShell invocation form(s) match the recording");
+        return Ok(());
+    }
+    Err(errors)
+}
+
 fn run_exit_semantics(root: &Path) -> Result<(), Vec<String>> {
     let path = root.join("contracts/golden/exit-builtin-semantics-v1.json");
     let raw = std::fs::read_to_string(&path)
@@ -2193,6 +2291,7 @@ fn dispatch(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Vec<Str
         Some("test-semantics") => run_test_semantics(root),
         Some("echo-semantics") => run_echo_semantics(root),
         Some("exit-semantics") => run_exit_semantics(root),
+        Some("powershell-invocation") => run_powershell_invocation(root),
         Some("builtin-table") => run_builtin_table(root),
         Some("posix-divergence") => run_posix_divergence(root),
         Some("printf-semantics") => run_printf_semantics(root),

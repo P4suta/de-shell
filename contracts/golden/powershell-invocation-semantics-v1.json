@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "contract": "powershell-invocation-semantics-v1",
+  "purpose": "Pin which PowerShell command forms invoke a file, so the frontend's native domain for a command is checked against a measurement rather than against a reading of the specification.",
+  "note": "PowerShell resolves a command name carrying a path separator as a path and anything else through its command table, so `./build.ps1`, `.\\build.ps1` and `& './build.ps1'` are one invocation and a bare `build.ps1` reaches no file. A case marked modelled is one the frontend lowers to an Exec. The harness writes the command into a wrapper script and runs `pwsh -File`, because `pwsh -Command` reports 0 or 1 and not the status the script left — which is itself why a workflow's pwsh step carries `exit $LASTEXITCODE`.",
+  "subject": "param()\nWrite-Output \"args=$($args -join ',')\"\nexit 7\n",
+  "cases": [
+    {"name": "call-operator", "command": "& './deshell-corpus.ps1' a b", "modelled": true, "stdout": "args=a,b\n", "exit": 7, "stderr_empty": true},
+    {"name": "dot-slash-path", "command": "./deshell-corpus.ps1 a b", "modelled": true, "stdout": "args=a,b\n", "exit": 7, "stderr_empty": true},
+    {"name": "dot-backslash-path", "command": ".\\deshell-corpus.ps1 a b", "modelled": true, "stdout": "args=a,b\n", "exit": 7, "stderr_empty": true},
+    {"name": "bare-name-is-not-a-command", "command": "deshell-corpus.ps1 a b", "modelled": false, "stdout": "", "exit": 0, "stderr_empty": false}
+  ]
+}

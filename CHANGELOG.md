@@ -177,6 +177,12 @@ All notable changes are documented here. No compatibility contract predates
   carries whether the host named the shell and the frontend reads the status
   from it.
 
+- Lowered a PowerShell command that names a path, not only one that uses the
+  call operator. `./build.ps1 a` and `& './build.ps1' a` are the same
+  invocation, measured;
+  `contracts/golden/powershell-invocation-semantics-v1.json` records it and
+  `cargo xtask powershell-invocation` re-measures it on every runner.
+
 ### Removed
 
 - Pre-v1 Effect IR and lock migration promises.

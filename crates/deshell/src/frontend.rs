@@ -4667,21 +4667,58 @@ fn lower_powershell_simple(parts: LowerPowershellSimpleArgs<'_>) -> Result<Node,
         environment,
     } = parts;
     let words = tokenize_powershell(&source[range.start..range.end], inputs, environment)?;
-    if words.len() < 2 || literal_expression(&words[0]).as_deref() != Some("&") {
-        return Err("PowerShell command is not an explicit call-operator invocation".into());
+    let first = literal_expression(words.first().ok_or("PowerShell command is empty")?);
+    // `& 'path' args` and `./path args` are the same invocation. Measured with
+    // pwsh 7.6.5: `./echo.ps1 a b`, `.\echo.ps1 a b` and `& './echo.ps1' a b`
+    // all print `args=a,b` and leave the same status, and a bare `echo.ps1 a b`
+    // is not recognised at all — which is why a path prefix is required here
+    // rather than any first word.
+    //
+    // Nine of this repository's own blockers were
+    // `run: ./scripts/install-nushell.ps1`, refused for being the second form.
+    let argv_start = match first.as_deref() {
+        Some("&") => 1,
+        Some(word) if powershell_path_command(word) => 0,
+        _ => {
+            return Err(
+                "PowerShell command is neither a call-operator invocation nor a path".into(),
+            );
+        }
+    };
+    if words.len() <= argv_start {
+        return Err("PowerShell call operator names no command".into());
     }
-    literal_expression(&words[1])
+    literal_expression(&words[argv_start])
         .filter(|value| !value.is_empty())
         .ok_or("dynamic PowerShell executable requires pinned interpreter delegation")?;
     Ok(native_node(
         Operation::Exec {
-            argv: words[1..].to_vec(),
+            argv: words[argv_start..].to_vec(),
             environment: Vec::new(),
             working_directory: None,
         },
         SemanticModel::StaticExternalCommand.named(&Interpreter::Powershell),
         span_for_range(path, source, range.start, range.end)?,
     ))
+}
+
+/// Whether this word invokes a command by naming its path.
+///
+/// PowerShell resolves a command name that carries a path separator as a path
+/// and anything else through its command table, so `./build.ps1` runs the file
+/// and `build.ps1` does not — measured, not assumed. A drive-qualified or
+/// absolute path is the same case.
+fn powershell_path_command(word: &str) -> bool {
+    word.starts_with("./")
+        || word.starts_with(".\\")
+        || word.starts_with("../")
+        || word.starts_with("..\\")
+        || word.starts_with('/')
+        || word.starts_with('\\')
+        || word
+            .as_bytes()
+            .get(1)
+            .is_some_and(|byte| *byte == b':' && word.as_bytes()[0].is_ascii_alphabetic())
 }
 
 fn tokenize_powershell(
@@ -5884,6 +5921,47 @@ mod tests {
             Err(crate::agent_process::AgentError::TimedOut)
         ));
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    /// A PowerShell command that names a path is an invocation.
+    ///
+    /// `& 'path' args` and `./path args` are the same thing, and the frontend
+    /// took only the first — nine of this repository's own blockers were
+    /// `run: ./scripts/install-nushell.ps1`. A bare name is not a command at
+    /// all, which is why a path prefix is required rather than any first word.
+    ///
+    /// `contracts/golden/powershell-invocation-semantics-v1.json` is the
+    /// measurement and `cargo xtask powershell-invocation` re-measures it.
+    #[test]
+    fn a_powershell_command_that_names_a_path_is_an_invocation() {
+        let argv = |source: &str| {
+            let lowered = lower_powershell(".github/workflows/ci.yml.deshell.ps1", source)?;
+            let Operation::Exec {
+                argv,
+                environment: _,
+                working_directory: _,
+            } = lowered.body.operation
+            else {
+                panic!("an invocation is an exec");
+            };
+            Ok::<Vec<String>, String>(
+                argv.iter()
+                    .map(|word| literal_expression(word).unwrap_or_default())
+                    .collect(),
+            )
+        };
+        let expected = vec!["./scripts/install-nushell.ps1".to_owned(), "a".to_owned()];
+        assert_eq!(
+            argv("& './scripts/install-nushell.ps1' a\n").unwrap(),
+            expected
+        );
+        assert_eq!(argv("./scripts/install-nushell.ps1 a\n").unwrap(), expected);
+        assert_eq!(
+            argv(".\\scripts\\install-nushell.ps1 a\n").unwrap(),
+            vec![".\\scripts\\install-nushell.ps1".to_owned(), "a".to_owned()]
+        );
+        // A bare name reaches no file, so nothing is claimed about it.
+        assert!(argv("install-nushell.ps1 a\n").is_err());
     }
 
     /// A workflow step is lowered under the options the runner sets, not only
