@@ -216,47 +216,46 @@ Nushell), with both official Rust and Go generators where applicable.
   | blockers | 118 |
   | retired | 0 |
 
-  The blockers, by code:
+  The blockers, by code, on 2026-09-19 after the work below:
 
   | count | code | what it is |
   | --- | --- | --- |
-  | 37 | `DUPLICATE_TARGET` | 27 `run:` blocks in one `ci.yml` all want to be a target in one host file |
-  | 36 | `DYNAMIC_CANDIDATE` | shell text inside `contracts/golden/*.json` and `mise.toml`, most of it now declarable |
-  | 18 | `UNIMPLEMENTED_SEMANTIC` | the PowerShell scripts, which use control syntax outside the modelled subset |
-  | 18 | `UNRESOLVED_CALL_SITE` | `run: ./scripts/install-nushell.ps1`, whose target is one of those scripts |
-  | 6 | `RESIDUAL_SOURCE` | `run:` blocks holding `${{ matrix.target }}`, which GitHub substitutes before a shell sees it |
+  | 18 | `UNIMPLEMENTED_SEMANTIC` | PowerShell steps and scripts using control syntax outside the modelled subset |
+  | 11 | `DYNAMIC_CANDIDATE` | shell in `mise.toml` tasks and a Python contract validator |
+  | 9 | `UNRESOLVED_CALL_SITE` | `run: ./scripts/install-nushell.ps1`, whose target is one of those scripts |
+  | 6 | `RESIDUAL_SOURCE` | steps holding `${{ }}`, which GitHub substitutes before a shell sees them |
+  | 2 | `GENERATOR_UNSUPPORTED` | |
   | 2 | `SCENARIO_INPUT_COVERAGE` | |
-  | 1 | `GENERATOR_UNSUPPORTED` | |
 
-  The last row moved. Three of those six read `PARSE_ERROR` and three read
-  `UNIMPLEMENTED_SEMANTIC`, because `tree-sitter-bash` happened to reject some
-  of the shapes and the PowerShell frontend happened to reject the others. The
-  shapes nothing rejected were lowered `native` — see 00536a4. The count is the
-  same and the classification is no longer an accident of two grammars.
+  It started at 118. What came off, and what each was:
 
-  None of these is a wrong answer. Each names work: multiple targets per host
-  file, and a wider PowerShell subset. The number to drive down is 118, and it
-  is the honest measure of how far the oracle reaches on real code — this
-  repository's own.
+  | | |
+  | --- | --- |
+  | 37 | `DUPLICATE_TARGET` — several `run:` blocks in one workflow. Every proposal now carries the same whole-file rewrite, with every block replaced, and identical patches are applied once. Sound because `apply` applies a plan in one transaction. |
+  | 25 | `DYNAMIC_CANDIDATE` — the golden corpora, now declared shell rather than shell to retire. |
+  | 8 | `GENERATOR_UNSUPPORTED` — a step with several commands now generates a program that runs them in order and stops where the step stops. |
 
-  One of them was not work at all. `contracts/golden/*.json` records shell
-  behaviour measured from real shells, and `cargo xtask` re-measures it by
-  running exactly those bytes. It is the evidence the oracle rests on, and the
-  gate counted it as shell to retire. `[[declared_shell]]` says so: an exact
-  span, the reason it stays, and an approval digest, still scanned and still
-  counted — `shell-free: verified (0 live, 36 declared)`. Walked here, 25
-  declarations take the live count from 101 to 76.
+  None of the 48 is a wrong answer. Three things came out of driving the number
+  down, and all three were the same shape: reading a host's bytes without the
+  host's rules.
 
-  The remaining shape of the work is two design changes, both of which touch the
-  evidence and approval model and neither of which is a threshold to loosen:
+  - `${{ }}` is substituted by the runner before a shell sees the text, so those
+    bytes are a template. `run: /bin/echo '${{ matrix.os }}'` was lowered
+    `native` and would have printed the template where the step printed the
+    value.
+  - The runner executes `bash -e {0}`, so `set -e` is in effect whether or not
+    the step says so. A two-command step lowered to a sequence that carries on
+    after a failure, and was claimed `native`.
+  - The comparison ran the original as `bash -c <text>`. The baseline was a
+    program the runner never runs, so the two agreed when they should not have
+    and disagreed when they should not have.
 
-  - A host file with several `run:` blocks needs one proposal covering all of
-    them. Each proposal carries a whole-file replacement computed from the
-    original, so two of them describe the same file twice — which is what the 37
-    `DUPLICATE_TARGET` blockers say, correctly. Batching means a proposal with
-    one `run_argv` per block, which the Proposal contract does not have.
-  - The PowerShell frontend lowers explicit call-operator invocations and `&&`
-    chains. Everything else in this repository's five scripts is outside it.
+  `pipefail` is the one still open in that family: the runner's default is
+  `bash -e {0}` without it and an explicit `shell: bash` is
+  `bash --noprofile --norc -eo pipefail {0}` with it, and the scanner reports
+  both as `bash`. A pipeline the host has not placed is delegated rather than
+  guessed. Teaching the scanner to keep the `shell:` key would close it.
+
 - [ ] Run the fixed 2026-08-25 48-repository audit selection through both
   deterministic implementations and record zero scanner errors/skips,
   unclassified files, residual executable coverage, nondeterminism, or
