@@ -186,15 +186,47 @@ fn run_bash_semantics(root: &Path) -> Result<(), Vec<String>> {
     Ok(())
 }
 
-/// Measure the modelled `test` operators against the shell builtin and the
-/// external utility, and report every case where either disagrees with the
-/// recording or with the other.
-///
-/// The builtin is what de-shell models, since `[` never reaches the PATH lookup.
-/// The external utility is measured alongside it because an operator where the
-/// two disagree is a difference this tool exists to report rather than model
-/// away — and because a table checked only against its author's reading of the
-/// specification is not checked at all.
+/// A shell column in the checked-in builtin recordings.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShellColumn {
+    Bash,
+    Sh,
+    Zsh,
+}
+
+impl ShellColumn {
+    const ALL: [Self; 3] = [Self::Bash, Self::Sh, Self::Zsh];
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Bash => "bash",
+            Self::Sh => "sh",
+            Self::Zsh => "zsh",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ObservationEffect {
+    Enforce,
+    Report,
+}
+
+const fn echo_observation_effect(shell: ShellColumn, modelled: bool) -> ObservationEffect {
+    match (shell, modelled) {
+        (ShellColumn::Bash, true) => ObservationEffect::Enforce,
+        (ShellColumn::Bash | ShellColumn::Sh | ShellColumn::Zsh, false)
+        | (ShellColumn::Sh | ShellColumn::Zsh, true) => ObservationEffect::Report,
+    }
+}
+
+const fn exit_observation_effect(modelled: bool) -> ObservationEffect {
+    match modelled {
+        true => ObservationEffect::Enforce,
+        false => ObservationEffect::Report,
+    }
+}
+
 /// Check each shell's `echo` builtin against the recording, and check the
 /// frontend's native rule against bash.
 ///
@@ -217,8 +249,13 @@ fn run_echo_semantics(root: &Path) -> Result<(), Vec<String>> {
     }
     let mut errors = Vec::new();
     let mut checked = 0_usize;
+    let mut reported_differences = 0_usize;
     for case in cases {
         let name = case["name"].as_str().unwrap_or("<unnamed>");
+        let Some(modelled) = case["modelled"].as_bool() else {
+            errors.push(format!("{name} does not say whether it is modelled"));
+            continue;
+        };
         let arguments = case["arguments"]
             .as_array()
             .ok_or_else(|| vec![format!("{name} has no arguments array")])?
@@ -232,7 +269,8 @@ fn run_echo_semantics(root: &Path) -> Result<(), Vec<String>> {
             .join(" ");
         // Bash is the only shell the frontend models, so its absence is fatal
         // rather than a column to skip.
-        for shell in ["bash", "sh", "zsh"] {
+        for shell_column in ShellColumn::ALL {
+            let shell = shell_column.name();
             let Some(recorded) = case[shell].as_str() else {
                 errors.push(format!("{name} has no {shell} column"));
                 continue;
@@ -255,16 +293,17 @@ fn run_echo_semantics(root: &Path) -> Result<(), Vec<String>> {
             let actual = String::from_utf8_lossy(&output.stdout).into_owned();
             checked += 1;
             if actual != recorded {
-                errors.push(format!(
-                    "{name}/{shell}: recorded {recorded:?}, observed {actual:?}"
-                ));
+                let difference =
+                    format!("{name}/{shell}: recorded {recorded:?}, observed {actual:?}");
+                match echo_observation_effect(shell_column, modelled) {
+                    ObservationEffect::Enforce => errors.push(difference),
+                    ObservationEffect::Report => {
+                        reported_differences += 1;
+                        println!("differs  {difference}");
+                    }
+                }
             }
         }
-        let modelled = case["modelled"].as_bool();
-        let Some(modelled) = modelled else {
-            errors.push(format!("{name} does not say whether it is modelled"));
-            continue;
-        };
         if !modelled {
             continue;
         }
@@ -277,10 +316,17 @@ fn run_echo_semantics(root: &Path) -> Result<(), Vec<String>> {
         }
     }
     if errors.is_empty() {
-        println!(
-            "{} echo case(s) match the recording across {checked} shell observation(s)",
-            cases.len()
-        );
+        if reported_differences == 0 {
+            println!(
+                "{} echo case(s) match the recording across {checked} shell observation(s)",
+                cases.len()
+            );
+        } else {
+            println!(
+                "{} echo case(s) preserve every native claim; {reported_differences} non-binding shell observation(s) differ from the recording",
+                cases.len()
+            );
+        }
         return Ok(());
     }
     Err(errors)
@@ -667,13 +713,19 @@ fn run_exit_semantics(root: &Path) -> Result<(), Vec<String>> {
     }
     let mut errors = Vec::new();
     let mut checked = 0_usize;
+    let mut reported_differences = 0_usize;
     for case in cases {
         let name = case["name"].as_str().unwrap_or("<unnamed>");
+        let Some(modelled) = case["modelled"].as_bool() else {
+            errors.push(format!("{name} does not say whether it is modelled"));
+            continue;
+        };
         let Some(status) = case["status"].as_str() else {
             errors.push(format!("{name} has no status"));
             continue;
         };
-        for shell in ["bash", "sh", "zsh"] {
+        for shell_column in ShellColumn::ALL {
+            let shell = shell_column.name();
             let Some(recorded) = case[shell].as_i64() else {
                 errors.push(format!("{name} has no {shell} column"));
                 continue;
@@ -696,15 +748,16 @@ fn run_exit_semantics(root: &Path) -> Result<(), Vec<String>> {
             let code = i64::from(observed.code().unwrap_or(-1));
             checked += 1;
             if code != recorded {
-                errors.push(format!(
-                    "{name}/{shell}: recorded {recorded}, observed {code}"
-                ));
+                let difference = format!("{name}/{shell}: recorded {recorded}, observed {code}");
+                match exit_observation_effect(modelled) {
+                    ObservationEffect::Enforce => errors.push(difference),
+                    ObservationEffect::Report => {
+                        reported_differences += 1;
+                        println!("differs  {difference}");
+                    }
+                }
             }
         }
-        let Some(modelled) = case["modelled"].as_bool() else {
-            errors.push(format!("{name} does not say whether it is modelled"));
-            continue;
-        };
         if !modelled {
             continue;
         }
@@ -715,7 +768,8 @@ fn run_exit_semantics(root: &Path) -> Result<(), Vec<String>> {
             continue;
         };
         let reduced = parsed.rem_euclid(256);
-        for shell in ["bash", "sh", "zsh"] {
+        for shell_column in ShellColumn::ALL {
+            let shell = shell_column.name();
             let recorded = case[shell].as_i64().unwrap_or(-1);
             if recorded != reduced {
                 errors.push(format!(
@@ -725,10 +779,17 @@ fn run_exit_semantics(root: &Path) -> Result<(), Vec<String>> {
         }
     }
     if errors.is_empty() {
-        println!(
-            "{} exit case(s) match the recording across {checked} shell observation(s)",
-            cases.len()
-        );
+        if reported_differences == 0 {
+            println!(
+                "{} exit case(s) match the recording across {checked} shell observation(s)",
+                cases.len()
+            );
+        } else {
+            println!(
+                "{} exit case(s) preserve every native claim; {reported_differences} non-binding shell observation(s) differ from the recording",
+                cases.len()
+            );
+        }
         return Ok(());
     }
     Err(errors)
@@ -2623,6 +2684,15 @@ fn walk_rust_sources(root: &Path) -> Result<Vec<std::path::PathBuf>, Vec<String>
     Ok(sources)
 }
 
+/// Measure the modelled `test` operators against the shell builtin and the
+/// external utility, and report every case where either disagrees with the
+/// recording or with the other.
+///
+/// The builtin is what de-shell models, since `[` never reaches the PATH lookup.
+/// The external utility is measured alongside it because an operator where the
+/// two disagree is a difference this tool exists to report rather than model
+/// away — and because a table checked only against its author's reading of the
+/// specification is not checked at all.
 fn run_test_semantics(root: &Path) -> Result<(), Vec<String>> {
     let path = root.join("contracts/golden/test-builtin-semantics-v1.json");
     let raw = std::fs::read_to_string(&path)
@@ -3827,6 +3897,24 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_shell_drift_is_enforced_only_where_the_frontend_makes_a_native_claim() {
+        assert_eq!(
+            ShellColumn::ALL.map(|shell| echo_observation_effect(shell, true)),
+            [
+                ObservationEffect::Enforce,
+                ObservationEffect::Report,
+                ObservationEffect::Report,
+            ]
+        );
+        assert_eq!(
+            ShellColumn::ALL.map(|shell| echo_observation_effect(shell, false)),
+            [ObservationEffect::Report; 3]
+        );
+        assert_eq!(exit_observation_effect(true), ObservationEffect::Enforce);
+        assert_eq!(exit_observation_effect(false), ObservationEffect::Report);
+    }
 
     #[test]
     fn rust_policy_rejects_trait_objects_without_matching_comments_or_strings() {

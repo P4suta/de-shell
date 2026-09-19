@@ -73,10 +73,11 @@ jobs:
         run: cargo run --locked -p xtask -- bash-semantics
 
       - name: Measure the test, echo and exit builtins against their recordings
-        # Unlike the `set` corpus above this one fails on disagreement: the
-        # frontend lowers `[` and `echo` to modelled operations, so a runner
-        # whose builtin writes different bytes makes that lowering wrong rather
-        # than merely undescribed.
+        # Unlike the `set` corpus above, a disagreement inside a native claim is
+        # fatal: the frontend lowers `[` and Bash `echo`, plus numeric `exit`
+        # for every supported shell. Observations outside those claims are
+        # reported without pretending that an ambient `/bin/sh` alias or an
+        # explicitly delegated edge case changes the recorded semantic model.
         shell: bash
         run: |
           cargo run --locked -p xtask -- test-semantics
