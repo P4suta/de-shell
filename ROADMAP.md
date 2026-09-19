@@ -250,6 +250,16 @@ Nushell), with both official Rust and Go generators where applicable.
     program the runner never runs, so the two agreed when they should not have
     and disagreed when they should not have.
 
+  A fifth: a pwsh step is not `pwsh -Command <text>` either. The runner writes
+  it to a file with `$ErrorActionPreference = 'stop'` and `exit $LASTEXITCODE`
+  and dot-sources that. Measured, a step whose cmdlet fails carries on and ends
+  successfully under the first form and stops with 1 under the second — and no
+  end-to-end case reaches the difference today, because the PowerShell frontend
+  lowers external command invocations and those behave the same either way. It
+  is pinned by
+  `contracts/golden/powershell-step-invocation-semantics-v1.json` and a unit
+  test rather than by a case that exercises it.
+
   `pipefail` was the fourth and is closed. The runner's default is `bash -e {0}`
   without it and an explicit `shell: bash` is
   `bash --noprofile --norc -eo pipefail {0}` with it — both known, once somebody
