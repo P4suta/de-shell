@@ -1,217 +1,157 @@
 {
- "schema_version": 1,
- "contract": "posix-sh-divergence-v1",
- "purpose": "Record what each shell does with the constructs that are not in POSIX, so a script's choice of interpreter is a measured fact rather than a habit.",
- "note": "Columns are shell implementations, not paths, because `/bin/sh` is not one program: it is bash on macOS and dash on Debian and Ubuntu. `cargo xtask posix-divergence` re-measures each implementation and then decides which column `/bin/sh` on the runner belongs to by running the same scripts through it \u2014 so the answer to `what is /bin/sh here` comes from behaviour rather than from a version string. Most of these diverge in silence: only substring-expansion reports an error. A construct whose columns disagree is a reason a script names its interpreter, and a reason de-shell will not lower it without one.",
- "shells": [
-  "bash",
-  "zsh",
-  "dash"
- ],
- "cases": [
-  {
-   "name": "ansi-c-quoting-in-a-case-pattern",
-   "script": "case \"a\nb\" in *$'\\n'*) echo MATCHED ;; *) echo NO_MATCH ;; esac",
-   "note": "A newline check written with $'\\n' silently passes everything under a shell without ANSI-C quoting: the pattern becomes the literal characters and never matches.",
-   "bash": {
-    "stdout": "MATCHED\n",
-    "exit": 0
-   },
-   "zsh": {
-    "stdout": "MATCHED\n",
-    "exit": 0
-   },
-   "dash": {
-    "stdout": "NO_MATCH\n",
-    "exit": 0
-   }
-  },
-  {
-   "name": "ansi-c-quoting-expansion",
-   "script": "printf '[%s]' $'\\t'",
-   "note": "Without ANSI-C quoting the word is left as written, so a tab becomes four characters.",
-   "bash": {
-    "stdout": "[\t]",
-    "exit": 0
-   },
-   "zsh": {
-    "stdout": "[\t]",
-    "exit": 0
-   },
-   "dash": {
-    "stdout": "[$\\t]",
-    "exit": 0
-   }
-  },
-  {
-   "name": "double-bracket-test",
-   "script": "[[ \"abc\" == a* ]] && echo YES || echo NO",
-   "note": "`[[` is a keyword, not a builtin. A shell without it runs `[[` as a command, which fails, so a guard written this way inverts in silence.",
-   "bash": {
-    "stdout": "YES\n",
-    "exit": 0
-   },
-   "zsh": {
-    "stdout": "YES\n",
-    "exit": 0
-   },
-   "dash": {
-    "stdout": "NO\n",
-    "exit": 0
-   }
-  },
-  {
-   "name": "brace-expansion",
-   "script": "echo a{1,2}b",
-   "note": "Without brace expansion the word is one literal argument rather than two.",
-   "bash": {
-    "stdout": "a1b a2b\n",
-    "exit": 0
-   },
-   "zsh": {
-    "stdout": "a1b a2b\n",
-    "exit": 0
-   },
-   "dash": {
-    "stdout": "a{1,2}b\n",
-    "exit": 0
-   }
-  },
-  {
-   "name": "substring-expansion",
-   "script": "x=abcdef; echo \"${x:1:3}\"",
-   "note": "The one on this list that fails loudly: a shell without it reports a syntax error instead of running.",
-   "bash": {
-    "stdout": "bcd\n",
-    "exit": 0
-   },
-   "zsh": {
-    "stdout": "bcd\n",
-    "exit": 0
-   },
-   "dash": {
-    "stdout": "",
-    "exit": 2
-   }
-  },
-  {
-   "name": "local-in-a-function",
-   "script": "f() { local x=1; echo \"$x\"; }; f",
-   "note": "Not in POSIX, and every shell measured here has it anyway.",
-   "bash": {
-    "stdout": "1\n",
-    "exit": 0
-   },
-   "zsh": {
-    "stdout": "1\n",
-    "exit": 0
-   },
-   "dash": {
-    "stdout": "1\n",
-    "exit": 0
-   }
-  },
-  {
-   "name": "echo-suppress-newline",
-   "script": "echo -n x; echo END",
-   "note": "Whether `-n` is an option or a word to print.",
-   "bash": {
-    "stdout": "xEND\n",
-    "exit": 0
-   },
-   "zsh": {
-    "stdout": "xEND\n",
-    "exit": 0
-   },
-   "dash": {
-    "stdout": "xEND\n",
-    "exit": 0
-   }
-  },
-  {
-   "name": "echo-backslash-in-a-variable",
-   "script": "x='a\\tb'; echo \"$x\"",
-   "note": "Whether the echo builtin rescans its arguments for escapes.",
-   "bash": {
-    "stdout": "a\\tb\n",
-    "exit": 0
-   },
-   "zsh": {
-    "stdout": "a\tb\n",
-    "exit": 0
-   },
-   "dash": {
-    "stdout": "a\tb\n",
-    "exit": 0
-   }
-  },
-  {
-   "name": "ansi-c-newline-and-tab",
-   "script": "printf '%s' $'a\\nb\\tc'",
-   "note": "ANSI-C quoting is a word-expansion form, so what it produces is decided before anything reads the word.",
-   "bash": {
-    "stdout": "a\nb\tc",
-    "exit": 0
-   },
-   "zsh": {
-    "stdout": "a\nb\tc",
-    "exit": 0
-   },
-   "dash": {
-    "stdout": "$a\\nb\\tc",
-    "exit": 0
-   }
-  },
-  {
-   "name": "ansi-c-escaped-backslash",
-   "script": "printf '%s' $'a\\\\b'",
-   "note": "ANSI-C quoting is a word-expansion form, so what it produces is decided before anything reads the word.",
-   "bash": {
-    "stdout": "a\\b",
-    "exit": 0
-   },
-   "zsh": {
-    "stdout": "a\\b",
-    "exit": 0
-   },
-   "dash": {
-    "stdout": "$a\\\\b",
-    "exit": 0
-   }
-  },
-  {
-   "name": "ansi-c-unknown-escape",
-   "script": "printf '%s' $'a\\qb'",
-   "note": "ANSI-C quoting is a word-expansion form, so what it produces is decided before anything reads the word.",
-   "bash": {
-    "stdout": "a\\qb",
-    "exit": 0
-   },
-   "zsh": {
-    "stdout": "aqb",
-    "exit": 0
-   },
-   "dash": {
-    "stdout": "$a\\qb",
-    "exit": 0
-   }
-  },
-  {
-   "name": "ansi-c-single-quote",
-   "script": "printf '%s' $'a\\'b'",
-   "note": "ANSI-C quoting is a word-expansion form, so what it produces is decided before anything reads the word.",
-   "bash": {
-    "stdout": "a'b",
-    "exit": 0
-   },
-   "zsh": {
-    "stdout": "a'b",
-    "exit": 0
-   },
-   "dash": {
-    "stdout": "",
-    "exit": 2
-   }
-  }
- ]
+  "schema_version": 1,
+  "contract": "posix-sh-divergence-v1",
+  "purpose": "Record what each shell does with constructs outside their common portable subset, so a script's choice of interpreter is measured rather than assumed.",
+  "note": "Program names are not semantic versions. In particular, observed dash builds exist both without and with ANSI-C quote support. Each installed program must match exactly one complete profile across every case; alternatives are never accepted case by case. `cargo xtask posix-divergence` also runs the same exact script bytes through `/bin/sh` and compares that result with the selected profiles. Most differences are silent, which is why every profile and every case is recorded explicitly.",
+  "programs": [
+    {
+      "name": "bash",
+      "profiles": ["bash"]
+    },
+    {
+      "name": "zsh",
+      "profiles": ["zsh"]
+    },
+    {
+      "name": "dash",
+      "profiles": [
+        "dash-without-ansi-c-quotes",
+        "dash-with-ansi-c-quotes"
+      ]
+    }
+  ],
+  "cases": [
+    {
+      "name": "ansi-c-quoting-in-a-case-pattern",
+      "script": "case \"a\nb\" in *$'\\n'*) echo MATCHED ;; *) echo NO_MATCH ;; esac",
+      "note": "A newline check written with `$'\\n'` silently fails under a shell without ANSI-C quoting because the pattern remains literal text.",
+      "profiles": {
+        "bash": {"stdout": "MATCHED\n", "exit": 0},
+        "zsh": {"stdout": "MATCHED\n", "exit": 0},
+        "dash-without-ansi-c-quotes": {"stdout": "NO_MATCH\n", "exit": 0},
+        "dash-with-ansi-c-quotes": {"stdout": "MATCHED\n", "exit": 0}
+      }
+    },
+    {
+      "name": "ansi-c-quoting-expansion",
+      "script": "printf '[%s]' $'\\t'",
+      "note": "Without ANSI-C quoting the word is left as written; with it the argument is one tab byte.",
+      "profiles": {
+        "bash": {"stdout": "[\t]", "exit": 0},
+        "zsh": {"stdout": "[\t]", "exit": 0},
+        "dash-without-ansi-c-quotes": {"stdout": "[$\\t]", "exit": 0},
+        "dash-with-ansi-c-quotes": {"stdout": "[\t]", "exit": 0}
+      }
+    },
+    {
+      "name": "double-bracket-test",
+      "script": "[[ \"abc\" == a* ]] && echo YES || echo NO",
+      "note": "`[[` is a keyword rather than a portable builtin; a shell without it attempts a command and reaches the opposite branch.",
+      "profiles": {
+        "bash": {"stdout": "YES\n", "exit": 0},
+        "zsh": {"stdout": "YES\n", "exit": 0},
+        "dash-without-ansi-c-quotes": {"stdout": "NO\n", "exit": 0},
+        "dash-with-ansi-c-quotes": {"stdout": "NO\n", "exit": 0}
+      }
+    },
+    {
+      "name": "brace-expansion",
+      "script": "echo a{1,2}b",
+      "note": "Without brace expansion the word is one literal argument rather than two.",
+      "profiles": {
+        "bash": {"stdout": "a1b a2b\n", "exit": 0},
+        "zsh": {"stdout": "a1b a2b\n", "exit": 0},
+        "dash-without-ansi-c-quotes": {"stdout": "a{1,2}b\n", "exit": 0},
+        "dash-with-ansi-c-quotes": {"stdout": "a{1,2}b\n", "exit": 0}
+      }
+    },
+    {
+      "name": "substring-expansion",
+      "script": "x=abcdef; echo \"${x:1:3}\"",
+      "note": "A shell without substring expansion reports a syntax error instead of running the command.",
+      "profiles": {
+        "bash": {"stdout": "bcd\n", "exit": 0},
+        "zsh": {"stdout": "bcd\n", "exit": 0},
+        "dash-without-ansi-c-quotes": {"stdout": "", "exit": 2},
+        "dash-with-ansi-c-quotes": {"stdout": "", "exit": 2}
+      }
+    },
+    {
+      "name": "local-in-a-function",
+      "script": "f() { local x=1; echo \"$x\"; }; f",
+      "note": "`local` is outside the common portable subset, although every recorded profile implements it.",
+      "profiles": {
+        "bash": {"stdout": "1\n", "exit": 0},
+        "zsh": {"stdout": "1\n", "exit": 0},
+        "dash-without-ansi-c-quotes": {"stdout": "1\n", "exit": 0},
+        "dash-with-ansi-c-quotes": {"stdout": "1\n", "exit": 0}
+      }
+    },
+    {
+      "name": "echo-suppress-newline",
+      "script": "echo -n x; echo END",
+      "note": "The case records whether `-n` is an option or a word to print.",
+      "profiles": {
+        "bash": {"stdout": "xEND\n", "exit": 0},
+        "zsh": {"stdout": "xEND\n", "exit": 0},
+        "dash-without-ansi-c-quotes": {"stdout": "xEND\n", "exit": 0},
+        "dash-with-ansi-c-quotes": {"stdout": "xEND\n", "exit": 0}
+      }
+    },
+    {
+      "name": "echo-backslash-in-a-variable",
+      "script": "x='a\\tb'; echo \"$x\"",
+      "note": "The case records whether the echo builtin rescans its argument for escapes.",
+      "profiles": {
+        "bash": {"stdout": "a\\tb\n", "exit": 0},
+        "zsh": {"stdout": "a\tb\n", "exit": 0},
+        "dash-without-ansi-c-quotes": {"stdout": "a\tb\n", "exit": 0},
+        "dash-with-ansi-c-quotes": {"stdout": "a\tb\n", "exit": 0}
+      }
+    },
+    {
+      "name": "ansi-c-newline-and-tab",
+      "script": "printf '%s' $'a\\nb\\tc'",
+      "note": "ANSI-C quoting decides the word's newline and tab bytes before `printf` reads it.",
+      "profiles": {
+        "bash": {"stdout": "a\nb\tc", "exit": 0},
+        "zsh": {"stdout": "a\nb\tc", "exit": 0},
+        "dash-without-ansi-c-quotes": {"stdout": "$a\\nb\\tc", "exit": 0},
+        "dash-with-ansi-c-quotes": {"stdout": "a\nb\tc", "exit": 0}
+      }
+    },
+    {
+      "name": "ansi-c-escaped-backslash",
+      "script": "printf '%s' $'a\\\\b'",
+      "note": "The script contains two backslashes; the harness supplies those exact bytes on standard input so a native argv layer cannot consume one.",
+      "profiles": {
+        "bash": {"stdout": "a\\b", "exit": 0},
+        "zsh": {"stdout": "a\\b", "exit": 0},
+        "dash-without-ansi-c-quotes": {"stdout": "$a\\\\b", "exit": 0},
+        "dash-with-ansi-c-quotes": {"stdout": "a\\b", "exit": 0}
+      }
+    },
+    {
+      "name": "ansi-c-unknown-escape",
+      "script": "printf '%s' $'a\\qb'",
+      "note": "Profiles differ on both recognizing ANSI-C quotes and retaining an unknown escape's backslash.",
+      "profiles": {
+        "bash": {"stdout": "a\\qb", "exit": 0},
+        "zsh": {"stdout": "aqb", "exit": 0},
+        "dash-without-ansi-c-quotes": {"stdout": "$a\\qb", "exit": 0},
+        "dash-with-ansi-c-quotes": {"stdout": "a\\qb", "exit": 0}
+      }
+    },
+    {
+      "name": "ansi-c-single-quote",
+      "script": "printf '%s' $'a\\'b'",
+      "note": "Recognizing ANSI-C quotes makes the escaped single quote data; without them it leaves an unterminated quote.",
+      "profiles": {
+        "bash": {"stdout": "a'b", "exit": 0},
+        "zsh": {"stdout": "a'b", "exit": 0},
+        "dash-without-ansi-c-quotes": {"stdout": "", "exit": 2},
+        "dash-with-ansi-c-quotes": {"stdout": "a'b", "exit": 0}
+      }
+    }
+  ]
 }

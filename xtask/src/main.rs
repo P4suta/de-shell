@@ -4,7 +4,7 @@
 )]
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use syn::spanned::Spanned as _;
@@ -105,6 +105,40 @@ struct CliCase {
     fixture: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PosixDivergenceCorpus {
+    schema_version: u32,
+    contract: String,
+    purpose: String,
+    note: String,
+    programs: Vec<PosixDivergenceProgram>,
+    cases: Vec<PosixDivergenceCase>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PosixDivergenceProgram {
+    name: String,
+    profiles: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PosixDivergenceCase {
+    name: String,
+    script: String,
+    note: String,
+    profiles: BTreeMap<String, PosixDivergenceObservation>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct PosixDivergenceObservation {
+    stdout: String,
+    exit: i32,
+}
+
 fn repository_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..")
 }
@@ -153,12 +187,49 @@ impl PosixPrograms {
     }
 
     fn output(&self, name: &str, script: &str) -> std::io::Result<std::process::Output> {
-        self.command(name)?.arg("-c").arg(script).output()
+        let mut command = self.command(name)?;
+        let mut child = command
+            .arg("-s")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        write_posix_script(&mut child, script)?;
+        child.wait_with_output()
     }
 
     fn status(&self, name: &str, script: &str) -> std::io::Result<std::process::ExitStatus> {
-        self.command(name)?.arg("-c").arg(script).status()
+        let mut command = self.command(name)?;
+        let mut child = command
+            .arg("-s")
+            .stdin(std::process::Stdio::piped())
+            .spawn()?;
+        write_posix_script(&mut child, script)?;
+        child.wait()
     }
+}
+
+/// Supply observation programs as exact bytes on standard input.
+///
+/// Passing the program as the value after `-c` adds the host's native command
+/// line parser before the POSIX shell. On Windows, the MSYS boundary can consume
+/// a layer of backslashes, so the harness would be measuring argv conversion
+/// instead of the shell program recorded in the corpus.
+fn write_posix_script(child: &mut std::process::Child, script: &str) -> std::io::Result<()> {
+    let mut stdin = child.stdin.take().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "POSIX observation child has no piped standard input",
+        )
+    })?;
+    if let Err(error) = std::io::Write::write_all(&mut stdin, script.as_bytes()) {
+        drop(stdin);
+        let _kill_result = child.kill();
+        let _wait_result = child.wait();
+        return Err(error);
+    }
+    drop(stdin);
+    Ok(())
 }
 
 fn resolve_posix_program(name: &str) -> std::io::Result<PathBuf> {
@@ -1184,130 +1255,271 @@ fn run_builtin_table(root: &Path) -> Result<(), Vec<String>> {
     Err(errors)
 }
 
-/// Re-measure the constructs that are not in POSIX, and decide by behaviour
-/// which shell `/bin/sh` is on this runner.
-///
-/// `/bin/sh` is not one program: bash on macOS, dash on Debian and Ubuntu.
-/// Reading a version string would name the binary; running the same scripts
-/// through it names what it does, which is what a script depends on. Most of
-/// these diverge in silence — a newline check written with `$'\n'` accepts
-/// everything under dash without a word — so the point of the gate is that the
-/// silence is written down somewhere a change has to pass through.
-fn run_posix_divergence(root: &Path) -> Result<(), Vec<String>> {
-    let path = root.join("contracts/golden/posix-sh-divergence-v1.json");
-    let raw = std::fs::read_to_string(&path)
-        .map_err(|error| vec![format!("cannot read {}: {error}", path.display())])?;
-    let corpus: serde_json::Value =
-        serde_json::from_str(&raw).map_err(|error| vec![format!("malformed corpus: {error}")])?;
-    let shells: Vec<&str> = corpus["shells"]
-        .as_array()
-        .ok_or_else(|| vec!["corpus has no shells array".to_owned()])?
-        .iter()
-        .filter_map(|value| value.as_str())
-        .collect();
-    let cases = corpus["cases"]
-        .as_array()
-        .ok_or_else(|| vec!["corpus has no cases array".to_owned()])?;
-    if cases.is_empty() || shells.is_empty() {
-        return Err(vec!["corpus is empty".to_owned()]);
-    }
-    let shell_programs =
-        PosixPrograms::discover(shells.iter().copied().chain(std::iter::once("/bin/sh")));
-
-    let observe = |shell: &str, script: &str| -> Option<(String, i64)> {
-        let output = shell_programs.output(shell, script).ok()?;
-        Some((
-            String::from_utf8_lossy(&output.stdout).into_owned(),
-            i64::from(output.status.code().unwrap_or(-1)),
-        ))
-    };
-
+fn validate_posix_divergence_corpus(corpus: &PosixDivergenceCorpus) -> Result<(), Vec<String>> {
     let mut errors = Vec::new();
-    let mut checked = 0_usize;
-    // A shell the runner does not carry is reported and skipped once, rather
-    // than once per case.
-    let present: Vec<&str> = shells
-        .iter()
-        .copied()
-        .filter(|shell| {
-            let ok = observe(shell, "exit 0").is_some();
-            if !ok {
-                println!("skipped  {shell}: not on this runner");
-            }
-            ok
-        })
-        .collect();
-    if present.is_empty() {
-        return Err(vec!["no recorded shell is on this runner".to_owned()]);
+    if corpus.schema_version != 1 {
+        errors.push(format!(
+            "corpus schema_version is {}, expected 1",
+            corpus.schema_version
+        ));
+    }
+    if corpus.contract != "posix-sh-divergence-v1" {
+        errors.push(format!(
+            "corpus contract is {:?}, expected posix-sh-divergence-v1",
+            corpus.contract
+        ));
+    }
+    for (field, value) in [("purpose", &corpus.purpose), ("note", &corpus.note)] {
+        if value.trim().is_empty() {
+            errors.push(format!("corpus {field} is empty"));
+        }
+    }
+    if corpus.programs.is_empty() || corpus.cases.is_empty() {
+        errors.push("corpus must name at least one program and one case".to_owned());
     }
 
-    for case in cases {
-        let name = case["name"].as_str().unwrap_or("<unnamed>");
-        let Some(script) = case["script"].as_str() else {
-            errors.push(format!("{name} has no script"));
-            continue;
-        };
-        for shell in &present {
-            let Some(recorded) = case[*shell].as_object() else {
-                errors.push(format!("{name} has no {shell} column"));
-                continue;
-            };
-            let Some((stdout, code)) = observe(shell, script) else {
-                errors.push(format!("{name}: cannot run {shell}"));
-                continue;
-            };
-            checked += 1;
-            let expected = recorded["stdout"].as_str().unwrap_or_default();
-            let expected_code = recorded["exit"].as_i64().unwrap_or(-1);
-            if stdout != expected || code != expected_code {
+    let mut program_names = BTreeSet::new();
+    let mut profile_names = BTreeSet::new();
+    for program in &corpus.programs {
+        if program.name.is_empty() {
+            errors.push("corpus has a program with an empty name".to_owned());
+        } else if !program_names.insert(program.name.as_str()) {
+            errors.push(format!("corpus repeats program {:?}", program.name));
+        }
+        if program.profiles.is_empty() {
+            errors.push(format!("program {:?} has no profiles", program.name));
+        }
+        for profile in &program.profiles {
+            if profile.is_empty() {
+                errors.push(format!("program {:?} has an empty profile", program.name));
+            } else if !profile_names.insert(profile.as_str()) {
+                errors.push(format!("corpus repeats profile {profile:?}"));
+            }
+        }
+    }
+
+    let mut case_names = BTreeSet::new();
+    for case in &corpus.cases {
+        if case.name.is_empty() {
+            errors.push("corpus has a case with an empty name".to_owned());
+        } else if !case_names.insert(case.name.as_str()) {
+            errors.push(format!("corpus repeats case {:?}", case.name));
+        }
+        if case.script.is_empty() || case.note.trim().is_empty() {
+            errors.push(format!("case {:?} has an empty script or note", case.name));
+        }
+        let case_profiles = case
+            .profiles
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        for profile in profile_names.difference(&case_profiles) {
+            errors.push(format!("case {:?} omits profile {profile:?}", case.name));
+        }
+        for profile in case_profiles.difference(&profile_names) {
+            errors.push(format!(
+                "case {:?} has unknown profile {profile:?}",
+                case.name
+            ));
+        }
+    }
+
+    let profiles = profile_names.into_iter().collect::<Vec<_>>();
+    for (index, left) in profiles.iter().enumerate() {
+        for right in &profiles[index + 1..] {
+            let indistinguishable = corpus.cases.iter().all(|case| {
+                case.profiles
+                    .get(*left)
+                    .zip(case.profiles.get(*right))
+                    .is_some_and(|(left, right)| left == right)
+            });
+            if indistinguishable {
                 errors.push(format!(
-                    "{name}/{shell}: recorded ({expected:?}, {expected_code}), observed ({stdout:?}, {code})"
+                    "profiles {left:?} and {right:?} are indistinguishable across the corpus"
                 ));
             }
         }
     }
 
-    // Which column does `/bin/sh` belong to here? Decided by running the same
-    // scripts through it, not by asking it what it is.
-    let mut differences: Vec<(&str, Vec<&str>)> = Vec::new();
-    for shell in &present {
-        let mut differs = Vec::new();
-        for case in cases {
-            let name = case["name"].as_str().unwrap_or("<unnamed>");
-            let script = case["script"].as_str().unwrap_or_default();
-            let Some((stdout, code)) = observe("/bin/sh", script) else {
-                differs.push(name);
-                continue;
-            };
-            if case[*shell]["stdout"].as_str() != Some(stdout.as_str())
-                || case[*shell]["exit"].as_i64() != Some(code)
-            {
-                differs.push(name);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+fn posix_profile_differences<'a>(
+    cases: &'a [PosixDivergenceCase],
+    profile: &str,
+    observed: &[PosixDivergenceObservation],
+) -> Vec<&'a str> {
+    cases
+        .iter()
+        .zip(observed)
+        .filter(|(case, seen)| case.profiles.get(profile) != Some(*seen))
+        .map(|(case, _)| case.name.as_str())
+        .collect()
+}
+
+/// Re-measure constructs outside the common POSIX-shell subset, select one
+/// complete recorded profile for each installed program, and classify
+/// `/bin/sh` by the same observations.
+///
+/// A program name is not a stable semantic version. In particular, dash builds
+/// exist both with and without ANSI-C quote support. A build must match exactly
+/// one whole-corpus profile: accepting alternatives per case would fabricate a
+/// shell that no runner was observed to provide.
+fn run_posix_divergence(root: &Path) -> Result<(), Vec<String>> {
+    let path = root.join("contracts/golden/posix-sh-divergence-v1.json");
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|error| vec![format!("cannot read {}: {error}", path.display())])?;
+    let corpus: PosixDivergenceCorpus =
+        serde_json::from_str(&raw).map_err(|error| vec![format!("malformed corpus: {error}")])?;
+    validate_posix_divergence_corpus(&corpus)?;
+
+    let shell_programs = PosixPrograms::discover(
+        corpus
+            .programs
+            .iter()
+            .map(|program| program.name.as_str())
+            .chain(std::iter::once("/bin/sh")),
+    );
+    let observe = |program: &str, script: &str| -> std::io::Result<PosixDivergenceObservation> {
+        let output = shell_programs.output(program, script)?;
+        let exit = output.status.code().unwrap_or(-1);
+        let stdout = String::from_utf8(output.stdout).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{program} wrote non-UTF-8 observation output: {error}"),
+            )
+        })?;
+        Ok(PosixDivergenceObservation { stdout, exit })
+    };
+
+    let mut errors = Vec::new();
+    let present = corpus
+        .programs
+        .iter()
+        .filter(|program| match observe(&program.name, "exit 0") {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                println!("skipped  {}: {error}", program.name);
+                false
+            }
+            Err(error) => {
+                errors.push(format!("cannot probe {}: {error}", program.name));
+                false
+            }
+        })
+        .collect::<Vec<_>>();
+    if present.is_empty() {
+        errors.push("no recorded POSIX program is on this runner".to_owned());
+        return Err(errors);
+    }
+
+    let mut checked = 0_usize;
+    let mut selected_profiles = Vec::new();
+    for program in present {
+        let mut observations = Vec::with_capacity(corpus.cases.len());
+        for case in &corpus.cases {
+            match observe(&program.name, &case.script) {
+                Ok(observation) => {
+                    checked += 1;
+                    observations.push(observation);
+                }
+                Err(error) => errors.push(format!(
+                    "{}/{:?}: cannot run observation: {error}",
+                    program.name, case.name
+                )),
             }
         }
-        differences.push((shell, differs));
+        if observations.len() != corpus.cases.len() {
+            continue;
+        }
+        let matching = program
+            .profiles
+            .iter()
+            .filter(|profile| {
+                posix_profile_differences(&corpus.cases, profile, &observations).is_empty()
+            })
+            .collect::<Vec<_>>();
+        match matching.as_slice() {
+            [profile] => {
+                println!("{} matches recorded profile {profile}", program.name);
+                selected_profiles.push((program.name.as_str(), profile.as_str()));
+            }
+            [] => {
+                errors.push(format!(
+                    "{} matches no complete recorded profile",
+                    program.name
+                ));
+                for profile in &program.profiles {
+                    let differences =
+                        posix_profile_differences(&corpus.cases, profile, &observations);
+                    errors.push(format!(
+                        "{} differs from {profile} on: {}",
+                        program.name,
+                        differences.join(", ")
+                    ));
+                }
+            }
+            profiles => errors.push(format!(
+                "{} ambiguously matches profiles {}",
+                program.name,
+                profiles
+                    .iter()
+                    .map(|profile| profile.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        }
     }
-    match differences.iter().find(|(_, differs)| differs.is_empty()) {
-        Some((shell, _)) => println!("/bin/sh here behaves like {shell}"),
-        // Naming the closest and the cases it differs on is the useful answer:
-        // macOS ships bash as `/bin/sh`, and bash in that mode is neither the
-        // bash on `PATH` nor dash.
-        None => {
-            println!("/bin/sh here behaves like none of the recorded shells");
-            for (shell, differs) in &differences {
-                println!("  unlike {shell} on: {}", differs.join(", "));
+
+    let mut sh_observations = Vec::with_capacity(corpus.cases.len());
+    for case in &corpus.cases {
+        match observe("/bin/sh", &case.script) {
+            Ok(observation) => sh_observations.push(observation),
+            Err(error) => errors.push(format!(
+                "/bin/sh/{:?}: cannot run observation: {error}",
+                case.name
+            )),
+        }
+    }
+    if sh_observations.len() == corpus.cases.len() {
+        let differences = selected_profiles
+            .iter()
+            .map(|(program, profile)| {
+                let label = if program == profile {
+                    (*program).to_owned()
+                } else {
+                    format!("{program} ({profile})")
+                };
+                (
+                    label,
+                    posix_profile_differences(&corpus.cases, profile, &sh_observations),
+                )
+            })
+            .collect::<Vec<_>>();
+        match differences.iter().find(|(_, differs)| differs.is_empty()) {
+            Some((profile, _)) => println!("/bin/sh here behaves like {profile}"),
+            None => {
+                println!("/bin/sh here behaves like none of the selected profiles");
+                for (profile, differs) in &differences {
+                    println!("  unlike {profile} on: {}", differs.join(", "));
+                }
             }
         }
     }
 
     if errors.is_empty() {
         println!(
-            "{} construct(s) match the recording across {checked} shell observation(s)",
-            cases.len()
+            "{} construct(s) match one complete profile across {checked} program observation(s)",
+            corpus.cases.len()
         );
-        return Ok(());
+        Ok(())
+    } else {
+        Err(errors)
     }
-    Err(errors)
 }
 
 /// Check each shell's `printf` builtin against the recording.
@@ -4533,6 +4745,12 @@ mod tests {
         );
 
         let output = programs
+            .output("bash", r"printf '%s' $'a\\b'")
+            .expect("the script must cross the native process boundary unchanged");
+        assert!(output.status.success(), "{output:#?}");
+        assert_eq!(output.stdout, b"a\\b");
+
+        let output = programs
             .command("/bin/echo")
             .expect("the POSIX path must resolve to a native executable")
             .arg("deshell-posix-path")
@@ -4586,6 +4804,42 @@ mod tests {
         let error =
             render_powershell_posix_template("& __DESHELL_POSIX_TRUE__", &programs).unwrap_err();
         assert!(error.contains("was not discovered"), "{error}");
+    }
+
+    #[test]
+    fn posix_divergence_profiles_are_complete_known_and_distinguishable() {
+        const CORPUS: &str = include_str!("../../contracts/golden/posix-sh-divergence-v1.json");
+        let corpus: PosixDivergenceCorpus = serde_json::from_str(CORPUS).unwrap();
+        validate_posix_divergence_corpus(&corpus).unwrap();
+
+        let mut missing: PosixDivergenceCorpus = serde_json::from_str(CORPUS).unwrap();
+        missing.cases[0].profiles.remove("bash");
+        let errors = validate_posix_divergence_corpus(&missing).unwrap_err();
+        assert!(errors.iter().any(|error| error.contains("omits profile")));
+
+        let mut unknown: PosixDivergenceCorpus = serde_json::from_str(CORPUS).unwrap();
+        unknown.cases[0].profiles.insert(
+            "invented-shell".to_owned(),
+            PosixDivergenceObservation {
+                stdout: String::new(),
+                exit: 0,
+            },
+        );
+        let errors = validate_posix_divergence_corpus(&unknown).unwrap_err();
+        assert!(errors.iter().any(|error| error.contains("unknown profile")));
+
+        let mut ambiguous: PosixDivergenceCorpus = serde_json::from_str(CORPUS).unwrap();
+        for case in &mut ambiguous.cases {
+            let bash = case.profiles["bash"].clone();
+            case.profiles.insert("zsh".to_owned(), bash);
+        }
+        let errors = validate_posix_divergence_corpus(&ambiguous).unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("are indistinguishable")),
+            "{errors:#?}"
+        );
     }
 
     #[test]
