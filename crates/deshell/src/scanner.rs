@@ -452,6 +452,20 @@ pub(crate) fn static_script_references(
     Ok(output)
 }
 
+/// Whether this program name is an interpreter that runs what it is given.
+///
+/// The distinction a process launch turns on: `spawnSync("/bin/echo", [word])`
+/// runs `echo` whatever `word` holds, and `spawnSync("/bin/sh", [word])` runs
+/// whatever `word` holds. Only the second is a shell location.
+fn names_a_shell(program: &str) -> bool {
+    let name = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    let name = name.strip_suffix(".exe").unwrap_or(name);
+    matches!(
+        name,
+        "sh" | "bash" | "zsh" | "fish" | "dash" | "ksh" | "pwsh" | "powershell" | "cmd" | "nu"
+    )
+}
+
 fn direct_invoked_target(
     source: &[u8],
     targets: &std::collections::BTreeSet<String>,
@@ -1956,12 +1970,23 @@ fn append_process_reference_findings(parts: AppendProcessReferenceFindingsArgs<'
             });
         let safe = match syntax {
             ProcessSyntax::Python => !shell_true && static_argv_collection(first),
-            ProcessSyntax::Javascript => {
-                quoted_literal(first).is_some()
-                    && values
-                        .get(1)
-                        .is_none_or(|value| static_argv_collection(value.trim()))
-            }
+            ProcessSyntax::Javascript => match quoted_literal(first) {
+                // A program that is not a shell starts no shell, whatever its
+                // arguments are. The rule used to want the argument array to be
+                // literal too, so `spawnSync("/bin/echo", [name], ...)` was a
+                // shell candidate — and de-shell's own generated action, which
+                // is exactly that, failed the shell-free gate it exists to
+                // satisfy.
+                //
+                // A program that is a shell is the other case: there the
+                // arguments are the program, so a dynamic one is not something
+                // this can read.
+                Some(program) if !names_a_shell(&program) => true,
+                Some(_) => values
+                    .get(1)
+                    .is_none_or(|value| static_argv_collection(value.trim())),
+                None => false,
+            },
         };
         if safe {
             continue;
@@ -2950,6 +2975,52 @@ spawn(dynamicProgram, dynamicArguments);
         assert_eq!(inventory.skipped.len(), 1);
         assert_eq!(inventory.skipped[0].path, "build.py");
         assert_eq!(inventory.skipped[0].reason, "unsupported_encoding");
+    }
+
+    /// A process launch is a shell location when the program is a shell, not
+    /// when its arguments are not literal.
+    ///
+    /// The rule wanted the argument array to be literal too, so
+    /// `spawnSync("/bin/echo", [name], ...)` was a shell candidate. de-shell's
+    /// own generated action is exactly that once a step assigns a variable and
+    /// passes it on, so the generated program failed the shell-free gate it
+    /// exists to satisfy.
+    ///
+    /// `/bin/echo` runs `echo` whatever the argument holds. `/bin/sh` runs
+    /// whatever the argument holds, and that is the case the rule is for.
+    #[test]
+    fn a_process_launch_is_a_shell_location_when_the_program_is_a_shell() {
+        let directory = tempfile::tempdir().unwrap();
+        write(
+            directory.path(),
+            "run.js",
+            br#"const {spawnSync} = require('node:child_process');
+const word = process.env.WORD;
+spawnSync("/bin/echo", [word], { shell: false });
+spawnSync("/bin/sh", [word], { shell: false });
+spawnSync(program, ["status"], { shell: false });
+"#,
+        );
+        let inventory = scan(directory.path()).unwrap();
+        assert!(inventory.errors.is_empty(), "{:#?}", inventory.errors);
+        let sources: Vec<_> = inventory
+            .findings
+            .iter()
+            .map(|finding| String::from_utf8_lossy(&finding.source).into_owned())
+            .collect();
+        assert_eq!(sources.len(), 2, "{sources:#?}");
+        assert!(
+            sources.iter().all(|source| !source.contains("/bin/echo")),
+            "a launch of a program that is not a shell was reported: {sources:#?}"
+        );
+        assert!(
+            sources.iter().any(|source| source.contains("/bin/sh")),
+            "a launch of a shell with a dynamic argument was not reported: {sources:#?}"
+        );
+        assert!(
+            sources.iter().any(|source| source.contains("program")),
+            "a launch of a dynamic program was not reported: {sources:#?}"
+        );
     }
 
     /// Two locations holding the same text get their own byte spans.

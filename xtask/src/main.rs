@@ -308,6 +308,84 @@ fn run_echo_semantics(root: &Path) -> Result<(), Vec<String>> {
 /// difference today — the PowerShell frontend lowers external command
 /// invocations, and those behave the same under both forms — so this is what
 /// checks the rule instead.
+/// The names PowerShell defines before a script runs.
+///
+/// The frontend models `$name = 'literal'` as a plain assignment, and that is
+/// only true for a name the script owns. `$ErrorActionPreference` changes how
+/// errors are handled and `$LASTEXITCODE` changes what a later `exit` reports;
+/// neither is a value the IR can carry as text. Which names those are is a fact
+/// about PowerShell, so it is measured.
+fn run_powershell_variables(root: &Path) -> Result<(), Vec<String>> {
+    let path = root.join("contracts/golden/powershell-variable-inventory-v1.json");
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|error| vec![format!("cannot read {}: {error}", path.display())])?;
+    let corpus: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|error| vec![format!("malformed corpus: {error}")])?;
+    let recorded = corpus["names"]
+        .as_array()
+        .ok_or_else(|| vec!["corpus has no names array".to_owned()])?
+        .iter()
+        .map(|name| name.as_str().unwrap_or_default().to_owned())
+        .collect::<Vec<_>>();
+    if recorded.is_empty() {
+        return Err(vec!["corpus is empty".to_owned()]);
+    }
+    // Two conditions, because one of them is not a detail: `LASTEXITCODE` does
+    // not exist until a native command sets it, and a list measured only at
+    // startup let `$LASTEXITCODE = '0'` through as an ordinary assignment.
+    let mut observed = Vec::new();
+    for command in [
+        "Get-Variable | Select-Object -ExpandProperty Name | Sort-Object",
+        "& '/usr/bin/true'; Get-Variable | Select-Object -ExpandProperty Name | Sort-Object",
+    ] {
+        let run = std::process::Command::new("pwsh")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                command,
+            ])
+            .output();
+        let run = match run {
+            Ok(run) => run,
+            Err(error) => {
+                println!("skipped  no PowerShell runtime answered: {error}");
+                return Ok(());
+            }
+        };
+        for line in String::from_utf8_lossy(&run.stdout).lines() {
+            let line = line.trim_end_matches('\r').trim().to_owned();
+            if !line.is_empty() && !observed.contains(&line) {
+                observed.push(line);
+            }
+        }
+    }
+    let mut errors = Vec::new();
+    for name in &observed {
+        if !recorded.contains(name) {
+            errors.push(format!(
+                "{name} is defined by PowerShell and is not recorded"
+            ));
+        }
+    }
+    for name in &recorded {
+        if !observed.contains(name) {
+            errors.push(format!(
+                "{name} is recorded and PowerShell does not define it"
+            ));
+        }
+    }
+    if errors.is_empty() {
+        println!(
+            "{} PowerShell variable name(s) match the recording",
+            recorded.len()
+        );
+        return Ok(());
+    }
+    Err(errors)
+}
+
 fn run_powershell_step_invocation(root: &Path) -> Result<(), Vec<String>> {
     let path = root.join("contracts/golden/powershell-step-invocation-semantics-v1.json");
     let raw = std::fs::read_to_string(&path)
@@ -2392,6 +2470,7 @@ fn dispatch(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Vec<Str
         Some("exit-semantics") => run_exit_semantics(root),
         Some("powershell-invocation") => run_powershell_invocation(root),
         Some("powershell-step-invocation") => run_powershell_step_invocation(root),
+        Some("powershell-variables") => run_powershell_variables(root),
         Some("builtin-table") => run_builtin_table(root),
         Some("posix-divergence") => run_posix_divergence(root),
         Some("printf-semantics") => run_printf_semantics(root),

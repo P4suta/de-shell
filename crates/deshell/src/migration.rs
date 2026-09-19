@@ -2796,6 +2796,39 @@ fn github_run_replacement(
     ))
 }
 
+/// A JavaScript name for a shell variable.
+///
+/// Prefixed so a script's `$status` cannot collide with the generated program's
+/// own bookkeeping, and because a shell name is not always a JavaScript one.
+fn javascript_variable(name: &str) -> String {
+    let mut output = String::from("deshellVar_");
+    for character in name.chars() {
+        if character.is_ascii_alphanumeric() || character == '_' {
+            output.push(character);
+        } else {
+            output.push('_');
+        }
+    }
+    output
+}
+
+/// One word of a command, as JavaScript.
+///
+/// A name the program assigned reads the constant it set. Any other name is the
+/// environment's, and an unset one is the empty string — measured with pwsh
+/// 7.6.5, where `$env:UNSET` passed as an argument arrives as one empty
+/// argument rather than as no argument at all.
+fn javascript_word(word: &HostWord, assigned: &BTreeSet<String>) -> Result<String, String> {
+    match word {
+        HostWord::Literal(value) => serde_json::to_string(value).map_err(|error| error.to_string()),
+        HostWord::Variable(name) if assigned.contains(name) => Ok(javascript_variable(name)),
+        HostWord::Variable(name) => {
+            let name = serde_json::to_string(name).map_err(|error| error.to_string())?;
+            Ok(format!("(process.env[{name}] ?? \"\")"))
+        }
+    }
+}
+
 /// The local action a step's replacement lives in.
 ///
 /// Keyed by the step's content digest, so two steps running the same command
@@ -2842,27 +2875,50 @@ fn generate_github_action_host(
     // candidate — correctly. The generated program would have failed the
     // shell-free gate it exists to satisfy, which is how this was found.
     let mut body = String::new();
-    for (index, command) in commands.iter().enumerate() {
-        let program = serde_json::to_string(&command[0]).map_err(|error| error.to_string())?;
-        let arguments = serde_json::to_string(&command[1..]).map_err(|error| error.to_string())?;
-        body.push_str(&format!(
-            concat!(
-                "  {{\n",
-                "    const result = spawnSync({program}, {arguments}, {{ stdio: \"inherit\", shell: false }});\n",
-                "    if (result.error) throw result.error;\n",
-                "    if (result.signal) process.kill(process.pid, result.signal);\n",
-                "    deshellStatus = result.status === null ? 1 : result.status;\n",
-                "  }}\n",
-            ),
-            program = program,
-            arguments = arguments,
-        ));
-        // `stop` is `set -e`: the step ends at the first command that fails.
-        // `continue` runs them all and reports the last one, which is what a
-        // shell without the option does. The last command has nothing after it
-        // either way.
-        if on_failure == crate::ir::SequenceFailure::Stop && index + 1 < commands.len() {
-            body.push_str("  if (deshellStatus !== 0) break deshell;\n");
+    let mut assigned: BTreeSet<String> = BTreeSet::new();
+    let run_steps = commands
+        .iter()
+        .filter(|step| matches!(step, HostStep::Run(_)))
+        .count();
+    let mut written = 0_usize;
+    for step in &commands {
+        match step {
+            HostStep::Assign { name, value } => {
+                let value = serde_json::to_string(value).map_err(|error| error.to_string())?;
+                body.push_str(&format!(
+                    "  const {} = {value};\n",
+                    javascript_variable(name)
+                ));
+                assigned.insert(name.clone());
+            }
+            HostStep::Run(argv) => {
+                let program = javascript_word(&argv[0], &assigned)?;
+                let arguments = argv[1..]
+                    .iter()
+                    .map(|word| javascript_word(word, &assigned))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .join(", ");
+                body.push_str(&format!(
+                    concat!(
+                        "  {{\n",
+                        "    const result = spawnSync({program}, [{arguments}], {{ stdio: \"inherit\", shell: false }});\n",
+                        "    if (result.error) throw result.error;\n",
+                        "    if (result.signal) process.kill(process.pid, result.signal);\n",
+                        "    deshellStatus = result.status === null ? 1 : result.status;\n",
+                        "  }}\n",
+                    ),
+                    program = program,
+                    arguments = arguments,
+                ));
+                written += 1;
+                // `stop` is `set -e`: the step ends at the first command that
+                // fails. `continue` runs them all and reports the last one,
+                // which is what a shell without the option does. The last
+                // command has nothing after it either way.
+                if on_failure == crate::ir::SequenceFailure::Stop && written < run_steps {
+                    body.push_str("  if (deshellStatus !== 0) break deshell;\n");
+                }
+            }
         }
     }
     let javascript = format!(
@@ -3044,8 +3100,31 @@ fn generate_python_host(
     })
 }
 
-/// The literal commands a host generator runs, in order, and what a failure
-/// does.
+/// One step of a generated host program.
+///
+/// A workflow step is not only a list of commands: it can set a variable and
+/// pass it on. Keeping the two in one ordered list is what lets the generated
+/// program run them in the order the step does.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum HostStep {
+    Assign { name: String, value: String },
+    Run(Vec<HostWord>),
+}
+
+/// One word of a generated command.
+///
+/// A variable reference stays a reference rather than being resolved here: its
+/// value is whatever the assignment before it set, or the environment when
+/// nothing did. Measured with pwsh 7.6.5: `$env:UNSET` passed as an argument
+/// arrives as one empty argument, and a value holding a space arrives as one
+/// argument rather than two.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum HostWord {
+    Literal(String),
+    Variable(String),
+}
+
+/// The steps a host generator runs, in order, and what a failure does.
 ///
 /// `literal_exec_argv` takes one command, which is what a host generator writing
 /// a single call needs. A workflow step is usually several lines, and refusing
@@ -3059,7 +3138,7 @@ fn generate_python_host(
 fn literal_exec_sequence(
     plan: &crate::ir::Plan,
     context: &str,
-) -> Result<(Vec<Vec<String>>, crate::ir::SequenceFailure), String> {
+) -> Result<(Vec<HostStep>, crate::ir::SequenceFailure), String> {
     let task = plan
         .tasks
         .iter()
@@ -3078,6 +3157,11 @@ fn literal_exec_sequence(
             predicate: _,
             if_true: _,
             if_false: _,
+        }
+        | crate::ir::Operation::SetVariable {
+            name: _,
+            value_type: _,
+            value: _,
         } => (vec![&task.body], crate::ir::SequenceFailure::Stop),
         crate::ir::Operation::Sequence { nodes, on_failure } => {
             (nodes.iter().collect(), *on_failure)
@@ -3089,19 +3173,24 @@ fn literal_exec_sequence(
             ));
         }
     };
-    let mut commands = Vec::new();
+    let mut steps = Vec::new();
     for node in nodes {
-        flatten_literal_commands(node, on_failure, context, &mut commands)?;
+        flatten_literal_commands(node, on_failure, context, &mut steps)?;
     }
-    if commands.is_empty() {
+    if steps.is_empty() {
         return Err(format!(
             "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: {context} is empty"
         ));
     }
-    Ok((commands, on_failure))
+    if !steps.iter().any(|step| matches!(step, HostStep::Run(_))) {
+        return Err(format!(
+            "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: {context} runs nothing"
+        ));
+    }
+    Ok((steps, on_failure))
 }
 
-/// Append the literal commands `node` runs, in order.
+/// Append the steps `node` runs, in order.
 ///
 /// An `&&` chain lowers to a `Condition`, and a step of
 /// `sudo apt-get update && sudo apt-get install ...` was refused for being one.
@@ -3116,7 +3205,7 @@ fn flatten_literal_commands(
     node: &crate::ir::Node,
     on_failure: crate::ir::SequenceFailure,
     context: &str,
-    commands: &mut Vec<Vec<String>>,
+    steps: &mut Vec<HostStep>,
 ) -> Result<(), String> {
     match &node.operation {
         crate::ir::Operation::Exec {
@@ -3131,14 +3220,30 @@ fn flatten_literal_commands(
             }
             let argv = argv
                 .iter()
-                .map(literal_text_expression)
+                .map(|word| host_word(word, context))
                 .collect::<Result<Vec<_>, _>>()?;
             if argv.is_empty() {
                 return Err(format!(
                     "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: {context} is empty"
                 ));
             }
-            commands.push(argv);
+            steps.push(HostStep::Run(argv));
+            Ok(())
+        }
+        crate::ir::Operation::SetVariable {
+            name,
+            value_type,
+            value,
+        } => {
+            if !value_type.is_plain_text() {
+                return Err(format!(
+                    "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: {context} carries text, and this assignment is typed"
+                ));
+            }
+            steps.push(HostStep::Assign {
+                name: name.clone(),
+                value: literal_text_expression(value)?,
+            });
             Ok(())
         }
         crate::ir::Operation::Condition {
@@ -3146,13 +3251,27 @@ fn flatten_literal_commands(
             if_true,
             if_false,
         } if if_false.is_none() && on_failure == crate::ir::SequenceFailure::Stop => {
-            flatten_literal_commands(predicate, on_failure, context, commands)?;
-            flatten_literal_commands(if_true, on_failure, context, commands)
+            flatten_literal_commands(predicate, on_failure, context, steps)?;
+            flatten_literal_commands(if_true, on_failure, context, steps)
         }
         other => Err(format!(
             "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: {context} runs commands, and this step holds {}",
             other.name()
         )),
+    }
+}
+
+/// One word of a command, as a literal or a name to read.
+fn host_word(word: &crate::ir::TextExpression, context: &str) -> Result<HostWord, String> {
+    match word.parts.as_slice() {
+        [crate::ir::TextPart::Variable { name }] => Ok(HostWord::Variable(name.clone())),
+        _ => Ok(HostWord::Literal(literal_text_expression(word).map_err(
+            |_| {
+                format!(
+                    "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: {context} carries literal words and whole variables"
+                )
+            },
+        )?)),
     }
 }
 
@@ -11177,7 +11296,13 @@ mod tests {
 
         let (commands, on_failure) = step("/bin/echo one\n/bin/echo two\n/bin/echo three\n");
         assert_eq!(commands.len(), 3);
-        assert_eq!(commands[0], vec!["/bin/echo".to_owned(), "one".to_owned()]);
+        assert_eq!(
+            commands[0],
+            HostStep::Run(vec![
+                HostWord::Literal("/bin/echo".to_owned()),
+                HostWord::Literal("one".to_owned()),
+            ])
+        );
         // The runner executes `bash -e {0}`, so a step stops at the first
         // failure whether or not it says `set -e`.
         assert_eq!(on_failure, crate::ir::SequenceFailure::Stop);
@@ -11278,8 +11403,14 @@ mod tests {
         assert_eq!(
             commands,
             vec![
-                vec!["/bin/echo".to_owned(), "one".to_owned()],
-                vec!["/bin/echo".to_owned(), "two".to_owned()],
+                HostStep::Run(vec![
+                    HostWord::Literal("/bin/echo".to_owned()),
+                    HostWord::Literal("one".to_owned()),
+                ]),
+                HostStep::Run(vec![
+                    HostWord::Literal("/bin/echo".to_owned()),
+                    HostWord::Literal("two".to_owned()),
+                ]),
             ]
         );
         assert_eq!(on_failure, crate::ir::SequenceFailure::Stop);

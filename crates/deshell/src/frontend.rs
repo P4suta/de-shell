@@ -1793,6 +1793,81 @@ const SHELL_SUPPLIED_VARIABLES: &[&str] = &[
     "UID",
 ];
 
+/// The names PowerShell answers itself.
+///
+/// A script that writes `$ErrorActionPreference = 'Stop'` is not assigning a
+/// value; it is changing how the script handles errors, and `$LASTEXITCODE`
+/// decides what a later `exit` reports. Modelling either as a plain assignment
+/// would carry the text and drop the meaning.
+///
+/// Measured with `Get-Variable` rather than listed from the documentation:
+/// `contracts/golden/powershell-variable-inventory-v1.json` holds it and
+/// `cargo xtask powershell-variables` re-runs it. A name absent here is the
+/// script's own.
+const POWERSHELL_SUPPLIED_VARIABLES: &[&str] = &[
+    "$",
+    "?",
+    "^",
+    "args",
+    "ConfirmPreference",
+    "DebugPreference",
+    "EnabledExperimentalFeatures",
+    "Error",
+    "ErrorActionPreference",
+    "ErrorView",
+    "ExecutionContext",
+    "false",
+    "FormatEnumerationLimit",
+    "HOME",
+    "Host",
+    "InformationPreference",
+    "input",
+    "IsCoreCLR",
+    "IsLinux",
+    "IsMacOS",
+    "IsWindows",
+    "LASTEXITCODE",
+    "MaximumHistoryCount",
+    "MyInvocation",
+    "NestedPromptLevel",
+    "null",
+    "OutputEncoding",
+    "PID",
+    "PROFILE",
+    "ProgressPreference",
+    "PSBoundParameters",
+    "PSCommandPath",
+    "PSCulture",
+    "PSDefaultParameterValues",
+    "PSEdition",
+    "PSEmailServer",
+    "PSHOME",
+    "PSNativeCommandArgumentPassing",
+    "PSNativeCommandUseErrorActionPreference",
+    "PSScriptRoot",
+    "PSSessionApplicationName",
+    "PSSessionConfigurationName",
+    "PSSessionOption",
+    "PSStyle",
+    "PSUICulture",
+    "PSVersionTable",
+    "PWD",
+    "ShellId",
+    "StackTrace",
+    "true",
+    "VerbosePreference",
+    "WarningPreference",
+    "WhatIfPreference",
+];
+
+/// Whether PowerShell answers this name itself. Case-insensitive, because
+/// PowerShell variable names are.
+fn powershell_supplied_variable(name: &str) -> bool {
+    POWERSHELL_SUPPLIED_VARIABLES
+        .iter()
+        .any(|supplied| supplied.eq_ignore_ascii_case(name))
+}
+
 /// Whether the shell answers this name itself.
 fn shell_supplied_variable(name: &str) -> bool {
     SHELL_SUPPLIED_VARIABLES.contains(&name)
@@ -4475,6 +4550,7 @@ fn lower_powershell(path: &str, source: &str) -> Result<Lowered, String> {
     let ranges = shell_statements(source)?;
     let mut inputs = BTreeSet::new();
     let mut environment = BTreeSet::new();
+    let mut locals = BTreeSet::new();
     let mut nodes = Vec::new();
     let mut terminal_status_span = None;
     let range_count = ranges.len();
@@ -4496,6 +4572,7 @@ fn lower_powershell(path: &str, source: &str) -> Result<Lowered, String> {
             range,
             inputs: &mut inputs,
             environment: &mut environment,
+            locals: &mut locals,
         })?);
     }
     if nodes.is_empty() {
@@ -4538,6 +4615,7 @@ struct LowerPowershellControlArgs<'a> {
     range: Range,
     inputs: &'a mut BTreeSet<String>,
     environment: &'a mut BTreeSet<String>,
+    locals: &'a mut BTreeSet<String>,
 }
 
 fn lower_powershell_control(parts: LowerPowershellControlArgs<'_>) -> Result<Node, String> {
@@ -4548,6 +4626,7 @@ fn lower_powershell_control(parts: LowerPowershellControlArgs<'_>) -> Result<Nod
         range,
         inputs,
         environment,
+        locals,
     } = parts;
     let controls = powershell_and_controls(source, range)?;
     if controls.is_empty() {
@@ -4557,6 +4636,7 @@ fn lower_powershell_control(parts: LowerPowershellControlArgs<'_>) -> Result<Nod
             range,
             inputs,
             environment,
+            locals,
         });
     }
     let mut pieces = Vec::new();
@@ -4584,6 +4664,7 @@ fn lower_powershell_control(parts: LowerPowershellControlArgs<'_>) -> Result<Nod
                 range: piece,
                 inputs,
                 environment,
+                locals,
             })
         })
         .collect::<Result<Vec<_>, _>>()?
@@ -4655,6 +4736,86 @@ struct LowerPowershellSimpleArgs<'a> {
     range: Range,
     inputs: &'a mut BTreeSet<String>,
     environment: &'a mut BTreeSet<String>,
+    /// The names this script has assigned. A `$name` that is not here is one
+    /// nothing in the script set, so reading it would be reading whatever the
+    /// session happened to hold.
+    locals: &'a mut BTreeSet<String>,
+}
+
+/// The inputs of [`lower_powershell_assignment`].
+struct LowerPowershellAssignmentArgs<'a> {
+    path: &'a str,
+    source: &'a str,
+    range: Range,
+    locals: &'a mut BTreeSet<String>,
+}
+
+/// `$name = <literal>`, if that is what this statement is.
+///
+/// `Ok(None)` means the statement is not an assignment and the caller carries
+/// on; an assignment this cannot model is an `Err`, because taking the part it
+/// understands and dropping the rest is how a substitution becomes silent.
+///
+/// A name PowerShell answers itself is refused: `$ErrorActionPreference = 'Stop'`
+/// changes how the script handles errors and `$LASTEXITCODE` decides what a
+/// later `exit` reports, and neither is a value the IR can carry as text. See
+/// `POWERSHELL_SUPPLIED_VARIABLES`.
+fn lower_powershell_assignment(
+    parts: LowerPowershellAssignmentArgs<'_>,
+) -> Result<Option<Node>, String> {
+    let LowerPowershellAssignmentArgs {
+        path,
+        source,
+        range,
+        locals,
+    } = parts;
+    let statement = source[range.start..range.end].trim();
+    let Some(rest) = statement.strip_prefix('$') else {
+        return Ok(None);
+    };
+    let Some((name, value)) = rest.split_once('=') else {
+        return Ok(None);
+    };
+    let name = name.trim();
+    if !valid_identifier(name) {
+        return Ok(None);
+    }
+    if powershell_supplied_variable(name) {
+        return Err(format!(
+            "PowerShell answers ${name} itself, so assigning it is not a value this can carry"
+        ));
+    }
+    let value = value.trim();
+    let literal = powershell_literal_string(value)
+        .ok_or_else(|| format!("PowerShell assignment to ${name} is not a literal string"))?;
+    locals.insert(name.to_owned());
+    Ok(Some(native_node(
+        Operation::SetVariable {
+            name: name.to_owned(),
+            value_type: crate::ir::ValueType::Primitive(crate::ir::PrimitiveType::Text),
+            value: TextExpression::literal(literal),
+        },
+        SemanticModel::ImmutableAssignment.named(&Interpreter::Powershell),
+        span_for_range(path, source, range.start, range.end)?,
+    )))
+}
+
+/// The text a quoted PowerShell string holds, if it holds only text.
+///
+/// A single-quoted string is literal. A double-quoted one interpolates, so one
+/// holding `$` or a backtick is not text and is refused rather than read as if
+/// it were.
+fn powershell_literal_string(value: &str) -> Option<&str> {
+    let inner = value
+        .strip_prefix('\'')
+        .and_then(|value| value.strip_suffix('\''))
+        .or_else(|| {
+            value
+                .strip_prefix('"')
+                .and_then(|value| value.strip_suffix('"'))
+                .filter(|inner| !inner.contains(['$', '`']))
+        })?;
+    (!inner.contains(['\'', '"'])).then_some(inner)
 }
 
 fn lower_powershell_simple(parts: LowerPowershellSimpleArgs<'_>) -> Result<Node, String> {
@@ -4665,8 +4826,20 @@ fn lower_powershell_simple(parts: LowerPowershellSimpleArgs<'_>) -> Result<Node,
         range,
         inputs,
         environment,
+        locals,
     } = parts;
-    let words = tokenize_powershell(&source[range.start..range.end], inputs, environment)?;
+    // `$name = <literal>` is an assignment, not an invocation. Measured with
+    // pwsh 7.6.5: a value holding a space stays one argument when the variable
+    // is passed on, so the text travels whole and nothing splits it.
+    if let Some(node) = lower_powershell_assignment(LowerPowershellAssignmentArgs {
+        path,
+        source,
+        range,
+        locals,
+    })? {
+        return Ok(node);
+    }
+    let words = tokenize_powershell(&source[range.start..range.end], inputs, environment, locals)?;
     let first = literal_expression(words.first().ok_or("PowerShell command is empty")?);
     // `& 'path' args` and `./path args` are the same invocation. Measured with
     // pwsh 7.6.5: `./echo.ps1 a b`, `.\echo.ps1 a b` and `& './echo.ps1' a b`
@@ -4725,6 +4898,7 @@ fn tokenize_powershell(
     source: &str,
     inputs: &mut BTreeSet<String>,
     environment: &mut BTreeSet<String>,
+    locals: &BTreeSet<String>,
 ) -> Result<Vec<TextExpression>, String> {
     let bytes = source.as_bytes();
     let mut index = 0;
@@ -4790,6 +4964,16 @@ fn tokenize_powershell(
                     return Err("unsupported PowerShell environment variable".into());
                 }
                 environment.insert(name.into());
+                TextExpression {
+                    parts: vec![TextPart::Variable { name: name.into() }],
+                }
+            } else if let Some(name) = value.strip_prefix('$')
+                && valid_identifier(name)
+                && locals.contains(name)
+            {
+                // A whole argument that is a variable the script assigned.
+                // Measured with pwsh 7.6.5: a value holding a space arrives as
+                // one argument, so nothing splits and the text travels whole.
                 TextExpression {
                     parts: vec![TextPart::Variable { name: name.into() }],
                 }
@@ -5921,6 +6105,66 @@ mod tests {
             Err(crate::agent_process::AgentError::TimedOut)
         ));
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    /// A PowerShell script's own variable is a value; one PowerShell answers is
+    /// not.
+    ///
+    /// `$word = 'hello world'` then `& '/bin/echo' $word` passes one argument
+    /// holding a space — measured with pwsh 7.6.5, where nothing splits it. So
+    /// the text travels whole.
+    ///
+    /// `$ErrorActionPreference = 'Stop'` has the same shape and is not an
+    /// assignment: it changes how the script handles errors, and
+    /// `$LASTEXITCODE` decides what a later `exit` reports.
+    /// `contracts/golden/powershell-variable-inventory-v1.json` is the measured
+    /// list of names PowerShell answers and `cargo xtask powershell-variables`
+    /// re-runs it.
+    #[test]
+    fn a_powershell_script_variable_is_a_value_and_a_supplied_one_is_not() {
+        let lowered =
+            lower_powershell("build.ps1", "$word = 'hello world'\n& '/bin/echo' $word\n").unwrap();
+        let Operation::Sequence { nodes, .. } = &lowered.body.operation else {
+            panic!(
+                "two statements are a sequence: {:?}",
+                lowered.body.operation
+            );
+        };
+        let Operation::SetVariable { name, value, .. } = &nodes[0].operation else {
+            panic!("the first is an assignment");
+        };
+        assert_eq!(name, "word");
+        assert_eq!(literal_expression(value).as_deref(), Some("hello world"));
+        let Operation::Exec { argv, .. } = &nodes[1].operation else {
+            panic!("the second is an exec");
+        };
+        assert_eq!(
+            argv[1].parts,
+            vec![TextPart::Variable {
+                name: "word".into()
+            }]
+        );
+
+        // A name PowerShell answers itself is refused rather than carried as
+        // text.
+        for supplied in [
+            "$ErrorActionPreference = 'Stop'",
+            "$LASTEXITCODE = '0'",
+            "$erroractionpreference = 'Stop'",
+        ] {
+            let source = format!("{supplied}\n& '/bin/echo' one\n");
+            assert!(
+                lower_powershell("build.ps1", &source).is_err(),
+                "{supplied} was carried as a value"
+            );
+        }
+
+        // A variable nothing assigned is not read.
+        assert!(lower_powershell("build.ps1", "& '/bin/echo' $nothing\n").is_err());
+        // An assignment that is not a literal string is refused whole rather
+        // than having the part it understands taken.
+        assert!(lower_powershell("build.ps1", "$x = 1 + 1\n& '/bin/echo' $x\n").is_err());
+        assert!(lower_powershell("build.ps1", "$x = \"pre-$y\"\n& '/bin/echo' $x\n").is_err());
     }
 
     /// A PowerShell command that names a path is an invocation.

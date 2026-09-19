@@ -203,6 +203,17 @@ All notable changes are documented here. No compatibility contract predates
   `contracts/golden/powershell-step-invocation-semantics-v1.json` records it and
   `cargo xtask powershell-step-invocation` re-measures it.
 
+- Lowered a PowerShell script's own variable: `$name = '<literal>'` becomes an
+  assignment and `$name` passed as an argument reads it. Measured: a value
+  holding a space arrives as one argument, so nothing splits it. A name
+  PowerShell answers itself is refused —
+  `contracts/golden/powershell-variable-inventory-v1.json` records the measured
+  list and `cargo xtask powershell-variables` re-runs it.
+- Generated a host action that sets a variable and passes it on, and stopped
+  the scanner reporting `spawnSync("/bin/echo", [name])` as a shell location. A
+  program that is not a shell starts no shell whatever its arguments are; a
+  program that is one is the case the rule is for.
+
 ### Removed
 
 - Pre-v1 Effect IR and lock migration promises.
