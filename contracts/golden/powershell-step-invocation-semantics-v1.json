@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "contract": "powershell-step-invocation-semantics-v1",
+  "purpose": "Pin how a GitHub workflow's pwsh step differs from handing its text to `pwsh -Command`, so the verification baseline is checked against a measurement rather than against a reading of the runner's template.",
+  "note": "The runner writes the step to a file with `$ErrorActionPreference = 'stop'` before it and `if ((Test-Path -LiteralPath variable:/LASTEXITCODE)) { exit $LASTEXITCODE }` after it, then dot-sources that file. The template is GitHub's documented one and is not measured here; what is measured is that it produces a different program from the text handed to `-Command`. A case marked `differs` is one where the two forms disagree, which is what makes the baseline a choice rather than a detail.",
+  "cases": [
+    {
+      "name": "cmdlet-error-stops-the-step",
+      "step": "Write-Output \"before\"\nGet-Item /deshell/definitely/not/there\nWrite-Output \"after\"\n",
+      "differs": true,
+      "command_form": {"exit": 0, "stdout": "before\nafter\n"},
+      "runner_form": {"exit": 1, "stdout": "before\n"}
+    },
+    {
+      "name": "native-failure-does-not-stop-the-step",
+      "step": "& '/bin/echo' one\n& '/usr/bin/false'\n& '/bin/echo' two\n",
+      "differs": false,
+      "command_form": {"exit": 0, "stdout": "one\ntwo\n"},
+      "runner_form": {"exit": 0, "stdout": "one\ntwo\n"}
+    },
+    {
+      "name": "a-native-status-is-reported-as-failure-by-both",
+      "step": "& '/bin/sh' -c 'exit 42'\n",
+      "differs": false,
+      "command_form": {"exit": 1, "stdout": ""},
+      "runner_form": {"exit": 1, "stdout": ""}
+    }
+  ]
+}

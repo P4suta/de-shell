@@ -195,6 +195,14 @@ All notable changes are documented here. No compatibility contract predates
   a time, each after somebody needed it. `dispatch` now lets a command hand the
   report its own items.
 
+- Ran the original of a pwsh workflow step the way the runner does — a file
+  carrying `$ErrorActionPreference = 'stop'` and `exit $LASTEXITCODE`,
+  dot-sourced — rather than handing its text to `pwsh -Command`. Measured: a
+  step whose cmdlet fails carries on and ends successfully under the second form
+  and stops with status 1 under the first.
+  `contracts/golden/powershell-step-invocation-semantics-v1.json` records it and
+  `cargo xtask powershell-step-invocation` re-measures it.
+
 ### Removed
 
 - Pre-v1 Effect IR and lock migration promises.

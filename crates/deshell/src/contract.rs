@@ -160,6 +160,7 @@ mod tests {
             "contracts/golden/shell-variable-inventory-v1.json",
             "contracts/golden/ir-verifier-coverage-v1.json",
             "contracts/golden/powershell-invocation-semantics-v1.json",
+            "contracts/golden/powershell-step-invocation-semantics-v1.json",
             "contracts/semantic-models-v1.json",
         ] {
             assert!(root().join(relative).is_file(), "missing {relative}");

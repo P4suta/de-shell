@@ -300,6 +300,105 @@ fn run_echo_semantics(root: &Path) -> Result<(), Vec<String>> {
 /// with `exit $LASTEXITCODE` after it. `pwsh -Command` reports 0 or 1 and not
 /// the status the script left — which is the same reason a workflow's pwsh step
 /// carries that line.
+/// How a workflow's pwsh step differs from its text handed to `pwsh -Command`.
+///
+/// The verification baseline runs the original the way the host runs it, and
+/// for a pwsh step that is a file carrying `$ErrorActionPreference = 'stop'`
+/// and `exit $LASTEXITCODE`, dot-sourced. No end-to-end case reaches the
+/// difference today — the PowerShell frontend lowers external command
+/// invocations, and those behave the same under both forms — so this is what
+/// checks the rule instead.
+fn run_powershell_step_invocation(root: &Path) -> Result<(), Vec<String>> {
+    let path = root.join("contracts/golden/powershell-step-invocation-semantics-v1.json");
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|error| vec![format!("cannot read {}: {error}", path.display())])?;
+    let corpus: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|error| vec![format!("malformed corpus: {error}")])?;
+    let cases = corpus["cases"]
+        .as_array()
+        .ok_or_else(|| vec!["corpus has no cases array".to_owned()])?;
+    if cases.is_empty() {
+        return Err(vec!["corpus is empty".to_owned()]);
+    }
+    // Under `target/` and not the system temporary root: a version-manager shim
+    // resolves its version from the configuration nearest the working directory.
+    let directory = root.join(format!("target/deshell-pwsh-step-{}", std::process::id()));
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| vec![format!("cannot create {}: {error}", directory.display())])?;
+    let mut errors = Vec::new();
+    let mut checked = 0_usize;
+    for case in cases {
+        let name = case["name"].as_str().unwrap_or("<unnamed>");
+        let Some(step) = case["step"].as_str() else {
+            errors.push(format!("{name} has no step"));
+            continue;
+        };
+        let file = directory.join("step.ps1");
+        if let Err(error) = std::fs::write(
+            &file,
+            format!(
+                "$ErrorActionPreference = 'stop'\n{step}\nif ((Test-Path -LiteralPath variable:/LASTEXITCODE)) {{ exit $LASTEXITCODE }}\n"
+            ),
+        ) {
+            errors.push(format!("cannot write the step for {name}: {error}"));
+            continue;
+        }
+        let quoted = file.to_string_lossy().into_owned();
+        for (form, argument) in [
+            ("command_form", step.to_owned()),
+            ("runner_form", format!(". '{quoted}'")),
+        ] {
+            let observed = std::process::Command::new("pwsh")
+                .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
+                .arg(&argument)
+                .current_dir(&directory)
+                .output();
+            let observed = match observed {
+                Ok(observed) => observed,
+                Err(error) => {
+                    println!("skipped  {name}/{form}: {error}");
+                    continue;
+                }
+            };
+            checked += 1;
+            let stdout = String::from_utf8_lossy(&observed.stdout).replace("\r\n", "\n");
+            let exit = i64::from(observed.status.code().unwrap_or(-1));
+            if case[form]["stdout"].as_str() != Some(stdout.as_str()) {
+                errors.push(format!(
+                    "{name}/{form}/stdout: recorded {:?}, observed {stdout:?}",
+                    case[form]["stdout"].as_str()
+                ));
+            }
+            if case[form]["exit"].as_i64() != Some(exit) {
+                errors.push(format!(
+                    "{name}/{form}/exit: recorded {:?}, observed {exit}",
+                    case[form]["exit"].as_i64()
+                ));
+            }
+        }
+        // The recording says whether the two forms disagree, and a case that
+        // stopped disagreeing would leave the baseline rule resting on nothing.
+        let differs = case["differs"].as_bool().unwrap_or(false);
+        let same = case["command_form"] == case["runner_form"];
+        if differs == same {
+            errors.push(format!(
+                "{name}: recorded differs={differs} but the two forms are {}",
+                if same { "identical" } else { "different" }
+            ));
+        }
+    }
+    let _ = std::fs::remove_dir_all(&directory);
+    if checked == 0 {
+        println!("skipped  no PowerShell runtime answered");
+        return Ok(());
+    }
+    if errors.is_empty() {
+        println!("{checked} PowerShell step invocation(s) match the recording");
+        return Ok(());
+    }
+    Err(errors)
+}
+
 fn run_powershell_invocation(root: &Path) -> Result<(), Vec<String>> {
     let path = root.join("contracts/golden/powershell-invocation-semantics-v1.json");
     let raw = std::fs::read_to_string(&path)
@@ -2292,6 +2391,7 @@ fn dispatch(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Vec<Str
         Some("echo-semantics") => run_echo_semantics(root),
         Some("exit-semantics") => run_exit_semantics(root),
         Some("powershell-invocation") => run_powershell_invocation(root),
+        Some("powershell-step-invocation") => run_powershell_step_invocation(root),
         Some("builtin-table") => run_builtin_table(root),
         Some("posix-divergence") => run_posix_divergence(root),
         Some("printf-semantics") => run_printf_semantics(root),

@@ -7667,6 +7667,53 @@ fn embedded_original_invocation(
 ) -> Result<EmbeddedOriginalInvocation, String> {
     let snippet = String::from_utf8(snippet)
         .map_err(|_| "embedded shell verification requires UTF-8 source")?;
+    if is_github_workflow_path(host) && interpreter == "powershell" {
+        // The runner does not hand a pwsh step to `-Command` as text. It writes
+        // the step to a file with `$ErrorActionPreference = 'stop'` before it and
+        // `if ((Test-Path -LiteralPath variable:/LASTEXITCODE)) { exit $LASTEXITCODE }`
+        // after it, then dot-sources that file.
+        //
+        // Both lines change what is observed, measured here. Without the first,
+        // a step whose `Get-Item` fails prints the error, carries on to the next
+        // line and ends successfully; with it, the step stops and ends with 1.
+        // Without the second, `pwsh -Command` reports 0 or 1 and never the
+        // status the step left — `exit 7` comes back as 1.
+        //
+        // The template itself is GitHub's documented one and is not measured
+        // here; what is measured is that it produces a different program from
+        // the one de-shell was comparing against. That is the same footing the
+        // `bash -e {0}` baseline stands on.
+        let directory = tempfile::Builder::new()
+            .prefix("deshell-original-workflow-")
+            .tempdir()
+            .map_err(|error| format!("cannot create embedded step directory: {error}"))?;
+        let script = directory.path().join("step.ps1");
+        crate::patch::scratch::write(
+            &script,
+            format!(
+                "$ErrorActionPreference = 'stop'\n{snippet}\nif ((Test-Path -LiteralPath variable:/LASTEXITCODE)) {{ exit $LASTEXITCODE }}\n"
+            )
+            .as_bytes(),
+        )
+        .map_err(|error| format!("cannot write embedded step script: {error}"))?;
+        let script = script
+            .to_str()
+            .ok_or("embedded step script path is not UTF-8")?;
+        if script.contains('\'') {
+            return Err("embedded step script path holds a quote".into());
+        }
+        return Ok(EmbeddedOriginalInvocation {
+            argv: vec![
+                "pwsh".into(),
+                "-NoLogo".into(),
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-Command".into(),
+                format!(". '{script}'"),
+            ],
+            _script_directory: Some(directory),
+        });
+    }
     if is_github_workflow_path(host) && matches!(interpreter, "sh" | "bash") {
         let directory = tempfile::Builder::new()
             .prefix("deshell-original-workflow-")
@@ -11137,6 +11184,72 @@ mod tests {
 
         let (single, _) = step("/bin/echo only\n");
         assert_eq!(single.len(), 1);
+    }
+
+    /// A workflow step is run the way the runner runs it, per interpreter.
+    ///
+    /// A bash step is `bash -e {0}` over a file and a pwsh step is a file
+    /// carrying `$ErrorActionPreference = 'stop'` and `exit $LASTEXITCODE`,
+    /// dot-sourced. Both are the host's rules rather than the interpreter's, and
+    /// reading a step as `bash -c <text>` is what made a `set -e` step's
+    /// baseline carry on after a failure.
+    ///
+    /// No end-to-end case reaches the pwsh difference yet — the PowerShell
+    /// frontend lowers external command invocations, and those behave the same
+    /// under both forms — so this pins the shape and
+    /// `contracts/golden/powershell-step-invocation-semantics-v1.json` records
+    /// the measurement that says the forms are not interchangeable.
+    #[test]
+    fn a_workflow_step_is_run_the_way_the_runner_runs_it() {
+        let bash = embedded_original_invocation(
+            ".github/workflows/ci.yml",
+            "bash",
+            b"/bin/echo one\n".to_vec(),
+        )
+        .unwrap();
+        assert_eq!(&bash.argv[..2], ["bash", "-e"]);
+        assert_eq!(bash.argv.len(), 3);
+        assert!(bash.argv[2].ends_with("step.sh"), "{:?}", bash.argv);
+
+        let pwsh = embedded_original_invocation(
+            ".github/workflows/ci.yml",
+            "powershell",
+            b"& '/bin/echo' one\n".to_vec(),
+        )
+        .unwrap();
+        assert_eq!(
+            &pwsh.argv[..5],
+            [
+                "pwsh",
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command"
+            ]
+        );
+        assert!(pwsh.argv[5].starts_with(". '"), "{:?}", pwsh.argv);
+        let script = std::fs::read_to_string(
+            pwsh.argv[5]
+                .trim_start_matches(". '")
+                .trim_end_matches('\''),
+        )
+        .unwrap();
+        assert!(
+            script.starts_with("$ErrorActionPreference = 'stop'\n"),
+            "{script}"
+        );
+        assert!(script.contains("& '/bin/echo' one"), "{script}");
+        assert!(
+            script.contains(
+                "if ((Test-Path -LiteralPath variable:/LASTEXITCODE)) { exit $LASTEXITCODE }"
+            ),
+            "{script}"
+        );
+
+        // A host with no such rule is left alone.
+        let plain =
+            embedded_original_invocation("Makefile", "bash", b"/bin/echo one\n".to_vec()).unwrap();
+        assert_eq!(&plain.argv[..2], ["bash", "-c"]);
     }
 
     /// An `&&` chain in a workflow step is the commands in order.
