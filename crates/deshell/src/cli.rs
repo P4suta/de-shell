@@ -5899,8 +5899,16 @@ mod tests {
                 .map(|mut event| {
                     let object = event.as_object_mut().unwrap();
                     object.remove("elapsed_nanos");
-                    let rendered = serde_json::to_string(&object).unwrap();
-                    rendered.replace(&root, "<root>")
+                    // Normalize values before JSON escaping. Replacing text in
+                    // the serialized form happened to work for `/` paths, but
+                    // could not find a Windows root once each `\` had become
+                    // `\\` in JSON.
+                    for value in object.values_mut() {
+                        if let serde_json::Value::String(text) = value {
+                            *text = text.replace(&root, "<root>");
+                        }
+                    }
+                    serde_json::to_string(&object).unwrap()
                 })
                 .collect::<Vec<_>>()
         };

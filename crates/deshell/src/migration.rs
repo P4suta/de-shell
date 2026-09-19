@@ -12150,10 +12150,10 @@ mod tests {
         let tasks: Vec<crate::ir::Task> = Vec::new();
         let statements = || {
             vec![
-                node(crate::ir::Operation::Exec {
-                    argv: vec![crate::ir::TextExpression::literal("/usr/bin/false")],
-                    environment: Vec::new(),
-                    working_directory: None,
+                node(crate::ir::Operation::Test {
+                    predicate: crate::ir::TestPredicate::NonEmpty {
+                        value: crate::ir::TextExpression::literal(""),
+                    },
                 }),
                 node(crate::ir::Operation::WriteStdout {
                     contents: crate::ir::TextExpression::literal("unreachable\n"),
@@ -12750,6 +12750,14 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
             .unwrap();
         plan.tasks[0].body = body;
         plan
+    }
+
+    /// An executable produced for the current test host.
+    ///
+    /// Passing the suffix to both compilers avoids relying on `PATHEXT` lookup
+    /// or on a compiler silently changing the requested output name on Windows.
+    fn test_executable(root: &Path, stem: &str) -> PathBuf {
+        root.join(format!("{stem}{}", std::env::consts::EXE_SUFFIX))
     }
 
     fn node(operation: crate::ir::Operation) -> crate::ir::Node {
@@ -13430,16 +13438,18 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
         );
 
         let directory = tempfile::tempdir().unwrap();
-        std::fs::write(directory.path().join("end.sh"), script).unwrap();
         std::fs::write(
             directory.path().join("end.rs"),
             generate_rust(&plan).unwrap(),
         )
         .unwrap();
         std::fs::write(directory.path().join("end.go"), generate_go(&plan).unwrap()).unwrap();
+        let rust_program = test_executable(directory.path(), "end-rust");
+        let go_program = test_executable(directory.path(), "end-go");
         let built = std::process::Command::new("rustc")
             .arg("end.rs")
-            .args(["--edition=2024", "-D", "warnings", "-o", "end-rust"])
+            .args(["--edition=2024", "-D", "warnings", "-o"])
+            .arg(&rust_program)
             .current_dir(directory.path())
             .output()
             .unwrap();
@@ -13449,7 +13459,9 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
             String::from_utf8_lossy(&built.stderr)
         );
         let built = std::process::Command::new("go")
-            .args(["build", "-o", "end-go", "end.go"])
+            .args(["build", "-o"])
+            .arg(&go_program)
+            .arg("end.go")
             .current_dir(directory.path())
             .output()
             .unwrap();
@@ -13459,16 +13471,13 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
             String::from_utf8_lossy(&built.stderr)
         );
 
-        // Inside the domain: the same status bash ends with, measured rather
-        // than assumed, including the values that wrap.
+        // Inside the measured domain, the semantic model is the oracle. An
+        // ambient `bash` is not: on Windows that name can be the WSL launcher,
+        // and even native Bash versions disagree outside this domain.
         for code in ["0", "1", "2", "255", "256", "300", "-1", " 7 "] {
-            let shell = std::process::Command::new("bash")
-                .arg("end.sh")
-                .env("DESHELL_TEST_CODE", code)
-                .current_dir(directory.path())
-                .status()
-                .unwrap();
-            for program in ["./end-rust", "./end-go"] {
+            let expected =
+                i32::try_from(code.trim().parse::<i64>().unwrap().rem_euclid(256)).unwrap();
+            for program in [&rust_program, &go_program] {
                 let ran = std::process::Command::new(program)
                     .env("DESHELL_TEST_CODE", code)
                     .current_dir(directory.path())
@@ -13476,8 +13485,9 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
                     .unwrap();
                 assert_eq!(
                     ran.code(),
-                    shell.code(),
-                    "{program} ended differently for {code:?}"
+                    Some(expected),
+                    "{} ended differently for {code:?}",
+                    program.display()
                 );
             }
         }
@@ -13489,16 +13499,20 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
         // declared semantic model. The message is the part that cannot be
         // reproduced — bash names its own path and a line number — so the
         // program names the value instead.
-        for program in ["./end-rust", "./end-go"] {
+        for program in [&rust_program, &go_program] {
             let ran = std::process::Command::new(program)
                 .env("DESHELL_TEST_CODE", "not-a-number")
                 .current_dir(directory.path())
                 .output()
                 .unwrap();
-            assert_eq!(ran.status.code(), Some(255), "{program}");
-            assert!(ran.stdout.is_empty(), "{program}");
+            assert_eq!(ran.status.code(), Some(255), "{}", program.display());
+            assert!(ran.stdout.is_empty(), "{}", program.display());
             let stderr = String::from_utf8_lossy(&ran.stderr);
-            assert!(stderr.contains("not-a-number"), "{program}: {stderr}");
+            assert!(
+                stderr.contains("not-a-number"),
+                "{}: {stderr}",
+                program.display()
+            );
         }
     }
 
@@ -13511,7 +13525,7 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
     #[test]
     fn a_redirection_target_is_expanded_like_any_other_word() {
         let script = "/bin/echo appended >>\"${DESHELL_TEST_OUT}\"\n";
-        let plan = crate::frontend::lower(
+        let mut plan = crate::frontend::lower(
             "write.sh",
             format!("#!/bin/bash\n{script}").as_bytes(),
             crate::config::UnknownInterpreter::TraceOnly,
@@ -13533,8 +13547,36 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
             }]
         );
 
+        // The frontend assertion above deliberately uses an external command:
+        // it proves that redirection around an Exec survives lowering. For the
+        // generator assertion below, replace only that body with `rustc
+        // --version`, an external command required on every test host. The
+        // redirection and its expanded target remain the ones the frontend
+        // produced, while the generated binaries no longer depend on
+        // `/bin/echo` existing on the host that runs this test.
+        let crate::ir::Operation::Redirect { body, .. } = &mut plan.tasks[0].body.operation else {
+            panic!("the immutable assertion above established this shape")
+        };
+        **body = node(crate::ir::Operation::Exec {
+            argv: ["rustc", "--version"]
+                .map(crate::ir::TextExpression::literal)
+                .into(),
+            environment: Vec::new(),
+            working_directory: None,
+        });
+
+        let rustc_version = std::process::Command::new("rustc")
+            .arg("--version")
+            .output()
+            .unwrap();
+        assert!(rustc_version.status.success());
+        let expected = [
+            rustc_version.stdout.as_slice(),
+            rustc_version.stdout.as_slice(),
+        ]
+        .concat();
+
         let directory = tempfile::tempdir().unwrap();
-        std::fs::write(directory.path().join("write.sh"), script).unwrap();
         std::fs::write(
             directory.path().join("write.rs"),
             generate_rust(&plan).unwrap(),
@@ -13545,9 +13587,12 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
             generate_go(&plan).unwrap(),
         )
         .unwrap();
+        let rust_program = test_executable(directory.path(), "write-rust");
+        let go_program = test_executable(directory.path(), "write-go");
         let built = std::process::Command::new("rustc")
             .arg("write.rs")
-            .args(["--edition=2024", "-D", "warnings", "-o", "write-rust"])
+            .args(["--edition=2024", "-D", "warnings", "-o"])
+            .arg(&rust_program)
             .current_dir(directory.path())
             .output()
             .unwrap();
@@ -13557,7 +13602,9 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
             String::from_utf8_lossy(&built.stderr)
         );
         let built = std::process::Command::new("go")
-            .args(["build", "-o", "write-go", "write.go"])
+            .args(["build", "-o"])
+            .arg(&go_program)
+            .arg("write.go")
             .current_dir(directory.path())
             .output()
             .unwrap();
@@ -13567,29 +13614,26 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
             String::from_utf8_lossy(&built.stderr)
         );
 
-        for (program, arguments) in [
-            ("bash", vec!["write.sh"]),
-            ("./write-rust", vec![]),
-            ("./write-go", vec![]),
-        ] {
-            let target = directory
-                .path()
-                .join(format!("{}.out", program.replace(['.', '/'], "")));
+        for program in [&rust_program, &go_program] {
+            let target = directory.path().join(format!(
+                "{}.out",
+                program.file_stem().unwrap().to_string_lossy()
+            ));
             // Appended twice: the second run has to add to the first, which is
             // what separates `>>` from `>`.
             for _ in 0..2 {
                 let status = std::process::Command::new(program)
-                    .args(&arguments)
                     .env("DESHELL_TEST_OUT", &target)
                     .current_dir(directory.path())
                     .status()
                     .unwrap();
-                assert!(status.success(), "{program}");
+                assert!(status.success(), "{}", program.display());
             }
             assert_eq!(
-                std::fs::read_to_string(&target).unwrap(),
-                "appended\nappended\n",
-                "{program} wrote other bytes"
+                std::fs::read(&target).unwrap(),
+                expected,
+                "{} wrote other bytes",
+                program.display()
             );
         }
     }
@@ -13673,8 +13717,8 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
     fn set_u_reaches_the_generated_programs() {
         let script = concat!(
             "set -u\n",
-            "/bin/echo \"${DESHELL_ABSENT}\"\n",
-            "/bin/echo reached\n"
+            "printf '%s\\n' \"${DESHELL_ABSENT}\"\n",
+            "printf 'reached\\n'\n"
         );
         let plan = crate::frontend::lower(
             "unset.sh",
@@ -13685,21 +13729,16 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
         assert!(plan.tasks[0].nounset, "the plan records the option");
 
         let directory = tempfile::tempdir().unwrap();
-        std::fs::write(directory.path().join("unset.sh"), script).unwrap();
         std::fs::write(
             directory.path().join("unset.rs"),
             generate_rust(&plan).unwrap(),
         )
         .unwrap();
+        let unset_rust = test_executable(directory.path(), "unset-rust");
+        let unset_go = test_executable(directory.path(), "unset-go");
         let built = std::process::Command::new("rustc")
-            .args([
-                "unset.rs",
-                "--edition=2024",
-                "-D",
-                "warnings",
-                "-o",
-                "unset-rust",
-            ])
+            .args(["unset.rs", "--edition=2024", "-D", "warnings", "-o"])
+            .arg(&unset_rust)
             .current_dir(directory.path())
             .output()
             .unwrap();
@@ -13714,7 +13753,9 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
         )
         .unwrap();
         let built = std::process::Command::new("go")
-            .args(["build", "-o", "unset-go", "unset.go"])
+            .args(["build", "-o"])
+            .arg(&unset_go)
+            .arg("unset.go")
             .current_dir(directory.path())
             .output()
             .unwrap();
@@ -13724,77 +13765,74 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
             String::from_utf8_lossy(&built.stderr)
         );
 
-        // Unset: the shell stops before `echo reached`, and so does the program.
-        let shell = std::process::Command::new("bash")
-            .arg("unset.sh")
-            .env_remove("DESHELL_ABSENT")
-            .current_dir(directory.path())
-            .output()
-            .unwrap();
-        assert_eq!(shell.stdout, b"");
-        assert_eq!(shell.status.code(), Some(1));
-        for program in ["./unset-rust", "./unset-go"] {
+        // Unset: expansion fails before the following write. These are the
+        // exact native semantics carried by `Task.nounset`; no ambient shell
+        // is allowed to redefine the oracle on a test runner.
+        for program in [&unset_rust, &unset_go] {
             let ran = std::process::Command::new(program)
                 .env_remove("DESHELL_ABSENT")
                 .current_dir(directory.path())
                 .output()
                 .unwrap();
             assert_eq!(
-                ran.stdout, shell.stdout,
-                "{program} ran past the unset name"
+                ran.stdout,
+                b"",
+                "{} ran past the unset name",
+                program.display()
             );
-            assert_eq!(ran.status.code(), shell.status.code(), "{program}");
+            assert_eq!(ran.status.code(), Some(1), "{}", program.display());
             assert!(
                 String::from_utf8_lossy(&ran.stderr).contains("DESHELL_ABSENT"),
-                "{program}: the message names the variable: {}",
+                "{}: the message names the variable: {}",
+                program.display(),
                 String::from_utf8_lossy(&ran.stderr)
             );
         }
 
         // Set but empty: `set -u` says that is a value, and both carry on.
-        for empty in ["", "value"] {
-            let shell = std::process::Command::new("bash")
-                .arg("unset.sh")
-                .env("DESHELL_ABSENT", empty)
-                .current_dir(directory.path())
-                .output()
-                .unwrap();
-            let ran = std::process::Command::new("./unset-rust")
-                .env("DESHELL_ABSENT", empty)
-                .current_dir(directory.path())
-                .output()
-                .unwrap();
-            assert_eq!(
-                String::from_utf8_lossy(&ran.stdout),
-                String::from_utf8_lossy(&shell.stdout),
-                "{empty:?}"
-            );
-            assert_eq!(ran.status.code(), shell.status.code(), "{empty:?}");
+        for (value, expected) in [("", "\nreached\n"), ("value", "value\nreached\n")] {
+            for program in [&unset_rust, &unset_go] {
+                let ran = std::process::Command::new(program)
+                    .env("DESHELL_ABSENT", value)
+                    .current_dir(directory.path())
+                    .output()
+                    .unwrap();
+                assert_eq!(
+                    ran.stdout,
+                    expected.as_bytes(),
+                    "{value:?}: {}",
+                    program.display()
+                );
+                assert_eq!(
+                    ran.status.code(),
+                    Some(0),
+                    "{value:?}: {}",
+                    program.display()
+                );
+            }
         }
 
         // A positional the call did not pass is the same rule.
-        let script = concat!("set -u\n", "/bin/echo \"$1\"\n", "/bin/echo reached\n");
+        let script = concat!(
+            "set -u\n",
+            "printf '%s\\n' \"$1\"\n",
+            "printf 'reached\\n'\n"
+        );
         let plan = crate::frontend::lower(
             "arg.sh",
             format!("#!/bin/bash\n{script}").as_bytes(),
             crate::config::UnknownInterpreter::TraceOnly,
         )
         .unwrap();
-        std::fs::write(directory.path().join("arg.sh"), script).unwrap();
         std::fs::write(
             directory.path().join("arg.rs"),
             generate_rust(&plan).unwrap(),
         )
         .unwrap();
+        let arg_rust = test_executable(directory.path(), "arg-rust");
         let built = std::process::Command::new("rustc")
-            .args([
-                "arg.rs",
-                "--edition=2024",
-                "-D",
-                "warnings",
-                "-o",
-                "arg-rust",
-            ])
+            .args(["arg.rs", "--edition=2024", "-D", "warnings", "-o"])
+            .arg(&arg_rust)
             .current_dir(directory.path())
             .output()
             .unwrap();
@@ -13803,24 +13841,17 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
             "rustc rejected generated source:\n{}",
             String::from_utf8_lossy(&built.stderr)
         );
-        for arguments in [vec![], vec!["given"]] {
-            let shell = std::process::Command::new("bash")
-                .arg("arg.sh")
+        for (arguments, stdout, status) in [
+            (Vec::<&str>::new(), "", 1),
+            (vec!["given"], "given\nreached\n", 0),
+        ] {
+            let ran = std::process::Command::new(&arg_rust)
                 .args(&arguments)
                 .current_dir(directory.path())
                 .output()
                 .unwrap();
-            let ran = std::process::Command::new("./arg-rust")
-                .args(&arguments)
-                .current_dir(directory.path())
-                .output()
-                .unwrap();
-            assert_eq!(
-                String::from_utf8_lossy(&ran.stdout),
-                String::from_utf8_lossy(&shell.stdout),
-                "{arguments:?}"
-            );
-            assert_eq!(ran.status.code(), shell.status.code(), "{arguments:?}");
+            assert_eq!(ran.stdout, stdout.as_bytes(), "{arguments:?}");
+            assert_eq!(ran.status.code(), Some(status), "{arguments:?}");
         }
     }
 
@@ -13831,8 +13862,12 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
     /// that runs on past a failure the script would have stopped at, with the
     /// wrong exit status at the end of it. The plan said `Stop` the whole time.
     #[test]
-    fn set_e_stops_the_generated_programs_where_it_stops_the_shell() {
-        let script = concat!("set -e\n", "/bin/sh -c 'exit 3'\n", "echo reached\n");
+    fn set_e_stops_generated_programs_at_the_first_failure() {
+        let script = concat!(
+            "set -e\n",
+            "rustc --deshell-intentional-invalid-option\n",
+            "echo reached\n"
+        );
         let plan = crate::frontend::lower(
             "stop.sh",
             format!("#!/bin/bash\n{script}").as_bytes(),
@@ -13846,7 +13881,6 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
         assert_eq!(*on_failure, crate::ir::SequenceFailure::Stop);
 
         let directory = tempfile::tempdir().unwrap();
-        std::fs::write(directory.path().join("stop.sh"), script).unwrap();
         std::fs::write(
             directory.path().join("stop.rs"),
             generate_rust(&plan).unwrap(),
@@ -13857,75 +13891,69 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
             generate_go(&plan).unwrap(),
         )
         .unwrap();
-        for (program, arguments) in [
-            (
-                "rustc",
-                vec![
-                    "stop.rs",
-                    "--edition=2024",
-                    "-D",
-                    "warnings",
-                    "-o",
-                    "stop-rust",
-                ],
-            ),
-            ("go", vec!["build", "-o", "stop-go", "stop.go"]),
-        ] {
-            let built = std::process::Command::new(program)
-                .args(&arguments)
-                .current_dir(directory.path())
-                .output()
-                .unwrap();
-            assert!(
-                built.status.success(),
-                "{program} rejected generated source:\n{}",
-                String::from_utf8_lossy(&built.stderr)
-            );
-        }
-
-        let shell = std::process::Command::new("bash")
-            .arg("stop.sh")
+        let stop_rust = test_executable(directory.path(), "stop-rust");
+        let stop_go = test_executable(directory.path(), "stop-go");
+        let built = std::process::Command::new("rustc")
+            .args(["stop.rs", "--edition=2024", "-D", "warnings", "-o"])
+            .arg(&stop_rust)
             .current_dir(directory.path())
             .output()
             .unwrap();
-        assert_eq!(shell.stdout, b"", "the shell stops before `echo reached`");
-        assert_eq!(shell.status.code(), Some(3));
-        for program in ["./stop-rust", "./stop-go"] {
+        assert!(
+            built.status.success(),
+            "rustc rejected generated source:\n{}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        let built = std::process::Command::new("go")
+            .args(["build", "-o"])
+            .arg(&stop_go)
+            .arg("stop.go")
+            .current_dir(directory.path())
+            .output()
+            .unwrap();
+        assert!(
+            built.status.success(),
+            "go rejected generated source:\n{}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+
+        // rustc is already a required tool on every runner and its unknown
+        // option is a portable, real process failure. The emitted sequence must
+        // return that status without writing the following line.
+        for program in [&stop_rust, &stop_go] {
             let ran = std::process::Command::new(program)
                 .current_dir(directory.path())
                 .output()
                 .unwrap();
             assert_eq!(
-                String::from_utf8_lossy(&ran.stdout),
-                String::from_utf8_lossy(&shell.stdout),
-                "{program} ran past the failure"
+                ran.stdout,
+                b"",
+                "{} ran past the failure",
+                program.display()
             );
-            assert_eq!(ran.status.code(), shell.status.code(), "{program}");
+            assert_eq!(ran.status.code(), Some(1), "{}", program.display());
         }
 
-        // Without `set -e` the shell runs on, and so do the programs.
-        let script = concat!("/bin/sh -c 'exit 3'\n", "echo reached\n");
+        // Without `set -e` the sequence runs on and its final write succeeds.
+        let script = concat!(
+            "rustc --deshell-intentional-invalid-option\n",
+            "echo reached\n"
+        );
         let plan = crate::frontend::lower(
             "go-on.sh",
             format!("#!/bin/bash\n{script}").as_bytes(),
             crate::config::UnknownInterpreter::TraceOnly,
         )
         .unwrap();
-        std::fs::write(directory.path().join("go-on.sh"), script).unwrap();
         std::fs::write(
             directory.path().join("go-on.rs"),
             generate_rust(&plan).unwrap(),
         )
         .unwrap();
+        let go_on_rust = test_executable(directory.path(), "go-on-rust");
         let built = std::process::Command::new("rustc")
-            .args([
-                "go-on.rs",
-                "--edition=2024",
-                "-D",
-                "warnings",
-                "-o",
-                "go-on-rust",
-            ])
+            .args(["go-on.rs", "--edition=2024", "-D", "warnings", "-o"])
+            .arg(&go_on_rust)
             .current_dir(directory.path())
             .output()
             .unwrap();
@@ -13934,26 +13962,20 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
             "{}",
             String::from_utf8_lossy(&built.stderr)
         );
-        let shell = std::process::Command::new("bash")
-            .arg("go-on.sh")
+        let ran = std::process::Command::new(&go_on_rust)
             .current_dir(directory.path())
             .output()
             .unwrap();
-        assert_eq!(shell.stdout, b"reached\n");
-        let ran = std::process::Command::new("./go-on-rust")
-            .current_dir(directory.path())
-            .output()
-            .unwrap();
-        assert_eq!(ran.stdout, shell.stdout);
-        assert_eq!(ran.status.code(), shell.status.code());
+        assert_eq!(ran.stdout, b"reached\n");
+        assert_eq!(ran.status.code(), Some(0));
     }
 
     /// A shell function arrives as a function, and behaves like one.
     ///
     /// The point of not inlining is that the definition is where "these call
     /// sites are the same check" is written down. So this asserts both: that
-    /// one function is emitted and called twice, and that the two programs
-    /// agree with bash over inputs that take each path.
+    /// one function is emitted and called twice, and that both generated
+    /// programs produce the exact modelled bytes and statuses on every path.
     #[test]
     fn a_shell_function_arrives_as_a_function_and_behaves_like_one() {
         let script = concat!(
@@ -13992,9 +14014,10 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
         assert_eq!(go.matches("reject([]string{").count(), 2, "{go}");
 
         let directory = tempfile::tempdir().unwrap();
-        std::fs::write(directory.path().join("check.sh"), script).unwrap();
         std::fs::write(directory.path().join("check.rs"), &rust).unwrap();
         std::fs::write(directory.path().join("check.go"), &go).unwrap();
+        let rust_program = test_executable(directory.path(), "check-rust");
+        let go_program = test_executable(directory.path(), "check-go");
         // The project receiving this code decides which lints it runs, and the
         // one this was written for denies `missing_docs` and runs
         // `clippy::pedantic`. Building under both here is how the generator
@@ -14009,8 +14032,8 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
                 "-D",
                 "missing_docs",
                 "-o",
-                "check-rust",
             ])
+            .arg(&rust_program)
             .current_dir(directory.path())
             .output()
             .unwrap();
@@ -14046,7 +14069,9 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
             Err(error) => eprintln!("clippy-driver unavailable, skipped: {error}"),
         }
         let built = std::process::Command::new("go")
-            .args(["build", "-o", "check-go", "check.go"])
+            .args(["build", "-o"])
+            .arg(&go_program)
+            .arg("check.go")
             .current_dir(directory.path())
             .output()
             .unwrap();
@@ -14056,28 +14081,29 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
             String::from_utf8_lossy(&built.stderr)
         );
 
-        for arguments in [["ok", "fine"], ["oops", "xyz"], ["bad", "ok"]] {
-            let shell = std::process::Command::new("bash")
-                .arg("check.sh")
-                .args(arguments)
-                .current_dir(directory.path())
-                .output()
-                .unwrap();
-            for program in ["./check-rust", "./check-go"] {
+        for (arguments, expected_stdout, expected_status) in [
+            (["ok", "fine"], "accepted\n", 0),
+            (["oops", "xyz"], "second holds an x\n", 2),
+            (["xray", "ok"], "first holds an x\n", 2),
+            (["bad", "ok"], "accepted\n", 0),
+        ] {
+            for program in [&rust_program, &go_program] {
                 let ran = std::process::Command::new(program)
                     .args(arguments)
                     .current_dir(directory.path())
                     .output()
                     .unwrap();
                 assert_eq!(
-                    String::from_utf8_lossy(&ran.stdout),
-                    String::from_utf8_lossy(&shell.stdout),
-                    "{program} wrote other bytes for {arguments:?}"
+                    ran.stdout,
+                    expected_stdout.as_bytes(),
+                    "{} wrote other bytes for {arguments:?}",
+                    program.display()
                 );
                 assert_eq!(
                     ran.status.code(),
-                    shell.status.code(),
-                    "{program} ended with another status for {arguments:?}"
+                    Some(expected_status),
+                    "{} ended with another status for {arguments:?}",
+                    program.display()
                 );
             }
         }
@@ -14254,16 +14280,15 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
         }
     }
 
-    /// The generated programs match a `case` pattern the way the shell does.
+    /// The generated programs implement the exact modelled `case` table.
     ///
-    /// Both are built and run against the same words, because a generator that
-    /// compared for equality where the shell matched a pattern would produce a
-    /// program that compiles, runs, and takes the wrong arm. The pattern here
-    /// is the one `action.yml` writes for a line-break guard, spelled with a
-    /// real newline: `$'\n'` is resolved during word expansion, so what
-    /// reaches the pattern is an ordinary character.
+    /// Both are built and run against an explicit word/output table, because a
+    /// generator that compared for equality where the model matches a pattern
+    /// would compile and still take the wrong arm. The frontend tests bind the
+    /// same model to the measured shell corpus; this test has no ambient shell
+    /// executable that can silently become a different oracle on Windows.
     #[test]
-    fn generated_programs_match_a_case_pattern_the_way_the_shell_does() {
+    fn generated_programs_match_the_exact_case_pattern_table() {
         let arm = |pattern: crate::ir::PatternExpression, text: &str| crate::ir::MatchCase {
             pattern,
             body: node(crate::ir::Operation::WriteStdout {
@@ -14295,18 +14320,14 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
         }));
 
         let directory = tempfile::tempdir().unwrap();
-        std::fs::write(
-            directory.path().join("original.sh"),
-            "case \"$1\" in\n  *'\n'*) printf 'REJECTED\\n' ;;\n  'a*c') printf 'STAR\\n' ;;\n  *) printf 'ACCEPTED\\n' ;;\nesac\n",
-        )
-        .unwrap();
-
         let rust = directory.path().join("matching.rs");
+        let rust_program = test_executable(directory.path(), "matching-rust");
+        let go_program = test_executable(directory.path(), "matching-go");
         std::fs::write(&rust, generate_rust(&plan).unwrap()).unwrap();
         let built = std::process::Command::new("rustc")
             .arg(&rust)
             .args(["--edition=2024", "-D", "warnings", "-o"])
-            .arg(directory.path().join("matching-rust"))
+            .arg(&rust_program)
             .output()
             .unwrap();
         assert!(
@@ -14320,7 +14341,9 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
         )
         .unwrap();
         let built = std::process::Command::new("go")
-            .args(["build", "-o", "matching-go", "matching.go"])
+            .args(["build", "-o"])
+            .arg(&go_program)
+            .arg("matching.go")
             .current_dir(directory.path())
             .output()
             .unwrap();
@@ -14330,36 +14353,38 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
             String::from_utf8_lossy(&built.stderr)
         );
 
-        for word in ["a\nb", "abc", "a*c", "", "\n", "aXc"] {
-            let shell = std::process::Command::new("bash")
-                .arg("original.sh")
-                .arg(word)
-                .current_dir(directory.path())
-                .output()
-                .unwrap();
-            for program in ["matching-rust", "matching-go"] {
-                let ran = std::process::Command::new(directory.path().join(program))
+        for (word, expected) in [
+            ("a\nb", "REJECTED\n"),
+            ("abc", "ACCEPTED\n"),
+            ("a*c", "STAR\n"),
+            ("", "ACCEPTED\n"),
+            ("\n", "REJECTED\n"),
+            ("aXc", "ACCEPTED\n"),
+        ] {
+            for program in [&rust_program, &go_program] {
+                let ran = std::process::Command::new(program)
                     .arg(word)
                     .output()
                     .unwrap();
                 assert_eq!(
-                    String::from_utf8_lossy(&ran.stdout),
-                    String::from_utf8_lossy(&shell.stdout),
-                    "{program} took a different arm for {word:?}"
+                    ran.stdout,
+                    expected.as_bytes(),
+                    "{} took a different arm for {word:?}",
+                    program.display()
                 );
+                assert!(ran.status.success(), "{}", program.display());
             }
         }
     }
 
-    /// The generated programs end where the shell ends, with the same bytes and
-    /// the same status.
+    /// The generated programs end at `exit`, with exact bytes and status.
     ///
     /// Compiling is not enough for `exit`: a generator that emitted it as a
     /// status rather than as a jump would produce a program that compiles and
-    /// keeps running. So both are built and run, and their output is compared
-    /// against bash running the script they replaced.
+    /// keeps running. Both are therefore built and run against the explicit IR
+    /// result; shell measurements belong to the frontend semantic corpus.
     #[test]
-    fn generated_programs_stop_at_exit_exactly_where_bash_does() {
+    fn generated_programs_stop_at_exit_with_exact_bytes_and_status() {
         let plan = plan_with_body(node(crate::ir::Operation::Match {
             value: crate::ir::TextExpression::literal("1"),
             cases: vec![
@@ -14390,26 +14415,14 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
         }));
         let directory = tempfile::tempdir().unwrap();
 
-        // What the script this replaces does, measured rather than assumed.
-        std::fs::write(
-            directory.path().join("original.sh"),
-            "case '1' in\n  0) ;;\n  1)\n    echo before\n    exit 3\n    echo after\n    ;;\nesac\n",
-        )
-        .unwrap();
-        let shell = std::process::Command::new("bash")
-            .arg("original.sh")
-            .current_dir(directory.path())
-            .output()
-            .unwrap();
-        assert_eq!(String::from_utf8_lossy(&shell.stdout), "before\n");
-        assert_eq!(shell.status.code(), Some(3));
-
         let rust = directory.path().join("exiting.rs");
+        let rust_program = test_executable(directory.path(), "exiting-rust");
+        let go_program = test_executable(directory.path(), "exiting-go");
         std::fs::write(&rust, generate_rust(&plan).unwrap()).unwrap();
         let built = std::process::Command::new("rustc")
             .arg(&rust)
             .args(["--edition=2024", "-D", "warnings", "-o"])
-            .arg(directory.path().join("exiting-rust"))
+            .arg(&rust_program)
             .output()
             .unwrap();
         assert!(
@@ -14417,11 +14430,9 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
             "rustc rejected generated source:\n{}",
             String::from_utf8_lossy(&built.stderr)
         );
-        let ran = std::process::Command::new(directory.path().join("exiting-rust"))
-            .output()
-            .unwrap();
-        assert_eq!(ran.stdout, shell.stdout, "generated Rust wrote other bytes");
-        assert_eq!(ran.status.code(), shell.status.code());
+        let ran = std::process::Command::new(&rust_program).output().unwrap();
+        assert_eq!(ran.stdout, b"before\n", "generated Rust wrote other bytes");
+        assert_eq!(ran.status.code(), Some(3));
 
         std::fs::write(
             directory.path().join("exiting.go"),
@@ -14442,7 +14453,9 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
         // and prints the real status to its own stderr, which would hide exactly
         // what this checks.
         let built = std::process::Command::new("go")
-            .args(["build", "-o", "exiting-go", "exiting.go"])
+            .args(["build", "-o"])
+            .arg(&go_program)
+            .arg("exiting.go")
             .current_dir(directory.path())
             .output()
             .unwrap();
@@ -14451,11 +14464,9 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
             "go build rejected generated source:\n{}",
             String::from_utf8_lossy(&built.stderr)
         );
-        let ran = std::process::Command::new(directory.path().join("exiting-go"))
-            .output()
-            .unwrap();
-        assert_eq!(ran.stdout, shell.stdout, "generated Go wrote other bytes");
-        assert_eq!(ran.status.code(), shell.status.code());
+        let ran = std::process::Command::new(&go_program).output().unwrap();
+        assert_eq!(ran.stdout, b"before\n", "generated Go wrote other bytes");
+        assert_eq!(ran.status.code(), Some(3));
     }
 
     /// A build that ran out of time is not a build that failed.

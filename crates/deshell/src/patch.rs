@@ -140,6 +140,7 @@ pub(crate) fn remove_empty_directory(path: &Path) {
 /// keeps "this is outside the project" an assertion a reader can check, rather
 /// than something inferred from how the path was built several frames up.
 pub(crate) mod scratch {
+    use std::io::{BufReader, BufWriter, Write as _};
     use std::path::Path;
 
     /// Write `bytes` to a path inside a scratch tree.
@@ -153,9 +154,15 @@ pub(crate) mod scratch {
     /// separate also avoids platform-specific clone syscalls here, so the same
     /// byte-copying path is exercised under Miri on every host.
     pub(crate) fn copy(from: &Path, to: &Path) -> std::io::Result<u64> {
-        let mut source = std::fs::File::open(from)?;
-        let mut destination = std::fs::File::create(to)?;
-        std::io::copy(&mut source, &mut destination)
+        // `io::copy(File, File)` specializes to `copy_file_range` on Linux.
+        // Besides making the operation platform-dependent, that syscall is not
+        // available under Miri. Buffering both sides deliberately selects the
+        // ordinary Read/Write contract on every platform.
+        let mut source = BufReader::new(std::fs::File::open(from)?);
+        let mut destination = BufWriter::new(std::fs::File::create(to)?);
+        let copied = std::io::copy(&mut source, &mut destination)?;
+        destination.flush()?;
+        Ok(copied)
     }
 
     /// Set permissions on a path inside a scratch tree.
@@ -445,7 +452,7 @@ fn apply_all_inner(
             sync_parent(&item.canonical).err()
         } else {
             match temporary {
-                Some(temporary) => match temporary.persist(&item.canonical) {
+                Some(temporary) => match temporary.persist_noclobber(&item.canonical) {
                     Ok(_) => {
                         let digest = crate::digest::sha256(&item.proposal.replacement);
                         crate::trace::record(|| crate::trace::Event::FileCommit {
@@ -455,7 +462,36 @@ fn apply_all_inner(
                         committed.push((item.canonical.clone(), digest));
                         sync_parent(&item.canonical).err()
                     }
-                    Err(error) => Some(format!("{}", error.error)),
+                    Err(error) => match &item.proposal.expected {
+                        Expectation::MissingOrIdentical => {
+                            // Revalidate the original canonical pathname, not
+                            // the caller's spelling of it. An alias whose
+                            // ancestor changed after staging cannot satisfy the
+                            // immutable target this transaction validated.
+                            let mut verification = item.proposal.clone();
+                            verification.path.clone_from(&item.canonical);
+                            match validate_proposal(&verification) {
+                                Ok(_) => {
+                                    // Another content-addressed writer won. This
+                                    // intent is complete, but this transaction does
+                                    // not own that writer's file and must therefore
+                                    // not add it to its rollback set.
+                                    crate::trace::record(|| crate::trace::Event::FileCommit {
+                                        path: crate::trace::path_name(&item.canonical),
+                                        digest: crate::digest::sha256(&item.proposal.replacement),
+                                    });
+                                    None
+                                }
+                                Err(validation_error) => Some(format!(
+                                    "{}; cannot verify concurrent content-addressed target: {validation_error}",
+                                    error.error
+                                )),
+                            }
+                        }
+                        Expectation::Existing(_) | Expectation::Missing => {
+                            Some(error.error.to_string())
+                        }
+                    },
                 },
                 None => Some(format!(
                     "write mutation for {} has no staged file",
@@ -635,8 +671,9 @@ fn validate_current(validated: &[Validated]) -> Result<(), String> {
             }
             Expectation::Missing => {}
             Expectation::MissingOrIdentical => match std::fs::read(&item.canonical) {
-                // A writer that won the race wrote these exact bytes, so the staged
-                // write remains correct and the rename below is idempotent.
+                // A writer that won the race wrote these exact bytes, so the
+                // no-clobber commit below may treat that writer as completing
+                // the same content-addressed intent.
                 Ok(current) if current == item.proposal.replacement => {}
                 Ok(_) => {
                     return Err(format!(
@@ -1402,6 +1439,22 @@ mod tests {
 
         apply_all(&[create]).unwrap();
         assert_eq!(fs::read(&target).unwrap(), bytes);
+    }
+
+    #[test]
+    fn a_losing_transaction_never_claims_an_idempotent_winner_for_rollback() {
+        let temporary = tempfile::tempdir().unwrap();
+        let shared = temporary.path().join("shared.json");
+        let owned = temporary.path().join("owned.json");
+        let bytes = b"content-addressed".to_vec();
+        let shared_proposal = prepare_create_idempotent(&shared, bytes.clone(), 0o644).unwrap();
+        fs::write(&shared, &bytes).unwrap();
+        let owned_proposal = prepare_create(&owned, b"owned".to_vec(), 0o644).unwrap();
+
+        let error = apply_all_inner(&[shared_proposal, owned_proposal], Some(2)).unwrap_err();
+        assert!(error.contains("injected commit failure"), "{error}");
+        assert_eq!(fs::read(&shared).unwrap(), bytes);
+        assert!(!owned.exists());
     }
 
     #[test]

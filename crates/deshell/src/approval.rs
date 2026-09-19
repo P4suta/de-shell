@@ -491,18 +491,21 @@ fn load_scenarios(root: &Path) -> Result<Vec<(String, crate::config::Scenario)>,
 
 fn load_approvals(root: &Path) -> Result<Vec<Approval>, String> {
     let root = canonical_root(root)?;
-    let directory = root.join(".deshell/approvals/sha256");
-    let metadata = match directory.symlink_metadata() {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(format!("cannot inspect {}: {error}", directory.display())),
-        Ok(metadata) => metadata,
+    // Inspect every component independently. Windows reports `NotFound` for a
+    // descendant of a regular file, while Unix reports `NotADirectory`; looking
+    // only at the leaf would therefore mistake an unsafe approval parent for an
+    // absent approval store on one platform.
+    let Some(deshell) = optional_approval_directory(&root, ".deshell", "approval root")? else {
+        return Ok(Vec::new());
     };
-    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
-        return Err(format!(
-            "approval directory is unsafe: {}",
-            directory.display()
-        ));
-    }
+    let Some(approvals) = optional_approval_directory(&deshell, "approvals", "approval parent")?
+    else {
+        return Ok(Vec::new());
+    };
+    let Some(directory) = optional_approval_directory(&approvals, "sha256", "approval directory")?
+    else {
+        return Ok(Vec::new());
+    };
     let mut paths = std::fs::read_dir(&directory)
         .map_err(|error| format!("cannot read {}: {error}", directory.display()))?
         .map(|entry| {
@@ -542,6 +545,28 @@ fn load_approvals(root: &Path) -> Result<Vec<Approval>, String> {
         output.push(approval);
     }
     Ok(output)
+}
+
+fn optional_approval_directory(
+    parent: &Path,
+    name: &str,
+    label: &str,
+) -> Result<Option<PathBuf>, String> {
+    let path = parent.join(name);
+    let metadata = match path.symlink_metadata() {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "cannot inspect {label} {}: {error}",
+                path.display()
+            ));
+        }
+        Ok(metadata) => metadata,
+    };
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+        return Err(format!("{label} is unsafe: {}", path.display()));
+    }
+    Ok(Some(path))
 }
 
 fn scenario_review_digest(
@@ -969,6 +994,15 @@ mod tests {
         let missing = tempfile::tempdir().unwrap();
         assert!(load_approvals(missing.path()).unwrap().is_empty());
 
+        // A missing store is optional; an inspection failure is not. A NUL is
+        // rejected by every host filesystem before lookup, which makes this a
+        // portable observation of the non-NotFound branch rather than a Unix
+        // permissions trick.
+        let error =
+            optional_approval_directory(missing.path(), "invalid\0component", "approval parent")
+                .unwrap_err();
+        assert!(error.contains("cannot inspect approval parent"), "{error}");
+
         let scenarios = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(scenarios.path().join(".deshell/scenarios/bad.toml")).unwrap();
         let error = load_scenarios(scenarios.path()).unwrap_err();
@@ -982,7 +1016,7 @@ mod tests {
         )
         .unwrap();
         let error = load_approvals(broken_parent.path()).unwrap_err();
-        assert!(error.contains("cannot inspect"), "{error}");
+        assert!(error.contains("approval parent is unsafe"), "{error}");
 
         let unsafe_directory = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(unsafe_directory.path().join(".deshell/approvals")).unwrap();

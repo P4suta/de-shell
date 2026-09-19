@@ -195,11 +195,11 @@ an unmutated baseline:
 
 | file | mutants | caught | unviable | missed | timeout |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| `approval.rs` | 117 | 100 | 17 | 0 | 0 |
+| `approval.rs` | 119 | 102 | 17 | 0 | 0 |
 | `patch.rs` | 97 | 89 | 8 | 0 | 0 |
 | `host.rs` | 16 | 12 | 4 | 0 | 0 |
 | `trace.rs` | 12 | 12 | 0 | 0 | 0 |
-| **total** | **242** | **213** | **29** | **0** | **0** |
+| **total** | **244** | **215** | **29** | **0** | **0** |
 
 Replacing the trace writer trait object with the closed `Sink` enum exposed
 five additional mutation points. Direct tests for file/stderr selection, flush
@@ -207,14 +207,22 @@ delegation and canonical path naming catch all five; they are included in the
 table rather than hidden behind the original 35-item boundary.
 
 The one-shot directory race hook is `cfg(test)`, thread-local and consumed
-immediately after the real `create_dir` syscall. Production behavior, public
-APIs, schemas and CLI output did not change.
+immediately after the real `create_dir` syscall. The hook does not enter a
+production build; public APIs, schemas and CLI output did not change.
+
+The final portability pass added two approval-directory inspection mutations.
+A NUL-bearing component observes the cross-platform non-`NotFound` error path,
+so both are caught. The patch count stayed at 97 after replacing overwrite-by-
+rename with an exhaustive `Expectation` match and `persist_noclobber`; the
+idempotent winner is explicitly proved to remain outside a losing transaction's
+rollback set. Linux Miri now reaches scratch copies through buffered Read/Write
+instead of the unsupported `copy_file_range` specialization.
 
 The mutation task now also names `migration.rs` and `frontend.rs`. A
 reproducible `cargo mutants --list` reports **2,931** mutations in those two
-files and **3,173** across all six configured files. The new 2,931 are listed
+files and **3,175** across all six configured files. The new 2,931 are listed
 scope only: they have not been executed in this increment, so any survivors
-they reveal are the next measured backlog rather than part of the clean 242.
+they reveal are the next measured backlog rather than part of the clean 244.
 
 Reproduce only in a trusted disposable git worktree. `cargo-mutants --in-place`
 edits source while it runs, and a mutant can leave approval artifacts outside
@@ -231,9 +239,9 @@ PowerShell/Go and Nushell/Rust migration paths. `coverage` reports only after
 that shared collection step, so CI and release cannot accidentally measure a
 smaller test surface.
 
-The trusted clean run on 2026-09-20 passed all 521 workspace tests (481
-`deshell`, 40 `xtask`) and finished at **90.40% line coverage**: 54,234 lines,
-5,204 missed. `cargo llvm-cov` enforced `--fail-under-lines 90` on the result.
+The trusted clean run on 2026-09-20 passed all 522 workspace tests (482
+`deshell`, 40 `xtask`) and finished at **90.36% line coverage**: 54,329 lines,
+5,235 missed. `cargo llvm-cov` enforced `--fail-under-lines 90` on the result.
 
 ## Next, in the order I would take it
 

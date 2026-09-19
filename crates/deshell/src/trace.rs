@@ -487,15 +487,17 @@ mod tests {
     /// Nothing is written when nobody asked for a trace.
     #[test]
     fn a_run_that_asked_for_no_trace_records_nothing() {
-        let sink = Shared::default();
         let (_, before) = super::testing::held(|| ());
         assert!(before.is_empty(), "{before}");
         // Recording ends with the run, and an event after it is dropped rather
         // than held for whoever records next.
-        start_shared(sink.clone());
-        stop();
-        record(|| Event::ClockRead);
-        assert!(sink.text().is_empty(), "{}", sink.text());
+        serialized(|| {
+            let sink = Shared::default();
+            start_shared(sink.clone());
+            stop();
+            record(|| Event::ClockRead);
+            assert!(sink.text().is_empty(), "{}", sink.text());
+        });
     }
 
     /// No event carries a value that could be a secret.

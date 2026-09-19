@@ -212,6 +212,50 @@ enum ObservationEffect {
     Report,
 }
 
+/// A column in the case-pattern recording.
+///
+/// `sh` deliberately remains distinct from `dash`: the former names an
+/// implementation-selected family while the latter names the interpreter that
+/// produced its column. Only an executable with that same identity can
+/// invalidate an interpreter-specific recording.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum CaseShellColumn {
+    Bash,
+    Sh,
+    Zsh,
+    Dash,
+}
+
+impl CaseShellColumn {
+    const ALL: [Self; 4] = [Self::Bash, Self::Sh, Self::Zsh, Self::Dash];
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Bash => "bash",
+            Self::Sh => "sh",
+            Self::Zsh => "zsh",
+            Self::Dash => "dash",
+        }
+    }
+
+    fn parse(name: &str) -> Option<Self> {
+        match name {
+            "bash" => Some(Self::Bash),
+            "sh" => Some(Self::Sh),
+            "zsh" => Some(Self::Zsh),
+            "dash" => Some(Self::Dash),
+            _ => None,
+        }
+    }
+
+    const fn observation_effect(self) -> ObservationEffect {
+        match self {
+            Self::Sh => ObservationEffect::Report,
+            Self::Bash | Self::Zsh | Self::Dash => ObservationEffect::Enforce,
+        }
+    }
+}
+
 const fn echo_observation_effect(shell: ShellColumn, modelled: bool) -> ObservationEffect {
     match (shell, modelled) {
         (ShellColumn::Bash, true) => ObservationEffect::Enforce,
@@ -1104,19 +1148,41 @@ fn run_printf_semantics(root: &Path) -> Result<(), Vec<String>> {
 /// ASCII token the shell prints, so nothing here depends on how bytes are
 /// decoded. A shell that refuses the pattern is `ERROR` and nothing more — the
 /// message names the interpreter's own path, which is not a property of the
-/// pattern.
+/// pattern. `bash`, `zsh`, and `dash` identify their recorded columns and
+/// therefore enforce drift. Ambient `sh` is an implementation-selected family;
+/// its drift is reported while the checked-in cross-shell reduction remains
+/// strict in the frontend test.
 fn run_case_patterns(root: &Path) -> Result<(), Vec<String>> {
     let path = root.join("contracts/golden/case-pattern-semantics-v1.json");
     let raw = std::fs::read_to_string(&path)
         .map_err(|error| vec![format!("cannot read {}: {error}", path.display())])?;
     let corpus: serde_json::Value =
         serde_json::from_str(&raw).map_err(|error| vec![format!("malformed corpus: {error}")])?;
-    let shells: Vec<&str> = corpus["shells"]
+    let shell_values = corpus["shells"]
         .as_array()
-        .ok_or_else(|| vec!["corpus has no shells array".to_owned()])?
+        .ok_or_else(|| vec!["corpus has no shells array".to_owned()])?;
+    let mut shells = Vec::with_capacity(shell_values.len());
+    for value in shell_values {
+        let name = value
+            .as_str()
+            .ok_or_else(|| vec!["case-pattern shell name is not a string".to_owned()])?;
+        let shell = CaseShellColumn::parse(name)
+            .ok_or_else(|| vec![format!("case-pattern corpus names unknown shell {name:?}")])?;
+        if shells.contains(&shell) {
+            return Err(vec![format!("case-pattern corpus repeats shell {name:?}")]);
+        }
+        shells.push(shell);
+    }
+    let recorded = shells
         .iter()
-        .filter_map(|value| value.as_str())
-        .collect();
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let expected = CaseShellColumn::ALL.into_iter().collect();
+    if recorded != expected {
+        return Err(vec![format!(
+            "case-pattern corpus shell set is {recorded:?}, expected {expected:?}"
+        )]);
+    }
     let cases = corpus["cases"]
         .as_array()
         .ok_or_else(|| vec!["corpus has no cases array".to_owned()])?;
@@ -1125,6 +1191,7 @@ fn run_case_patterns(root: &Path) -> Result<(), Vec<String>> {
     }
     let mut errors = Vec::new();
     let mut checked = 0_usize;
+    let mut reported_differences = 0_usize;
     for case in cases {
         let id = case["id"].as_str().unwrap_or("<unnamed>");
         let (Some(script), Some(encoded)) = (case["script"].as_str(), case["word_base64"].as_str())
@@ -1141,18 +1208,19 @@ fn run_case_patterns(root: &Path) -> Result<(), Vec<String>> {
             continue;
         };
         for shell in &shells {
-            let Some(recorded) = case[*shell].as_str() else {
-                errors.push(format!("{id} has no {shell} column"));
+            let shell_name = shell.name();
+            let Some(recorded) = case[shell_name].as_str() else {
+                errors.push(format!("{id} has no {shell_name} column"));
                 continue;
             };
-            let output = std::process::Command::new(shell)
+            let output = std::process::Command::new(shell_name)
                 .arg("-c")
                 .arg(script)
-                .arg(shell)
+                .arg(shell_name)
                 .arg(&word)
                 .output();
             let Ok(output) = output else {
-                println!("skipped  {id}/{shell}: not on this runner");
+                println!("skipped  {id}/{shell_name}: not on this runner");
                 continue;
             };
             let observed = match String::from_utf8_lossy(&output.stdout).into_owned() {
@@ -1161,17 +1229,30 @@ fn run_case_patterns(root: &Path) -> Result<(), Vec<String>> {
             };
             checked += 1;
             if observed != recorded {
-                errors.push(format!(
-                    "{id}/{shell}: recorded {recorded}, observed {observed}"
-                ));
+                let difference =
+                    format!("{id}/{shell_name}: recorded {recorded}, observed {observed}");
+                match shell.observation_effect() {
+                    ObservationEffect::Enforce => errors.push(difference),
+                    ObservationEffect::Report => {
+                        reported_differences += 1;
+                        println!("differs  {difference}");
+                    }
+                }
             }
         }
     }
     if errors.is_empty() {
-        println!(
-            "{} case pattern(s) match the recording across {checked} shell observation(s)",
-            cases.len()
-        );
+        if reported_differences == 0 {
+            println!(
+                "{} case pattern(s) match the recording across {checked} shell observation(s)",
+                cases.len()
+            );
+        } else {
+            println!(
+                "{} case pattern(s) preserve every interpreter-specific claim across {checked} shell observation(s); {reported_differences} non-binding sh observation(s) differ",
+                cases.len()
+            );
+        }
         return Ok(());
     }
     Err(errors)
@@ -4203,6 +4284,19 @@ mod tests {
         assert_eq!(
             ShellColumn::ALL.map(|shell| exit_observation_effect(shell, false)),
             [ObservationEffect::Report; 3]
+        );
+        assert_eq!(
+            CaseShellColumn::ALL.map(CaseShellColumn::observation_effect),
+            [
+                ObservationEffect::Enforce,
+                ObservationEffect::Report,
+                ObservationEffect::Enforce,
+                ObservationEffect::Enforce,
+            ]
+        );
+        assert_eq!(
+            CaseShellColumn::ALL.map(CaseShellColumn::name),
+            ["bash", "sh", "zsh", "dash"]
         );
     }
 
