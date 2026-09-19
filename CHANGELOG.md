@@ -145,6 +145,15 @@ All notable changes are documented here. No compatibility contract predates
   learns from it that there are a lot. It now names the first few, says how many
   more and in how many files, and gives the argv that lists them all.
 
+- Retired several shell blocks of one workflow together. A host rewrite
+  replaces the whole file, and each proposal carried the rewrite of its own
+  block only, so two proposals for one workflow described the same file
+  differently — `DESHELL_BLOCKER_DUPLICATE_TARGET`, 37 times on de-shell's own
+  repository. Every proposal now carries the same rewrite with every block
+  replaced, and identical patches across proposals are applied once.
+- Stopped `deshell init` from writing `declared_shell = []`, which made the
+  obvious `[[declared_shell]]` block appended underneath a duplicate key.
+
 ### Removed
 
 - Pre-v1 Effect IR and lock migration promises.

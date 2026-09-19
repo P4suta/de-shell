@@ -601,7 +601,20 @@ pub(crate) fn create_plan(root: &Path) -> Result<PlanOutput, String> {
         proposals: Vec::new(),
     };
     let mut coverage = Coverage::default();
-    let mut targets = BTreeSet::new();
+    let mut targets: BTreeMap<String, String> = BTreeMap::new();
+    // Only the approved ones. An unapproved declaration removes nothing, here
+    // or at the shell-free gate, so a plan cannot be cleared by writing a line
+    // nobody reviewed.
+    let mut declared_locations = BTreeSet::new();
+    for location in &config.declared_shell {
+        if crate::approval::declared_shell_approval(root, location)?.is_some() {
+            declared_locations.insert(Location {
+                path: location.path.clone(),
+                start_byte: location.start_byte,
+                end_byte: location.end_byte,
+            });
+        }
+    }
     let mut network_replay_digest = None;
 
     for finding in &inventory.findings {
@@ -610,6 +623,13 @@ pub(crate) fn create_plan(root: &Path) -> Result<PlanOutput, String> {
             start_byte: finding.span.start_byte,
             end_byte: finding.span.end_byte,
         };
+        // A location this project has declared and approved is not a migration
+        // source. It is shell that stays, with a reason and a review; reporting
+        // it as a blocker would ask somebody to migrate what they have already
+        // decided to keep.
+        if declared_locations.contains(&location) {
+            continue;
+        }
         if finding.kind.is_a_candidate() {
             blockers.push(Blocker {
                 code: "DESHELL_BLOCKER_DYNAMIC_CANDIDATE".into(),
@@ -731,6 +751,7 @@ pub(crate) fn create_plan(root: &Path) -> Result<PlanOutput, String> {
                     call_sites,
                     selection,
                     &mut targets,
+                    host_siblings_of(&inventory, finding).as_slice(),
                 ) {
                     Ok((request, proposal)) => {
                         proposal_digest = Some(proposal.proposal_digest.clone());
@@ -886,6 +907,44 @@ pub(crate) fn create_plan(root: &Path) -> Result<PlanOutput, String> {
     })
 }
 
+/// One patch per path across a set of proposals.
+///
+/// A host rewrite replaces the whole file, and every proposal for a file with
+/// several shell blocks carries the same rewrite — the one with all of them
+/// replaced. Applying it once per block would leave the second attempt reading
+/// an expected digest the first had already changed, which is a conflict
+/// between a proposal and itself.
+///
+/// Identical bytes are one edit. Different bytes for one path are a real
+/// conflict; the plan refuses them when the proposals are built, and this says
+/// so again rather than assuming it.
+fn unique_patches(proposals: &[&Proposal]) -> Result<Vec<GeneratorPatch>, String> {
+    let mut written: BTreeMap<String, String> = BTreeMap::new();
+    let mut output = Vec::new();
+    for proposal in proposals {
+        for patch in &proposal.patches {
+            match written.entry(patch.path.clone()) {
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(patch.content_digest.clone());
+                }
+                std::collections::btree_map::Entry::Occupied(slot)
+                    if *slot.get() == patch.content_digest =>
+                {
+                    continue;
+                }
+                std::collections::btree_map::Entry::Occupied(_) => {
+                    return Err(format!(
+                        "two proposals write {} with different content",
+                        patch.path
+                    ));
+                }
+            }
+            output.push(patch.clone());
+        }
+    }
+    Ok(output)
+}
+
 fn remaining_static_references_after_proposals(
     root: &Path,
     retiring_paths: &BTreeSet<String>,
@@ -895,9 +954,8 @@ fn remaining_static_references_after_proposals(
         return crate::scanner::static_script_references(root, retiring_paths);
     }
     let workspace = crate::workspace::private_snapshot(root)?;
-    for proposal in proposals {
-        apply_generator_patches(workspace.path(), proposal)?;
-    }
+    let patches = unique_patches(&proposals.iter().collect::<Vec<_>>())?;
+    apply_patch_set(workspace.path(), &patches)?;
     crate::scanner::static_script_references(workspace.path(), retiring_paths)
 }
 
@@ -1032,6 +1090,52 @@ fn generator_selection<'a>(
         )
 }
 
+/// Record that this plan writes `bytes` to `target`, or say who else already
+/// claimed it with something different.
+fn claim_generated_target(
+    targets: &mut BTreeMap<String, String>,
+    target: &str,
+    bytes: &[u8],
+) -> Result<(), String> {
+    claim_generated_digest(targets, target, &crate::digest::sha256(bytes))
+}
+
+fn claim_generated_digest(
+    targets: &mut BTreeMap<String, String>,
+    target: &str,
+    digest: &str,
+) -> Result<(), String> {
+    match targets.entry(target.to_owned()) {
+        std::collections::btree_map::Entry::Vacant(slot) => {
+            slot.insert(digest.to_owned());
+            Ok(())
+        }
+        std::collections::btree_map::Entry::Occupied(slot) if slot.get() == digest => Ok(()),
+        std::collections::btree_map::Entry::Occupied(_) => Err(format!(
+            "DESHELL_BLOCKER_DUPLICATE_TARGET: two sources write {target} with different content"
+        )),
+    }
+}
+
+/// The other shell locations in the same file as `finding`.
+///
+/// A host rewrite replaces the whole file, so a proposal for one location has to
+/// describe what happens to the rest of them. Ordered and deduplicated by the
+/// inventory, which is already sorted by path and span.
+fn host_siblings_of(
+    inventory: &crate::scanner::Inventory,
+    finding: &crate::scanner::Finding,
+) -> Vec<crate::scanner::Finding> {
+    inventory
+        .findings
+        .iter()
+        .filter(|other| {
+            other.path == finding.path && other.span != finding.span && other.kind.is_embedded()
+        })
+        .cloned()
+        .collect()
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "the arguments are a contract record; grouping them into a struct would hide which fields the caller must supply"
@@ -1045,7 +1149,8 @@ fn build_request_and_proposal(
     ir_digest: &str,
     call_sites: Vec<Location>,
     selection: GeneratorSelection<'_>,
-    targets: &mut BTreeSet<String>,
+    targets: &mut BTreeMap<String, String>,
+    host_siblings: &[crate::scanner::Finding],
 ) -> Result<(MigrationRequest, Proposal), String> {
     let task = plan
         .tasks
@@ -1110,14 +1215,8 @@ fn build_request_and_proposal(
         })
         .map_err(external_generator_blocker)?;
         for patch in &proposal.patches {
-            if targets.contains(&patch.path) {
-                return Err(format!(
-                    "DESHELL_BLOCKER_DUPLICATE_TARGET: multiple sources generate {}",
-                    patch.path
-                ));
-            }
+            claim_generated_digest(targets, &patch.path, &patch.content_digest)?;
         }
-        targets.extend(proposal.patches.iter().map(|patch| patch.path.clone()));
         return Ok((request, proposal));
     }
     let mut host_build_argv = None;
@@ -1136,28 +1235,11 @@ fn build_request_and_proposal(
             return Err("DESHELL_BLOCKER_GENERATOR_POLICY: agent target requires a digest-pinned external generator".into());
         }
     };
-    if !targets.insert(target.clone()) {
-        // Two generated programs cannot be one file, and that is what the set
-        // is for. A host rewrite is different: several shell blocks in one
-        // workflow or action are several spans of the same file, and each
-        // proposal carries a whole-file replacement computed from the original
-        // — so two of them describe the same file twice rather than a file
-        // twice rewritten. Saying which of the two it is, is the difference
-        // between "this cannot be done" and "this is what has to change".
-        if selection.target.rewrites_the_source_in_place() {
-            return Err(format!(
-                "DESHELL_BLOCKER_DUPLICATE_TARGET: {target} holds more than one shell block, and a host rewrite replaces the whole file; the blocks have to be rewritten together rather than one at a time"
-            ));
-        }
-        return Err(format!(
-            "DESHELL_BLOCKER_DUPLICATE_TARGET: multiple sources generate {target}"
-        ));
-    }
     let generated = match selection.target {
         crate::config::MigrationTarget::Rust => generate_rust(plan)?,
         crate::config::MigrationTarget::Go => generate_go(plan)?,
         crate::config::MigrationTarget::Host => {
-            let host = generate_structured_host(root, finding, plan)?;
+            let host = generate_structured_host(root, finding, plan, host_siblings)?;
             host_build_argv = Some(host.build_argv);
             host_run_argv = Some(host.run_argv);
             generated_span = Some(host.generated_span);
@@ -1166,6 +1248,17 @@ fn build_request_and_proposal(
         }
         crate::config::MigrationTarget::Agent => unreachable!(),
     };
+    // Checked after generating, not before, because two proposals writing one
+    // path are only a conflict when they write different bytes.
+    //
+    // Two generated programs cannot be one file, and that is what this is for.
+    // A host rewrite is different: several shell blocks in one workflow are
+    // several spans of the same file, and the rewrite for each one replaces
+    // every span — so the proposals describe the same file identically, which is
+    // a file rewritten once and named by each of the blocks it retires. The
+    // whole plan is applied in one transaction, so there is no state where some
+    // of the blocks are replaced and the rest are not.
+    claim_generated_target(targets, &target, &generated)?;
     let canonical_root = canonical_root(root)?;
     let verification_output = verification_binary_path(&stem, std::env::consts::OS);
     let (build_argv, run_argv) = match selection.target {
@@ -1210,21 +1303,14 @@ fn build_request_and_proposal(
     })
     .unwrap_or_default();
     for patch in call_site_patches {
-        if !targets.insert(patch.path.clone()) {
-            return Err(format!(
-                "DESHELL_BLOCKER_DUPLICATE_TARGET: multiple sources generate {}",
-                patch.path
-            ));
-        }
+        // A call-site rewrite of a file several sources also point at is the
+        // same case as the host rewrite: identical bytes are one edit named
+        // twice, different bytes are a conflict.
+        claim_generated_digest(targets, &patch.path, &patch.content_digest)?;
         patches.push(patch);
     }
     for file in host_additional_files {
-        if !targets.insert(file.path.clone()) {
-            return Err(format!(
-                "DESHELL_BLOCKER_DUPLICATE_TARGET: multiple sources generate {}",
-                file.path
-            ));
-        }
+        claim_generated_target(targets, &file.path, &file.bytes)?;
         patches.push(generator_patch(
             &canonical_root,
             &file.path,
@@ -2570,10 +2656,20 @@ struct HostFile {
     permissions: u32,
 }
 
+/// Rewrite the host file that holds `finding`.
+///
+/// `siblings` are the other shell locations in the same file that this plan is
+/// also retiring. A host rewrite replaces the whole file, so every proposal for
+/// that file has to describe the same file — the one with all of them replaced —
+/// or two proposals describe it differently and only one can be applied. Only
+/// the GitHub workflow host uses them today; the others hold one location per
+/// file in every corpus measured so far, and a second one there still reports
+/// `DESHELL_BLOCKER_DUPLICATE_TARGET`.
 fn generate_structured_host(
     root: &Path,
     finding: &crate::scanner::Finding,
     plan: &crate::ir::Plan,
+    siblings: &[crate::scanner::Finding],
 ) -> Result<HostGeneration, String> {
     let name = finding.path.rsplit('/').next().unwrap_or(&finding.path);
     let lower = name.to_ascii_lowercase();
@@ -2599,7 +2695,7 @@ fn generate_structured_host(
     if finding.path.starts_with(".github/workflows/")
         && (lower.ends_with(".yml") || lower.ends_with(".yaml"))
     {
-        return generate_github_action_host(root, finding, plan);
+        return generate_github_action_host(root, finding, plan, siblings);
     }
     // A composite action is a `run:` step like a workflow's, and the rewrite
     // that replaces one is not the same. A workflow step becomes
@@ -2630,16 +2726,21 @@ fn generate_structured_host(
     ))
 }
 
-fn generate_github_action_host(
-    root: &Path,
+/// Where one workflow step's `run:` sits, and what replaces it.
+///
+/// Split out of `generate_github_action_host` because a workflow holds many
+/// steps and a host rewrite replaces the whole file. Two proposals for one file
+/// each carrying their own single-step rewrite describe the same file twice —
+/// which is what `DESHELL_BLOCKER_DUPLICATE_TARGET` said, correctly. The way to
+/// stop saying it is for every proposal to carry the same rewrite, with every
+/// step replaced, and for that the replacement of a step has to be computable
+/// without lowering it: the local action's name comes from the step's content
+/// digest and nothing else.
+fn github_run_replacement(
+    host: &[u8],
     finding: &crate::scanner::Finding,
-    plan: &crate::ir::Plan,
-) -> Result<HostGeneration, String> {
-    let argv = literal_exec_argv(plan, "GitHub local action argv")?;
-    let (_, path) = crate::project::resolve_entry(root, &finding.path)?;
-    let host = std::fs::read(&path)
-        .map_err(|error| format!("cannot read structured host {}: {error}", finding.path))?;
-    let (start, end, original) = structured_host_span(&host, finding)?;
+) -> Result<(usize, usize, String), String> {
+    let (start, end, original) = structured_host_span(host, finding)?;
     let line_start = host[..start]
         .iter()
         .rposition(|byte| *byte == b'\n')
@@ -2688,16 +2789,53 @@ fn generate_github_action_host(
             );
         }
     }
-    let action_id = &finding.content_digest[..12];
-    let action_directory = format!(".github/actions/deshell-{action_id}");
-    let uses = format!("uses: ./{action_directory}");
-    let (bytes, _workflow_span) = replace_structured_host_span(ReplaceStructuredHostSpanArgs {
-        host: &host,
-        finding,
-        start: key_start,
+    Ok((
+        key_start,
         end,
-        replacement: uses.as_bytes(),
-    });
+        format!("uses: ./{}", github_action_directory(finding)),
+    ))
+}
+
+/// The local action a step's replacement lives in.
+///
+/// Keyed by the step's content digest, so two steps running the same command
+/// share one action and a step is named the same whoever computes it.
+fn github_action_directory(finding: &crate::scanner::Finding) -> String {
+    format!(".github/actions/deshell-{}", &finding.content_digest[..12])
+}
+
+fn generate_github_action_host(
+    root: &Path,
+    finding: &crate::scanner::Finding,
+    plan: &crate::ir::Plan,
+    siblings: &[crate::scanner::Finding],
+) -> Result<HostGeneration, String> {
+    let argv = literal_exec_argv(plan, "GitHub local action argv")?;
+    let (_, path) = crate::project::resolve_entry(root, &finding.path)?;
+    let host = std::fs::read(&path)
+        .map_err(|error| format!("cannot read structured host {}: {error}", finding.path))?;
+    // Every step in this file, not only this one. Applied from the end so that
+    // an earlier replacement does not move a later span.
+    let mut replacements = Vec::new();
+    for step in std::iter::once(finding).chain(siblings.iter()) {
+        replacements.push(github_run_replacement(&host, step)?);
+    }
+    replacements.sort_by_key(|(start, _, _)| std::cmp::Reverse(*start));
+    if replacements.windows(2).any(|pair| pair[0].0 < pair[1].1) {
+        return Err(
+            "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: two GitHub run steps in one file overlap"
+                .into(),
+        );
+    }
+    let mut bytes = host.clone();
+    for (start, end, uses) in &replacements {
+        let mut rewritten = Vec::with_capacity(bytes.len() - (end - start) + uses.len());
+        rewritten.extend_from_slice(&bytes[..*start]);
+        rewritten.extend_from_slice(uses.as_bytes());
+        rewritten.extend_from_slice(&bytes[*end..]);
+        bytes = rewritten;
+    }
+    let action_directory = github_action_directory(finding);
     let program = serde_json::to_string(&argv[0]).map_err(|error| error.to_string())?;
     let arguments = serde_json::to_string(&argv[1..]).map_err(|error| error.to_string())?;
     let javascript = format!(
@@ -8550,11 +8688,15 @@ fn execute_exact(parts: ExecuteExactArgs<'_>) -> Result<crate::agent_process::Ou
 }
 
 fn apply_generator_patches(root: &Path, proposal: &Proposal) -> Result<(), String> {
+    apply_patch_set(root, &proposal.patches)
+}
+
+fn apply_patch_set(root: &Path, patches_to_apply: &[GeneratorPatch]) -> Result<(), String> {
     let canonical = canonical_root(root)?;
-    let created_directories = ensure_patch_directories(&canonical, &proposal.patches)?;
+    let created_directories = ensure_patch_directories(&canonical, patches_to_apply)?;
     let result = (|| {
         let mut patches = Vec::new();
-        for patch in &proposal.patches {
+        for patch in patches_to_apply {
             let path = safe_target(&canonical, &patch.path)?;
             let contents = patch.contents()?;
             patches.push(match patch.operation {
@@ -9448,25 +9590,28 @@ fn prepare_retirement(
 ) -> Result<Vec<crate::patch::Proposal>, String> {
     let root = canonical_root(root)?;
     let mut proposals = Vec::new();
-    for digest in &plan.proposals {
-        let proposal = load_proposal(plan_directory, digest)?;
-        for patch in &proposal.patches {
-            let target = safe_target(&root, &patch.path)?;
-            let contents = patch.contents()?;
-            proposals.push(match patch.operation {
-                PatchOperation::Create => {
-                    crate::patch::prepare_create(&target, contents, patch.permissions)?
-                }
-                PatchOperation::Update => crate::patch::prepare_expected(
-                    &target,
-                    patch
-                        .expected_digest
-                        .as_deref()
-                        .ok_or("update proposal omitted expected digest")?,
-                    contents,
-                )?,
-            });
-        }
+    let loaded = plan
+        .proposals
+        .iter()
+        .map(|digest| load_proposal(plan_directory, digest))
+        .collect::<Result<Vec<_>, _>>()?;
+    // One edit per path: see `unique_patches`.
+    for patch in unique_patches(&loaded.iter().collect::<Vec<_>>())? {
+        let target = safe_target(&root, &patch.path)?;
+        let contents = patch.contents()?;
+        proposals.push(match patch.operation {
+            PatchOperation::Create => {
+                crate::patch::prepare_create(&target, contents, patch.permissions)?
+            }
+            PatchOperation::Update => crate::patch::prepare_expected(
+                &target,
+                patch
+                    .expected_digest
+                    .as_deref()
+                    .ok_or("update proposal omitted expected digest")?,
+                contents,
+            )?,
+        });
     }
 
     let mut archive = load_archive_manifest(&root, &plan.plan_digest)?;
@@ -10777,6 +10922,85 @@ mod tests {
             produced,
             "the IR verifier's coverage changed; re-record with DESHELL_UPDATE_GOLDEN=1 and say why in the commit"
         );
+    }
+
+    /// Several shell blocks in one workflow retire together.
+    ///
+    /// A host rewrite replaces the whole file. Each proposal used to carry the
+    /// rewrite of its own block only, so two proposals for one workflow
+    /// described the same file differently and only one could be applied —
+    /// which is what `DESHELL_BLOCKER_DUPLICATE_TARGET` said, correctly, 37
+    /// times on de-shell's own repository.
+    ///
+    /// Every proposal now carries the same rewrite, with every block replaced,
+    /// and `unique_patches` makes the repeats one edit. That is sound because
+    /// `apply` applies a plan in one transaction: there is no state where some
+    /// blocks are replaced and the rest are not.
+    #[test]
+    fn several_run_steps_in_one_workflow_become_one_rewrite() {
+        let directory = tempfile::tempdir().unwrap();
+        let workflow = concat!(
+            "name: ci\n",
+            "on:\n",
+            "  push:\n",
+            "jobs:\n",
+            "  build:\n",
+            "    runs-on: ubuntu-latest\n",
+            "    steps:\n",
+            "      - name: one\n",
+            "        run: /bin/echo one\n",
+            "      - name: two\n",
+            "        run: |\n",
+            "          /bin/echo two\n",
+            "      - name: three\n",
+            "        run: /bin/echo three\n",
+        );
+        let path = directory.path().join(".github/workflows");
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("ci.yml"), workflow).unwrap();
+        let inventory = crate::scanner::scan(directory.path()).unwrap();
+        let steps: Vec<_> = inventory
+            .findings
+            .iter()
+            .filter(|finding| finding.kind.is_embedded())
+            .cloned()
+            .collect();
+        assert_eq!(steps.len(), 3, "{inventory:#?}");
+
+        let host = std::fs::read(path.join("ci.yml")).unwrap();
+        let rewrite = |step: &crate::scanner::Finding| {
+            let mut replacements = Vec::new();
+            for each in &steps {
+                replacements.push(github_run_replacement(&host, each).unwrap());
+            }
+            let _ = step;
+            replacements.sort_by_key(|(start, _, _)| std::cmp::Reverse(*start));
+            let mut bytes = host.clone();
+            for (start, end, uses) in &replacements {
+                let mut next = Vec::new();
+                next.extend_from_slice(&bytes[..*start]);
+                next.extend_from_slice(uses.as_bytes());
+                next.extend_from_slice(&bytes[*end..]);
+                bytes = next;
+            }
+            bytes
+        };
+        // Each step's rewrite replaces every step, so the three agree byte for
+        // byte. Two that did not would be a real conflict, and the plan still
+        // refuses those.
+        let rewritten: std::collections::BTreeSet<_> = steps.iter().map(rewrite).collect();
+        assert_eq!(
+            rewritten.len(),
+            1,
+            "the steps disagree about what the file becomes"
+        );
+        let only = String::from_utf8(rewritten.into_iter().next().unwrap()).unwrap();
+        assert_eq!(
+            only.matches("uses: ./.github/actions/deshell-").count(),
+            3,
+            "{only}"
+        );
+        assert!(!only.contains("run:"), "{only}");
     }
 
     /// A set of checks reports the worst status in it, and `unavailable` is

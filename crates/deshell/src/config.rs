@@ -24,8 +24,14 @@ pub(crate) struct ProjectConfig {
     /// repository.
     ///
     /// `#[serde(default)]` so a project written before this field reads
-    /// unchanged and its review digests do not move.
-    #[serde(default)]
+    /// unchanged and its review digests do not move, and
+    /// `skip_serializing_if` so a project with nothing declared writes the same
+    /// bytes it wrote before the field existed. Without that, `deshell init`
+    /// emits `declared_shell = []` and appending the obvious
+    /// `[[declared_shell]]` block underneath is a duplicate key — a TOML error
+    /// naming the line the reader just wrote rather than the empty array three
+    /// hundred lines above it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub declared_shell: Vec<DeclaredShell>,
     pub interpreter_overrides: Vec<InterpreterOverride>,
     pub platform_cells: Vec<PlatformCell>,
