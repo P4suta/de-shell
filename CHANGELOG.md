@@ -51,8 +51,15 @@ All notable changes are documented here. No compatibility contract predates
   the vocabulary rather than of each call site, so it holds for a caller who
   has not thought about it.
 
-  The events come from the three layers that are already the only route to what
-  they describe, so a new call site is traced because it compiles.
+  The events come from the layers that are already the only route to what they
+  describe, so a new call site is traced because it compiles: the filesystem
+  from the transactional layer, the clock and environment from the ambient one,
+  the launches from the launch one, the approval decisions from the single
+  function that produces a review status, and the provider selections from the
+  single function that chooses one. A stale approval and a missing one both
+  come back "not current", and which it was is the whole question a reviewer is
+  asking; a run that ends in exit 6 said only that nothing was available, and
+  now says which platform was asked and what the probe answered.
   `cargo xtask trace-events` holds `trace::Event` and the contract equal in
   both directions and in order.
 

@@ -343,7 +343,46 @@ fn current_approval(
     Ok(approval)
 }
 
+impl Subject {
+    /// What this review is about, as the trace names it.
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Scenario { .. } => "scenario",
+            Self::Matrix { .. } => "matrix",
+            Self::DeclaredShell { .. } => "declared_shell",
+        }
+    }
+}
+
+impl ReviewStatus {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Draft => "draft",
+            Self::Approved => "approved",
+            Self::Stale => "stale",
+        }
+    }
+}
+
 fn review_state(
+    approvals: &[Approval],
+    subject: &Subject,
+    digest: &str,
+    inline_approved: bool,
+) -> Result<(ReviewStatus, Option<String>), String> {
+    let decided = review_status(approvals, subject, digest, inline_approved)?;
+    // One place, because this is the only place the answer is produced. A
+    // stale approval and a missing one both come back "not current", and the
+    // difference between them is the whole question a reviewer is asking.
+    crate::trace::record(|| crate::trace::Event::ApprovalDecision {
+        subject: subject.kind().to_owned(),
+        digest: digest.to_owned(),
+        status: decided.0.name().to_owned(),
+    });
+    Ok(decided)
+}
+
+fn review_status(
     approvals: &[Approval],
     subject: &Subject,
     digest: &str,

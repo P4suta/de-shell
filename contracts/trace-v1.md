@@ -29,6 +29,8 @@ argv, and how each ended.
 | `digest` | A digest was computed: how many bytes, and the answer |
 | `process_start` | A process was started, with the exact argv |
 | `process_exit` | A process ended; `code` is absent when a signal ended it |
+| `approval_decision` | A review was decided: its subject, the digest reviewed, and whether it stands |
+| `provider_select` | A disposable provider was chosen, or refused for want of one |
 
 `cargo xtask trace-events` holds this table, `trace::Event` and
 `schema/trace-v1.schema.json` equal, in that order, so a reader can decode a
@@ -60,7 +62,8 @@ within a trace.
 ## Where the events come from
 
 The filesystem events come from the transactional layer, the environment and
-clock events from the ambient-input layer, and the process events from the
-launch layer. `clippy.toml` makes each of those the only route to what it
+clock events from the ambient-input layer, the process events from the launch
+layer, the approval decisions from the one function that produces a review
+status, and the provider selections from the one function that chooses one. `clippy.toml` makes each of those the only route to what it
 describes, so a new call site is traced because it compiles rather than because
 somebody remembered to add a line.

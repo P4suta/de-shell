@@ -68,6 +68,20 @@ pub(crate) enum Event {
     ProcessStart { program: String, argv: Vec<String> },
     /// A process ended. `code` is absent when a signal ended it.
     ProcessExit { program: String, code: Option<i32> },
+    /// A review was decided: what it is about, the digest of the thing
+    /// reviewed, and whether the review stands. A stale approval and a missing
+    /// one look the same from outside and mean different things.
+    ApprovalDecision {
+        subject: String,
+        digest: String,
+        status: String,
+    },
+    /// A disposable provider was chosen, or refused. `provider` is absent when
+    /// this platform has none available.
+    ProviderSelect {
+        platform: String,
+        provider: Option<String>,
+    },
 }
 
 impl Event {
@@ -78,7 +92,7 @@ impl Event {
     /// the schema is the only thing that needs the list. `cargo xtask
     /// trace-events` reads it as text, so it is checked in a release build too.
     #[cfg(test)]
-    pub(crate) const NAMES: [&'static str; 10] = [
+    pub(crate) const NAMES: [&'static str; 12] = [
         "directory_create",
         "file_stage",
         "file_commit",
@@ -89,6 +103,8 @@ impl Event {
         "digest",
         "process_start",
         "process_exit",
+        "approval_decision",
+        "provider_select",
     ];
 }
 
@@ -318,6 +334,15 @@ mod tests {
             Event::ProcessExit {
                 program: "/bin/sh".into(),
                 code: Some(0),
+            },
+            Event::ApprovalDecision {
+                subject: "scenario".into(),
+                digest: "sha256:dd".into(),
+                status: "stale".into(),
+            },
+            Event::ProviderSelect {
+                platform: "macos".into(),
+                provider: None,
             },
         ];
         let text = recorded(|| {

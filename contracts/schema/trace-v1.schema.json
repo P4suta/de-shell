@@ -344,6 +344,94 @@
         "sequence"
       ],
       "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "digest": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "elapsed_nanos": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "event": {
+          "const": "approval_decision"
+        },
+        "schema_version": {
+          "const": 1
+        },
+        "sequence": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "status": {
+          "enum": [
+            "draft",
+            "approved",
+            "stale"
+          ]
+        },
+        "subject": {
+          "enum": [
+            "scenario",
+            "matrix",
+            "declared_shell"
+          ]
+        }
+      },
+      "required": [
+        "digest",
+        "elapsed_nanos",
+        "event",
+        "schema_version",
+        "sequence",
+        "status",
+        "subject"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "elapsed_nanos": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "event": {
+          "const": "provider_select"
+        },
+        "platform": {
+          "enum": [
+            "linux",
+            "macos",
+            "windows"
+          ]
+        },
+        "provider": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "schema_version": {
+          "const": 1
+        },
+        "sequence": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "elapsed_nanos",
+        "event",
+        "platform",
+        "provider",
+        "schema_version",
+        "sequence"
+      ],
+      "type": "object"
     }
   ],
   "title": "de-shell trace v1"

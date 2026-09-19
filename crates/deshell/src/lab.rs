@@ -83,6 +83,15 @@ pub(crate) enum LaunchSpec {
     AgentRequest(AgentRequest),
 }
 
+/// The platform, as the trace names it.
+fn platform_name(platform: Platform) -> &'static str {
+    match platform {
+        Platform::Linux => "linux",
+        Platform::Macos => "macos",
+        Platform::Windows => "windows",
+    }
+}
+
 pub(crate) fn provider_name(provider: Provider) -> &'static str {
     match provider {
         Provider::Podman => "podman",
@@ -98,6 +107,21 @@ pub(crate) fn execution_connected(provider: Provider) -> bool {
 }
 
 pub(crate) fn select(platform: Platform, probe: &dyn Probe) -> Result<Provider, String> {
+    let chosen = choose(platform, probe);
+    // What the probe saw is what decided this, and a run that ends in exit 6
+    // says only that nothing was available. The record says which platform was
+    // asked and what it answered.
+    crate::trace::record(|| crate::trace::Event::ProviderSelect {
+        platform: platform_name(platform).to_owned(),
+        provider: chosen
+            .as_ref()
+            .ok()
+            .map(|provider| provider_name(*provider).to_owned()),
+    });
+    chosen
+}
+
+fn choose(platform: Platform, probe: &dyn Probe) -> Result<Provider, String> {
     match platform {
         // The signed helper is preferred on macOS because it observes macOS as
         // macOS. A container observes Linux, which is the right answer for a step
@@ -875,6 +899,38 @@ mod tests {
         fn docker_rootless(&self) -> bool {
             self.rootless
         }
+    }
+
+    /// Choosing a provider, and failing to, are both recorded.
+    ///
+    /// A run that ends in exit 6 says only that nothing was available. Which
+    /// platform was asked, and what the probe found, is the part somebody
+    /// debugging it needs, and it was nowhere.
+    #[test]
+    fn selecting_a_provider_records_the_platform_and_the_answer() {
+        let recorded = |platform: Platform, probe: &FakeProbe| {
+            let text = crate::trace::testing::recorded(|| {
+                let _ = select(platform, probe);
+            });
+            crate::trace::testing::events(&text)
+                .into_iter()
+                .filter(|event| event["event"] == "provider_select")
+                .map(|event| format!("{} {}", event["platform"], event["provider"]))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            recorded(Platform::Linux, &probe(&["podman"], &[], false)),
+            vec![r#""linux" "podman""#]
+        );
+        assert_eq!(
+            recorded(Platform::Macos, &probe(&["deshell-vz-agent"], &[], false)),
+            vec![r#""macos" "virtualization-framework""#]
+        );
+        // The refusal is a decision too, and the one worth recording most.
+        assert_eq!(
+            recorded(Platform::Windows, &probe(&[], &[], false)),
+            vec![r#""windows" null"#]
+        );
     }
 
     fn probe(commands: &[&'static str], features: &[&'static str], rootless: bool) -> FakeProbe {
