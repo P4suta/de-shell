@@ -1923,6 +1923,113 @@ fn append_javascript_shell_findings(
     }
 }
 
+/// What a process launch is, once its program has been read.
+///
+/// Three outcomes and not two. The rule used to answer "safe or not", and a
+/// launch that is plainly shell but plainly resolved — `["sh", "build.sh"]`,
+/// which `find_script_references` rewrites — has no honest answer to that
+/// question. It is not safe, and reporting it as an unresolvable candidate
+/// says the opposite of what the scan knows about it.
+enum ProcessReading {
+    /// The program is not a shell. No shell starts here, whatever the
+    /// arguments are.
+    NotAShell,
+    /// A shell handed a command in the call itself: shell that is nowhere else
+    /// and can be retired.
+    Command {
+        interpreter: &'static str,
+        command: String,
+    },
+    /// A shell handed a script file. The file is its own location and the call
+    /// site is a script reference; reporting it again here would double-count
+    /// it and call a resolved call site dynamic.
+    ShellScript,
+    /// The program, or the command it was handed, is not in the source.
+    Unreadable,
+}
+
+/// The interpreter name the frontend knows this program by.
+///
+/// `None` for a program that is not a shell, and for `ksh`, which
+/// [`names_a_shell`] recognizes and no frontend models — so a `ksh` call is
+/// read as unresolvable rather than lowered as something else.
+fn shell_interpreter(program: &str) -> Option<&'static str> {
+    let name = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    let name = name.strip_suffix(".exe").unwrap_or(name);
+    match name {
+        // dash is the POSIX shell this models; `sh` is what the frontend calls
+        // it.
+        "sh" | "dash" => Some("sh"),
+        "bash" => Some("bash"),
+        "zsh" => Some("zsh"),
+        "fish" => Some("fish"),
+        "nu" => Some("nu"),
+        "pwsh" | "powershell" => Some("powershell"),
+        "cmd" => Some("cmd"),
+        "ksh" => None,
+        _ => None,
+    }
+}
+
+/// The command a shell was handed inline, when it was handed one.
+///
+/// Each shell's own spelling, because that is the thing this keeps getting
+/// wrong: `-c` is not `cmd`'s and `-Command` is not `sh`'s.
+fn inline_shell_command(interpreter: &str, argv: &[String]) -> Option<String> {
+    let names_the_command = |argument: &str| match interpreter {
+        // Short options bundle: `bash -lc 'printf x'` and `sh -euc 'printf x'`
+        // hand over a command exactly as `-c` does, and reading only `-c` was
+        // the same mistake in a smaller place.
+        "sh" | "bash" | "zsh" | "fish" => {
+            argument.starts_with('-')
+                && !argument.starts_with("--")
+                && argument.contains('c')
+                && argument[1..]
+                    .chars()
+                    .all(|letter| letter.is_ascii_alphabetic())
+        }
+        "nu" => argument == "-c" || argument == "--commands",
+        // PowerShell's CLI parameters are case-insensitive and `-c` is the
+        // documented abbreviation of `-Command`.
+        "powershell" => {
+            let lower = argument.to_ascii_lowercase();
+            "-command".starts_with(&lower) && lower.starts_with("-c")
+        }
+        // `/k` runs the command too; it keeps the shell afterwards.
+        "cmd" => {
+            let lower = argument.to_ascii_lowercase();
+            lower == "/c" || lower == "/k"
+        }
+        _ => false,
+    };
+    let index = argv
+        .iter()
+        .position(|argument| names_the_command(argument))?;
+    argv.get(index + 1).cloned()
+}
+
+/// Read a launch from its program and the arguments that follow it.
+///
+/// `argv` is `None` when some argument is not in the source.
+fn read_process_launch(program: Option<&str>, argv: Option<&[String]>) -> ProcessReading {
+    let Some(program) = program else {
+        return ProcessReading::Unreadable;
+    };
+    if !names_a_shell(program) {
+        return ProcessReading::NotAShell;
+    }
+    let (Some(interpreter), Some(argv)) = (shell_interpreter(program), argv) else {
+        return ProcessReading::Unreadable;
+    };
+    match inline_shell_command(interpreter, argv) {
+        Some(command) => ProcessReading::Command {
+            interpreter,
+            command,
+        },
+        None => ProcessReading::ShellScript,
+    }
+}
+
 #[derive(Clone, Copy)]
 enum ProcessSyntax {
     Python,
@@ -1968,37 +2075,79 @@ fn append_process_reference_findings(parts: AppendProcessReferenceFindingsArgs<'
                     .split_once('=')
                     .is_some_and(|(name, value)| name.trim() == "shell" && value.trim() == "True")
             });
-        let safe = match syntax {
-            ProcessSyntax::Python => !shell_true && static_argv_collection(first),
-            ProcessSyntax::Javascript => match quoted_literal(first) {
-                // A program that is not a shell starts no shell, whatever its
-                // arguments are. The rule used to want the argument array to be
-                // literal too, so `spawnSync("/bin/echo", [name], ...)` was a
-                // shell candidate — and de-shell's own generated action, which
-                // is exactly that, failed the shell-free gate it exists to
-                // satisfy.
-                //
-                // A program that is a shell is the other case: there the
-                // arguments are the program, so a dynamic one is not something
-                // this can read.
-                Some(program) if !names_a_shell(&program) => true,
-                Some(_) => values
+        // The program is `args[0]`, and the arguments are not the program.
+        // The rule asked whether the whole call was literal, which is a
+        // different question, and answered this one wrongly in both
+        // directions: `["/bin/sh", "-c", "printf x"]` was excluded because
+        // every element was a literal, and `["/bin/echo", name]` was reported
+        // as shell because one element was not.
+        let reading = match syntax {
+            ProcessSyntax::Python => {
+                if shell_true {
+                    // `shell=True` runs `args[0]` through a shell whatever it
+                    // says, and hands the rest of a sequence to it as `$0`,
+                    // `$1` and so on — so the command is `args[0]` either way.
+                    quoted_literal(first)
+                        .or_else(|| collection_program(first).flatten())
+                        .map_or(ProcessReading::Unreadable, |command| {
+                            ProcessReading::Command {
+                                interpreter: "sh",
+                                command,
+                            }
+                        })
+                } else if let Some(command) = quoted_literal(first) {
+                    // A string rather than a sequence. POSIX hands the whole
+                    // string to `execvp` as a program name, and Windows hands
+                    // it to `CreateProcess`, so this is a command written as
+                    // one string either way.
+                    ProcessReading::Command {
+                        interpreter: "sh",
+                        command,
+                    }
+                } else {
+                    let argv = static_argv_literals(first);
+                    read_process_launch(
+                        collection_program(first).flatten().as_deref(),
+                        argv.as_ref().map(|argv| &argv[1..]),
+                    )
+                }
+            }
+            ProcessSyntax::Javascript => {
+                let argv = values
                     .get(1)
-                    .is_none_or(|value| static_argv_collection(value.trim())),
-                None => false,
-            },
+                    .and_then(|value| static_argv_literals(value.trim()));
+                read_process_launch(
+                    quoted_literal(first).as_deref(),
+                    // A launch with no argument array was handed none, which is
+                    // a readable empty one.
+                    if values.len() < 2 {
+                        Some(&[][..])
+                    } else {
+                        argv.as_deref()
+                    },
+                )
+            }
         };
-        if safe {
-            continue;
-        }
-        let quoted = quoted_literal(first);
-        let quoted_command = quoted.is_some();
-        let (kind, command) = if matches!(syntax, ProcessSyntax::Python) {
-            quoted
-                .map(|value| (FindingKind::EmbeddedShell, value))
-                .unwrap_or_else(|| (FindingKind::Candidate, first.into()))
-        } else {
-            (FindingKind::Candidate, arguments.trim().to_owned())
+        let (kind, interpreter, command, confidence) = match reading {
+            ProcessReading::NotAShell | ProcessReading::ShellScript => continue,
+            ProcessReading::Command {
+                interpreter,
+                command,
+            } => (
+                FindingKind::EmbeddedShell,
+                interpreter,
+                command,
+                InterpreterConfidence::High,
+            ),
+            ProcessReading::Unreadable => (
+                FindingKind::Candidate,
+                "sh",
+                match syntax {
+                    ProcessSyntax::Python => first.to_owned(),
+                    ProcessSyntax::Javascript => arguments.trim().to_owned(),
+                },
+                InterpreterConfidence::Low,
+            ),
         };
         let line_index = line_offsets
             .partition_point(|offset| *offset <= start.start())
@@ -2009,12 +2158,8 @@ fn append_process_reference_findings(parts: AppendProcessReferenceFindingsArgs<'
         output.push(finding(FindingParts {
             path,
             kind,
-            interpreter: Some("sh".into()),
-            interpreter_confidence: if quoted_command {
-                InterpreterConfidence::High
-            } else {
-                InterpreterConfidence::Low
-            },
+            interpreter: Some(interpreter.into()),
+            interpreter_confidence: confidence,
             locator: Some(format!("line:{line}:column:{column}")),
             host_named_the_shell: false,
             span: ByteSpan {
@@ -2095,8 +2240,26 @@ pub(crate) fn split_top_level_arguments(arguments: &str) -> Vec<&str> {
     output
 }
 
-fn static_argv_collection(value: &str) -> bool {
-    static_argv_literals(value).is_some()
+/// The program a sequence argument names, when the argument is a sequence.
+///
+/// Three answers, not two: `None` is "not a sequence at all", `Some(None)` is
+/// "a sequence whose first element is not a literal", and `Some(Some(program))`
+/// is the program it runs. A caller that folded the first two together would
+/// have to guess which it was looking at.
+fn collection_program(value: &str) -> Option<Option<String>> {
+    let value = value.trim();
+    let inner = if value.starts_with('[') && value.ends_with(']')
+        || value.starts_with('(') && value.ends_with(')')
+    {
+        &value[1..value.len() - 1]
+    } else {
+        return None;
+    };
+    Some(
+        split_top_level_arguments(inner)
+            .first()
+            .and_then(|argument| quoted_literal(argument.trim())),
+    )
 }
 
 pub(crate) fn static_argv_literals(value: &str) -> Option<Vec<String>> {
@@ -2643,6 +2806,100 @@ mod tests {
                 .iter()
                 .any(|finding| finding.kind == FindingKind::EmbeddedShell
                     && finding.source == b"printf static")
+        );
+    }
+
+    /// The program is `args[0]`, and the arguments are not the program.
+    ///
+    /// `shell=False` with a sequence is `execvp(args[0], args)`. The rule asked
+    /// whether every element was a literal, which is a different question and
+    /// answered this one wrongly in both directions: a literal
+    /// `["/bin/sh", "-c", "…"]` was excluded as safe because it was all
+    /// literals, and `["/bin/echo", name]` was reported as shell because one
+    /// element was not.
+    ///
+    /// Three answers rather than two, because a shell handed a script file —
+    /// `["sh", "build.sh"]` — is neither. `find_script_references` resolves and
+    /// rewrites that call site, and the script is its own location; calling it
+    /// an unresolvable dynamic candidate says the opposite of what the scan
+    /// knows.
+    #[test]
+    fn a_process_launch_is_read_for_its_program_and_the_command_it_hands_over() {
+        let temporary = tempfile::tempdir().unwrap();
+        write(temporary.path(), "build.sh", b"#!/bin/sh\nprintf built\n");
+        write(
+            temporary.path(),
+            "processes.py",
+            concat!(
+                "import subprocess\n",
+                "subprocess.run([\"/bin/sh\", \"-c\", \"printf one\"], check=True)\n",
+                "subprocess.Popen((\"bash\", \"-lc\", \"printf two\"))\n",
+                "subprocess.run([\"cmd.exe\", \"/C\", \"printf three\"])\n",
+                "subprocess.run([\"pwsh\", \"-Command\", \"printf four\"])\n",
+                "subprocess.run([\"/bin/echo\", name], check=True)\n",
+                "subprocess.run([\"sh\", \"build.sh\"], check=True)\n",
+                "subprocess.run([\"ksh\", \"-c\", \"printf five\"])\n",
+                "subprocess.run([program, \"-c\", \"printf six\"])\n",
+                "subprocess.run([\"/bin/echo\", \"hi\"], shell=True)\n",
+            )
+            .as_bytes(),
+        );
+        write(
+            temporary.path(),
+            "processes.js",
+            concat!(
+                "const {spawnSync} = require('node:child_process');\n",
+                "spawnSync('/bin/sh', ['-c', 'printf seven']);\n",
+                "spawnSync('/bin/echo', [name]);\n",
+                "spawnSync('sh', ['build.sh']);\n",
+            )
+            .as_bytes(),
+        );
+        let inventory = scan(temporary.path()).unwrap();
+        assert!(inventory.errors.is_empty(), "{:#?}", inventory.errors);
+        let read = inventory
+            .findings
+            .iter()
+            .filter(|finding| finding.kind != FindingKind::ShellFile)
+            .map(|finding| {
+                format!(
+                    "{} {:?} {} {}",
+                    finding.locator.clone().unwrap_or_default(),
+                    finding.kind,
+                    finding.interpreter.clone().unwrap_or_default(),
+                    String::from_utf8_lossy(&finding.source),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            read,
+            vec![
+                "line:2:column:0 EmbeddedShell sh printf seven",
+                // The shell is in the call, so the call is the location.
+                "line:2:column:0 EmbeddedShell sh printf one",
+                // Short options bundle: `-lc` hands over a command as `-c` does.
+                "line:3:column:0 EmbeddedShell bash printf two",
+                "line:4:column:0 EmbeddedShell cmd printf three",
+                "line:5:column:0 EmbeddedShell powershell printf four",
+                // `ksh` is a shell no frontend models, so it is not read as one
+                // that is.
+                "line:8:column:0 Candidate sh [\"ksh\", \"-c\", \"printf five\"]",
+                // The program is not in the source, so it might be a shell.
+                "line:9:column:0 Candidate sh [program, \"-c\", \"printf six\"]",
+                // `shell=True` is a shell however the sequence reads.
+                "line:10:column:0 EmbeddedShell sh /bin/echo",
+            ],
+            "{:#?}",
+            inventory.findings
+        );
+        // `/bin/echo` starts no shell, and `sh build.sh` is a script reference
+        // and a shell file, both of which this scan already holds.
+        assert!(
+            inventory
+                .findings
+                .iter()
+                .any(|finding| finding.kind == FindingKind::ShellFile
+                    && finding.path == "build.sh")
         );
     }
 

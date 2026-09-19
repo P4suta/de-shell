@@ -55,6 +55,19 @@ All notable changes are documented here. No compatibility contract predates
 
 ### Fixed
 
+- Read a process launch for its program and the command it hands over, rather
+  than for whether every argument is a literal. Those are different questions,
+  and the second answered the first wrongly in both directions:
+  `subprocess.run(["/bin/sh", "-c", command])` was excluded as safe because
+  every element was a literal, and `subprocess.run(["/bin/echo", name])` was
+  reported as shell because one was not. `shell=False` with a sequence is
+  `execvp(args[0], args)`, so the program is `args[0]` and the arguments are
+  not the program. `sh -lc` and `cmd /C` hand over a command exactly as `-c`
+  does. A shell handed a script file — `["sh", "build.sh"]` — is a third
+  answer, not a candidate: the script is its own location and the call site is
+  a script reference this already resolves. The JavaScript arm carried half of
+  this rule already; it now carries all of it, and so does Python.
+
 - Closed the set of `details.items[].kind`. All fifteen report contracts
   declared it `"type": "string"`, and the structured report is built by
   re-reading the command's human output, so `scan` took whatever token stood in
