@@ -315,6 +315,92 @@ fn run_echo_semantics(root: &Path) -> Result<(), Vec<String>> {
 /// errors are handled and `$LASTEXITCODE` changes what a later `exit` reports;
 /// neither is a value the IR can carry as text. Which names those are is a fact
 /// about PowerShell, so it is measured.
+/// What `$ErrorActionPreference` changes.
+///
+/// The frontend skips the statement, and that is sound exactly while it reaches
+/// nothing the frontend lowers. Both halves are measured: a failing external
+/// command is unaffected by it, and a failing cmdlet is not.
+fn run_powershell_preference(root: &Path) -> Result<(), Vec<String>> {
+    let path = root.join("contracts/golden/powershell-preference-semantics-v1.json");
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|error| vec![format!("cannot read {}: {error}", path.display())])?;
+    let corpus: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|error| vec![format!("malformed corpus: {error}")])?;
+    let cases = corpus["cases"]
+        .as_array()
+        .ok_or_else(|| vec!["corpus has no cases array".to_owned()])?;
+    if cases.is_empty() {
+        return Err(vec!["corpus is empty".to_owned()]);
+    }
+    let directory = root.join(format!("target/deshell-pwsh-pref-{}", std::process::id()));
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| vec![format!("cannot create {}: {error}", directory.display())])?;
+    let mut errors = Vec::new();
+    let mut checked = 0_usize;
+    for case in cases {
+        let name = case["name"].as_str().unwrap_or("<unnamed>");
+        let Some(body) = case["body"].as_str() else {
+            errors.push(format!("{name} has no body"));
+            continue;
+        };
+        for (form, preamble) in [
+            ("with_stop", "$ErrorActionPreference = 'Stop'\n"),
+            ("without", ""),
+        ] {
+            let script = directory.join("case.ps1");
+            if let Err(error) = std::fs::write(&script, format!("{preamble}{body}")) {
+                errors.push(format!("cannot write {name}: {error}"));
+                continue;
+            }
+            let observed = std::process::Command::new("pwsh")
+                .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-File"])
+                .arg("./case.ps1")
+                .current_dir(&directory)
+                .output();
+            let observed = match observed {
+                Ok(observed) => observed,
+                Err(error) => {
+                    println!("skipped  {name}/{form}: {error}");
+                    continue;
+                }
+            };
+            checked += 1;
+            let stdout = String::from_utf8_lossy(&observed.stdout).replace("\r\n", "\n");
+            let exit = i64::from(observed.status.code().unwrap_or(-1));
+            if case[form]["stdout"].as_str() != Some(stdout.as_str()) {
+                errors.push(format!(
+                    "{name}/{form}/stdout: recorded {:?}, observed {stdout:?}",
+                    case[form]["stdout"].as_str()
+                ));
+            }
+            if case[form]["exit"].as_i64() != Some(exit) {
+                errors.push(format!(
+                    "{name}/{form}/exit: recorded {:?}, observed {exit}",
+                    case[form]["exit"].as_i64()
+                ));
+            }
+        }
+        let differs = case["differs"].as_bool().unwrap_or(false);
+        let same = case["with_stop"] == case["without"];
+        if differs == same {
+            errors.push(format!(
+                "{name}: recorded differs={differs} but the two settings are {}",
+                if same { "identical" } else { "different" }
+            ));
+        }
+    }
+    let _ = std::fs::remove_dir_all(&directory);
+    if checked == 0 {
+        println!("skipped  no PowerShell runtime answered");
+        return Ok(());
+    }
+    if errors.is_empty() {
+        println!("{checked} PowerShell preference case(s) match the recording");
+        return Ok(());
+    }
+    Err(errors)
+}
+
 fn run_powershell_variables(root: &Path) -> Result<(), Vec<String>> {
     let path = root.join("contracts/golden/powershell-variable-inventory-v1.json");
     let raw = std::fs::read_to_string(&path)
@@ -2471,6 +2557,7 @@ fn dispatch(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Vec<Str
         Some("powershell-invocation") => run_powershell_invocation(root),
         Some("powershell-step-invocation") => run_powershell_step_invocation(root),
         Some("powershell-variables") => run_powershell_variables(root),
+        Some("powershell-preference") => run_powershell_preference(root),
         Some("builtin-table") => run_builtin_table(root),
         Some("posix-divergence") => run_posix_divergence(root),
         Some("printf-semantics") => run_printf_semantics(root),

@@ -4559,6 +4559,21 @@ fn lower_powershell(path: &str, source: &str) -> Result<Lowered, String> {
         if raw.is_empty() || raw.starts_with('#') {
             continue;
         }
+        if powershell_declaration(raw) {
+            // A declaration, not a statement: it runs nothing.
+            //
+            // Measured with pwsh 7.6.5: a script carrying `[CmdletBinding()]`
+            // and an empty `param()` behaves as one without them when it is
+            // called with no arguments, and rejects a positional argument that
+            // the same script without them would leave in `$args`. Nothing here
+            // claims anything about that second case — the IR has no term for
+            // "an unexpected argument is an error", so what the declarations buy
+            // is only that they stop the file at the first line they appear on.
+            //
+            // A `param(...)` that declares parameters is a different thing and
+            // is still refused: those are the task's inputs, with types.
+            continue;
+        }
         if raw == "exit $LASTEXITCODE" {
             if index + 1 != range_count {
                 return Err("PowerShell LASTEXITCODE forwarding must be terminal".into());
@@ -4616,6 +4631,48 @@ struct LowerPowershellControlArgs<'a> {
     inputs: &'a mut BTreeSet<String>,
     environment: &'a mut BTreeSet<String>,
     locals: &'a mut BTreeSet<String>,
+}
+
+/// Whether this statement declares something rather than running it.
+///
+/// `[CmdletBinding()]` and an empty `param()` open five of the six PowerShell
+/// files in this repository and were the first thing every one of them was
+/// refused for, because both carry parentheses and the `&&` splitter refuses
+/// those. Neither runs anything.
+///
+/// Only the empty `param()`. A `param($Name)` declares the task's inputs and
+/// their types, which is a separate piece of work and is still refused rather
+/// than skipped — skipping it would drop the arity and leave a script that
+/// reads `$Name` reading nothing.
+fn powershell_declaration(statement: &str) -> bool {
+    let statement = statement.trim();
+    if statement.eq_ignore_ascii_case("param()") {
+        return true;
+    }
+    // `$ErrorActionPreference = <literal>` reaches nothing this frontend
+    // lowers. Measured: a failing external command is unaffected by it and a
+    // failing cmdlet is not, so skipping it is sound exactly while every cmdlet
+    // is refused —
+    // `a_powershell_cmdlet_is_refused_which_is_what_skipping_the_preference_rests_on`
+    // is that invariant and
+    // `contracts/golden/powershell-preference-semantics-v1.json` is the
+    // measurement.
+    if let Some((name, value)) = statement.split_once('=')
+        && name.trim().eq_ignore_ascii_case("$ErrorActionPreference")
+        && powershell_literal_string(value.trim()).is_some()
+    {
+        return true;
+    }
+    let Some(inner) = statement
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+    else {
+        return false;
+    };
+    // An attribute with no arguments of its own, such as `[CmdletBinding()]`.
+    inner
+        .strip_suffix("()")
+        .is_some_and(|name| !name.is_empty() && name.chars().all(char::is_alphanumeric))
 }
 
 fn lower_powershell_control(parts: LowerPowershellControlArgs<'_>) -> Result<Node, String> {
@@ -4777,15 +4834,19 @@ fn lower_powershell_assignment(
         return Ok(None);
     };
     let name = name.trim();
+    let value = value.trim();
     if !valid_identifier(name) {
         return Ok(None);
     }
     if powershell_supplied_variable(name) {
+        // `$ErrorActionPreference` never reaches here: it is a declaration, and
+        // `powershell_declaration` takes it before a statement is lowered.
+        // Every other supplied name is refused, because carrying it as text
+        // would drop what it means.
         return Err(format!(
             "PowerShell answers ${name} itself, so assigning it is not a value this can carry"
         ));
     }
-    let value = value.trim();
     let literal = powershell_literal_string(value)
         .ok_or_else(|| format!("PowerShell assignment to ${name} is not a literal string"))?;
     locals.insert(name.to_owned());
@@ -6107,6 +6168,73 @@ mod tests {
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 
+    /// A declaration runs nothing, and `$ErrorActionPreference` reaches nothing
+    /// this lowers.
+    ///
+    /// `[CmdletBinding()]` and an empty `param()` open five of the six
+    /// PowerShell files in this repository, and both carry parentheses, so the
+    /// `&&` splitter refused every one of them on its first line.
+    ///
+    /// Skipping `$ErrorActionPreference` is the narrower claim and rests on
+    /// something: measured, a failing external command is unaffected by it and a
+    /// failing cmdlet is not, so it holds exactly while every cmdlet is refused.
+    /// `a_powershell_cmdlet_is_refused_which_is_what_skipping_the_preference_rests_on`
+    /// is that invariant and
+    /// `contracts/golden/powershell-preference-semantics-v1.json` is the
+    /// measurement.
+    #[test]
+    fn a_powershell_declaration_runs_nothing() {
+        let lowered = lower_powershell(
+            "build.ps1",
+            "[CmdletBinding()]\nparam()\n$ErrorActionPreference = 'Stop'\n& '/bin/echo' one\n",
+        )
+        .unwrap();
+        let Operation::Exec { argv, .. } = &lowered.body.operation else {
+            panic!("only the invocation is left: {:?}", lowered.body.operation);
+        };
+        assert_eq!(literal_expression(&argv[0]).as_deref(), Some("/bin/echo"));
+
+        // A `param` that declares parameters is the task's inputs and is not a
+        // thing to skip.
+        assert!(
+            lower_powershell("build.ps1", "param($Name)\n& '/bin/echo' one\n").is_err(),
+            "a declared parameter was dropped"
+        );
+        // Every other supplied name still refuses.
+        assert!(lower_powershell("build.ps1", "$LASTEXITCODE = '0'\n& '/bin/echo' one\n").is_err());
+        // And a preference whose value is not literal text is not read.
+        assert!(
+            lower_powershell(
+                "build.ps1",
+                "$ErrorActionPreference = $wanted\n& '/bin/echo' one\n"
+            )
+            .is_err()
+        );
+    }
+
+    /// A cmdlet is refused, which is what skipping `$ErrorActionPreference`
+    /// rests on.
+    ///
+    /// The preference reaches a cmdlet and nothing else this frontend lowers —
+    /// measured. So the day a cmdlet becomes lowerable, skipping the preference
+    /// stops being sound, and this is the test that says so rather than a
+    /// sentence in a comment.
+    #[test]
+    fn a_powershell_cmdlet_is_refused_which_is_what_skipping_the_preference_rests_on() {
+        for cmdlet in [
+            "Get-Item /deshell/nope",
+            "Write-Output one",
+            "Join-Path a b",
+            "Test-Path /deshell/nope",
+        ] {
+            let source = format!("$ErrorActionPreference = 'Stop'\n{cmdlet}\n");
+            assert!(
+                lower_powershell("build.ps1", &source).is_err(),
+                "{cmdlet} lowered while the preference that governs it was skipped"
+            );
+        }
+    }
+
     /// A PowerShell script's own variable is a value; one PowerShell answers is
     /// not.
     ///
@@ -6146,12 +6274,10 @@ mod tests {
         );
 
         // A name PowerShell answers itself is refused rather than carried as
-        // text.
-        for supplied in [
-            "$ErrorActionPreference = 'Stop'",
-            "$LASTEXITCODE = '0'",
-            "$erroractionpreference = 'Stop'",
-        ] {
+        // text. `$ErrorActionPreference` is the exception and is skipped
+        // instead: see `a_powershell_declaration_runs_nothing` and the invariant
+        // it rests on.
+        for supplied in ["$LASTEXITCODE = '0'", "$PID = '1'", "$PSHOME = '/x'"] {
             let source = format!("{supplied}\n& '/bin/echo' one\n");
             assert!(
                 lower_powershell("build.ps1", &source).is_err(),

@@ -85,6 +85,7 @@ jobs:
           cargo run --locked -p xtask -- powershell-invocation
           cargo run --locked -p xtask -- powershell-step-invocation
           cargo run --locked -p xtask -- powershell-variables
+          cargo run --locked -p xtask -- powershell-preference
           cargo run --locked -p xtask -- builtin-table
           cargo run --locked -p xtask -- posix-divergence
           cargo run --locked -p xtask -- printf-semantics

@@ -162,6 +162,7 @@ mod tests {
             "contracts/golden/powershell-invocation-semantics-v1.json",
             "contracts/golden/powershell-step-invocation-semantics-v1.json",
             "contracts/golden/powershell-variable-inventory-v1.json",
+            "contracts/golden/powershell-preference-semantics-v1.json",
             "contracts/semantic-models-v1.json",
         ] {
             assert!(root().join(relative).is_file(), "missing {relative}");

@@ -214,6 +214,14 @@ All notable changes are documented here. No compatibility contract predates
   program that is not a shell starts no shell whatever its arguments are; a
   program that is one is the case the rule is for.
 
+- Skipped a PowerShell declaration: `[CmdletBinding()]`, an empty `param()`,
+  and `$ErrorActionPreference = '<literal>'` run nothing. All three carry
+  parentheses or a supplied name, and they were the first line every PowerShell
+  file in this repository was refused for. Skipping the preference rests on a
+  measurement — it reaches a cmdlet and nothing else this frontend lowers —
+  recorded in `contracts/golden/powershell-preference-semantics-v1.json` and
+  held by a test that every cmdlet is still refused.
+
 ### Removed
 
 - Pre-v1 Effect IR and lock migration promises.
