@@ -237,13 +237,18 @@ the workflow. All POSIX observations now resolve each interpreter or utility
 once through Git/MSYS `sh`, then launch that native absolute path. PowerShell
 corpora carry host-neutral executable markers; the harness replaces them with
 single-quoted native paths, rejects unknown markers, and escapes apostrophes.
-POSIX programs arrive on standard input as exact bytes instead of crossing the
-Windows native argv parser after `-c`; a doubled-backslash case proves that the
-transport cannot rewrite the program being measured. Cross-platform tests also
-require the selected Bash to expose `BASH_VERSION`, run an absolute `/bin/echo`
-through the same resolver, and require unknown or absent names to fail closed.
-Neither a shell observation nor a PowerShell native-command observation can
-silently fall back to an unrelated Windows command or a missing Unix mount.
+Recorded POSIX programs arrive on standard input as exact bytes instead of
+crossing the Windows native argv parser after `-c`. Positional data is rendered
+by one NUL-rejecting POSIX-word encoder into that same byte stream, so embedded
+newlines, carriage returns, apostrophes, dollars and backslashes never cross the
+native argv boundary either. The corpus that specifically measures `bash -c`
+uses a fixed `. /dev/stdin` wrapper, preserving command-string exit semantics
+without putting corpus bytes in argv. Tests cover every one of those boundary
+characters and doubled backslashes. Cross-platform tests also require the
+selected Bash to expose `BASH_VERSION`, run an absolute `/bin/echo` through the
+same resolver, and require unknown or absent names to fail closed. Neither a
+shell observation nor a PowerShell native-command observation can silently
+fall back to an unrelated Windows command or a missing Unix mount.
 
 Program names are not treated as semantic versions. Git for Windows carries a
 dash build with ANSI-C quotes while the Ubuntu and macOS observations carry the
@@ -274,8 +279,8 @@ that shared collection step, so CI and release cannot accidentally measure a
 smaller test surface.
 
 The trusted clean run on 2026-09-20 passed all 525 workspace tests (482
-`deshell`, 43 `xtask`) and finished at **90.22% line coverage**: 54,810 lines,
-5,360 missed. `cargo llvm-cov` enforced `--fail-under-lines 90` on the result.
+`deshell`, 43 `xtask`) and finished at **90.22% line coverage**: 54,862 lines,
+5,366 missed. `cargo llvm-cov` enforced `--fail-under-lines 90` on the result.
 
 ## Next, in the order I would take it
 
