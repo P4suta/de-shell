@@ -154,6 +154,15 @@ All notable changes are documented here. No compatibility contract predates
 - Stopped `deshell init` from writing `declared_shell = []`, which made the
   obvious `[[declared_shell]]` block appended underneath a duplicate key.
 
+- Lowered a GitHub workflow step under the options the runner sets. GitHub
+  executes a `run:` step as `bash -e {0}`, so `set -e` is in effect whether or
+  not the step says so; de-shell read the text alone and lowered a two-command
+  step to a sequence that carries on after a failure, then claimed it `native`.
+- Delegated a pipeline inside a workflow step. The runner's default is
+  `bash -e {0}` and an explicit `shell: bash` is
+  `bash --noprofile --norc -eo pipefail {0}`, the scanner reports both as
+  `bash`, and the two statuses are two programs.
+
 ### Removed
 
 - Pre-v1 Effect IR and lock migration promises.
