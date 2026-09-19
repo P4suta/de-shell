@@ -221,6 +221,31 @@ impl EvidenceStatus {
     }
 }
 
+/// How bad a status is, so that a set of checks reports the worst one.
+///
+/// This was an `if`/`else` chain over three questions — is anything
+/// nondeterministic, is anything different, did a validation command fail — and
+/// everything that answered no to all three came out `Verified`. `Unavailable`
+/// answers no to all three. A plan holding a check whose run could not be made
+/// was reported as a plan that had been verified.
+///
+/// Nothing produced an `Unavailable` check until the interpreter probe did,
+/// which is the shape of hole that waits for its first caller rather than
+/// announcing itself. The `match` is exhaustive and takes the status by value,
+/// so a status added later has to be given a place instead of inheriting
+/// "verified" from an `else`.
+fn evidence_severity(status: EvidenceStatus) -> u8 {
+    match status {
+        EvidenceStatus::Verified => 0,
+        // Nobody looked. Not a verdict about the two programs, and not a claim
+        // that they agree.
+        EvidenceStatus::Unavailable => 1,
+        EvidenceStatus::Failed => 2,
+        EvidenceStatus::Different => 3,
+        EvidenceStatus::Nondeterministic => 4,
+    }
+}
+
 impl EvidenceStatus {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
@@ -6941,6 +6966,34 @@ pub(crate) fn verify(
                         requirement.name, requirement.digest
                     )
                 })?;
+            // `different` means both ran and disagreed. If the original's
+            // interpreter does not start, nothing was compared, and the
+            // evidence says so with the status that already exists for it.
+            if let Err(reason) = original_interpreter_starts(root, source, scenario) {
+                checks.push(EvidenceCheck {
+                    source: source.location.clone(),
+                    scenario: scenario.name.clone(),
+                    key: EvidenceKey {
+                        source_digest: source.content_digest.clone(),
+                        ir_digest: source.ir_digest.clone(),
+                        proposal_digest: proposal.proposal_digest.clone(),
+                        generator_digest: proposal
+                            .generator_digest
+                            .strip_prefix("sha256:")
+                            .unwrap_or(&proposal.generator_digest)
+                            .into(),
+                        toolchain_digest: toolchain_digest.clone(),
+                        scenario_digest: requirement.digest.clone(),
+                        platform_fingerprint: cell.platform_fingerprint.clone(),
+                        runtime_fingerprint: cell.runtime_fingerprint.clone(),
+                    },
+                    status: EvidenceStatus::Unavailable,
+                    error: Some(reason),
+                    covered_nodes: Vec::new(),
+                    comparisons: Vec::new(),
+                });
+                continue;
+            }
             let mut comparisons = Vec::new();
             let mut covered_nodes = BTreeSet::new();
             for _ in 0..2 {
@@ -6994,18 +7047,17 @@ pub(crate) fn verify(
         }
     }
     let validation = verify_validation_commands(root, &directory, &plan)?;
-    let status = if checks
+    let status = checks
         .iter()
-        .any(|check| check.status.is_nondeterministic())
-    {
-        EvidenceStatus::Nondeterministic
-    } else if checks.iter().any(|check| check.status.is_a_difference()) {
-        EvidenceStatus::Different
-    } else if validation.iter().any(|command| command.exit_code != 0) {
-        EvidenceStatus::Failed
-    } else {
-        EvidenceStatus::Verified
-    };
+        .map(|check| check.status)
+        .chain(
+            validation
+                .iter()
+                .any(|command| command.exit_code != 0)
+                .then_some(EvidenceStatus::Failed),
+        )
+        .max_by_key(|status| evidence_severity(*status))
+        .unwrap_or(EvidenceStatus::Verified);
     let evidence = MigrationEvidence {
         schema_version: 1,
         plan_digest: plan.plan_digest,
@@ -7180,6 +7232,78 @@ fn current_embedded_source(root: &Path, source: &PlanSource) -> Result<(Vec<u8>,
         ));
     };
     Ok((finding.source.clone(), source.interpreter.clone()))
+}
+
+/// Whether the original's interpreter starts at all, where the comparison will
+/// run it.
+///
+/// A comparison says two programs behaved differently. It can only say that if
+/// both of them ran. An interpreter that never started leaves an empty stdout
+/// and a non-zero status, which reads as a difference — and the report then
+/// blames the replacement for a baseline that was never taken.
+///
+/// Measured, not imagined: `pwsh` on this machine is a `mise` shim, and a shim
+/// resolves its version from the configuration nearest the working directory.
+/// The comparison runs in a private workspace under the system temporary root,
+/// so for a project that does not carry that configuration the original exited 1
+/// with the shim's error on stderr, the replacement printed `one` and exited 0,
+/// and de-shell reported `different`. Every byte of that was accurate and the
+/// conclusion a reader draws from it is wrong.
+///
+/// The probe is an empty script run through `original_script_argv`, so it is the
+/// same argv shape the comparison uses rather than a second idea of how to start
+/// an interpreter. Measured on this machine: `sh`, `bash`, `zsh`, `nu` and
+/// `pwsh` each exit 0 with empty stderr on an empty script of their own
+/// extension. `cmd` is not measured here and waits for a Windows runner.
+///
+/// It runs in the prepared workspace and not a bare temporary directory, because
+/// a project that declares its runtime carries that declaration into the
+/// snapshot — which is the case where the interpreter does resolve, and a probe
+/// somewhere else would deny it.
+fn original_interpreter_starts(
+    root: &Path,
+    source: &PlanSource,
+    scenario: &crate::config::Scenario,
+) -> Result<(), String> {
+    let workspace = prepared_workspace(root, scenario)?;
+    let interpreter = if source.kind == SourceKind::EmbeddedShell {
+        current_embedded_source(workspace.path(), source)?.1
+    } else {
+        source.interpreter.clone()
+    };
+    let extension = match interpreter.as_str() {
+        "sh" | "bash" | "zsh" => "sh",
+        "fish" => "fish",
+        "powershell" => "ps1",
+        "nu" => "nu",
+        "cmd" => "cmd",
+        other => return Err(format!("unknown original interpreter: {other}")),
+    };
+    let probe = workspace.path().join(format!("deshell-probe.{extension}"));
+    crate::patch::scratch::write(&probe, b"").map_err(|error| error.to_string())?;
+    let outcome = crate::agent_process::execute(
+        workspace.path(),
+        crate::agent_process::Request {
+            argv: original_script_argv(&interpreter, &probe.to_string_lossy())?,
+            environment: Vec::new(),
+            working_directory: None,
+            stdin: Vec::new(),
+            limits: scenario.limits.into(),
+        },
+    )?;
+    if outcome.exit_code == 0
+        && outcome.stderr.is_empty()
+        && !outcome.timed_out
+        && outcome.signal.is_none()
+        && outcome.limit_exceeded.is_none()
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "{interpreter} did not start in the verification workspace, so the original was never run: exit={} stderr={}",
+        outcome.exit_code,
+        String::from_utf8_lossy(&outcome.stderr).trim()
+    ))
 }
 
 fn observe_original(
@@ -10657,6 +10781,80 @@ mod tests {
             produced,
             "the IR verifier's coverage changed; re-record with DESHELL_UPDATE_GOLDEN=1 and say why in the commit"
         );
+    }
+
+    /// A set of checks reports the worst status in it, and `unavailable` is
+    /// worse than `verified`.
+    ///
+    /// The aggregation was an `if`/`else` chain over three questions — is
+    /// anything nondeterministic, is anything different, did a validation
+    /// command fail — and everything answering no to all three came out
+    /// `Verified`. `Unavailable` answers no to all three, so a plan holding a
+    /// check whose run could not be made was reported as verified, with exit 0.
+    ///
+    /// Nothing produced an `Unavailable` check at that level until the
+    /// interpreter probe did. The hole had been there the whole time, waiting
+    /// for its first caller rather than announcing itself, which is the reason
+    /// the ordering is now a total one over an exhaustive `match`.
+    #[test]
+    fn a_status_that_is_not_a_difference_is_still_not_a_verification() {
+        let ranked = |status| evidence_severity(status);
+        assert_eq!(ranked(EvidenceStatus::Verified), 0);
+        for status in [
+            EvidenceStatus::Unavailable,
+            EvidenceStatus::Failed,
+            EvidenceStatus::Different,
+            EvidenceStatus::Nondeterministic,
+        ] {
+            assert!(
+                ranked(status) > ranked(EvidenceStatus::Verified),
+                "{} ranked no worse than verified",
+                status.as_str()
+            );
+            assert!(!status.is_verified(), "{}", status.as_str());
+        }
+
+        // The aggregation the verifier runs, over the shape that used to come
+        // out `verified`: one check that could not be run and nothing else.
+        let worst = |statuses: &[EvidenceStatus]| {
+            statuses
+                .iter()
+                .copied()
+                .max_by_key(|status| evidence_severity(*status))
+                .unwrap_or(EvidenceStatus::Verified)
+        };
+        assert_eq!(
+            worst(&[EvidenceStatus::Unavailable]),
+            EvidenceStatus::Unavailable
+        );
+        assert_eq!(
+            worst(&[EvidenceStatus::Verified, EvidenceStatus::Unavailable]),
+            EvidenceStatus::Unavailable
+        );
+        assert_eq!(
+            worst(&[EvidenceStatus::Unavailable, EvidenceStatus::Different]),
+            EvidenceStatus::Different
+        );
+        assert_eq!(worst(&[]), EvidenceStatus::Verified);
+    }
+
+    /// Every status has a place in the ordering.
+    ///
+    /// `evidence_severity` is an exhaustive `match`, so a status added to the
+    /// enum fails to compile until it is ranked. This says the ranks are also
+    /// distinct, so two statuses cannot share a place and make `max_by_key`
+    /// pick by accident of iteration order.
+    #[test]
+    fn the_evidence_statuses_are_totally_ordered() {
+        let statuses = [
+            EvidenceStatus::Verified,
+            EvidenceStatus::Unavailable,
+            EvidenceStatus::Failed,
+            EvidenceStatus::Different,
+            EvidenceStatus::Nondeterministic,
+        ];
+        let ranks: BTreeSet<u8> = statuses.iter().map(|s| evidence_severity(*s)).collect();
+        assert_eq!(ranks.len(), statuses.len(), "two statuses share a rank");
     }
 
     /// The refusal vocabulary is the three values the ledger can record.

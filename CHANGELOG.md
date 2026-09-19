@@ -100,6 +100,18 @@ All notable changes are documented here. No compatibility contract predates
   lowered natively depending on how busy the machine was; a budget failure is
   now an error, because nobody measured.
 
+- Stopped reporting a migration as `different` when the original never ran.
+  The comparison starts the original's interpreter in a private workspace, and
+  an interpreter that fails to start leaves an empty stdout and a non-zero
+  status, which reads as a difference — so the report blamed the replacement for
+  a baseline that was never taken. A probe now runs an empty script through the
+  same argv the comparison uses, and the evidence says `unavailable` with the
+  interpreter's own error.
+- Made a set of Evidence checks report the worst status in it. The aggregation
+  asked three questions and everything that answered no to all three came out
+  `verified`, so a check whose run could not be made was reported as a verified
+  plan with exit 0.
+
 ### Removed
 
 - Pre-v1 Effect IR and lock migration promises.
