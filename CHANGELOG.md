@@ -33,6 +33,23 @@ All notable changes are documented here. No compatibility contract predates
   dependency-policy and coverage floors, a CycloneDX SBOM, checksums, keyless
   signatures, provenance, smoke tests, and protected crates.io publication.
 
+- `mise run test:miri`, `test:fuzz-smoke` and `test:mutation`, and a CI job
+  that runs the first two on every change. The ROADMAP has listed "fuzz smoke /
+  Miri / ASan / UBSan / mutation thresholds" as unmet since 0.1 planning.
+
+  Miri covers the canonical byte forms, the IR, the digests, the report, the
+  trace and the transactional filesystem layer — everything that does not reach
+  a tree-sitter parser, because Miri interprets the program and cannot call
+  foreign code. Isolation is disabled because `patch::` is about real files and
+  checking it against a filesystem that is not there would check nothing.
+
+- `cargo xtask fuzz-modules`. `fuzz/src/lib.rs` re-declares every module of
+  `crates/deshell/src/main.rs` with a `#[path]`, and nothing in the workspace
+  build reaches it: `cargo clippy --workspace` does not, and the nightly fuzz
+  job was the only thing that did. Adding `host` and `trace` to the binary
+  broke the fuzz build invisibly. The two lists are compared now, and a module
+  that belongs to only one of them is named in the fuzz crate with its reason.
+
 - Trace v1: `--trace off|jsonl` and `--trace-output PATH`, `deshell schema
   trace`, `contracts/trace-v1.md` and `contracts/schema/trace-v1.schema.json`.
   Off by default, never on stdout, and `--trace-output` without `--trace` is a
@@ -113,6 +130,15 @@ All notable changes are documented here. No compatibility contract predates
   finding — the existing test uses `expires = "2099-01-01"` precisely because
   the real clock would never reach it, which is the same as not testing the
   window. The day can be moved across the boundary now, and is.
+
+- Refused a stored approval for each way it can be wrong. `Approval::validate`
+  is what makes an approval artifact trustworthy — it is read back from a
+  directory on disk that anything can write to — and mutation testing replaced
+  the entire function with `Ok(())` without a single test failing. Two `||`
+  between its checks could also be `&&` unnoticed, and `declared_shell_name`
+  could return an empty string, which would give two declarations in one file
+  one name. All four are covered, and each new case was checked by
+  reintroducing the mutation.
 
 - Made `span_of` state and keep its own precondition. It took an unchecked byte
   offset, and an offset can land inside a multi-byte character: the search asked

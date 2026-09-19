@@ -1338,6 +1338,81 @@ fn run_enum_equality(root: &Path) -> Result<(), Vec<String>> {
     Err(errors)
 }
 
+/// The fuzz crate is compiled from the same modules as the binary.
+///
+/// `fuzz/src/lib.rs` re-declares every module of `crates/deshell/src/main.rs`
+/// with a `#[path]`, and nothing built it: `cargo clippy --workspace` does not
+/// reach it, and the nightly fuzz job is the only thing that does. Adding
+/// `host` and `trace` to the binary broke the fuzz build and the break was
+/// invisible for a day.
+///
+/// Upstream holds the identity and downstream drops it — the same shape as a
+/// span, a digest and a `shell:` key before it. The lists are compared here so
+/// the next module is either in both or in neither.
+fn run_fuzz_modules(root: &Path) -> Result<(), Vec<String>> {
+    let declared = |text: &str| {
+        text.lines()
+            .filter_map(|line| line.trim().strip_prefix("mod ")?.strip_suffix(';'))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let main = std::fs::read_to_string(root.join("crates/deshell/src/main.rs"))
+        .map_err(|error| vec![format!("cannot read main.rs: {error}")])?;
+    let fuzz = std::fs::read_to_string(root.join("fuzz/src/lib.rs"))
+        .map_err(|error| vec![format!("cannot read fuzz/src/lib.rs: {error}")])?;
+    // A module can belong to exactly one of them, and when it does the fuzz
+    // crate says so and says why. Named there rather than here, so the decision
+    // sits with the code it is about and an addition is visible in review.
+    let omitted = fuzz
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("// deshell-fuzz omits:"))
+        .map(|names| {
+            names
+                .split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut binary = declared(&main)
+        .into_iter()
+        .filter(|name| !omitted.contains(name))
+        .collect::<Vec<_>>();
+    let mut fuzzed = declared(&fuzz);
+    binary.sort();
+    fuzzed.sort();
+    if binary.is_empty() {
+        return Err(vec!["main.rs declares no modules".to_owned()]);
+    }
+    if binary == fuzzed {
+        println!(
+            "the fuzz crate is compiled from the same {} modules as the binary, omitting {}",
+            binary.len(),
+            if omitted.is_empty() {
+                "none".to_owned()
+            } else {
+                omitted.join(", ")
+            }
+        );
+        return Ok(());
+    }
+    let mut failures = Vec::new();
+    for name in &binary {
+        if !fuzzed.contains(name) {
+            failures.push(format!("fuzz/src/lib.rs does not compile `{name}`"));
+        }
+    }
+    for name in &fuzzed {
+        if !binary.contains(name) {
+            failures.push(format!(
+                "fuzz/src/lib.rs compiles `{name}`, which the binary does not"
+            ));
+        }
+    }
+    Err(failures)
+}
+
 /// `trace::Event` and `contracts/schema/trace-v1.schema.json` name the same
 /// events, in the same order.
 ///
@@ -3564,6 +3639,7 @@ fn dispatch(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Vec<Str
         Some("enum-equality") => run_enum_equality(root),
         Some("report-item-kinds") => run_report_item_kinds(root),
         Some("trace-events") => run_trace_events(root),
+        Some("fuzz-modules") => run_fuzz_modules(root),
         Some("lint-expectations") => run_lint_expectations(root),
         Some("repository-guardrails") => run_repository_guardrails(root),
         Some("corpus-audit") => {
@@ -3727,6 +3803,57 @@ mod tests {
                 .any(|error| error.contains("bytes; maximum is 10485760 bytes")),
             "{errors:#?}"
         );
+    }
+
+    /// The fuzz-module gate reads both lists and the exclusions the fuzz crate
+    /// names for itself.
+    #[test]
+    fn the_fuzz_modules_gate_catches_a_module_only_one_crate_compiles() {
+        run_fuzz_modules(&repository_root()).expect("the repository agrees with itself");
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::create_dir_all(root.join("crates/deshell/src")).unwrap();
+        std::fs::create_dir_all(root.join("fuzz/src")).unwrap();
+        let binary = |text: &str| {
+            std::fs::write(root.join("crates/deshell/src/main.rs"), text).unwrap();
+        };
+        let fuzz = |text: &str| std::fs::write(root.join("fuzz/src/lib.rs"), text).unwrap();
+
+        binary("mod ir;\nmod cli;\nmod trace;\n");
+        fuzz("// deshell-fuzz omits: cli\nmod ir;\nmod trace;\n");
+        run_fuzz_modules(root).expect("two lists that agree, with a named omission, pass");
+
+        // A module the binary gained and the fuzz crate did not: the break this
+        // gate exists for.
+        binary("mod ir;\nmod cli;\nmod trace;\nmod host;\n");
+        let errors = run_fuzz_modules(root).expect_err("a missing module fails");
+        assert_eq!(
+            errors,
+            vec!["fuzz/src/lib.rs does not compile `host`".to_owned()]
+        );
+
+        // An omission that is not declared is not an omission.
+        binary("mod ir;\nmod cli;\nmod trace;\n");
+        fuzz("mod ir;\nmod trace;\n");
+        let errors = run_fuzz_modules(root).expect_err("an undeclared omission fails");
+        assert_eq!(
+            errors,
+            vec!["fuzz/src/lib.rs does not compile `cli`".to_owned()]
+        );
+
+        // And a module only the fuzz crate has.
+        fuzz("// deshell-fuzz omits: cli\nmod ir;\nmod trace;\nmod ghost;\n");
+        let errors = run_fuzz_modules(root).expect_err("an extra module fails");
+        assert_eq!(
+            errors,
+            vec!["fuzz/src/lib.rs compiles `ghost`, which the binary does not".to_owned()]
+        );
+
+        // An empty binary list is a gate that would pass for the wrong reason.
+        binary("// deshell\n");
+        let errors = run_fuzz_modules(root).expect_err("an empty binary list fails");
+        assert_eq!(errors, vec!["main.rs declares no modules".to_owned()]);
     }
 
     /// The trace vocabulary gate reads both sides and fails when either moves.

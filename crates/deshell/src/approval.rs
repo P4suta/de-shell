@@ -648,6 +648,164 @@ fn portable_id(value: &str) -> bool {
     reason = "tests construct the races and corrupt trees the production ban prevents"
 )]
 mod tests {
+
+    /// Every way a stored approval can be wrong is a way it is refused.
+    ///
+    /// `Approval::validate` is what makes an approval artifact trustworthy: it
+    /// is read back from `.deshell/approvals/sha256/`, which is a directory on
+    /// disk that anything can write to. Mutation testing replaced the whole
+    /// function with `Ok(())` and the suite passed, so the checks below were
+    /// load-bearing for nothing.
+    ///
+    /// Each case changes one thing about an approval that is otherwise valid,
+    /// and names the refusal it should produce.
+    #[test]
+    fn a_stored_approval_is_refused_for_each_way_it_can_be_wrong() {
+        let scenario = || Subject::Scenario {
+            name: "default".into(),
+            path: ".deshell/scenarios/default.toml".into(),
+        };
+        let signed = |subject: Subject| {
+            signed_approval(subject, format!("sha256:{}", "a".repeat(64))).unwrap()
+        };
+        let refusal = |approval: Approval| {
+            approval
+                .validate()
+                .expect_err("this approval must be refused")
+        };
+
+        // The one that is right, so a refusal below is about the change and not
+        // about the shape.
+        signed(scenario()).validate().expect("a signed approval");
+
+        let mut wrong = signed(scenario());
+        wrong.schema_version = 2;
+        assert!(refusal(wrong).contains("schema_version must be 1"));
+
+        // A digest that is not a pinned sha256, on either side. The `||` between
+        // the two checks was mutated to `&&` and nothing noticed, so both sides
+        // are named here.
+        for (approval_digest, subject_digest) in [
+            ("sha256:short", format!("sha256:{}", "a".repeat(64))),
+            (
+                &"a".repeat(64) as &str,
+                format!("sha256:{}", "a".repeat(64)),
+            ),
+            (&format!("sha256:{}", "a".repeat(64)), "sha256:short".into()),
+            (&format!("sha256:{}", "a".repeat(64)), "a".repeat(64)),
+            // Uppercase hex is not the canonical form.
+            (
+                &format!("sha256:{}", "A".repeat(64)),
+                format!("sha256:{}", "a".repeat(64)),
+            ),
+        ] {
+            let mut wrong = signed(scenario());
+            wrong.approval_digest = approval_digest.to_owned();
+            wrong.subject_digest = subject_digest.clone();
+            assert!(
+                refusal(wrong).contains("digests must use sha256:"),
+                "{approval_digest} {subject_digest:?}"
+            );
+        }
+
+        let mut wrong = signed(scenario());
+        wrong.subject = Subject::Scenario {
+            name: "   ".into(),
+            path: ".deshell/scenarios/default.toml".into(),
+        };
+        assert!(refusal(wrong).contains("scenario name must not be empty"));
+
+        // A path that normalizes to something else, and one that normalizes to
+        // itself but is not under the scenario directory. The `||` between those
+        // two checks was mutated to `&&` and nothing noticed either.
+        for path in [
+            ".deshell/scenarios/../scenarios/default.toml",
+            "scenarios/default.toml",
+            ".deshell/default.toml",
+        ] {
+            let mut wrong = signed(scenario());
+            wrong.subject = Subject::Scenario {
+                name: "default".into(),
+                path: path.into(),
+            };
+            let message = wrong.validate().expect_err("this path must be refused");
+            assert!(
+                message.contains("scenario path is not canonical") || message.contains("path"),
+                "{path}: {message}"
+            );
+        }
+
+        let mut wrong = signed(scenario());
+        wrong.subject = Subject::Matrix {
+            id: "not a portable id".into(),
+        };
+        assert!(refusal(wrong).contains("matrix id is not portable"));
+
+        let mut wrong = signed(scenario());
+        wrong.subject = Subject::DeclaredShell {
+            path: "./scripts/build.sh".into(),
+            start_byte: 0,
+            end_byte: 4,
+        };
+        assert!(
+            wrong
+                .validate()
+                .expect_err("a non-canonical path must be refused")
+                .contains("path")
+        );
+
+        // An empty span names nothing, and a reversed one names it backwards.
+        for (start_byte, end_byte) in [(4, 4), (9, 4)] {
+            let mut wrong = signed(scenario());
+            wrong.subject = Subject::DeclaredShell {
+                path: "scripts/build.sh".into(),
+                start_byte,
+                end_byte,
+            };
+            assert!(
+                refusal(wrong).contains("span must be non-empty and ordered"),
+                "{start_byte}..{end_byte}"
+            );
+        }
+
+        // The signature itself: every field above is inside the digest, so
+        // changing any of them without re-signing must be caught here even when
+        // the changed value is otherwise valid.
+        let mut wrong = signed(scenario());
+        wrong.subject_digest = format!("sha256:{}", "b".repeat(64));
+        assert!(refusal(wrong).contains("does not match its canonical content"));
+
+        let mut wrong = signed(scenario());
+        wrong.subject = Subject::Scenario {
+            name: "other".into(),
+            path: ".deshell/scenarios/other.toml".into(),
+        };
+        assert!(refusal(wrong).contains("does not match its canonical content"));
+    }
+
+    /// A declared shell is named by its exact span, so the name carries it.
+    ///
+    /// Mutation testing replaced the whole function with an empty string and
+    /// with a constant, and nothing failed — two different declarations would
+    /// then share one name, which is what identifying them by span exists to
+    /// prevent.
+    #[test]
+    fn a_declared_shell_name_carries_the_span_that_identifies_it() {
+        assert_eq!(
+            declared_shell_name("scripts/build.sh", 12, 40),
+            "scripts/build.sh@12..40"
+        );
+        // Two declarations in one file are two names.
+        assert_ne!(
+            declared_shell_name("a.ps1", 0, 10),
+            declared_shell_name("a.ps1", 10, 20)
+        );
+        // And the same span in two files is two names.
+        assert_ne!(
+            declared_shell_name("a.ps1", 0, 10),
+            declared_shell_name("b.ps1", 0, 10)
+        );
+    }
     use super::*;
 
     fn initialized_project() -> tempfile::TempDir {

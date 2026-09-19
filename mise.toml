@@ -40,6 +40,7 @@ run = [
   "cargo run --locked -p xtask -- lint-expectations",
   "cargo run --locked -p xtask -- report-item-kinds",
   "cargo run --locked -p xtask -- trace-events",
+  "cargo run --locked -p xtask -- fuzz-modules",
   "cargo clippy --locked --workspace --all-targets -- -D warnings",
   "mise run repository:guardrails",
   "actionlint .github/workflows/ci.yml .github/workflows/release.yml .github/workflows/nightly.yml .github/workflows/dependency-review.yml .github/workflows/scorecard.yml",
@@ -98,6 +99,51 @@ run = [
   "cargo test --locked -p deshell replay::tests",
   "cargo test --locked -p deshell strict_json::tests",
   "cargo test --locked -p deshell protocol::tests",
+]
+
+[tasks."test:fuzz-smoke"]
+description = "Build every fuzz target and run each briefly over the saved corpus"
+# The nightly job runs these for fifteen minutes each. This is the short form,
+# for a change: building the targets at all is most of the value, because the
+# fuzz crate re-declares every module of the binary and nothing else builds it.
+run = [
+  "cargo run --locked -p xtask -- fuzz-modules",
+  "cargo +nightly-2026-08-21 fuzz run frontend fuzz/corpus/frontend -- -runs=2000 -timeout=10 -max_len=16384",
+  "cargo +nightly-2026-08-21 fuzz run scanner fuzz/corpus/scanner -- -runs=2000 -timeout=10 -max_len=16384",
+  "cargo +nightly-2026-08-21 fuzz run protocol fuzz/corpus/protocol -- -runs=2000 -timeout=10 -max_len=16384",
+  "cargo +nightly-2026-08-21 fuzz run schema fuzz/corpus/schema -- -runs=2000 -timeout=10 -max_len=16384",
+]
+
+[tasks."test:miri"]
+description = "Check the pure logic and the transactional layer for undefined behaviour"
+# Miri interprets the program, so it cannot call into foreign code. Every module
+# that reaches a tree-sitter parser is therefore out, and so is the private
+# workspace snapshot, which clones files with `fclonefileat`. What is left is
+# where undefined behaviour would be worst anyway: the canonical byte forms, the
+# IR, the digests, and the transactional filesystem layer.
+#
+# Isolation is disabled because `patch::` is about real files: staging beside a
+# destination, committing by rename, and rolling back. Checking it against a
+# filesystem that is not there would check nothing.
+env = { MIRIFLAGS = "-Zmiri-disable-isolation" }
+run = [
+  "cargo +nightly miri test -p deshell canonical_json::",
+  "cargo +nightly miri test -p deshell strict_json::",
+  "cargo +nightly miri test -p deshell ir::",
+  "cargo +nightly miri test -p deshell digest::",
+  "cargo +nightly miri test -p deshell report::",
+  "cargo +nightly miri test -p deshell trace::",
+  "cargo +nightly miri test -p deshell patch::",
+]
+
+[tasks."test:mutation"]
+description = "Check that the tests fail when the code they cover is changed"
+# Scoped to the layers a wrong answer is worst in: the approval record, the
+# transactional filesystem layer, the ambient inputs, and the trace. Run in a
+# git worktree rather than in place, because cargo-mutants edits the tree it
+# tests and this one is being worked in.
+run = [
+  "cargo mutants --in-place --file crates/deshell/src/approval.rs --file crates/deshell/src/patch.rs --file crates/deshell/src/host.rs --file crates/deshell/src/trace.rs --timeout 300",
 ]
 
 [tasks."test:supply-chain"]

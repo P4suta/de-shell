@@ -1,4 +1,21 @@
-#![allow(dead_code)]
+// The fuzz targets reach a handful of entry points; the rest of the crate comes
+// along because those entry points call into it. `expect` rather than `allow`
+// so it fails if it ever stops being true, and on the crate because this is a
+// property of the crate's shape rather than of any item in it.
+#![expect(
+    dead_code,
+    reason = "this crate is de-shell's modules compiled for four fuzz entry points; everything the entry points do not reach is dead by construction"
+)]
+
+// The modules of `crates/deshell/src/main.rs`, compiled for the fuzz entry
+// points. `cargo xtask fuzz-modules` holds the two lists equal, so a module
+// added to the binary is added here or named below — the nightly fuzz job is
+// the only thing that builds this crate, so a mismatch is otherwise invisible
+// until it runs.
+//
+// deshell-fuzz omits: cli, properties
+// `cli` is the command line, which no fuzz target enters; `properties` is
+// `#[cfg(test)]` and a fuzz build has no tests.
 
 #[path = "../../crates/deshell/src/agent_process.rs"]
 mod agent_process;
@@ -26,6 +43,8 @@ mod exporter;
 mod frontend;
 #[path = "../../crates/deshell/src/harden.rs"]
 mod harden;
+#[path = "../../crates/deshell/src/host.rs"]
+mod host;
 #[path = "../../crates/deshell/src/ir.rs"]
 mod ir;
 #[path = "../../crates/deshell/src/lab.rs"]
@@ -54,6 +73,8 @@ mod runner;
 mod scanner;
 #[path = "../../crates/deshell/src/strict_json.rs"]
 mod strict_json;
+#[path = "../../crates/deshell/src/trace.rs"]
+mod trace;
 #[path = "../../crates/deshell/src/verify.rs"]
 mod verify;
 #[path = "../../crates/deshell/src/workspace.rs"]
