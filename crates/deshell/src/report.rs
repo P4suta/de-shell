@@ -75,6 +75,18 @@ pub(crate) struct Item {
     pub message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub argv: Option<Vec<String>>,
+    /// Where in `path` the item is, as a half-open byte range.
+    ///
+    /// A reader that cannot ask a follow-up question needs the bytes, not a
+    /// sentence about them. `scan` printed the span for nobody: the structured
+    /// report is built by re-reading the human output, so it could only carry
+    /// what the prose carried, and the prose carried a locator like `run:118`.
+    /// A line number is not a span, and `deshell verify --require shell-free`
+    /// was meanwhile printing spans for 101 locations on one line.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_byte: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_byte: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -175,8 +187,23 @@ impl Report {
             .map_err(|error| error.to_string())
     }
 
+    /// The code of the failure this report carries, if it carries one.
+    fn failure_code(&self) -> Option<&str> {
+        self.details
+            .items
+            .iter()
+            .find(|item| item.kind.as_deref() == Some("failure"))
+            .and_then(|item| item.name.as_deref())
+    }
+
     pub(crate) fn emit_human(&self, writer: &mut dyn Write) -> std::io::Result<()> {
-        writeln!(writer, "{}", self.summary)?;
+        // A failed command names its code once, on the line that says what
+        // happened. The code used to arrive as a second output line repeating
+        // the summary verbatim.
+        match self.failure_code() {
+            Some(code) => writeln!(writer, "{code}: {}", self.summary)?,
+            None => writeln!(writer, "{}", self.summary)?,
+        }
         for line in &self.details.output {
             writeln!(writer, "{line}")?;
         }

@@ -1139,10 +1139,11 @@ fn command_report(parts: CommandReportArgs<'_>) -> crate::report::Report {
             message: Some(failure.message.clone()),
             ..crate::report::Item::default()
         });
-        report
-            .details
-            .output
-            .push(format!("{}: {}", failure.code, failure.message));
+        // The code is not pushed into `output` beside the summary. It used to
+        // be, and `emit_human` prints the summary and then every output line,
+        // so a failing gate said the same sentence twice — 101 locations' worth
+        // of it, before the message was bounded. `emit_human` reads the code off
+        // the item instead, and machines read it there too.
         report.next_actions.extend(failure.next_actions.clone());
     }
     for line in stdout.lines() {
@@ -1221,17 +1222,27 @@ fn command_report(parts: CommandReportArgs<'_>) -> crate::report::Report {
                         message: fields.get(2).map(|reason| (*reason).into()),
                         ..crate::report::Item::default()
                     },
-                    kind => crate::report::Item {
-                        kind: Some(kind.into()),
-                        path: Some(fields[1].into()),
-                        name: fields.get(2).map(|interpreter| (*interpreter).into()),
-                        status: fields.get(3).map(|confidence| (*confidence).into()),
-                        message: fields
-                            .get(4)
-                            .filter(|locator| **locator != "-")
-                            .map(|locator| (*locator).into()),
-                        ..crate::report::Item::default()
-                    },
+                    kind => {
+                        let span = fields
+                            .get(5)
+                            .and_then(|span| span.split_once(".."))
+                            .and_then(|(start, end)| {
+                                Some((start.parse().ok()?, end.parse().ok()?))
+                            });
+                        crate::report::Item {
+                            kind: Some(kind.into()),
+                            path: Some(fields[1].into()),
+                            name: fields.get(2).map(|interpreter| (*interpreter).into()),
+                            status: fields.get(3).map(|confidence| (*confidence).into()),
+                            message: fields
+                                .get(4)
+                                .filter(|locator| **locator != "-")
+                                .map(|locator| (*locator).into()),
+                            start_byte: span.map(|(start, _)| start),
+                            end_byte: span.map(|(_, end)| end),
+                            ..crate::report::Item::default()
+                        }
+                    }
                 };
                 report.details.items.push(item);
             }
@@ -1447,12 +1458,14 @@ fn dispatch(
                         writeln_io(
                             stdout,
                             format_args!(
-                                "{}\t{}\t{}\t{}\t{}",
+                                "{}\t{}\t{}\t{}\t{}\t{}..{}",
                                 finding_kind(&finding.kind),
                                 finding.path,
                                 finding.interpreter.as_deref().unwrap_or("unknown"),
                                 interpreter_confidence(&finding.interpreter_confidence),
                                 finding.locator.as_deref().unwrap_or("-"),
+                                finding.span.start_byte,
+                                finding.span.end_byte,
                             ),
                         )?;
                     }
@@ -2115,28 +2128,76 @@ fn shell_free_command(root: &Path, stdout: &mut dyn Write) -> Result<i32, Failur
         )));
     }
     if !inventory.findings.is_empty() {
-        let locations = inventory
-            .findings
-            .iter()
-            .map(|finding| {
-                format!(
-                    "{}:{}@{}..{}",
-                    finding_kind(&finding.kind),
-                    finding.path,
-                    finding.span.start_byte,
-                    finding.span.end_byte
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(Failure::shell_reintroduced(format!(
-            "live tree is not shell-free ({} location(s)): {locations}",
-            inventory.findings.len()
-        )));
+        return Err(shell_reintroduced_failure(&inventory));
     }
     crate::migration::verify_integrity(root).map_err(Failure::policy)?;
     writeln_io(stdout, format_args!("shell-free: verified"))?;
     Ok(0)
+}
+
+/// The failure a live shell location produces, said in a length somebody can
+/// read.
+///
+/// It used to name every location in one line. On this repository that is 101
+/// of them, printed twice — once as the message and once beside the diagnostic
+/// code — and a reader learns from it that there are a lot. The list itself is
+/// what `deshell scan` is for, and `--format json` now carries each byte span,
+/// so the failure names the shape and the next argv instead of inlining the
+/// inventory.
+///
+/// The first few are still here. A gate that says only "101 locations" makes a
+/// reader run another command to find out whether the answer is surprising.
+fn shell_reintroduced_failure(inventory: &crate::scanner::Inventory) -> Failure {
+    const NAMED: usize = 5;
+    let mut by_kind: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    let mut by_path: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for finding in &inventory.findings {
+        *by_kind.entry(finding_kind(&finding.kind)).or_default() += 1;
+        *by_path.entry(finding.path.as_str()).or_default() += 1;
+    }
+    let shape = by_kind
+        .iter()
+        .map(|(kind, count)| format!("{count} {kind}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let named = inventory
+        .findings
+        .iter()
+        .take(NAMED)
+        .map(|finding| {
+            format!(
+                "{}:{}@{}..{}",
+                finding_kind(&finding.kind),
+                finding.path,
+                finding.span.start_byte,
+                finding.span.end_byte
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let remaining = inventory.findings.len().saturating_sub(NAMED);
+    let tail = if remaining == 0 {
+        String::new()
+    } else {
+        format!(", and {remaining} more in {} file(s)", by_path.len())
+    };
+    Failure {
+        help: Some(format!(
+            "Every location is in `deshell scan --format json`, with the byte span of each. {shape}."
+        )),
+        next_actions: vec![crate::report::Action::Command {
+            argv: vec![
+                "deshell".into(),
+                "scan".into(),
+                "--format".into(),
+                "json".into(),
+            ],
+        }],
+        ..Failure::shell_reintroduced(format!(
+            "live tree is not shell-free ({} location(s)): {named}{tail}",
+            inventory.findings.len()
+        ))
+    }
 }
 
 fn scenario_synthesize_command(
@@ -5919,6 +5980,84 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("DESHELL_BLOCKER_INTERPRETER_CONFLICT")
+        );
+    }
+
+    /// A structured scan carries the bytes, not a sentence about them.
+    ///
+    /// The structured report is built by re-reading the human output, so it
+    /// could only carry what the prose carried — and the prose carried a
+    /// locator like `run:118`. A line number is not a span. Meanwhile
+    /// `verify --require shell-free` was printing spans for every location in
+    /// one line, so the information existed and reached only the face that
+    /// could not use it.
+    #[test]
+    fn a_structured_scan_carries_the_byte_span_of_every_location() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        let source = b"/usr/bin/printf hello\n";
+        configure(directory.path(), "build.sh", source);
+        let scan = invoke_owned(vec![
+            "deshell".into(),
+            "scan".into(),
+            "--root".into(),
+            path(directory.path()),
+            "--format".into(),
+            "json".into(),
+        ]);
+        assert_eq!(scan.0, 0, "{}", String::from_utf8_lossy(&scan.2));
+        let report: serde_json::Value = crate::strict_json::parse(&scan.1).unwrap();
+        let items = report["details"]["items"].as_array().unwrap();
+        assert!(!items.is_empty(), "{report}");
+        for item in items {
+            let start = item["start_byte"].as_u64().expect("a start byte");
+            let end = item["end_byte"].as_u64().expect("an end byte");
+            assert!(start < end, "{item}");
+            assert!(end <= source.len() as u64, "{item}");
+        }
+    }
+
+    /// A gate that fails names its code once and does not inline the inventory.
+    ///
+    /// It used to print every location in one line, and print that line twice —
+    /// once as the summary and once as an output line prefixed with the code.
+    /// On de-shell's own repository that is 101 locations, twice, and what a
+    /// reader learns is that there are a lot of them.
+    #[test]
+    fn a_failing_gate_says_its_code_once_and_points_at_the_full_list() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        for index in 0..8 {
+            configure(
+                directory.path(),
+                &format!("build{index}.sh"),
+                b"/usr/bin/printf hello\n",
+            );
+        }
+        let verified = invoke_owned(vec![
+            "deshell".into(),
+            "verify".into(),
+            "--root".into(),
+            path(directory.path()),
+            "--require".into(),
+            "shell-free".into(),
+        ]);
+        assert_eq!(verified.0, 4);
+        let text = String::from_utf8(verified.1).unwrap();
+        assert_eq!(
+            text.matches("DESHELL_SHELL_REINTRODUCED").count(),
+            1,
+            "the code is said more than once: {text}"
+        );
+        assert_eq!(
+            text.matches("live tree is not shell-free").count(),
+            1,
+            "the message is said more than once: {text}"
+        );
+        assert!(text.contains("and 3 more in"), "{text}");
+        assert!(
+            text.contains(r#"next argv: ["deshell","scan","--format","json"]"#),
+            "the failure does not say where the full list is: {text}"
         );
     }
 

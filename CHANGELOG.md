@@ -129,6 +129,15 @@ All notable changes are documented here. No compatibility contract predates
   lowered natively and would have printed the template where the step printed
   the value. Such a step is now a residual and the plan blocks.
 
+- Carried the byte span of every scanned location into the structured report.
+  The report is built by re-reading the human output, so it could only carry
+  what the prose carried, and the prose carried a locator like `run:118`. A
+  reader that cannot ask a follow-up question needs the bytes.
+- Bounded what a failing shell-free gate prints. It named every location in one
+  line and printed that line twice; on a repository with 101 locations a reader
+  learns from it that there are a lot. It now names the first few, says how many
+  more and in how many files, and gives the argv that lists them all.
+
 ### Removed
 
 - Pre-v1 Effect IR and lock migration promises.
