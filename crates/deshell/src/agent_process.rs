@@ -854,6 +854,154 @@ fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
     }
 }
 
+/// Why a request to a long-lived agent did not produce an answer.
+///
+/// `TimedOut` is separate from the rest for the same reason `LoweringFailure`
+/// separates `Unmeasured` from `Delegate`: a budget that ran out is not an
+/// answer about the input, and treating it as one makes a guarantee depend on
+/// how busy the machine was.
+#[derive(Debug)]
+pub(crate) enum AgentError {
+    TimedOut,
+    Ended(String),
+}
+
+/// A process that stays alive across requests, one framed line each way.
+///
+/// `execute` starts a process, sends it one thing and waits for it to die. That
+/// is the right shape for running a script and the wrong one for a parser: the
+/// PowerShell adapter has always been a loop over framed requests on stdin — a
+/// long-lived agent — and de-shell started one, sent one request and let it die,
+/// so every parse paid a process start.
+///
+/// Measured on this machine: one `pwsh` start is 0.26 s, and sixteen concurrent
+/// starts are 4.6 s each, because `pwsh` here resolves through a version-manager
+/// shim that serialises. Under the test suite's parallelism that reached the
+/// parser's ten-second budget. It had always been reaching it; before budget
+/// failures stopped being delegated silently, the answer was a block marked
+/// `delegated` instead of a visible failure.
+pub(crate) struct Agent {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    lines: std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    stderr: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+}
+
+impl Agent {
+    /// Start `argv` in `directory`, with the same cleared environment every
+    /// other process here gets.
+    pub(crate) fn start(directory: &Path, argv: &[String]) -> Result<Self, String> {
+        let executable = argv
+            .first()
+            .ok_or_else(|| "agent argv must name an executable".to_owned())?;
+        let mut command = std::process::Command::new(executable);
+        command
+            .args(&argv[1..])
+            .current_dir(directory)
+            .env_clear()
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        add_essential_environment(&mut command);
+        let mut child = command
+            .spawn()
+            .map_err(|error| format!("cannot start {executable}: {error}"))?;
+        let stdin = child.stdin.take().ok_or("agent stdin is unavailable")?;
+        let stdout = child.stdout.take().ok_or("agent stdout is unavailable")?;
+        let child_stderr = child.stderr.take().ok_or("agent stderr is unavailable")?;
+
+        // Read on a thread so a request can wait with a budget, and drain stderr
+        // on another so a talkative agent cannot fill its pipe and block.
+        let (sender, lines) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            let mut reader = std::io::BufReader::new(stdout);
+            loop {
+                let mut line = Vec::new();
+                match reader.read_until(b'\n', &mut line) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        while matches!(line.last(), Some(b'\n' | b'\r')) {
+                            line.pop();
+                        }
+                        if sender.send(Ok(line)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = sender.send(Err(error));
+                        break;
+                    }
+                }
+            }
+        });
+        let stderr = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let drain = std::sync::Arc::clone(&stderr);
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut reader = child_stderr;
+            let mut buffer = [0_u8; 4096];
+            while let Ok(read) = reader.read(&mut buffer) {
+                if read == 0 {
+                    break;
+                }
+                if let Ok(mut held) = drain.lock() {
+                    held.extend_from_slice(&buffer[..read]);
+                }
+            }
+        });
+        Ok(Self {
+            child,
+            stdin,
+            lines,
+            stderr,
+        })
+    }
+
+    /// Send one line and wait for one back, for at most `budget`.
+    pub(crate) fn request(&mut self, line: &[u8], budget: Duration) -> Result<Vec<u8>, AgentError> {
+        use std::io::Write;
+        self.stdin
+            .write_all(line)
+            .and_then(|()| self.stdin.write_all(b"\n"))
+            .and_then(|()| self.stdin.flush())
+            .map_err(|error| AgentError::Ended(format!("cannot write to the agent: {error}")))?;
+        match self.lines.recv_timeout(budget) {
+            Ok(Ok(line)) => Ok(line),
+            Ok(Err(error)) => Err(AgentError::Ended(format!(
+                "cannot read from the agent: {error}"
+            ))),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(AgentError::TimedOut),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Err(AgentError::Ended(self.ending()))
+            }
+        }
+    }
+
+    /// What the agent said on its way out, for a message a reader can act on.
+    fn ending(&self) -> String {
+        let stderr = self
+            .stderr
+            .lock()
+            .map(|held| String::from_utf8_lossy(&held).trim().to_owned())
+            .unwrap_or_default();
+        if stderr.is_empty() {
+            "the agent ended without answering".into()
+        } else {
+            format!("the agent ended without answering: {stderr}")
+        }
+    }
+}
+
+impl Drop for Agent {
+    fn drop(&mut self) {
+        // Closing stdin is how the adapter's read loop ends. Killing follows in
+        // case it does not, so a dropped agent never outlives the run.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 #[cfg(test)]
 // Tests reach for the raw APIs on purpose: they stage corrupt trees, race two
 // writers against one path, and assert on what the transactional layer does with

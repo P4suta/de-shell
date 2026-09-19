@@ -979,7 +979,14 @@ fn is_make_or_package_path(path: &str) -> bool {
         || filename == "package.json"
 }
 
-fn is_github_workflow_path(path: &str) -> bool {
+/// Whether this path is a GitHub workflow.
+///
+/// `pub(crate)` because the frontend asks the same question: a workflow step's
+/// `run:` text is a template the runner substitutes before any shell sees it,
+/// and the frontend has to know that before it claims to have lowered a
+/// program. One definition, because two would be two places for the answer to
+/// drift.
+pub(crate) fn is_github_workflow_path(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     lower.starts_with(".github/workflows/") && (lower.ends_with(".yml") || lower.ends_with(".yaml"))
 }

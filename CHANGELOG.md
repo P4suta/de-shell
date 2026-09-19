@@ -118,6 +118,17 @@ All notable changes are documented here. No compatibility contract predates
   such candidate fell to the whole-file fallback: running de-shell on its own
   repository produced seven blockers on one golden corpus that all read `@0..1`.
 
+- Kept the PowerShell parser running instead of starting one process per parse.
+  `adapters/powershell/adapter.ps1` has always been a loop over framed requests
+  on stdin; de-shell started one, sent one request and let it die. Measured on
+  macOS: one `pwsh` start is 0.26 s and sixteen concurrent starts are 4.6 s each,
+  which under a parallel test run reached the parser's ten-second budget.
+- Refused to lower a GitHub workflow step whose `run:` holds a `${{ }}`
+  expression. The runner substitutes it before any shell sees it, so the bytes
+  the scanner read are a template; `run: /bin/echo '${{ matrix.os }}'` was
+  lowered natively and would have printed the template where the step printed
+  the value. Such a step is now a residual and the plan blocks.
+
 ### Removed
 
 - Pre-v1 Effect IR and lock migration promises.

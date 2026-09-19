@@ -170,41 +170,49 @@ pub(crate) fn lower(
         return Err(format!("unknown interpreter is rejected by policy: {name}"));
     }
 
-    let lowered = match std::str::from_utf8(source) {
-        Err(_) => Err("source is not valid UTF-8 and cannot be statically lowered".into()),
-        Ok(text) => match interpreter {
-            Interpreter::Sh | Interpreter::Bash | Interpreter::Zsh => validate_tree_sitter_cst(
-                &normalized,
-                text,
-                tree_sitter_bash::LANGUAGE.into(),
-                "tree-sitter-bash/0.25.1",
-            )
-            .and_then(|()| lower_posix(&normalized, text, &interpreter)),
-            Interpreter::Fish => {
-                validate_fish_cst(&normalized, text).and_then(|()| lower_fish(&normalized, text))
-            }
-            Interpreter::Cmd => {
-                validate_cmd_cst(&normalized, text).and_then(|()| lower_cmd(&normalized, text))
-            }
-            // These two start a process, so they are the only lowerings that
-            // can end without an answer. `Unmeasured` leaves this function
-            // rather than joining the delegation path below: a guarantee that
-            // depends on whether a parser finished in time is not a guarantee.
-            Interpreter::Powershell => match validate_powershell_syntax(&normalized, text) {
-                Ok(()) => lower_powershell(&normalized, text),
-                Err(LoweringFailure::Delegate(reason)) => Err(reason),
-                Err(failure @ LoweringFailure::Unmeasured(_)) => return Err(failure.message()),
+    // Asked before any parser runs: whether these bytes are a program at all is
+    // a question about the host, not about the shell grammar, and the grammar
+    // answered it by accident for three shapes and wrongly for the rest.
+    let substituted =
+        std::str::from_utf8(source).is_ok_and(|text| holds_a_host_substitution(&normalized, text));
+    let lowered = if substituted {
+        Err("the step holds a GitHub expression, which the runner substitutes before any shell sees it; these bytes are a template rather than a program".into())
+    } else {
+        match std::str::from_utf8(source) {
+            Err(_) => Err("source is not valid UTF-8 and cannot be statically lowered".into()),
+            Ok(text) => match interpreter {
+                Interpreter::Sh | Interpreter::Bash | Interpreter::Zsh => validate_tree_sitter_cst(
+                    &normalized,
+                    text,
+                    tree_sitter_bash::LANGUAGE.into(),
+                    "tree-sitter-bash/0.25.1",
+                )
+                .and_then(|()| lower_posix(&normalized, text, &interpreter)),
+                Interpreter::Fish => validate_fish_cst(&normalized, text)
+                    .and_then(|()| lower_fish(&normalized, text)),
+                Interpreter::Cmd => {
+                    validate_cmd_cst(&normalized, text).and_then(|()| lower_cmd(&normalized, text))
+                }
+                // These two start a process, so they are the only lowerings that
+                // can end without an answer. `Unmeasured` leaves this function
+                // rather than joining the delegation path below: a guarantee that
+                // depends on whether a parser finished in time is not a guarantee.
+                Interpreter::Powershell => match validate_powershell_syntax(&normalized, text) {
+                    Ok(()) => lower_powershell(&normalized, text),
+                    Err(LoweringFailure::Delegate(reason)) => Err(reason),
+                    Err(failure @ LoweringFailure::Unmeasured(_)) => return Err(failure.message()),
+                },
+                Interpreter::Nushell => match validate_nushell_syntax(&normalized, text) {
+                    Ok(()) => lower_nushell(&normalized, text, &interpreter),
+                    Err(LoweringFailure::Delegate(reason)) => Err(reason),
+                    Err(failure @ LoweringFailure::Unmeasured(_)) => return Err(failure.message()),
+                },
+                Interpreter::Unknown(_) => Err(format!(
+                    "{} frontend is trace-only; unobserved behavior is not claimed as verified",
+                    interpreter.name()
+                )),
             },
-            Interpreter::Nushell => match validate_nushell_syntax(&normalized, text) {
-                Ok(()) => lower_nushell(&normalized, text, &interpreter),
-                Err(LoweringFailure::Delegate(reason)) => Err(reason),
-                Err(failure @ LoweringFailure::Unmeasured(_)) => return Err(failure.message()),
-            },
-            Interpreter::Unknown(_) => Err(format!(
-                "{} frontend is trace-only; unobserved behavior is not claimed as verified",
-                interpreter.name()
-            )),
-        },
+        }
     };
 
     let (body, inputs, environment, invocation, platform_capabilities, nounset, mut tasks) =
@@ -220,7 +228,10 @@ pub(crate) fn lower(
             ),
             Err(reason) => {
                 let analysis = conservative_source_analysis(source, &interpreter, &reason);
-                let body = if matches!(interpreter, Interpreter::Unknown(_)) {
+                // A template is a residual for the same reason an unknown
+                // interpreter is: nothing here can say what it does, so nothing
+                // claims to.
+                let body = if substituted || matches!(interpreter, Interpreter::Unknown(_)) {
                     residual_node(&normalized, source, interpreter.name(), reason)
                 } else {
                     delegated_node(DelegatedNodeArgs {
@@ -531,6 +542,46 @@ fn secret_name(name: &str) -> bool {
     ]
     .iter()
     .any(|marker| upper.contains(marker))
+}
+
+/// The host a lowering path belongs to.
+///
+/// [`lower_with_interpreter`] appends `.deshell.<extension>` so that the right
+/// parser is chosen for an embedded block; the host is what is left when that
+/// comes off. Written once so the question below is asked the same way whether a
+/// caller came through the embedded path or the direct one.
+fn host_path_of(path: &str) -> &str {
+    match path.rfind(".deshell.") {
+        Some(index) => &path[..index],
+        None => path,
+    }
+}
+
+/// Whether these bytes are a GitHub workflow step holding an expression the
+/// runner substitutes before any shell sees them.
+///
+/// `${{ ... }}` is not shell. GitHub evaluates it while writing the script file,
+/// so the bytes the scanner read are a template and the bytes bash receives are
+/// something else.
+///
+/// This looked handled because `tree-sitter-bash` rejects some of the shapes, so
+/// they were delegated with a parse error. `bash -n` accepts all of them, and
+/// the shapes tree-sitter accepts went through: measured here,
+/// `run: /bin/echo '${{ matrix.os }}'` lowers to
+/// `argv = ["/bin/echo", "${{ matrix.os }}"]` and is claimed `native`. Once the
+/// step becomes `uses: ./.github/actions/...` the expression sits inside a
+/// generated file, where GitHub does not substitute, so the program prints the
+/// template where the step printed the value.
+///
+/// Verification does not catch it. It runs the original from the same template,
+/// so the baseline is a program the runner never runs and the two agree.
+///
+/// Neither guarantee is available: `native` claims a program that is not these
+/// bytes, and `delegated` would run the template under bash, which is also not
+/// what happens. So nothing is claimed and the plan blocks — the shell is
+/// visible, and what it does is not.
+fn holds_a_host_substitution(path: &str, source: &str) -> bool {
+    crate::migration::is_github_workflow_path(host_path_of(path)) && source.contains("${{")
 }
 
 fn residual_node(path: &str, source: &[u8], interpreter: &str, reason: String) -> Node {
@@ -1332,91 +1383,119 @@ fn execute_parser_process(
     Ok(outcome)
 }
 
-fn validate_powershell_syntax(path: &str, source: &str) -> Result<(), LoweringFailure> {
+/// The PowerShell parser, started once and kept.
+///
+/// `adapters/powershell/adapter.ps1` has always been a loop over framed requests
+/// on stdin. de-shell started one, sent one request and let it die, so every
+/// parse paid a process start — 0.26 s alone, 4.6 s when sixteen ran at once,
+/// because `pwsh` here resolves through a version-manager shim that serialises.
+/// Under the test suite's parallelism that reached the ten-second budget, and
+/// once a budget failure stopped being quietly delegated it became a visible
+/// intermittent failure. It had been reaching the budget all along; what changed
+/// was that somebody could see it.
+///
+/// A `Mutex` rather than a pool: the cost was starting, not parsing, so one
+/// agent answering in turn is both faster than many and simpler to reason about.
+/// A failed request drops the agent, so the next parse starts a fresh one.
+static POWERSHELL_PARSER: std::sync::Mutex<Option<PowershellParser>> = std::sync::Mutex::new(None);
+
+struct PowershellParser {
+    agent: crate::agent_process::Agent,
+    /// Holds `adapter.ps1` for as long as the agent runs.
+    _directory: tempfile::TempDir,
+}
+
+/// How long one parse may take.
+///
+/// Unchanged. What changed is what it now measures: a parse, rather than a
+/// parse plus a process start plus whatever a version manager was doing.
+const POWERSHELL_PARSE_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn start_powershell_parser() -> Result<PowershellParser, String> {
     let directory = tempfile::Builder::new()
         .prefix("deshell-powershell-parser-")
         .tempdir()
-        .map_err(|error| {
-            LoweringFailure::Delegate(format!("runtime unavailable for {path}: {error}"))
-        })?;
+        .map_err(|error| error.to_string())?;
     let adapter = directory.path().join("adapter.ps1");
     crate::patch::scratch::write(
         &adapter,
         include_bytes!("../../../adapters/powershell/adapter.ps1"),
     )
-    .map_err(|error| {
-        LoweringFailure::Delegate(format!("runtime unavailable for {path}: {error}"))
-    })?;
+    .map_err(|error| error.to_string())?;
+    let agent = crate::agent_process::Agent::start(
+        &parser_working_directory(directory.path()),
+        &[
+            "pwsh".into(),
+            "-NoLogo".into(),
+            "-NoProfile".into(),
+            "-NonInteractive".into(),
+            "-File".into(),
+            adapter.to_string_lossy().into_owned(),
+        ],
+    )?;
+    Ok(PowershellParser {
+        agent,
+        _directory: directory,
+    })
+}
+
+/// Ask the parser one question, starting it if it is not running.
+///
+/// Every failure drops the agent. A parser that stopped answering is not one to
+/// ask again, and a fresh one costs a single process start.
+fn ask_powershell_parser(request: &[u8]) -> Result<Vec<u8>, LoweringFailure> {
+    let mut held = POWERSHELL_PARSER
+        .lock()
+        .map_err(|_| LoweringFailure::Delegate("the PowerShell parser lock is poisoned".into()))?;
+    if held.is_none() {
+        *held = Some(start_powershell_parser().map_err(LoweringFailure::Delegate)?);
+    }
+    let parser = held
+        .as_mut()
+        .ok_or_else(|| LoweringFailure::Delegate("the PowerShell parser is not running".into()))?;
+    match parser.agent.request(request, POWERSHELL_PARSE_BUDGET) {
+        Ok(line) => Ok(line),
+        Err(error) => {
+            *held = None;
+            Err(agent_failure(error))
+        }
+    }
+}
+
+/// What an agent's failure means for a lowering.
+///
+/// The same split `unmeasured_outcome` makes for a one-shot process, stated for
+/// a long-lived one: a budget that ran out is not an answer about the source,
+/// and an agent that ended is the runtime being unavailable. A named function
+/// rather than an inline `match`, so a test can ask it directly instead of a
+/// source guard asking whether the right words appear in the right function.
+fn agent_failure(error: crate::agent_process::AgentError) -> LoweringFailure {
+    match error {
+        crate::agent_process::AgentError::TimedOut => LoweringFailure::Unmeasured(
+            "parser process exceeded its time budget, so the source was not examined".into(),
+        ),
+        crate::agent_process::AgentError::Ended(message) => LoweringFailure::Delegate(message),
+    }
+}
+
+fn validate_powershell_syntax(path: &str, source: &str) -> Result<(), LoweringFailure> {
     let request = serde_json::json!({
         "id": "parse",
         "jsonrpc": "2.0",
         "method": "frontend.parse",
         "params": {"source": source}
     });
-    let mut input = crate::canonical_json::canonical_bytes(&request).map_err(|error| {
+    let input = crate::canonical_json::canonical_bytes(&request).map_err(|error| {
         LoweringFailure::Delegate(format!("runtime unavailable for {path}: {error}"))
     })?;
-    input.push(b'\n');
-    let outcome = crate::agent_process::execute(
-        &parser_working_directory(directory.path()),
-        crate::agent_process::Request {
-            argv: vec![
-                "pwsh".into(),
-                "-NoLogo".into(),
-                "-NoProfile".into(),
-                "-NonInteractive".into(),
-                "-File".into(),
-                adapter.to_string_lossy().into_owned(),
-            ],
-            environment: Vec::new(),
-            working_directory: None,
-            stdin: input,
-            limits: crate::agent_process::Limits {
-                timeout_ms: 10_000,
-                memory_bytes: 8 * 1024 * 1024 * 1024,
-                processes: 1024,
-                stdout_bytes: 16 * 1024 * 1024,
-                stderr_bytes: 1024 * 1024,
-            },
-        },
-    )
-    .map_err(|error| {
-        parser_failure(
-            path,
-            "PowerShell Parser.ParseInput",
-            LoweringFailure::Delegate(error),
-        )
-    })?;
-    // The same split `execute_parser_process` makes: a budget that ran out or a
-    // parser that died is not an answer about the source. This validator starts
-    // its process directly because it also writes an adapter and speaks JSON-RPC
-    // over stdin, so the branch is stated twice and
-    // `budget_failures_are_not_delegations` checks both.
-    if let Some(unmeasured) = unmeasured_outcome(&outcome) {
-        return Err(parser_failure(
-            path,
-            "PowerShell Parser.ParseInput",
-            unmeasured,
-        ));
-    }
-    if outcome.exit_code != 0 || !outcome.stderr.is_empty() {
+    let frame = ask_powershell_parser(&input)
+        .map_err(|failure| parser_failure(path, "PowerShell Parser.ParseInput", failure))?;
+    if frame.is_empty() {
         return Err(LoweringFailure::Delegate(format!(
-            "runtime unavailable for {path} (PowerShell Parser.ParseInput): exit={} stderr={}",
-            outcome.exit_code,
-            String::from_utf8_lossy(&outcome.stderr)
+            "runtime unavailable for {path} (PowerShell Parser.ParseInput): the parser answered with an empty frame"
         )));
     }
-    let frames = outcome
-        .stdout
-        .split(|byte| *byte == b'\n')
-        .map(|frame| frame.strip_suffix(b"\r").unwrap_or(frame))
-        .filter(|frame| !frame.is_empty())
-        .collect::<Vec<_>>();
-    if frames.len() != 1 {
-        return Err(LoweringFailure::Delegate(format!(
-            "runtime unavailable for {path} (PowerShell Parser.ParseInput): expected one response frame"
-        )));
-    }
+    let frames = [frame.as_slice()];
     let result = crate::protocol::decode_response(frames[0], &serde_json::json!("parse")).map_err(
         |error| format!("runtime unavailable for {path} (PowerShell Parser.ParseInput): {error}"),
     )?;
@@ -5682,34 +5761,54 @@ mod tests {
         );
     }
 
-    /// The two parser validators classify a budget failure the same way.
+    /// Both parser paths classify a budget failure the same way.
     ///
-    /// They have to state the branch separately — the PowerShell one writes an
-    /// adapter and speaks JSON-RPC over stdin, so it starts its process itself
-    /// rather than through `execute_parser_process` — and two statements of one
-    /// rule are two places for it to drift. Both call `unmeasured_outcome`, and
-    /// this is what says they still do.
+    /// There are two, because one parser is a one-shot process and the other is
+    /// a long-lived agent, and each states the rule for its own shape. Asked
+    /// behaviourally rather than by reading the source for the right words: this
+    /// test used to check that both functions mentioned `unmeasured_outcome`,
+    /// and when the PowerShell path moved to an agent the guard failed for the
+    /// right reason and said nothing useful about whether the rule still held.
     #[test]
-    fn both_parser_validators_route_a_budget_failure_through_one_rule() {
-        let source = include_str!("frontend.rs");
-        let powershell = source
-            .split_once("fn validate_powershell_syntax")
-            .expect("the PowerShell validator")
-            .1;
-        let powershell = powershell.split_once("\nfn ").expect("its end").0;
-        assert!(
-            powershell.contains("unmeasured_outcome("),
-            "the PowerShell validator stopped routing budget failures through the shared rule"
-        );
-        let parser_process = source
-            .split_once("fn execute_parser_process")
-            .expect("the shared parser runner")
-            .1;
-        let parser_process = parser_process.split_once("\nfn ").expect("its end").0;
-        assert!(
-            parser_process.contains("unmeasured_outcome("),
-            "the shared parser runner stopped routing budget failures through the shared rule"
-        );
+    fn both_parser_paths_route_a_budget_failure_away_from_delegation() {
+        assert!(matches!(
+            agent_failure(crate::agent_process::AgentError::TimedOut),
+            LoweringFailure::Unmeasured(_)
+        ));
+        assert!(matches!(
+            agent_failure(crate::agent_process::AgentError::Ended("gone".into())),
+            LoweringFailure::Delegate(_)
+        ));
+        assert!(matches!(
+            unmeasured_outcome(&crate::agent_process::Outcome {
+                exit_code: 0,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                timed_out: true,
+                limit_exceeded: None,
+                signal: None,
+            }),
+            Some(LoweringFailure::Unmeasured(_))
+        ));
+    }
+
+    /// An agent that does not answer within its budget times out rather than
+    /// waiting forever.
+    #[test]
+    fn an_agent_that_does_not_answer_runs_out_of_its_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut agent = crate::agent_process::Agent::start(
+            directory.path(),
+            &["sh".into(), "-c".into(), "sleep 30".into()],
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        let answer = agent.request(b"{}", std::time::Duration::from_millis(250));
+        assert!(matches!(
+            answer,
+            Err(crate::agent_process::AgentError::TimedOut)
+        ));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 
     /// A parser runs where de-shell runs, not in its own scratch directory.
