@@ -14,6 +14,14 @@ use clap::{Parser, Subcommand, ValueEnum};
 struct Cli {
     #[arg(long, global = true, value_enum, default_value = "human")]
     diagnostics: crate::diagnostics::Mode,
+    /// Record what this run did. Off unless asked for, and never on stdout.
+    #[arg(long, global = true, value_enum, default_value = "off")]
+    trace: crate::trace::Mode,
+    /// Where the trace goes. Standard error when a trace was asked for and no
+    /// path was given, because a trace that lands in a file nobody named is a
+    /// trace nobody reads.
+    #[arg(long = "trace-output", global = true, value_name = "PATH")]
+    trace_output: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -467,6 +475,7 @@ enum ExportTarget {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum SchemaName {
     Approval,
+    Trace,
     #[value(name = "init-report")]
     InitReport,
     #[value(name = "scan-report")]
@@ -1050,6 +1059,20 @@ where
         }
     };
     let diagnostic_mode = cli.diagnostics;
+    // Started before anything else runs, so the first thing the trace holds is
+    // the first thing the run did. Stopped by the guard on every path out,
+    // including the early returns below.
+    let _recording = match start_recording(cli.trace, cli.trace_output.as_deref()) {
+        Ok(recording) => recording,
+        Err(message) => {
+            // A run that was asked to record and silently did not is worse than
+            // one that stops: the absence of an event would read as the absence
+            // of the work.
+            let diagnostic = crate::diagnostics::Diagnostic::error("DESHELL_IO", message);
+            let _ = crate::diagnostics::emit(stderr, diagnostic_mode, &diagnostic);
+            return 1;
+        }
+    };
     let mut command = cli.command;
     if let Some(spec) = command.report_spec() {
         command.force_human_report_source();
@@ -1121,6 +1144,47 @@ where
             }
         }
     }
+}
+
+/// Recording, for as long as this is held.
+///
+/// A guard rather than a call beside each `return`: `run_from` leaves by five
+/// paths and a trace that stops on four of them is a trace whose end means
+/// nothing.
+struct Recording(crate::trace::Mode);
+
+impl Drop for Recording {
+    fn drop(&mut self) {
+        match self.0 {
+            crate::trace::Mode::Off => {}
+            crate::trace::Mode::Jsonl => crate::trace::stop(),
+        }
+    }
+}
+
+fn start_recording(mode: crate::trace::Mode, output: Option<&Path>) -> Result<Recording, String> {
+    match mode {
+        crate::trace::Mode::Off => {
+            if let Some(path) = output {
+                return Err(format!(
+                    "--trace-output {} was given without --trace; a destination with nothing to write to it is a request that did not happen",
+                    path.display()
+                ));
+            }
+        }
+        crate::trace::Mode::Jsonl => {
+            let sink: Box<dyn std::io::Write + Send> = match output {
+                Some(path) => Box::new(std::fs::File::create(path).map_err(|error| {
+                    format!("cannot write the trace to {}: {error}", path.display())
+                })?),
+                // Standard error, because stdout carries the command's answer
+                // and a trace must never change those bytes.
+                None => Box::new(std::io::stderr()),
+            };
+            crate::trace::start(sink);
+        }
+    }
+    Ok(Recording(mode))
 }
 
 fn failure_diagnostic(failure: Failure) -> crate::diagnostics::Diagnostic {
@@ -2137,6 +2201,7 @@ fn schema(name: SchemaName) -> &'static [u8] {
         SchemaName::Diagnostic => {
             include_bytes!("../../../contracts/schema/diagnostic-v1.schema.json")
         }
+        SchemaName::Trace => include_bytes!("../../../contracts/schema/trace-v1.schema.json"),
         SchemaName::Protocol => include_bytes!("../../../contracts/schema/protocol-v1.schema.json"),
         SchemaName::Project => include_bytes!("../../../contracts/schema/project-v1.schema.json"),
         SchemaName::Scenario => include_bytes!("../../../contracts/schema/scenario-v1.schema.json"),
@@ -3479,7 +3544,8 @@ fn observed_interpreter_builds() -> serde_json::Value {
         ("powershell", "pwsh", "--version"),
         ("nushell", "nu", "--version"),
     ] {
-        let Ok(output) = std::process::Command::new(program).arg(argument).output() else {
+        let Ok(output) = crate::host::output(std::process::Command::new(program).arg(argument))
+        else {
             continue;
         };
         if !output.status.success() {
@@ -5228,6 +5294,67 @@ mod tests {
             reported.message.as_deref(),
             Some("scan printed the unmodelled location kind 'future_kind'")
         );
+    }
+
+    /// The same input twice produces the same trace, apart from how long it
+    /// took.
+    ///
+    /// de-shell's contract is deterministic output and canonical digest bytes,
+    /// and until now that was a claim about stdout only. A trace says what the
+    /// run *did*, so comparing two of them checks the same property one layer
+    /// down: the same files staged, in the same order, with the same digests,
+    /// after the same readings of the environment.
+    ///
+    /// `elapsed_nanos` is the one field that cannot match, which is why it is a
+    /// field of its own and not folded into the event.
+    #[test]
+    fn the_same_work_twice_records_the_same_trace_apart_from_its_timing() {
+        let run = || {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().to_path_buf();
+            std::fs::write(root.join("build.sh"), b"#!/bin/sh\nprintf hi\n").unwrap();
+            let text = crate::trace::testing::recorded(|| {
+                let mut stdout = Vec::new();
+                let mut stderr = Vec::new();
+                let code = run_from(
+                    [
+                        "deshell",
+                        "init",
+                        "--root",
+                        &root.to_string_lossy(),
+                        "--target",
+                        "rust",
+                    ],
+                    &mut stdout,
+                    &mut stderr,
+                );
+                assert_eq!(code, 0, "{}", String::from_utf8_lossy(&stderr));
+            });
+            // The temporary directory is part of the path, so it is removed the
+            // same way from both: what is being compared is the work, not where
+            // it happened.
+            let root = root.canonicalize().unwrap().to_string_lossy().into_owned();
+            crate::trace::testing::events(&text)
+                .into_iter()
+                .map(|mut event| {
+                    let object = event.as_object_mut().unwrap();
+                    object.remove("elapsed_nanos");
+                    let rendered = serde_json::to_string(&object).unwrap();
+                    rendered.replace(&root, "<root>")
+                })
+                .collect::<Vec<_>>()
+        };
+        let first = run();
+        let second = run();
+        assert!(!first.is_empty());
+        assert_eq!(first, second);
+        // And it is a trace of the work, not an empty one that trivially
+        // matches: `init` writes these four and reads no environment.
+        let committed = first
+            .iter()
+            .filter(|line| line.contains(r#""event":"file_commit""#))
+            .count();
+        assert_eq!(committed, 4, "{first:#?}");
     }
 
     fn invoke(args: &[&str]) -> (i32, Vec<u8>, Vec<u8>) {

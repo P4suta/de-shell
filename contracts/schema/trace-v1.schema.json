@@ -1,0 +1,350 @@
+{
+  "$id": "https://deshell.dev/contracts/trace/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "One record per line. Every event de-shell can record, and nothing else.",
+  "oneOf": [
+    {
+      "additionalProperties": false,
+      "properties": {
+        "created": {
+          "type": "boolean"
+        },
+        "elapsed_nanos": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "event": {
+          "const": "directory_create"
+        },
+        "path": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 1
+        },
+        "sequence": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "created",
+        "elapsed_nanos",
+        "event",
+        "path",
+        "schema_version",
+        "sequence"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "bytes": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "elapsed_nanos": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "event": {
+          "const": "file_stage"
+        },
+        "path": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 1
+        },
+        "sequence": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "bytes",
+        "elapsed_nanos",
+        "event",
+        "path",
+        "schema_version",
+        "sequence"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "digest": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "elapsed_nanos": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "event": {
+          "const": "file_commit"
+        },
+        "path": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 1
+        },
+        "sequence": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "digest",
+        "elapsed_nanos",
+        "event",
+        "path",
+        "schema_version",
+        "sequence"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "elapsed_nanos": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "event": {
+          "const": "file_remove"
+        },
+        "path": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 1
+        },
+        "sequence": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "elapsed_nanos",
+        "event",
+        "path",
+        "schema_version",
+        "sequence"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "elapsed_nanos": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "event": {
+          "const": "file_rollback"
+        },
+        "path": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 1
+        },
+        "sequence": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "elapsed_nanos",
+        "event",
+        "path",
+        "schema_version",
+        "sequence"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "elapsed_nanos": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "event": {
+          "const": "environment_read"
+        },
+        "name": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "present": {
+          "type": "boolean"
+        },
+        "schema_version": {
+          "const": 1
+        },
+        "sequence": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "elapsed_nanos",
+        "event",
+        "name",
+        "present",
+        "schema_version",
+        "sequence"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "elapsed_nanos": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "event": {
+          "const": "clock_read"
+        },
+        "schema_version": {
+          "const": 1
+        },
+        "sequence": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "elapsed_nanos",
+        "event",
+        "schema_version",
+        "sequence"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "bytes": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "digest": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "elapsed_nanos": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "event": {
+          "const": "digest"
+        },
+        "schema_version": {
+          "const": 1
+        },
+        "sequence": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "bytes",
+        "digest",
+        "elapsed_nanos",
+        "event",
+        "schema_version",
+        "sequence"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "argv": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "elapsed_nanos": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "event": {
+          "const": "process_start"
+        },
+        "program": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 1
+        },
+        "sequence": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "argv",
+        "elapsed_nanos",
+        "event",
+        "program",
+        "schema_version",
+        "sequence"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "elapsed_nanos": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "event": {
+          "const": "process_exit"
+        },
+        "program": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 1
+        },
+        "sequence": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "code",
+        "elapsed_nanos",
+        "event",
+        "program",
+        "schema_version",
+        "sequence"
+      ],
+      "type": "object"
+    }
+  ],
+  "title": "de-shell trace v1"
+}

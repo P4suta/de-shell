@@ -3,7 +3,15 @@ use std::io::Read;
 use std::path::Path;
 
 pub(crate) fn sha256(bytes: &[u8]) -> String {
-    lowercase_hex(Sha256::digest(bytes))
+    let digest = lowercase_hex(Sha256::digest(bytes));
+    // The length and the answer, never the input. Two runs that disagree
+    // disagree here first, and this is where a reader sees which bytes moved
+    // without the bytes themselves being written down.
+    crate::trace::record(|| crate::trace::Event::Digest {
+        bytes: bytes.len() as u64,
+        digest: digest.clone(),
+    });
+    digest
 }
 
 pub(crate) fn lowercase_hex(bytes: impl AsRef<[u8]>) -> String {

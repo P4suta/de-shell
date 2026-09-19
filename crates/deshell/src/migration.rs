@@ -4586,13 +4586,14 @@ fn rust_variable_binding(body: &crate::ir::Node, locals: Locals) -> String {
 }
 
 fn rustfmt_generated(source: &[u8]) -> Result<Vec<u8>, String> {
-    let mut child = std::process::Command::new("rustfmt")
-        .args(["--edition", "2024", "--emit", "stdout"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("official Rust generator requires rustfmt: {error}"))?;
+    let mut child = crate::host::spawn(
+        std::process::Command::new("rustfmt")
+            .args(["--edition", "2024", "--emit", "stdout"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped()),
+    )
+    .map_err(|error| format!("official Rust generator requires rustfmt: {error}"))?;
     child
         .stdin
         .take()

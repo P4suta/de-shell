@@ -667,19 +667,15 @@ fn valid_git_marker(root: &Path) -> bool {
 }
 
 fn git_inventory(root: &Path) -> Result<Vec<(String, PathBuf)>, String> {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args([
-            "ls-files",
-            "--cached",
-            "--others",
-            "--exclude-standard",
-            "-z",
-            "--",
-        ])
-        .output()
-        .map_err(|error| format!("cannot run git inventory: {error}"))?;
+    let output = crate::host::output(std::process::Command::new("git").arg("-C").arg(root).args([
+        "ls-files",
+        "--cached",
+        "--others",
+        "--exclude-standard",
+        "-z",
+        "--",
+    ]))
+    .map_err(|error| format!("cannot run git inventory: {error}"))?;
     if !output.status.success() {
         return Err(format!(
             "git inventory failed with status {}: {}",

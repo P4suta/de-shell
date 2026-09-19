@@ -33,6 +33,34 @@ All notable changes are documented here. No compatibility contract predates
   dependency-policy and coverage floors, a CycloneDX SBOM, checksums, keyless
   signatures, provenance, smoke tests, and protected crates.io publication.
 
+- Trace v1: `--trace off|jsonl` and `--trace-output PATH`, `deshell schema
+  trace`, `contracts/trace-v1.md` and `contracts/schema/trace-v1.schema.json`.
+  Off by default, never on stdout, and `--trace-output` without `--trace` is a
+  usage error rather than a request that quietly does not happen.
+
+  `--diagnostics` explains a failure to somebody who hit one and says nothing
+  about a run that succeeded. A trace says what the run *did*: which files it
+  staged and committed with which digests in which order, which environment
+  variables it read and whether they were set, which processes it started with
+  the exact argv and how each ended. The approval race that blocked this
+  repository's CI was a write that no record named.
+
+  No event carries a value read from outside — a variable contributes its name
+  and whether it was set, a file its path, length and digest, a process its
+  argv and exit code, the clock only that it was read. That is a property of
+  the vocabulary rather than of each call site, so it holds for a caller who
+  has not thought about it.
+
+  The events come from the three layers that are already the only route to what
+  they describe, so a new call site is traced because it compiles.
+  `cargo xtask trace-events` holds `trace::Event` and the contract equal in
+  both directions and in order.
+
+- `host::output`, `host::status` and `host::spawn`, the third enforced
+  chokepoint after `patch::` for the filesystem and `host::` for the clock and
+  the environment. `Command::output`, `Command::status` and `Command::spawn`
+  are disallowed elsewhere, so every process de-shell starts is one it can name.
+
 - `[[declared_shell]]` in `project.toml` and `deshell declared list` /
   `deshell declared approve`: shell that is in the repository on purpose, named
   by its exact byte span, carrying the reason it stays and an approval digest.
@@ -41,6 +69,13 @@ All notable changes are documented here. No compatibility contract predates
   shell has moved is reported stale rather than ignored.
 
 ### Changed
+
+- Turned de-shell's determinism claim into something a test can check one layer
+  down. It was a claim about the bytes a command writes to stdout; the same
+  work run twice now records the same trace apart from `elapsed_nanos` — the
+  same files staged in the same order with the same digests, after the same
+  readings of the environment. That is why the elapsed time is a field of its
+  own rather than folded into the event.
 
 - Made Rust the default for `deshell`, `mise run deshell`, CI, packaging, and
   distribution.

@@ -203,7 +203,7 @@ pub(crate) fn execute_pipeline(
         #[cfg(unix)]
         configure_unix_limits(&mut command, limits);
 
-        let mut child = match command.spawn() {
+        let mut child = match crate::host::spawn(&mut command) {
             Ok(child) => child,
             Err(error) => {
                 terminate_children(&mut children);
@@ -409,8 +409,7 @@ pub(crate) fn execute_with_clock(
     }
     #[cfg(unix)]
     configure_unix_limits(&mut command, request.limits);
-    let mut child = command
-        .spawn()
+    let mut child = crate::host::spawn(&mut command)
         .map_err(|error| format!("failed to start {executable}: {error}"))?;
     let child_stdout = child
         .stdout
@@ -903,8 +902,7 @@ impl Agent {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         add_essential_environment(&mut command);
-        let mut child = command
-            .spawn()
+        let mut child = crate::host::spawn(&mut command)
             .map_err(|error| format!("cannot start {executable}: {error}"))?;
         let stdin = child.stdin.take().ok_or("agent stdin is unavailable")?;
         let stdout = child.stdout.take().ok_or("agent stdout is unavailable")?;

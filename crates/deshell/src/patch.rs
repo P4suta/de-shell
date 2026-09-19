@@ -203,7 +203,13 @@ pub(crate) enum DirectoryError {
 /// first and the inspection second, so no window exists between deciding and acting.
 pub(crate) fn ensure_directory(path: &Path) -> Result<DirectoryState, DirectoryError> {
     match std::fs::create_dir(path) {
-        Ok(()) => Ok(DirectoryState::Created),
+        Ok(()) => {
+            crate::trace::record(|| crate::trace::Event::DirectoryCreate {
+                path: crate::trace::path_name(path),
+                created: true,
+            });
+            Ok(DirectoryState::Created)
+        }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             let metadata = path
                 .symlink_metadata()
@@ -211,6 +217,10 @@ pub(crate) fn ensure_directory(path: &Path) -> Result<DirectoryState, DirectoryE
             if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
                 return Err(DirectoryError::Occupied);
             }
+            crate::trace::record(|| crate::trace::Event::DirectoryCreate {
+                path: crate::trace::path_name(path),
+                created: false,
+            });
             Ok(DirectoryState::Existing)
         }
         Err(error) => Err(DirectoryError::Io(error.to_string())),
@@ -337,6 +347,10 @@ fn apply_all_inner(
                 item.canonical.display()
             )
         })?;
+        crate::trace::record(|| crate::trace::Event::FileStage {
+            path: crate::trace::path_name(&item.canonical),
+            bytes: item.proposal.replacement.len() as u64,
+        });
         staged.push(Some(temporary));
     }
     // Revalidate the complete read set after all writes are staged. No target
@@ -382,6 +396,9 @@ fn apply_all_inner(
     let mut commit_count = 0;
     for (item, temporary) in validated.iter().zip(staged) {
         let mut commit_error = if item.proposal.mutation == Mutation::Delete {
+            crate::trace::record(|| crate::trace::Event::FileRemove {
+                path: crate::trace::path_name(&item.canonical),
+            });
             sync_parent(&item.canonical).err()
         } else {
             match temporary
@@ -389,10 +406,12 @@ fn apply_all_inner(
                 .persist(&item.canonical)
             {
                 Ok(_) => {
-                    committed.push((
-                        item.canonical.clone(),
-                        crate::digest::sha256(&item.proposal.replacement),
-                    ));
+                    let digest = crate::digest::sha256(&item.proposal.replacement);
+                    crate::trace::record(|| crate::trace::Event::FileCommit {
+                        path: crate::trace::path_name(&item.canonical),
+                        digest: digest.clone(),
+                    });
+                    committed.push((item.canonical.clone(), digest));
                     sync_parent(&item.canonical).err()
                 }
                 Err(error) => Some(format!("{}", error.error)),
@@ -604,7 +623,12 @@ fn restore_backups(backups: &[(PathBuf, PathBuf)]) -> Vec<String> {
         }
         if let Err(error) = std::fs::rename(backup, target) {
             errors.push(format!("{}: {error}", target.display()));
-        } else if let Err(error) = sync_parent(target) {
+        } else if let Err(error) = {
+            crate::trace::record(|| crate::trace::Event::FileRollback {
+                path: crate::trace::path_name(target),
+            });
+            sync_parent(target)
+        } {
             errors.push(format!(
                 "cannot sync {} after rollback: {error}",
                 target.display()

@@ -413,15 +413,17 @@ impl Probe for SystemProbe {
     }
 
     fn docker_rootless(&self) -> bool {
-        std::process::Command::new("docker")
-            .args(["info", "--format", "{{json .SecurityOptions}}"])
-            .output()
-            .is_ok_and(|output| {
-                output.status.success()
-                    && String::from_utf8_lossy(&output.stdout)
-                        .to_ascii_lowercase()
-                        .contains("rootless")
-            })
+        crate::host::output(std::process::Command::new("docker").args([
+            "info",
+            "--format",
+            "{{json .SecurityOptions}}",
+        ]))
+        .is_ok_and(|output| {
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout)
+                    .to_ascii_lowercase()
+                    .contains("rootless")
+        })
     }
 }
 

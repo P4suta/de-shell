@@ -15,6 +15,7 @@ const REQUIRED_CONTRACTS: &[&str] = &[
     "contracts/README.md",
     "contracts/canonical-json-v1.md",
     "contracts/diagnostics-v1.md",
+    "contracts/trace-v1.md",
     "contracts/effect-ir-v1.md",
     "contracts/json-rpc-v1.md",
     "contracts/project-v1.md",
@@ -27,6 +28,7 @@ const REQUIRED_CONTRACTS: &[&str] = &[
     "contracts/schema/bundle-v1.schema.json",
     "contracts/schema/evidence-v1.schema.json",
     "contracts/schema/diagnostic-v1.schema.json",
+    "contracts/schema/trace-v1.schema.json",
     "contracts/schema/approval-v1.schema.json",
     "contracts/schema/migration-index-v1.schema.json",
     "contracts/schema/init-report-v1.schema.json",
@@ -1334,6 +1336,107 @@ fn run_enum_equality(root: &Path) -> Result<(), Vec<String>> {
         return Ok(());
     }
     Err(errors)
+}
+
+/// `trace::Event` and `contracts/schema/trace-v1.schema.json` name the same
+/// events, in the same order.
+///
+/// A trace is read by something that is not de-shell — that is the whole point
+/// of writing it down — so the vocabulary has to be a contract rather than an
+/// implementation detail. The same rule as `report-item-kinds`, for the same
+/// reason.
+fn run_trace_events(root: &Path) -> Result<(), Vec<String>> {
+    let source = std::fs::read_to_string(root.join("crates/deshell/src/trace.rs"))
+        .map_err(|error| vec![format!("cannot read trace.rs: {error}")])?;
+    let declared = source
+        .split_once("pub(crate) const NAMES: [&'static str; ")
+        .and_then(|(_, rest)| rest.split_once(']'))
+        .and_then(|(count, _)| count.parse::<usize>().ok())
+        .ok_or_else(|| vec!["trace.rs has no Event::NAMES".to_owned()])?;
+    let names = source
+        .split_once("pub(crate) const NAMES: [&'static str; ")
+        .and_then(|(_, rest)| rest.split_once("];"))
+        .map(|(body, _)| body)
+        .ok_or_else(|| vec!["trace.rs has no Event::NAMES body".to_owned()])?
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix('"')?.split_once('"'))
+        .map(|(name, _)| name.to_owned())
+        .collect::<Vec<_>>();
+    let mut failures = Vec::new();
+    if declared != names.len() {
+        failures.push(format!(
+            "Event::NAMES is declared to hold {declared} names and holds {}",
+            names.len()
+        ));
+    }
+    // Every variant carries its name, so the enum and the list must agree too.
+    let variants = source
+        .split_once("pub(crate) enum Event {")
+        .and_then(|(_, rest)| rest.split_once("\n}\n"))
+        .map(|(body, _)| body)
+        .ok_or_else(|| vec!["trace.rs has no Event enum".to_owned()])?
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let name = line.split([' ', '{', ',']).next()?;
+            (!name.is_empty()
+                && !line.starts_with("///")
+                && !line.starts_with("//")
+                && name.starts_with(|letter: char| letter.is_ascii_uppercase()))
+            .then(|| {
+                let mut snake = String::new();
+                for (index, letter) in name.char_indices() {
+                    if letter.is_ascii_uppercase() {
+                        if index != 0 {
+                            snake.push('_');
+                        }
+                        snake.push(letter.to_ascii_lowercase());
+                    } else {
+                        snake.push(letter);
+                    }
+                }
+                snake
+            })
+        })
+        .collect::<Vec<_>>();
+    if variants != names {
+        failures.push(format!(
+            "Event has variants {variants:?}; Event::NAMES holds {names:?}"
+        ));
+    }
+
+    let path = root.join("contracts/schema/trace-v1.schema.json");
+    let schema = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .ok_or_else(|| vec![format!("cannot read {}", path.display())])?;
+    let Some(records) = schema["oneOf"].as_array() else {
+        failures.push("trace-v1.schema.json must be a oneOf over its records".to_owned());
+        return Err(failures);
+    };
+    let contracted = records
+        .iter()
+        .map(|record| {
+            record["properties"]["event"]["const"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    if contracted != names {
+        failures.push(format!(
+            "trace-v1.schema.json contracts {contracted:?}; Event::NAMES holds {names:?}"
+        ));
+    }
+
+    if failures.is_empty() {
+        println!(
+            "the trace contract and `trace::Event` name the same {} events, in the same order",
+            names.len()
+        );
+        return Ok(());
+    }
+    Err(failures)
 }
 
 /// `ItemKind` and every report contract name the same kinds, in the same order.
@@ -3460,6 +3563,7 @@ fn dispatch(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Vec<Str
         Some("shell-variables") => run_shell_variables(root),
         Some("enum-equality") => run_enum_equality(root),
         Some("report-item-kinds") => run_report_item_kinds(root),
+        Some("trace-events") => run_trace_events(root),
         Some("lint-expectations") => run_lint_expectations(root),
         Some("repository-guardrails") => run_repository_guardrails(root),
         Some("corpus-audit") => {
@@ -3621,6 +3725,101 @@ mod tests {
             errors
                 .iter()
                 .any(|error| error.contains("bytes; maximum is 10485760 bytes")),
+            "{errors:#?}"
+        );
+    }
+
+    /// The trace vocabulary gate reads both sides and fails when either moves.
+    #[test]
+    fn the_trace_events_gate_catches_a_contract_that_lost_an_event() {
+        run_trace_events(&repository_root()).expect("the repository agrees with itself");
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::create_dir_all(root.join("crates/deshell/src")).unwrap();
+        std::fs::create_dir_all(root.join("contracts/schema")).unwrap();
+        let source = |count: usize, names: &str, variants: &str| {
+            format!(
+                concat!(
+                    "pub(crate) enum Event {{\n",
+                    "{variants}",
+                    "}}\n",
+                    "    pub(crate) const NAMES: [&'static str; {count}] = [\n",
+                    "{names}",
+                    "    ];\n",
+                ),
+                count = count,
+                names = names,
+                variants = variants,
+            )
+        };
+        let write = |text: String| {
+            std::fs::write(root.join("crates/deshell/src/trace.rs"), text).unwrap();
+        };
+        let schema = |events: &[&str]| {
+            let records = events
+                .iter()
+                .map(|event| format!(r#"{{"properties":{{"event":{{"const":"{event}"}}}}}}"#))
+                .collect::<Vec<_>>()
+                .join(",");
+            std::fs::write(
+                root.join("contracts/schema/trace-v1.schema.json"),
+                format!(r#"{{"oneOf":[{records}]}}"#),
+            )
+            .unwrap();
+        };
+
+        write(source(
+            2,
+            "        \"clock_read\",\n        \"file_remove\",\n",
+            "    ClockRead,\n    FileRemove { path: String },\n",
+        ));
+        schema(&["clock_read", "file_remove"]);
+        run_trace_events(root).expect("three lists that agree pass");
+
+        // A variant the list forgot.
+        write(source(
+            2,
+            "        \"clock_read\",\n        \"file_remove\",\n",
+            "    ClockRead,\n    FileRemove { path: String },\n    FileStage { path: String },\n",
+        ));
+        let errors = run_trace_events(root).expect_err("an unlisted variant fails");
+        assert!(
+            errors.iter().any(|error| error.contains("file_stage")),
+            "{errors:#?}"
+        );
+
+        // A contract the list outgrew.
+        write(source(
+            2,
+            "        \"clock_read\",\n        \"file_remove\",\n",
+            "    ClockRead,\n    FileRemove { path: String },\n",
+        ));
+        schema(&["clock_read"]);
+        let errors = run_trace_events(root).expect_err("a short contract fails");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("trace-v1.schema.json contracts")),
+            "{errors:#?}"
+        );
+
+        // The same events in a different order.
+        schema(&["file_remove", "clock_read"]);
+        run_trace_events(root).expect_err("a reordered contract fails");
+
+        // A declared count that does not match the list.
+        write(source(
+            9,
+            "        \"clock_read\",\n        \"file_remove\",\n",
+            "    ClockRead,\n    FileRemove { path: String },\n",
+        ));
+        schema(&["clock_read", "file_remove"]);
+        let errors = run_trace_events(root).expect_err("a miscounted list fails");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("declared to hold 9")),
             "{errors:#?}"
         );
     }

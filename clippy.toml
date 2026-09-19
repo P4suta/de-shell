@@ -103,6 +103,16 @@ disallowed-methods = [
   { path = "std::env::set_var", reason = "races with other threads and mutates ambient state a later read cannot distinguish from configuration" },
   { path = "std::env::remove_var", reason = "see std::env::set_var" },
 
+  # --- Process launches ---
+  # The third chokepoint, after `patch::` for the filesystem and `host::` for the
+  # clock and the environment. A launch is an ambient input: what it runs is not
+  # in the repository, and a tool that claims to know what it ran should be able
+  # to say so. `host::` records the exact argv and how the process ended, so a
+  # launch is traced because it compiles rather than because somebody remembered.
+  { path = "std::process::Command::output", reason = "launch through `host::output`, which records the exact argv and the exit code" },
+  { path = "std::process::Command::status", reason = "launch through `host::status`" },
+  { path = "std::process::Command::spawn", reason = "launch through `host::spawn`" },
+
   # --- Process and memory ---
   { path = "std::mem::forget", reason = "leaks destructors; a leaked temporary file or lock outlives the transaction that owns it" },
   { path = "std::process::exit", reason = "bypasses destructors, so a staged temporary or rollback backup can be left behind; return an exit code instead" },

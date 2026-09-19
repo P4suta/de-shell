@@ -44,6 +44,7 @@ mod rewrite;
 mod runner;
 mod scanner;
 mod strict_json;
+mod trace;
 mod verify;
 mod workspace;
 
