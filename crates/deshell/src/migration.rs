@@ -202,23 +202,12 @@ impl EvidenceStatus {
         }
     }
 
-    /// Whether the evidence says the two behaved differently, as opposed to
-    /// saying nothing because the run could not be made.
-    pub(crate) fn is_a_difference(&self) -> bool {
-        match self {
-            Self::Different => true,
-            Self::Verified | Self::Unavailable | Self::Failed | Self::Nondeterministic => false,
-        }
-    }
-
-    /// Whether the two runs of the same thing disagreed with each other, which
-    /// is a property of the thing rather than of the comparison.
-    pub(crate) fn is_nondeterministic(&self) -> bool {
-        match self {
-            Self::Nondeterministic => true,
-            Self::Verified | Self::Different | Self::Unavailable | Self::Failed => false,
-        }
-    }
+    // `is_a_difference` and `is_nondeterministic` were here, and each answered
+    // one question the aggregation below used to ask in an `if`/`else` chain.
+    // `evidence_severity` ranks every status instead, so the chain and its
+    // two predicates are gone. They are deleted rather than suppressed: a
+    // predicate nobody asks is a place for a status added later to be
+    // classified without anybody noticing, which is what the `else` was.
 }
 
 /// How bad a status is, so that a set of checks reports the worst one.
