@@ -845,10 +845,15 @@ fn synthesized_initial_scenarios(
         if let Some(finding) = source.finding {
             if let Some(interpreter) = finding.interpreter.as_deref()
                 && let Ok(plan) = crate::frontend::lower_with_interpreter(
-                    &source.path,
-                    &finding.source,
-                    crate::config::UnknownInterpreter::Reject,
-                    interpreter,
+                    crate::frontend::LowerWithInterpreterArgs {
+                        path: &source.path,
+                        source: &finding.source,
+                        unknown_policy: crate::config::UnknownInterpreter::Reject,
+                        configured: interpreter,
+                        host: crate::frontend::HostShell {
+                            named: finding.host_named_the_shell,
+                        },
+                    },
                 )
                 && let Some(task) = plan.tasks.iter().find(|task| task.name == plan.entrypoint)
             {
@@ -1067,12 +1072,16 @@ pub(crate) fn analyze(root: &Path, entry: &str) -> Result<AnalysisResult, String
         .iter()
         .find(|override_| override_.path == entry)
     {
-        Some(override_) => crate::frontend::lower_with_interpreter(
-            entry,
-            &source,
-            config.policy.unknown_interpreter,
-            override_.interpreter.name(),
-        )?,
+        // An entrypoint is a shell file, which has no host to name a shell.
+        Some(override_) => {
+            crate::frontend::lower_with_interpreter(crate::frontend::LowerWithInterpreterArgs {
+                path: entry,
+                source: &source,
+                unknown_policy: config.policy.unknown_interpreter,
+                configured: override_.interpreter.name(),
+                host: crate::frontend::HostShell::default(),
+            })?
+        }
         None => crate::frontend::lower(entry, &source, config.policy.unknown_interpreter)?,
     };
     crate::frontend::bind_interpreter_pins(&mut plan, &lock.interpreters)?;

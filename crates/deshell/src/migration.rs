@@ -3287,7 +3287,15 @@ fn lower_finding(
     policy: crate::config::UnknownInterpreter,
 ) -> Result<crate::ir::Plan, String> {
     let interpreter = resolved_finding_interpreter(finding)?;
-    crate::frontend::lower_with_interpreter(&finding.path, &finding.source, policy, &interpreter)
+    crate::frontend::lower_with_interpreter(crate::frontend::LowerWithInterpreterArgs {
+        path: &finding.path,
+        source: &finding.source,
+        unknown_policy: policy,
+        configured: &interpreter,
+        host: crate::frontend::HostShell {
+            named: finding.host_named_the_shell,
+        },
+    })
 }
 
 fn resolved_finding_interpreter(finding: &crate::scanner::Finding) -> Result<String, String> {
@@ -11872,13 +11880,15 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
     }
 
     fn plan_with_body(body: crate::ir::Node) -> crate::ir::Plan {
-        let mut plan = crate::frontend::lower_with_interpreter(
-            "build.sh",
-            b"true\n",
-            crate::config::UnknownInterpreter::Reject,
-            "sh",
-        )
-        .unwrap();
+        let mut plan =
+            crate::frontend::lower_with_interpreter(crate::frontend::LowerWithInterpreterArgs {
+                path: "build.sh",
+                source: b"true\n",
+                unknown_policy: crate::config::UnknownInterpreter::Reject,
+                configured: "sh",
+                host: crate::frontend::HostShell::default(),
+            })
+            .unwrap();
         plan.tasks[0].body = body;
         plan
     }

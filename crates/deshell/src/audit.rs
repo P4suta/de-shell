@@ -615,6 +615,7 @@ mod tests {
             interpreter: Some("sh".into()),
             interpreter_confidence: InterpreterConfidence::High,
             locator: None,
+            host_named_the_shell: false,
             span: ByteSpan {
                 start_byte: 0,
                 end_byte: source.len() as u64,

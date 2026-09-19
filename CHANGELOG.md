@@ -171,6 +171,12 @@ All notable changes are documented here. No compatibility contract predates
   over a file, not `bash -c <text>` — so the comparison has the baseline the
   step actually has.
 
+- Placed a pipeline inside a workflow step instead of delegating it. The
+  runner's default is `bash -e {0}` and an explicit `shell: bash` is
+  `bash --noprofile --norc -eo pipefail {0}`; both are bash, so the scanner now
+  carries whether the host named the shell and the frontend reads the status
+  from it.
+
 ### Removed
 
 - Pre-v1 Effect IR and lock migration promises.

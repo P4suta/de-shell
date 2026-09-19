@@ -207,12 +207,16 @@ pub(crate) fn plan(root: &Path) -> Result<PlanOutput, String> {
             .interpreter
             .as_deref()
             .ok_or_else(|| format!("DESHELL_HARDEN_INTERPRETER_REQUIRED: {}", finding.path))?;
-        let mut lowered = crate::frontend::lower_with_interpreter(
-            &finding.path,
-            result.output.as_bytes(),
-            config.policy.unknown_interpreter.clone(),
-            interpreter,
-        )?;
+        let mut lowered =
+            crate::frontend::lower_with_interpreter(crate::frontend::LowerWithInterpreterArgs {
+                path: &finding.path,
+                source: result.output.as_bytes(),
+                unknown_policy: config.policy.unknown_interpreter.clone(),
+                configured: interpreter,
+                host: crate::frontend::HostShell {
+                    named: finding.host_named_the_shell,
+                },
+            })?;
         crate::frontend::bind_interpreter_pins(&mut lowered, &lock.interpreters)?;
         let rules = result
             .edits

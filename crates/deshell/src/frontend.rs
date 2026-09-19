@@ -154,10 +154,33 @@ fn interpreter_from_extension(path: &str) -> Option<Interpreter> {
     }
 }
 
+/// What the host said about the shell this source runs under.
+///
+/// A GitHub workflow step with no `shell:` key runs as `bash -e {0}`, and one
+/// that says `shell: bash` runs as `bash --noprofile --norc -eo pipefail {0}`.
+/// Both are bash, so the interpreter name cannot tell them apart, and a pipeline
+/// reports a different status under each.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct HostShell {
+    /// Whether the host named it, as opposed to leaving the runner's default.
+    pub named: bool,
+}
+
 pub(crate) fn lower(
     path: &str,
     source: &[u8],
     unknown_policy: UnknownInterpreter,
+) -> Result<Plan, String> {
+    lower_under_host(path, source, unknown_policy, HostShell::default())
+}
+
+/// Lower under what the host said. A shell file has no host, which is what
+/// [`HostShell::default`] means.
+fn lower_under_host(
+    path: &str,
+    source: &[u8],
+    unknown_policy: UnknownInterpreter,
+    host: HostShell,
 ) -> Result<Plan, String> {
     let normalized = crate::ir::normalize_path(path)?;
     if normalized != path.replace('\\', "/") {
@@ -187,7 +210,7 @@ pub(crate) fn lower(
                     tree_sitter_bash::LANGUAGE.into(),
                     "tree-sitter-bash/0.25.1",
                 )
-                .and_then(|()| lower_posix(&normalized, text, &interpreter)),
+                .and_then(|()| lower_posix(&normalized, text, &interpreter, host)),
                 Interpreter::Fish => validate_fish_cst(&normalized, text)
                     .and_then(|()| lower_fish(&normalized, text)),
                 Interpreter::Cmd => {
@@ -294,12 +317,30 @@ pub(crate) fn lower(
     Ok(plan)
 }
 
-pub(crate) fn lower_with_interpreter(
-    path: &str,
-    source: &[u8],
-    unknown_policy: UnknownInterpreter,
-    configured: &str,
-) -> Result<Plan, String> {
+/// The inputs of [`lower_with_interpreter`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to
+/// a many-argument function stays invisible to every call site that already
+/// compiles. [`lower_with_interpreter`] takes this apart without `..`, so a
+/// field added here fails to compile until somebody gives it a destination —
+/// which is how `host` got to every caller that had one to give.
+pub(crate) struct LowerWithInterpreterArgs<'a> {
+    pub path: &'a str,
+    pub source: &'a [u8],
+    pub unknown_policy: UnknownInterpreter,
+    pub configured: &'a str,
+    pub host: HostShell,
+}
+
+pub(crate) fn lower_with_interpreter(parts: LowerWithInterpreterArgs<'_>) -> Result<Plan, String> {
+    // Destructured without `..`: see `LowerWithInterpreterArgs`.
+    let LowerWithInterpreterArgs {
+        path,
+        source,
+        unknown_policy,
+        configured,
+        host,
+    } = parts;
     let interpreter = resolve_configured_interpreter(path, source, configured)?;
     let extension = match interpreter {
         Interpreter::Sh => "sh",
@@ -314,7 +355,7 @@ pub(crate) fn lower_with_interpreter(
         }
     };
     let virtual_path = format!("{path}.deshell.{extension}");
-    let mut plan = lower(&virtual_path, source, unknown_policy)?;
+    let mut plan = lower_under_host(&virtual_path, source, unknown_policy, host)?;
     rebind_source_path(&mut plan, &virtual_path, path)?;
     Ok(plan)
 }
@@ -1578,16 +1619,6 @@ struct ShellOptions {
     errexit: bool,
     nounset: bool,
     pipefail: bool,
-    /// Whether nobody has said what `pipefail` is.
-    ///
-    /// A bool cannot hold "unknown", and here the difference matters: a GitHub
-    /// workflow step runs under `bash -e {0}` by default and under
-    /// `bash --noprofile --norc -eo pipefail {0}` when the step says
-    /// `shell: bash`, and the scanner reports both as `bash`. A pipeline lowered
-    /// under the wrong one reports a different status than the step does, so the
-    /// pipeline is delegated instead. A `set` statement naming `pipefail`
-    /// settles it either way.
-    pipefail_unknown: bool,
 }
 
 /// Read a `set` statement, if every option in it is one this frontend models.
@@ -1635,10 +1666,7 @@ fn set_statement(statement: &str, current: ShellOptions) -> Option<ShellOptions>
                 'e' => options.errexit = enable,
                 'u' => options.nounset = enable,
                 'o' if flags.peek().is_none() => match words.next()? {
-                    "pipefail" => {
-                        options.pipefail = enable;
-                        options.pipefail_unknown = false;
-                    }
+                    "pipefail" => options.pipefail = enable,
                     _ => return None,
                 },
                 _ => return None,
@@ -2295,7 +2323,6 @@ fn lower_statements(parts: LowerStatementsArgs<'_>) -> Result<Vec<Node>, String>
                 locals: &mut body_locals,
                 errexit: options.errexit,
                 pipefail: options.pipefail,
-                pipefail_unknown: options.pipefail_unknown,
             })?
             .ok_or("shell function body is empty")?;
             let arity = body_inputs
@@ -2344,7 +2371,6 @@ fn lower_statements(parts: LowerStatementsArgs<'_>) -> Result<Vec<Node>, String>
                     locals: &mut *locals,
                     errexit: options.errexit,
                     pipefail: options.pipefail,
-                    pipefail_unknown: options.pipefail_unknown,
                 })?
                 .ok_or_else(|| "loop arm is empty".to_owned())
             };
@@ -2411,7 +2437,6 @@ fn lower_statements(parts: LowerStatementsArgs<'_>) -> Result<Vec<Node>, String>
                             locals: &mut *locals,
                             errexit: options.errexit,
                             pipefail: options.pipefail,
-                            pipefail_unknown: options.pipefail_unknown,
                         });
                         // `a|b) ;;` is a real arm that does nothing, and it is
                         // how a script says "these values are fine". Running
@@ -2492,7 +2517,6 @@ fn lower_statements(parts: LowerStatementsArgs<'_>) -> Result<Vec<Node>, String>
                     locals: &mut *locals,
                     errexit: options.errexit,
                     pipefail: options.pipefail,
-                    pipefail_unknown: options.pipefail_unknown,
                 })?
                 .ok_or_else(|| "branch is empty".to_owned())
             };
@@ -2543,7 +2567,6 @@ fn lower_statements(parts: LowerStatementsArgs<'_>) -> Result<Vec<Node>, String>
             environment: &mut *environment,
             locals: &mut *locals,
             pipefail: options.pipefail,
-            pipefail_unknown: options.pipefail_unknown,
         })?;
         nodes.push(node);
     }
@@ -2563,20 +2586,27 @@ fn lower_statements(parts: LowerStatementsArgs<'_>) -> Result<Vec<Node>, String>
 /// `bash --noprofile --norc -eo pipefail {0}` with it, and the scanner reports
 /// both as `bash`. So `errexit` is stated and `pipefail` is not — see
 /// `lower_posix`, which delegates a pipeline it cannot place.
-fn host_shell_options(path: &str) -> ShellOptions {
+fn host_shell_options(path: &str, host: HostShell) -> ShellOptions {
     if crate::migration::is_github_workflow_path(host_path_of(path)) {
         ShellOptions {
             errexit: true,
             nounset: false,
-            pipefail: false,
-            pipefail_unknown: true,
+            // The runner's default is `bash -e {0}` and a named `bash` is
+            // `bash --noprofile --norc -eo pipefail {0}`. Both are known once
+            // the host says which it is; neither is a guess.
+            pipefail: host.named,
         }
     } else {
         ShellOptions::default()
     }
 }
 
-fn lower_posix(path: &str, source: &str, interpreter: &Interpreter) -> Result<Lowered, String> {
+fn lower_posix(
+    path: &str,
+    source: &str,
+    interpreter: &Interpreter,
+    host: HostShell,
+) -> Result<Lowered, String> {
     let statements = shell_statements(source)?;
     let mut inputs = BTreeSet::new();
     let mut environment = BTreeSet::new();
@@ -2584,7 +2614,7 @@ fn lower_posix(path: &str, source: &str, interpreter: &Interpreter) -> Result<Lo
     // Shell options apply from where they are set onwards, so this travels with
     // the statement cursor rather than being read once for the file. It starts
     // from what the host has already set: see `host_shell_options`.
-    let mut options = host_shell_options(path);
+    let mut options = host_shell_options(path, host);
     // `Operation::Sequence` carries one `on_failure` for the whole list, so a file
     // that changes `set -e` partway through has no honest lowering: the statements
     // before the change stop on failure and the ones after do not. Recording only
@@ -2779,8 +2809,6 @@ struct LowerStatementListArgs<'a> {
     errexit: bool,
     /// Whether `set -o pipefail` is in effect at these statements.
     pipefail: bool,
-    /// Whether nobody has said. See [`ShellOptions::pipefail_unknown`].
-    pipefail_unknown: bool,
 }
 
 /// Lower a run of statements into one node, or `None` if the run is empty.
@@ -2803,13 +2831,11 @@ fn lower_statement_list(parts: LowerStatementListArgs<'_>) -> Result<Option<Node
         locals,
         errexit,
         pipefail,
-        pipefail_unknown,
     } = parts;
     let mut options = ShellOptions {
         errexit,
         pipefail,
         nounset: false,
-        pipefail_unknown,
     };
     let mut errexit_regions = 0;
     // A definition inside a branch would be visible after the branch in the
@@ -2884,8 +2910,6 @@ struct LowerPosixControlArgs<'a> {
     locals: &'a mut BTreeSet<String>,
     /// Whether `set -o pipefail` is in effect at this statement.
     pipefail: bool,
-    /// Whether nobody has said. See [`ShellOptions::pipefail_unknown`].
-    pipefail_unknown: bool,
 }
 
 fn lower_posix_control(parts: LowerPosixControlArgs<'_>) -> Result<Node, String> {
@@ -2900,7 +2924,6 @@ fn lower_posix_control(parts: LowerPosixControlArgs<'_>) -> Result<Node, String>
         environment,
         locals,
         pipefail,
-        pipefail_unknown,
     } = parts;
     let controls = top_level_controls(source, range)?;
     if controls.is_empty() {
@@ -2950,29 +2973,18 @@ fn lower_posix_control(parts: LowerPosixControlArgs<'_>) -> Result<Node, String>
     }
     let span = span_for_range(path, source, range.start, range.end)?;
     match kind {
-        "|" => {
-            // The two statuses are different programs, and a host that has not
-            // said which option it runs with leaves no way to pick. See
-            // `ShellOptions::pipefail_unknown`.
-            if pipefail_unknown {
-                return Err(
-                    "the host does not say whether this runs with pipefail, and a pipeline reports a different status under each"
-                        .into(),
-                );
-            }
-            Ok(native_node(
-                Operation::Pipeline {
-                    nodes,
-                    status: if pipefail {
-                        crate::ir::PipelineStatus::Pipefail
-                    } else {
-                        crate::ir::PipelineStatus::Last
-                    },
+        "|" => Ok(native_node(
+            Operation::Pipeline {
+                nodes,
+                status: if pipefail {
+                    crate::ir::PipelineStatus::Pipefail
+                } else {
+                    crate::ir::PipelineStatus::Last
                 },
-                SemanticModel::StaticPipeline.under(ModelPrefix::Posix),
-                span,
-            ))
-        }
+            },
+            SemanticModel::StaticPipeline.under(ModelPrefix::Posix),
+            span,
+        )),
         "&&" => {
             let mut iterator = nodes.into_iter();
             let mut result = iterator.next().expect("pieces are non-empty");
@@ -5883,35 +5895,37 @@ mod tests {
     /// `Sequence { on_failure: Continue }` and was claimed `native`, so the step
     /// stopped at the first failure and the replacement would not have.
     ///
-    /// `pipefail` is the other half and is not knowable. The runner's default is
-    /// `bash -e {0}` without it and an explicit `shell: bash` is
-    /// `bash --noprofile --norc -eo pipefail {0}` with it, and the scanner
-    /// reports both as `bash`. Two statuses are two programs, so a pipeline the
-    /// host has not placed is delegated rather than guessed.
+    /// `pipefail` is the other half and depends on whether the host named the
+    /// shell: the runner's default is `bash -e {0}` without it, and an explicit
+    /// `shell: bash` is `bash --noprofile --norc -eo pipefail {0}` with it. Both
+    /// are bash, so the interpreter name cannot say which — the scanner carries
+    /// the answer instead.
     #[test]
     fn a_workflow_step_carries_the_options_the_runner_sets() {
         let workflow = ".github/workflows/ci.yml.deshell.sh";
         let plain = "build.sh";
-        assert!(host_shell_options(workflow).errexit);
-        assert!(host_shell_options(workflow).pipefail_unknown);
-        assert!(!host_shell_options(plain).errexit);
-        assert!(!host_shell_options(plain).pipefail_unknown);
+        let default_shell = HostShell { named: false };
+        let named_shell = HostShell { named: true };
+
+        assert!(host_shell_options(workflow, default_shell).errexit);
+        assert!(!host_shell_options(workflow, default_shell).pipefail);
+        assert!(host_shell_options(workflow, named_shell).pipefail);
+        assert!(!host_shell_options(plain, named_shell).errexit);
 
         let two_commands = "/usr/bin/false\n/bin/echo after\n";
-        let stopping = lower_posix(workflow, two_commands, &Interpreter::Bash).unwrap();
+        let stopping =
+            lower_posix(workflow, two_commands, &Interpreter::Bash, default_shell).unwrap();
         let Operation::Sequence {
             nodes: _,
             on_failure,
         } = &stopping.body.operation
         else {
-            panic!(
-                "a two-command step is a sequence: {:?}",
-                stopping.body.operation
-            );
+            panic!("a two-command step is a sequence");
         };
         assert_eq!(*on_failure, crate::ir::SequenceFailure::Stop);
 
-        let carrying_on = lower_posix(plain, two_commands, &Interpreter::Bash).unwrap();
+        let carrying_on =
+            lower_posix(plain, two_commands, &Interpreter::Bash, default_shell).unwrap();
         let Operation::Sequence {
             nodes: _,
             on_failure,
@@ -5925,18 +5939,17 @@ mod tests {
             "a plain script has no `set -e` unless it says so"
         );
 
-        // A pipeline the host has not placed is refused; one the step places
-        // itself is not.
+        // The same pipeline, two statuses, decided by what the host said.
         let pipeline = "/bin/echo one | /usr/bin/tr a b\n";
-        assert!(
-            lower_posix(workflow, pipeline, &Interpreter::Bash).is_err(),
-            "a pipeline was lowered without knowing the host's pipefail"
-        );
-        let placed = format!("set -o pipefail\n{pipeline}");
-        assert!(
-            lower_posix(workflow, &placed, &Interpreter::Bash).is_ok(),
-            "a step that places pipefail itself is not ambiguous"
-        );
+        let status = |host| {
+            let lowered = lower_posix(workflow, pipeline, &Interpreter::Bash, host).unwrap();
+            let Operation::Pipeline { nodes: _, status } = lowered.body.operation else {
+                panic!("a pipeline is a pipeline");
+            };
+            status
+        };
+        assert_eq!(status(default_shell), crate::ir::PipelineStatus::Last);
+        assert_eq!(status(named_shell), crate::ir::PipelineStatus::Pipefail);
     }
 
     /// A parser runs where de-shell runs, not in its own scratch directory.
@@ -7213,7 +7226,6 @@ mod tests {
                 errexit: true,
                 nounset: true,
                 pipefail: true,
-                pipefail_unknown: false
             })
         );
         assert_eq!(
@@ -7222,7 +7234,6 @@ mod tests {
                 errexit: true,
                 nounset: false,
                 pipefail: true,
-                pipefail_unknown: false
             })
         );
         assert_eq!(
@@ -7232,7 +7243,6 @@ mod tests {
                     errexit: true,
                     nounset: false,
                     pipefail: false,
-                    pipefail_unknown: false
                 }
             ),
             Some(ShellOptions::default())

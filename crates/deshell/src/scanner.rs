@@ -125,6 +125,19 @@ pub(crate) struct Finding {
     pub interpreter: Option<String>,
     pub interpreter_confidence: InterpreterConfidence,
     pub locator: Option<String>,
+    /// Whether the host names the shell this block runs under.
+    ///
+    /// A GitHub workflow step with no `shell:` key runs as `bash -e {0}`, and
+    /// one that says `shell: bash` runs as
+    /// `bash --noprofile --norc -eo pipefail {0}`. Both are bash, so
+    /// `interpreter` says `bash` for each and the frontend could not tell which
+    /// options were in effect — a pipeline reports a different status under
+    /// each, so it had to be delegated rather than guessed.
+    ///
+    /// `false` is not "no shell": it is the host's default, which is a
+    /// different thing from the host having been asked.
+    #[serde(default)]
+    pub host_named_the_shell: bool,
     pub span: ByteSpan,
     pub content_digest: String,
     #[serde(skip)]
@@ -261,6 +274,7 @@ pub(crate) fn scan_with_interpreters(
                 interpreter: Some(interpreter.name().into()),
                 interpreter_confidence: InterpreterConfidence::High,
                 locator: None,
+                host_named_the_shell: false,
                 span: ByteSpan::whole(&source),
                 source,
             })),
@@ -744,6 +758,7 @@ fn findings_for_file(relative: &str, absolute: &Path) -> FileScan {
             interpreter: Some(interpreter),
             interpreter_confidence: InterpreterConfidence::High,
             locator: None,
+            host_named_the_shell: false,
             span: ByteSpan::whole(&source),
             source,
         })]);
@@ -1007,6 +1022,9 @@ struct FindingParts<'a> {
     interpreter: Option<String>,
     interpreter_confidence: InterpreterConfidence,
     locator: Option<String>,
+    /// See [`Finding::host_named_the_shell`]. `false` for every host that has no
+    /// way of naming one, which is every host but a GitHub workflow today.
+    host_named_the_shell: bool,
     span: ByteSpan,
     source: Vec<u8>,
 }
@@ -1019,6 +1037,7 @@ fn finding(parts: FindingParts<'_>) -> Finding {
         interpreter,
         interpreter_confidence,
         locator,
+        host_named_the_shell,
         span,
         source,
     } = parts;
@@ -1028,6 +1047,7 @@ fn finding(parts: FindingParts<'_>) -> Finding {
         interpreter,
         interpreter_confidence,
         locator,
+        host_named_the_shell,
         span,
         content_digest: crate::digest::sha256(&source),
         source,
@@ -1135,6 +1155,7 @@ fn package_findings(path: &str, source: &str) -> Result<Vec<Finding>, String> {
                         interpreter: Some("package-shell".into()),
                         interpreter_confidence: InterpreterConfidence::Medium,
                         locator: Some(format!("scripts.{name}")),
+                        host_named_the_shell: false,
                         span: span_of(source, after_key, script),
                         source: script.as_bytes().to_vec(),
                     })
@@ -1159,6 +1180,7 @@ fn makefile_findings(path: &str, source: &str) -> Vec<Finding> {
                         interpreter: Some("sh".into()),
                         interpreter_confidence: InterpreterConfidence::High,
                         locator: Some(format!("recipe:{}", index + 1)),
+                        host_named_the_shell: false,
                         span: ByteSpan {
                             start_byte: start as u64,
                             end_byte: (start + command.len()) as u64,
@@ -1206,6 +1228,7 @@ fn dockerfile_findings(path: &str, source: &str) -> Result<Vec<Finding>, String>
                     interpreter: Some("sh".into()),
                     interpreter_confidence: InterpreterConfidence::High,
                     locator: Some(format!("RUN:{line}")),
+                    host_named_the_shell: false,
                     span: ByteSpan {
                         start_byte: offsets[first_index] as u64,
                         end_byte: (offsets[index] + lines[index].len()) as u64,
@@ -1264,6 +1287,14 @@ fn yaml_findings(path: &str, source: &str, lower: &str) -> Result<Vec<Finding>, 
             continue;
         }
         let key = raw_key.to_ascii_lowercase();
+        // Whether the host named the shell, as opposed to leaving the runner's
+        // default. Both are `bash` here and they are not the same shell: see
+        // `Finding::host_named_the_shell`.
+        let host_named_the_shell = key != "run" || yaml_step_shell(&lines, index).is_some() || {
+            let (job_start, job_end) = yaml_job_range(&lines, index);
+            yaml_defaults_shell(&lines, job_start, job_end).is_some()
+                || yaml_defaults_shell(&lines, 0, lines.len()).is_some()
+        };
         let interpreter = if key == "pwsh" || key == "powershell" {
             "powershell"
         } else if key == "bash" {
@@ -1305,6 +1336,7 @@ fn yaml_findings(path: &str, source: &str, lower: &str) -> Result<Vec<Finding>, 
                         InterpreterConfidence::Low
                     },
                     locator: Some(format!("{key}:{line}")),
+                    host_named_the_shell,
                     span: ByteSpan {
                         start_byte: offsets[line - 1] as u64,
                         end_byte: if index < offsets.len() {
@@ -1333,6 +1365,7 @@ fn yaml_findings(path: &str, source: &str, lower: &str) -> Result<Vec<Finding>, 
                     InterpreterConfidence::Low
                 },
                 locator: Some(format!("{key}:{line}")),
+                host_named_the_shell,
                 // Anchored at the line the key is on, the same way the block
                 // form above uses `offsets[line - 1]`. Searching the whole file
                 // gave every repeat of a one-line `run:` the first one's span.
@@ -1696,6 +1729,7 @@ fn collect_json_candidates(parts: CollectJsonCandidatesArgs<'_>) {
                 interpreter: None,
                 interpreter_confidence: InterpreterConfidence::Low,
                 locator: Some(locator.into()),
+                host_named_the_shell: false,
                 // A parsed value has no position; this is the closest the
                 // document can get to giving it one. See
                 // `span_of_encoded_string` for why it is the encoded form and
@@ -1780,6 +1814,7 @@ fn collect_toml_candidates(parts: CollectTomlCandidatesArgs<'_>) {
                 interpreter: None,
                 interpreter_confidence: InterpreterConfidence::Low,
                 locator: Some(locator.into()),
+                host_named_the_shell: false,
                 // See the JSON walker above.
                 span: span_of_encoded_string(source, command)
                     .unwrap_or_else(|| span_of(source, 0, command)),
@@ -1864,6 +1899,7 @@ fn append_javascript_shell_findings(
             interpreter: Some("sh".into()),
             interpreter_confidence: confidence,
             locator: Some(format!("line:{line}:column:{column}")),
+            host_named_the_shell: false,
             span: ByteSpan {
                 start_byte: start.start() as u64,
                 end_byte: end as u64,
@@ -1955,6 +1991,7 @@ fn append_process_reference_findings(parts: AppendProcessReferenceFindingsArgs<'
                 InterpreterConfidence::Low
             },
             locator: Some(format!("line:{line}:column:{column}")),
+            host_named_the_shell: false,
             span: ByteSpan {
                 start_byte: start.start() as u64,
                 end_byte: end as u64,
@@ -2105,6 +2142,7 @@ fn append_host_findings(parts: AppendHostFindingsArgs<'_>) {
             interpreter: Some(interpreter.into()),
             interpreter_confidence: confidence,
             locator: Some(format!("line:{line}:column:{column}")),
+            host_named_the_shell: false,
             span: ByteSpan {
                 start_byte: whole.start() as u64,
                 end_byte: whole.end() as u64,

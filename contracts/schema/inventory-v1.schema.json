@@ -44,6 +44,7 @@
               { "type": "null" }
             ]
           },
+          "host_named_the_shell": { "type": "boolean" },
           "interpreter_confidence": { "enum": ["high", "medium", "low"] },
           "kind": { "enum": ["shell_file", "embedded_shell", "candidate"] },
           "locator": {
