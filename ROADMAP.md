@@ -83,13 +83,30 @@ Nushell), with both official Rust and Go generators where applicable.
   place. `fish` and `cmd` lower and plan; `migrate verify` runs the original,
   which needs the interpreter, so those two wait for a runner that has one.
 
-  PowerShell was the one that taught something. Its first verification reported
-  `different` — the replacement wrote `one` and exit 0, the original wrote
-  nothing and exit 1. The original had failed to start, because `pwsh` here is
-  a `mise` shim and `agent_process` clears the environment before running
-  anything, deliberately. The tool was right on both counts: the difference was
-  real, and reporting it rather than passing is the whole point. It verifies
-  from a directory where `pwsh` resolves.
+  PowerShell was the one that taught something, and then taught it again. Its
+  first verification reported `different` — the replacement wrote `one` and exit
+  0, the original wrote nothing and exit 1. That was written down here as the
+  tool being right twice over: the difference was real, and reporting it rather
+  than passing is the point.
+
+  It was right about the bytes and wrong about what they meant, which is the
+  more expensive half. The original had not run at all. `pwsh` on this machine
+  is a `mise` shim, a shim resolves its version from the configuration nearest
+  the working directory, and the comparison happens in a private workspace under
+  the system temporary root. A reader following `DESHELL_DIFFERENCE` would go
+  looking for a fault in the generated program.
+
+  Two defects, both since fixed. The parsers ran in their own scratch
+  directories, which made de-shell unable to use *any* interpreter installed
+  through `mise`, `asdf` or `volta` — it reported `runtime unavailable` and
+  delegated a block whose runtime was present. And a comparison did not check
+  that the baseline had been taken. The original's interpreter is now probed
+  with an empty script through the same argv the comparison uses, and a failure
+  to start is `unavailable`, exit 6, not `different`, exit 5.
+
+  Walked both ways afterwards: the same source retires from a project whose
+  `mise.toml` declares the runtime, and reports `unavailable` from one that does
+  not.
 
   An embedded source walks the same flow. A workflow whose step is
 
