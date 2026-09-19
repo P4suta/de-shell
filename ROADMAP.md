@@ -250,11 +250,26 @@ Nushell), with both official Rust and Go generators where applicable.
     program the runner never runs, so the two agreed when they should not have
     and disagreed when they should not have.
 
-  `pipefail` is the one still open in that family: the runner's default is
-  `bash -e {0}` without it and an explicit `shell: bash` is
-  `bash --noprofile --norc -eo pipefail {0}` with it, and the scanner reports
-  both as `bash`. A pipeline the host has not placed is delegated rather than
-  guessed. Teaching the scanner to keep the `shell:` key would close it.
+  `pipefail` was the fourth and is closed. The runner's default is `bash -e {0}`
+  without it and an explicit `shell: bash` is
+  `bash --noprofile --norc -eo pipefail {0}` with it — both known, once somebody
+  asks which. Nothing had: `yaml_step_shell` was already consulted to pick the
+  interpreter and its answer was thrown away. `Finding` carries
+  `host_named_the_shell` now, and `ShellOptions::pipefail_unknown` is gone with
+  the refusal it guarded.
+
+  What is left is not this family. It is three pieces of modelling work:
+
+  - **The PowerShell subset** (18). Nine of those are
+    `run: ./scripts/install-nushell.ps1`, which is a path invocation rather than
+    an explicit `&` call; the other nine are the scripts themselves, which use
+    control syntax, cmdlets and variables the frontend does not model. Those
+    nine are also the nine `UNRESOLVED_CALL_SITE`, because the call sites cannot
+    be resolved until the script they call has a replacement.
+  - **A `mise.toml` host generator** (11). Task `run` values are shell in a task
+    runner's configuration, and de-shell has no host shape for one.
+  - **A GitHub expression model** (6). `${{ }}` would have to become a task
+    input the scenario supplies, rather than bytes.
 
 - [ ] Run the fixed 2026-08-25 48-repository audit selection through both
   deterministic implementations and record zero scanner errors/skips,
