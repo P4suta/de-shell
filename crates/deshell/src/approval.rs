@@ -7,8 +7,20 @@ const ZERO_PINNED_DIGEST: &str =
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum Subject {
-    Scenario { name: String, path: String },
-    Matrix { id: String },
+    Scenario {
+        name: String,
+        path: String,
+    },
+    Matrix {
+        id: String,
+    },
+    /// A shell location declared to stay. Identified by its exact span, so a
+    /// declaration cannot drift onto shell added later.
+    DeclaredShell {
+        path: String,
+        start_byte: u64,
+        end_byte: u64,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -85,6 +97,19 @@ impl Approval {
                     return Err("approval matrix id is not portable".into());
                 }
             }
+            Subject::DeclaredShell {
+                path,
+                start_byte,
+                end_byte,
+            } => {
+                let normalized = crate::ir::normalize_path(path)?;
+                if normalized != *path {
+                    return Err("approval declared shell path is not canonical".into());
+                }
+                if end_byte <= start_byte {
+                    return Err("approval declared shell span must be non-empty and ordered".into());
+                }
+            }
         }
         if self.computed_digest()? != self.approval_digest {
             return Err("approval digest does not match its canonical content".into());
@@ -147,6 +172,86 @@ pub(crate) fn matrix_reviews(root: &Path) -> Result<Vec<Review>, String> {
     }
     output.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(output)
+}
+
+pub(crate) fn declared_shell_reviews(root: &Path) -> Result<Vec<Review>, String> {
+    let approvals = load_approvals(root)?;
+    let config = crate::project::load_config(root).map_err(|errors| errors.join("; "))?;
+    let mut output = Vec::new();
+    for location in config.declared_shell {
+        let subject = Subject::DeclaredShell {
+            path: location.path.clone(),
+            start_byte: location.start_byte,
+            end_byte: location.end_byte,
+        };
+        let digest = declared_shell_review_digest(&location)?;
+        let (status, approval_digest) = review_state(
+            &approvals,
+            &subject,
+            &digest,
+            cfg!(test) && location.approval == crate::config::Approval::Approved,
+        )?;
+        output.push(Review {
+            kind: "declared".into(),
+            name: declared_shell_name(&location.path, location.start_byte, location.end_byte),
+            path: Some(location.path),
+            digest,
+            status,
+            approval_digest,
+        });
+    }
+    output.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(output)
+}
+
+/// How a declared location is named on the command line.
+///
+/// The same `path@start..end` every other location is printed as, so a name
+/// copied out of a gate failure is the name that approves it.
+pub(crate) fn declared_shell_name(path: &str, start_byte: u64, end_byte: u64) -> String {
+    format!("{path}@{start_byte}..{end_byte}")
+}
+
+pub(crate) fn approve_declared_shell(
+    root: &Path,
+    name: &str,
+    supplied_digest: &str,
+) -> Result<Approval, String> {
+    let config = crate::project::load_config(root).map_err(|errors| errors.join("; "))?;
+    let location = config
+        .declared_shell
+        .iter()
+        .find(|location| {
+            declared_shell_name(&location.path, location.start_byte, location.end_byte) == name
+        })
+        .ok_or_else(|| format!("declared shell not found: {name}"))?;
+    persist_approval(
+        root,
+        Subject::DeclaredShell {
+            path: location.path.clone(),
+            start_byte: location.start_byte,
+            end_byte: location.end_byte,
+        },
+        declared_shell_review_digest(location)?,
+        supplied_digest,
+    )
+}
+
+/// Whether this declared location is approved as it currently reads.
+pub(crate) fn declared_shell_approval(
+    root: &Path,
+    location: &crate::config::DeclaredShell,
+) -> Result<Option<String>, String> {
+    current_approval(
+        root,
+        &Subject::DeclaredShell {
+            path: location.path.clone(),
+            start_byte: location.start_byte,
+            end_byte: location.end_byte,
+        },
+        &declared_shell_review_digest(location)?,
+        cfg!(test) && location.approval == crate::config::Approval::Approved,
+    )
 }
 
 pub(crate) fn approve_scenario(
@@ -410,6 +515,14 @@ fn scenario_review_digest(
         "contract": "deshell-scenario-review-v1",
         "path": path,
         "scenario": scenario,
+    });
+    Ok(format!("sha256:{}", canonical_value_digest(&value)?))
+}
+
+fn declared_shell_review_digest(location: &crate::config::DeclaredShell) -> Result<String, String> {
+    let value = serde_json::json!({
+        "contract": "deshell-declared-shell-review-v1",
+        "location": location,
     });
     Ok(format!("sha256:{}", canonical_value_digest(&value)?))
 }

@@ -7,6 +7,26 @@ pub(crate) struct ProjectConfig {
     pub version: u32,
     pub entrypoints: Vec<String>,
     pub location_overrides: Vec<LocationOverride>,
+    /// Shell that is in the repository on purpose and must not be retired.
+    ///
+    /// Not an exclusion and not an `allow`. A declared location is still
+    /// scanned, still counted and still reported — `verify --require shell-free`
+    /// says `0 live, 36 declared` — and it carries the reason it is here and an
+    /// approval digest, so it cannot be added without somebody reviewing it.
+    ///
+    /// The case that made it necessary is de-shell's own: `contracts/golden/*.json`
+    /// records shell behaviour measured from real shells, and `cargo xtask`
+    /// re-measures it by running exactly those bytes. It is not shell waiting to
+    /// be replaced; it is the evidence the oracle rests on. Without a way to say
+    /// so, a repository whose subject matter is shell can never pass its own
+    /// gate, and the only alternatives are deleting the corpus or leaving the
+    /// gate permanently red — neither of which is a true statement about the
+    /// repository.
+    ///
+    /// `#[serde(default)]` so a project written before this field reads
+    /// unchanged and its review digests do not move.
+    #[serde(default)]
+    pub declared_shell: Vec<DeclaredShell>,
     pub interpreter_overrides: Vec<InterpreterOverride>,
     pub platform_cells: Vec<PlatformCell>,
     pub validation_commands: Vec<ValidationCommand>,
@@ -83,6 +103,24 @@ pub(crate) struct IntegrationTargets {
 #[serde(deny_unknown_fields)]
 pub(crate) struct LanguageIntegration {
     pub module_root: String,
+}
+
+/// One shell location that stays, with the reason it stays.
+///
+/// The span is exact rather than a path or a glob: declaring a file would let
+/// shell added to it later inherit the declaration, which is the loophole this
+/// is built to avoid. A span that no longer matches a scanned location is
+/// reported as stale rather than ignored.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DeclaredShell {
+    pub path: String,
+    pub start_byte: u64,
+    pub end_byte: u64,
+    /// Why this shell is here. Read by a human reviewing the approval, and by
+    /// anybody who later wonders whether it can go.
+    pub reason: String,
+    pub approval: Approval,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -472,6 +510,32 @@ fn validate_migration_config(config: &ProjectConfig, errors: &mut Vec<String>) {
         )) {
             errors.push(format!(
                 "duplicate exact location override: {}@{}..{}",
+                location.path, location.start_byte, location.end_byte
+            ));
+        }
+    }
+    let mut declared = std::collections::BTreeSet::new();
+    for location in &config.declared_shell {
+        validate_contract_path("declared shell", &location.path, errors);
+        if location.end_byte <= location.start_byte {
+            errors.push(format!(
+                "declared shell span must be non-empty and ordered: {}@{}..{}",
+                location.path, location.start_byte, location.end_byte
+            ));
+        }
+        if location.reason.trim().is_empty() {
+            errors.push(format!(
+                "declared shell must say why it stays: {}@{}..{}",
+                location.path, location.start_byte, location.end_byte
+            ));
+        }
+        if !declared.insert((
+            location.path.as_str(),
+            location.start_byte,
+            location.end_byte,
+        )) {
+            errors.push(format!(
+                "duplicate declared shell: {}@{}..{}",
                 location.path, location.start_byte, location.end_byte
             ));
         }

@@ -66,6 +66,11 @@ enum Command {
         #[command(subcommand)]
         command: MatrixCommand,
     },
+    /// Review and approve shell that stays in the repository on purpose.
+    Declared {
+        #[command(subcommand)]
+        command: DeclaredCommand,
+    },
     /// Lower an entrypoint into canonical Effect IR.
     Analyze {
         #[arg(long, default_value = ".")]
@@ -300,6 +305,29 @@ enum MatrixCommand {
         root: PathBuf,
         #[arg(long)]
         cell: String,
+        #[arg(long)]
+        digest: String,
+        #[arg(long, value_enum, default_value = "human")]
+        format: OutputFormat,
+    },
+}
+
+#[derive(Clone, Debug, Subcommand)]
+enum DeclaredCommand {
+    /// List declared shell review digests and approval state.
+    List {
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        #[arg(long, value_enum, default_value = "human")]
+        format: OutputFormat,
+    },
+    /// Approve the exact declared location shown by list.
+    Approve {
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        /// The location as `path@start..end`, copied from list.
+        #[arg(long)]
+        location: String,
         #[arg(long)]
         digest: String,
         #[arg(long, value_enum, default_value = "human")]
@@ -557,6 +585,11 @@ impl Command {
                     Some(root)
                 }
             },
+            Self::Declared { command } => match command {
+                DeclaredCommand::List { root, .. } | DeclaredCommand::Approve { root, .. } => {
+                    Some(root)
+                }
+            },
             Self::Harden { command } => match command {
                 HardenCommand::Plan { root, .. }
                 | HardenCommand::Verify { root, .. }
@@ -658,6 +691,24 @@ impl Command {
                     next_actions: vec![action(vec![
                         "deshell".into(),
                         "matrix".into(),
+                        "list".into(),
+                        "--root".into(),
+                        root_value(root),
+                    ])],
+                }
+            }
+            Self::Declared { command } => {
+                let (root, format) = match command {
+                    DeclaredCommand::List { root, format }
+                    | DeclaredCommand::Approve { root, format, .. } => (root, *format),
+                };
+                ReportSpec {
+                    command: "declared",
+                    root: root.clone(),
+                    format,
+                    next_actions: vec![action(vec![
+                        "deshell".into(),
+                        "declared".into(),
                         "list".into(),
                         "--root".into(),
                         root_value(root),
@@ -810,6 +861,11 @@ impl Command {
             },
             Self::Matrix { command } => match command {
                 MatrixCommand::List { format, .. } | MatrixCommand::Approve { format, .. } => {
+                    *format = OutputFormat::Human
+                }
+            },
+            Self::Declared { command } => match command {
+                DeclaredCommand::List { format, .. } | DeclaredCommand::Approve { format, .. } => {
                     *format = OutputFormat::Human
                 }
             },
@@ -1545,6 +1601,23 @@ fn dispatch(
                 stdout,
             }),
         },
+        Command::Declared { command } => match command {
+            DeclaredCommand::List { root, format } => {
+                declared_review_command(&root, format, stdout)
+            }
+            DeclaredCommand::Approve {
+                root,
+                location,
+                digest,
+                format,
+            } => declared_approve_command(DeclaredApproveCommandArgs {
+                root: &root,
+                location: &location,
+                digest: &digest,
+                format,
+                stdout,
+            }),
+        },
         Command::Matrix { command } => match command {
             MatrixCommand::List { root, format } => matrix_review_command(&root, format, stdout),
             MatrixCommand::Approve {
@@ -2102,7 +2175,7 @@ fn interpreter_confidence(confidence: &crate::scanner::InterpreterConfidence) ->
 }
 
 fn shell_free_command(root: &Path, stdout: &mut dyn Write) -> Result<i32, Failure> {
-    let inventory = crate::project::scan(root).map_err(Failure::io)?;
+    let mut inventory = crate::project::scan(root).map_err(Failure::io)?;
     if !inventory.errors.is_empty() || !inventory.skipped.is_empty() {
         let blockers = inventory
             .errors
@@ -2127,12 +2200,109 @@ fn shell_free_command(root: &Path, stdout: &mut dyn Write) -> Result<i32, Failur
             "shell-free scan is incomplete: {blockers}"
         )));
     }
+    let declared = take_declared_shell(root, &mut inventory)?;
     if !inventory.findings.is_empty() {
-        return Err(shell_reintroduced_failure(&inventory));
+        return Err(shell_reintroduced_failure(&inventory, declared.len()));
     }
     crate::migration::verify_integrity(root).map_err(Failure::policy)?;
-    writeln_io(stdout, format_args!("shell-free: verified"))?;
+    // The declared count is printed even when it is zero. A gate that says
+    // `verified` and nothing else cannot be told apart from one that has
+    // nothing declared, and the difference is the whole point of declaring.
+    writeln_io(
+        stdout,
+        format_args!("shell-free: verified (0 live, {} declared)", declared.len()),
+    )?;
+    for location in &declared {
+        writeln_io(stdout, format_args!("declared {location}"))?;
+    }
     Ok(0)
+}
+
+/// Remove the locations this project has declared and approved, and name them.
+///
+/// A declared location is not skipped: it is matched by its exact span, counted,
+/// and printed. A declaration that matches nothing is stale — the shell it named
+/// moved or went — and a declaration that is not approved does not remove
+/// anything, so neither can quietly widen the gate.
+fn take_declared_shell(
+    root: &Path,
+    inventory: &mut crate::scanner::Inventory,
+) -> Result<Vec<String>, Failure> {
+    let config = crate::project::load_config(root).map_err(classify_project_errors)?;
+    if config.declared_shell.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut approved = std::collections::BTreeSet::new();
+    let mut named = Vec::new();
+    let mut unapproved = Vec::new();
+    for location in &config.declared_shell {
+        let name = crate::approval::declared_shell_name(
+            &location.path,
+            location.start_byte,
+            location.end_byte,
+        );
+        match crate::approval::declared_shell_approval(root, location)
+            .map_err(classify_project_error)?
+        {
+            Some(_) => {
+                approved.insert((
+                    location.path.clone(),
+                    location.start_byte,
+                    location.end_byte,
+                ));
+                named.push(format!("{name}: {}", location.reason));
+            }
+            None => unapproved.push(name),
+        }
+    }
+    if !unapproved.is_empty() {
+        return Err(Failure {
+            help: Some(
+                "A declaration removes nothing until it is approved, so the gate would otherwise pass on a review nobody did.".into(),
+            ),
+            next_actions: vec![crate::report::Action::Command {
+                argv: vec![
+                    "deshell".into(),
+                    "declared".into(),
+                    "list".into(),
+                    "--root".into(),
+                    root.to_string_lossy().into_owned(),
+                ],
+            }],
+            ..Failure::policy(format!(
+                "declared shell is not approved: {}",
+                unapproved.join(", ")
+            ))
+        });
+    }
+    let mut matched = std::collections::BTreeSet::new();
+    inventory.findings.retain(|finding| {
+        let key = (
+            finding.path.clone(),
+            finding.span.start_byte,
+            finding.span.end_byte,
+        );
+        if approved.contains(&key) {
+            matched.insert(key);
+            false
+        } else {
+            true
+        }
+    });
+    let stale = approved
+        .difference(&matched)
+        .map(|(path, start, end)| crate::approval::declared_shell_name(path, *start, *end))
+        .collect::<Vec<_>>();
+    if !stale.is_empty() {
+        return Err(Failure {
+            help: Some(
+                "The shell a declaration named is no longer there. Remove the declaration, or point it at where the shell went.".into(),
+            ),
+            ..Failure::policy(format!("declared shell matches nothing: {}", stale.join(", ")))
+        });
+    }
+    named.sort();
+    Ok(named)
 }
 
 /// The failure a live shell location produces, said in a length somebody can
@@ -2147,7 +2317,7 @@ fn shell_free_command(root: &Path, stdout: &mut dyn Write) -> Result<i32, Failur
 ///
 /// The first few are still here. A gate that says only "101 locations" makes a
 /// reader run another command to find out whether the answer is surprising.
-fn shell_reintroduced_failure(inventory: &crate::scanner::Inventory) -> Failure {
+fn shell_reintroduced_failure(inventory: &crate::scanner::Inventory, declared: usize) -> Failure {
     const NAMED: usize = 5;
     let mut by_kind: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
     let mut by_path: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
@@ -2183,7 +2353,7 @@ fn shell_reintroduced_failure(inventory: &crate::scanner::Inventory) -> Failure 
     };
     Failure {
         help: Some(format!(
-            "Every location is in `deshell scan --format json`, with the byte span of each. {shape}."
+            "Every location is in `deshell scan --format json`, with the byte span of each. {shape}. {declared} declared."
         )),
         next_actions: vec![crate::report::Action::Command {
             argv: vec![
@@ -2507,6 +2677,114 @@ fn matrix_review_command(
                 }
             }
         }
+    }
+    Ok(0)
+}
+
+fn declared_review_command(
+    root: &Path,
+    format: OutputFormat,
+    stdout: &mut dyn Write,
+) -> Result<i32, Failure> {
+    let reviews = crate::approval::declared_shell_reviews(root).map_err(classify_project_error)?;
+    match format {
+        OutputFormat::Json => {
+            let value = serde_json::to_value(&reviews)
+                .map_err(|error| Failure::internal(error.to_string()))?;
+            write_io(
+                stdout,
+                &crate::canonical_json::pretty_bytes(&value).map_err(Failure::internal)?,
+            )?;
+        }
+        // `Agent` is collected from the human output by `command_report`,
+        // which sets the format to `Human` before dispatch runs, so it cannot
+        // arrive here. Listing it says that rather than leaving a wildcard.
+        OutputFormat::Agent | OutputFormat::Human => {
+            for review in &reviews {
+                writeln_io(
+                    stdout,
+                    format_args!(
+                        "{}\t{}\t{}",
+                        review.name,
+                        review_status(review.status),
+                        review.digest
+                    ),
+                )?;
+                if !review.status.is_current() {
+                    let argv = vec![
+                        "deshell".to_owned(),
+                        "declared".to_owned(),
+                        "approve".to_owned(),
+                        "--root".to_owned(),
+                        root.to_string_lossy().into_owned(),
+                        "--location".to_owned(),
+                        review.name.clone(),
+                        "--digest".to_owned(),
+                        review.digest.clone(),
+                    ];
+                    writeln_io(
+                        stdout,
+                        format_args!(
+                            "next argv: {}",
+                            serde_json::to_string(&argv)
+                                .map_err(|error| Failure::internal(error.to_string()))?
+                        ),
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(0)
+}
+
+/// The inputs of [`declared_approve_command`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to
+/// a many-argument function stays invisible to every call site that already
+/// compiles. [`declared_approve_command`] takes this apart without `..`, so a
+/// field added here fails to compile until somebody gives it a destination.
+struct DeclaredApproveCommandArgs<'a> {
+    root: &'a Path,
+    location: &'a str,
+    digest: &'a str,
+    format: OutputFormat,
+    stdout: &'a mut dyn Write,
+}
+
+fn declared_approve_command(parts: DeclaredApproveCommandArgs<'_>) -> Result<i32, Failure> {
+    // Destructured without `..`: see `DeclaredApproveCommandArgs`.
+    let DeclaredApproveCommandArgs {
+        root,
+        location,
+        digest,
+        format,
+        stdout,
+    } = parts;
+    let approval =
+        crate::approval::approve_declared_shell(root, location, digest).map_err(|message| {
+            if message.starts_with("review digest mismatch") {
+                Failure::policy(message)
+            } else {
+                classify_project_error(message)
+            }
+        })?;
+    match format {
+        OutputFormat::Json => {
+            let value = serde_json::to_value(&approval)
+                .map_err(|error| Failure::internal(error.to_string()))?;
+            write_io(
+                stdout,
+                &crate::canonical_json::pretty_bytes(&value).map_err(Failure::internal)?,
+            )?;
+        }
+        // See `declared_review_command`.
+        OutputFormat::Agent | OutputFormat::Human => writeln_io(
+            stdout,
+            format_args!(
+                "approved declared shell {location} as {}",
+                approval.approval_digest
+            ),
+        )?,
     }
     Ok(0)
 }
@@ -6015,6 +6293,117 @@ mod tests {
             assert!(start < end, "{item}");
             assert!(end <= source.len() as u64, "{item}");
         }
+    }
+
+    /// Shell that is in the repository on purpose is declared, approved, and
+    /// still counted.
+    ///
+    /// The case that made this necessary is de-shell's own: `contracts/golden`
+    /// records shell behaviour measured from real shells, and `cargo xtask`
+    /// re-measures it by running exactly those bytes. Without a way to say so, a
+    /// repository whose subject matter is shell can never pass its own gate, and
+    /// the alternatives are deleting the evidence or leaving the gate
+    /// permanently red — neither of which is a true statement about it.
+    ///
+    /// Four states are checked here, because the value of the mechanism is in
+    /// the three that are not "pass": a declaration nobody approved removes
+    /// nothing, a declaration whose shell moved is stale rather than ignored,
+    /// and a location that is not declared still fails.
+    #[test]
+    fn declared_shell_is_approved_matched_and_counted_rather_than_ignored() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        let kept = b"/usr/bin/printf measured\n";
+        configure(directory.path(), "corpus.sh", kept);
+        let root = path(directory.path());
+
+        let undeclared = invoke_owned(vec![
+            "deshell".into(),
+            "verify".into(),
+            "--root".into(),
+            root.clone(),
+            "--require".into(),
+            "shell-free".into(),
+        ]);
+        assert_eq!(undeclared.0, 4, "an undeclared location must still fail");
+
+        let config = directory.path().join(".deshell/project.toml");
+        let declare = |start: u64, end: u64| {
+            let mut text = std::fs::read_to_string(&config).unwrap();
+            text.push_str(&format!(
+                "\n[[declared_shell]]\npath = \"corpus.sh\"\nstart_byte = {start}\nend_byte = {end}\nreason = \"measured shell behaviour\"\napproval = \"draft\"\n"
+            ));
+            std::fs::write(&config, text).unwrap();
+        };
+        let gate = || {
+            invoke_owned(vec![
+                "deshell".into(),
+                "verify".into(),
+                "--root".into(),
+                root.clone(),
+                "--require".into(),
+                "shell-free".into(),
+            ])
+        };
+        let approve_every = || {
+            let listed = invoke_owned(vec![
+                "deshell".into(),
+                "declared".into(),
+                "list".into(),
+                "--root".into(),
+                root.clone(),
+            ]);
+            let text = String::from_utf8(listed.1).unwrap();
+            for line in text.lines() {
+                let fields = line.split('\t').collect::<Vec<_>>();
+                if fields.len() == 3 && fields[1] != "approved" {
+                    let approved = invoke_owned(vec![
+                        "deshell".into(),
+                        "declared".into(),
+                        "approve".into(),
+                        "--root".into(),
+                        root.clone(),
+                        "--location".into(),
+                        fields[0].into(),
+                        "--digest".into(),
+                        fields[2].into(),
+                    ]);
+                    assert_eq!(approved.0, 0, "{}", String::from_utf8_lossy(&approved.2));
+                }
+            }
+        };
+
+        // Declared and not approved: the gate refuses, because otherwise it
+        // would pass on a review nobody did.
+        declare(0, kept.len() as u64);
+        let unapproved = gate();
+        assert_eq!(unapproved.0, 4);
+        let text = String::from_utf8(unapproved.1).unwrap();
+        assert!(text.contains("declared shell is not approved"), "{text}");
+
+        // Approved and matching: the gate passes and says how many stayed.
+        approve_every();
+        let passing = gate();
+        assert_eq!(passing.0, 0, "{}", String::from_utf8_lossy(&passing.2));
+        let text = String::from_utf8(passing.1).unwrap();
+        assert!(
+            text.contains("shell-free: verified (0 live, 1 declared)"),
+            "{text}"
+        );
+        assert!(text.contains("measured shell behaviour"), "{text}");
+
+        // Approved and matching nothing: stale, not silently dropped.
+        let mut config_text = std::fs::read_to_string(&config).unwrap();
+        config_text = config_text.replace(
+            &format!("end_byte = {}", kept.len()),
+            &format!("end_byte = {}", kept.len() - 1),
+        );
+        std::fs::write(&config, config_text).unwrap();
+        approve_every();
+        let stale = gate();
+        assert_eq!(stale.0, 4);
+        let text = String::from_utf8(stale.1).unwrap();
+        assert!(text.contains("declared shell matches nothing"), "{text}");
     }
 
     /// A gate that fails names its code once and does not inline the inventory.

@@ -33,6 +33,13 @@ All notable changes are documented here. No compatibility contract predates
   dependency-policy and coverage floors, a CycloneDX SBOM, checksums, keyless
   signatures, provenance, smoke tests, and protected crates.io publication.
 
+- `[[declared_shell]]` in `project.toml` and `deshell declared list` /
+  `deshell declared approve`: shell that is in the repository on purpose, named
+  by its exact byte span, carrying the reason it stays and an approval digest.
+  `verify --require shell-free` reports `0 live, N declared` and prints each
+  reason. A declaration that is not approved removes nothing, and one whose
+  shell has moved is reported stale rather than ignored.
+
 ### Changed
 
 - Made Rust the default for `deshell`, `mise run deshell`, CI, packaging, and
