@@ -2,13 +2,76 @@
  "schema_version": 1,
  "contract": "case-pattern-semantics-v1",
  "purpose": "Record what each shell matches for the `case` patterns a real workflow writes, so the frontend's pattern model is checked against a measurement rather than against a reading of the specification.",
- "note": "The word is base64 so a newline survives the file, the script is the whole program each shell is given, and the answer is an ASCII token so nothing is lost to a text decode. Agreement across the columns is not evidence that a pattern does what it was written to do: `newline-via-command-substitution` answers the same in all four shells and is wrong in all four, because command substitution strips the newline the guard was built to hold; `caret-set-member` answers the same by two opposite rules, and the same pattern against a different word is where they part. A corpus that only asked whether the shells agree would pass both in silence. A shell that refuses the pattern is recorded as `ERROR` and nothing more: the message names the interpreter's own path and the script's name, neither of which is a property of the pattern.",
+ "note": "The word is base64 so a newline survives the file, the script is the whole program each shell is given, and the answer is an ASCII token so nothing is lost to a text decode. Agreement across the columns is not evidence that a pattern does what it was written to do: `newline-via-command-substitution` answers the same in all four shells and is wrong in all four, because command substitution strips the newline the guard was built to hold; `caret-set-member` answers the same by two opposite rules, and the same pattern against a different word is where they part. A corpus that only asked whether the shells agree would pass both in silence. A shell that refuses the pattern is recorded as `ERROR` and nothing more: the message names the interpreter's own path and the script's name, neither of which is a property of the pattern. Program names are not semantic versions: observed dash builds match one of two complete profiles across all 45 cases, never a convenient answer selected case by case.",
  "shells": [
   "bash",
   "sh",
   "zsh",
-  "dash"
+ "dash"
  ],
+ "programs": [
+  {
+   "name": "bash",
+   "profiles": ["bash"]
+  },
+  {
+   "name": "zsh",
+   "profiles": ["zsh"]
+  },
+  {
+   "name": "dash",
+   "profiles": ["dash", "dash-with-ansi-c-quotes"]
+  }
+ ],
+ "profile_variants": {
+  "dash-with-ansi-c-quotes": {
+   "ansi-c-newline-match": "MATCH",
+   "ansi-c-carriage-match": "MATCH",
+   "ansi-c-no-break": "NOMATCH",
+   "ansi-c-literal-backslash-n": "NOMATCH",
+   "version-prefix": "MATCH",
+   "version-prefix-absent": "NOMATCH",
+   "version-prefix-only": "MATCH",
+   "bool-alternation-true": "MATCH",
+   "bool-alternation-false": "MATCH",
+   "bool-alternation-longer": "NOMATCH",
+   "bool-alternation-empty": "NOMATCH",
+   "literal-with-slash": "MATCH",
+   "star-crosses-a-slash": "MATCH",
+   "star-crosses-two-slashes": "MATCH",
+   "quoted-star-is-literal": "MATCH",
+   "quoted-star-not-glob": "NOMATCH",
+   "escaped-star-is-literal": "MATCH",
+   "escaped-star-not-glob": "NOMATCH",
+   "half-quoted-star-is-glob": "MATCH",
+   "half-quoted-matches-star": "MATCH",
+   "quoted-question-literal": "MATCH",
+   "quoted-question-not-glob": "NOMATCH",
+   "quoted-bracket-literal": "MATCH",
+   "quoted-bracket-not-class": "NOMATCH",
+   "star-suffix": "MATCH",
+   "star-prefix": "MATCH",
+   "question-one-character": "MATCH",
+   "question-not-two": "NOMATCH",
+   "star-matches-empty": "MATCH",
+   "question-does-not": "NOMATCH",
+   "bracket-class": "MATCH",
+   "bracket-class-excluded": "NOMATCH",
+   "bracket-negated-posix": "MATCH",
+   "bracket-negated-caret": "MATCH",
+   "bracket-close-first": "MATCH",
+   "posix-character-class": "MATCH",
+   "posix-character-class-no": "NOMATCH",
+   "leading-dash": "MATCH",
+   "extglob-at-list": "ERROR",
+   "ansi-c-dollar-backslash": "NOMATCH",
+   "caret-set-member": "MATCH",
+   "newline-via-command-substitution": "MATCH",
+   "newline-via-substitution-guarded": "NOMATCH",
+   "literal-newline-in-quotes": "MATCH",
+   "literal-newline-in-quotes-no": "NOMATCH"
+  }
+ },
  "cases": [
   {
    "id": "ansi-c-newline-match",

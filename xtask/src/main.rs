@@ -139,6 +139,84 @@ struct PosixDivergenceObservation {
     exit: i32,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CasePatternCorpus {
+    schema_version: u32,
+    contract: String,
+    purpose: String,
+    note: String,
+    shells: Vec<String>,
+    programs: Vec<CasePatternProgram>,
+    profile_variants: BTreeMap<String, BTreeMap<String, CasePatternOutcome>>,
+    cases: Vec<CasePatternCase>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CasePatternProgram {
+    name: String,
+    profiles: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CasePatternCase {
+    id: String,
+    pattern: String,
+    word_base64: String,
+    script: String,
+    #[serde(rename = "note")]
+    _note: String,
+    bash: CasePatternOutcome,
+    sh: CasePatternOutcome,
+    zsh: CasePatternOutcome,
+    dash: CasePatternOutcome,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+enum CasePatternOutcome {
+    #[serde(rename = "MATCH")]
+    Match,
+    #[serde(rename = "NOMATCH")]
+    NoMatch,
+    #[serde(rename = "ERROR")]
+    Error,
+}
+
+impl CasePatternOutcome {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Match => "MATCH",
+            Self::NoMatch => "NOMATCH",
+            Self::Error => "ERROR",
+        }
+    }
+}
+
+impl CasePatternCase {
+    const fn base_outcome(&self, profile: &str) -> Option<CasePatternOutcome> {
+        match profile.as_bytes() {
+            b"bash" => Some(self.bash),
+            b"sh" => Some(self.sh),
+            b"zsh" => Some(self.zsh),
+            b"dash" => Some(self.dash),
+            _ => None,
+        }
+    }
+}
+
+impl CasePatternCorpus {
+    fn outcome(&self, case: &CasePatternCase, profile: &str) -> Option<CasePatternOutcome> {
+        case.base_outcome(profile).or_else(|| {
+            self.profile_variants
+                .get(profile)
+                .and_then(|outcomes| outcomes.get(&case.id))
+                .copied()
+        })
+    }
+}
+
 fn repository_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..")
 }
@@ -545,6 +623,13 @@ impl RecordedShellColumn {
             "zsh" => Some(Self::Zsh),
             "dash" => Some(Self::Dash),
             _ => None,
+        }
+    }
+
+    const fn program_is_required(self) -> bool {
+        match self {
+            Self::Bash => true,
+            Self::Sh | Self::Zsh | Self::Dash => false,
         }
     }
 
@@ -1674,102 +1759,317 @@ fn run_printf_semantics(root: &Path) -> Result<(), Vec<String>> {
     Err(errors)
 }
 
+fn validate_case_pattern_corpus(corpus: &CasePatternCorpus) -> Result<(), Vec<String>> {
+    const PROGRAMS: [(&str, &[&str]); 3] = [
+        ("bash", &["bash"]),
+        ("zsh", &["zsh"]),
+        ("dash", &["dash", "dash-with-ansi-c-quotes"]),
+    ];
+
+    let mut errors = Vec::new();
+    if corpus.schema_version != 1 {
+        errors.push(format!(
+            "case-pattern schema version is {}, expected 1",
+            corpus.schema_version
+        ));
+    }
+    if corpus.contract != "case-pattern-semantics-v1" {
+        errors.push(format!(
+            "case-pattern contract is {:?}, expected case-pattern-semantics-v1",
+            corpus.contract
+        ));
+    }
+    if corpus.purpose.trim().is_empty() || corpus.note.trim().is_empty() {
+        errors.push("case-pattern purpose and note must be non-empty".to_owned());
+    }
+
+    let mut shell_columns = BTreeSet::new();
+    for name in &corpus.shells {
+        let Some(shell) = RecordedShellColumn::parse(name) else {
+            errors.push(format!("case-pattern corpus names unknown shell {name:?}"));
+            continue;
+        };
+        if !shell_columns.insert(shell) {
+            errors.push(format!("case-pattern corpus repeats shell {name:?}"));
+        }
+    }
+    let expected_shells = RecordedShellColumn::ALL.into_iter().collect();
+    if shell_columns != expected_shells {
+        errors.push(format!(
+            "case-pattern corpus shell set is {shell_columns:?}, expected {expected_shells:?}"
+        ));
+    }
+
+    let mut case_ids = BTreeSet::new();
+    for case in &corpus.cases {
+        if case.id.is_empty() || !case_ids.insert(case.id.as_str()) {
+            errors.push(format!(
+                "case-pattern case id is empty or repeated: {:?}",
+                case.id
+            ));
+        }
+        if case.pattern.is_empty() || case.script.is_empty() {
+            errors.push(format!(
+                "case-pattern case {:?} has an empty pattern or script",
+                case.id
+            ));
+        }
+        match decode_base64(&case.word_base64) {
+            Some(word) if std::str::from_utf8(&word).is_ok() => {}
+            _ => errors.push(format!(
+                "case-pattern case {:?} has a word that is not base64 UTF-8",
+                case.id
+            )),
+        }
+    }
+    if corpus.cases.is_empty() {
+        errors.push("case-pattern corpus has no cases".to_owned());
+    }
+
+    let mut program_names = BTreeSet::new();
+    for program in &corpus.programs {
+        if !program_names.insert(program.name.as_str()) {
+            errors.push(format!(
+                "case-pattern corpus repeats program {:?}",
+                program.name
+            ));
+        }
+        let expected = PROGRAMS
+            .iter()
+            .find_map(|(name, profiles)| (*name == program.name).then_some(*profiles));
+        match expected {
+            Some(expected)
+                if program
+                    .profiles
+                    .iter()
+                    .map(String::as_str)
+                    .eq(expected.iter().copied()) => {}
+            Some(expected) => errors.push(format!(
+                "case-pattern program {:?} has profiles {:?}, expected {expected:?}",
+                program.name, program.profiles
+            )),
+            None => errors.push(format!(
+                "case-pattern corpus names unknown program {:?}",
+                program.name
+            )),
+        }
+    }
+    let expected_programs = PROGRAMS.into_iter().map(|(name, _)| name).collect();
+    if program_names != expected_programs {
+        errors.push(format!(
+            "case-pattern program set is {program_names:?}, expected {expected_programs:?}"
+        ));
+    }
+
+    let variant_names = corpus
+        .programs
+        .iter()
+        .flat_map(|program| program.profiles.iter())
+        .filter(|profile| !matches!(profile.as_str(), "bash" | "sh" | "zsh" | "dash"))
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let recorded_variants = corpus
+        .profile_variants
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if recorded_variants != variant_names {
+        errors.push(format!(
+            "case-pattern profile variants are {recorded_variants:?}, expected {variant_names:?}"
+        ));
+    }
+    for (profile, outcomes) in &corpus.profile_variants {
+        let outcome_ids = outcomes.keys().map(String::as_str).collect::<BTreeSet<_>>();
+        if outcome_ids != case_ids {
+            errors.push(format!(
+                "case-pattern profile {profile:?} covers {outcome_ids:?}, expected {case_ids:?}"
+            ));
+        }
+    }
+
+    for program in &corpus.programs {
+        for (index, left) in program.profiles.iter().enumerate() {
+            for right in program.profiles.iter().skip(index + 1) {
+                let distinguishable = corpus
+                    .cases
+                    .iter()
+                    .any(|case| corpus.outcome(case, left) != corpus.outcome(case, right));
+                if !distinguishable {
+                    errors.push(format!(
+                        "case-pattern profiles {left:?} and {right:?} are indistinguishable"
+                    ));
+                }
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+fn case_pattern_profile_differences(
+    corpus: &CasePatternCorpus,
+    profile: &str,
+    observations: &[CasePatternOutcome],
+) -> Vec<String> {
+    corpus
+        .cases
+        .iter()
+        .zip(observations)
+        .filter_map(|(case, observed)| match corpus.outcome(case, profile) {
+            Some(expected) if expected == *observed => None,
+            Some(expected) => Some(format!(
+                "{} (expected {}, observed {})",
+                case.id,
+                expected.label(),
+                observed.label()
+            )),
+            None => Some(format!("{} (profile has no outcome)", case.id)),
+        })
+        .collect()
+}
+
 /// Re-measure what each shell matches for the recorded `case` patterns.
 ///
 /// The word is base64 so a newline survives the file, and the answer is an
 /// ASCII token the shell prints, so nothing here depends on how bytes are
 /// decoded. A shell that refuses the pattern is `ERROR` and nothing more — the
 /// message names the interpreter's own path, which is not a property of the
-/// pattern. `bash`, `zsh`, and `dash` identify their recorded columns and
-/// therefore enforce drift. Ambient `sh` is an implementation-selected family;
-/// its drift is reported while the checked-in cross-shell reduction remains
-/// strict in the frontend test.
+/// pattern. `bash`, `zsh`, and `dash` must each match exactly one complete
+/// profile. Ambient `sh` is an implementation-selected family; its drift is
+/// reported while the checked-in cross-shell reduction remains strict in the
+/// frontend test.
 fn run_case_patterns(root: &Path) -> Result<(), Vec<String>> {
     let path = root.join("contracts/golden/case-pattern-semantics-v1.json");
     let raw = std::fs::read_to_string(&path)
         .map_err(|error| vec![format!("cannot read {}: {error}", path.display())])?;
-    let corpus: serde_json::Value =
+    let corpus: CasePatternCorpus =
         serde_json::from_str(&raw).map_err(|error| vec![format!("malformed corpus: {error}")])?;
-    let shells = recorded_shell_columns(&corpus, "case-pattern")?;
-    let cases = corpus["cases"]
-        .as_array()
-        .ok_or_else(|| vec!["corpus has no cases array".to_owned()])?;
-    if cases.is_empty() || shells.is_empty() {
-        return Err(vec!["corpus is empty".to_owned()]);
+    validate_case_pattern_corpus(&corpus)?;
+
+    let mut words = Vec::with_capacity(corpus.cases.len());
+    for case in &corpus.cases {
+        let word = decode_base64(&case.word_base64)
+            .ok_or_else(|| vec![format!("{} has a word that is not base64", case.id)])?;
+        let word = String::from_utf8(word)
+            .map_err(|error| vec![format!("{} has a word that is not UTF-8: {error}", case.id)])?;
+        words.push(word);
     }
-    let shell_programs =
-        PosixPrograms::discover(shells.iter().copied().map(RecordedShellColumn::name));
+
+    let shell_programs = PosixPrograms::discover(corpus.shells.iter().map(String::as_str));
     let mut errors = Vec::new();
     let mut checked = 0_usize;
     let mut reported_differences = 0_usize;
-    for case in cases {
-        let id = case["id"].as_str().unwrap_or("<unnamed>");
-        let (Some(script), Some(encoded)) = (case["script"].as_str(), case["word_base64"].as_str())
-        else {
-            errors.push(format!("{id} has no script or no word"));
-            continue;
-        };
-        let Some(word) = decode_base64(encoded) else {
-            errors.push(format!("{id} has a word that is not base64"));
-            continue;
-        };
-        let Ok(word) = String::from_utf8(word) else {
-            errors.push(format!("{id} has a word that is not UTF-8"));
-            continue;
-        };
-        for shell in &shells {
-            let shell_name = shell.name();
-            let Some(recorded) = case[shell_name].as_str() else {
-                errors.push(format!("{id} has no {shell_name} column"));
+    for shell in RecordedShellColumn::ALL {
+        let shell_name = shell.name();
+        match shell_programs.output(shell_name, "exit 0") {
+            Ok(_) => {}
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound && !shell.program_is_required() =>
+            {
+                println!("skipped  {shell_name}: {error}");
                 continue;
-            };
+            }
+            Err(error) => {
+                errors.push(format!("cannot probe {shell_name}: {error}"));
+                continue;
+            }
+        }
+
+        let mut observations = Vec::with_capacity(corpus.cases.len());
+        for (case, word) in corpus.cases.iter().zip(&words) {
             let output = shell_programs.output_with_positional_arguments(
                 shell_name,
-                script,
+                &case.script,
                 &[word.as_str()],
             );
             let output = match output {
                 Ok(output) => output,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    println!("skipped  {id}/{shell_name}: {error}");
-                    continue;
-                }
                 Err(error) => {
                     errors.push(format!(
-                        "{id}/{shell_name}: cannot run observation: {error}"
+                        "{}/{shell_name}: cannot run observation: {error}",
+                        case.id
                     ));
                     continue;
                 }
             };
-            let observed = match output.stdout.as_slice() {
-                b"MATCH" => "MATCH",
-                b"NOMATCH" => "NOMATCH",
-                _ => "ERROR",
+            let observed = match (output.status.success(), output.stdout.as_slice()) {
+                (true, b"MATCH") => CasePatternOutcome::Match,
+                (true, b"NOMATCH") => CasePatternOutcome::NoMatch,
+                _ => CasePatternOutcome::Error,
             };
             checked += 1;
-            if observed != recorded {
-                let difference =
-                    format!("{id}/{shell_name}: recorded {recorded}, observed {observed}");
-                match shell.case_pattern_effect() {
-                    ObservationEffect::Enforce => errors.push(difference),
-                    ObservationEffect::Report => {
-                        reported_differences += 1;
-                        println!("differs  {difference}");
-                    }
+            observations.push(observed);
+        }
+        if observations.len() != corpus.cases.len() {
+            continue;
+        }
+
+        match shell.case_pattern_effect() {
+            ObservationEffect::Report => {
+                let differences = case_pattern_profile_differences(&corpus, "sh", &observations);
+                reported_differences += differences.len();
+                for difference in differences {
+                    println!("differs  sh/{difference}");
+                }
+                continue;
+            }
+            ObservationEffect::Enforce => {}
+        }
+
+        let Some(program) = corpus
+            .programs
+            .iter()
+            .find(|program| program.name == shell_name)
+        else {
+            errors.push(format!("{shell_name} has no profile declaration"));
+            continue;
+        };
+        let matching = program
+            .profiles
+            .iter()
+            .filter(|profile| {
+                case_pattern_profile_differences(&corpus, profile, &observations).is_empty()
+            })
+            .collect::<Vec<_>>();
+        match matching.as_slice() {
+            [profile] => println!("{shell_name} matches recorded profile {profile}"),
+            [] => {
+                errors.push(format!(
+                    "{shell_name} matches no complete case-pattern profile"
+                ));
+                for profile in &program.profiles {
+                    let differences =
+                        case_pattern_profile_differences(&corpus, profile, &observations);
+                    errors.push(format!(
+                        "{shell_name} differs from {profile} on: {}",
+                        differences.join(", ")
+                    ));
                 }
             }
+            profiles => errors.push(format!(
+                "{shell_name} ambiguously matches case-pattern profiles {}",
+                profiles
+                    .iter()
+                    .map(|profile| profile.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
         }
     }
     if errors.is_empty() {
         if reported_differences == 0 {
             println!(
-                "{} case pattern(s) match the recording across {checked} shell observation(s)",
-                cases.len()
+                "{} case pattern(s) match one complete profile across {checked} shell observation(s)",
+                corpus.cases.len()
             );
         } else {
             println!(
-                "{} case pattern(s) preserve every interpreter-specific claim across {checked} shell observation(s); {reported_differences} non-binding sh observation(s) differ",
-                cases.len()
+                "{} case pattern(s) match one complete interpreter profile across {checked} shell observation(s); {reported_differences} non-binding sh observation(s) differ",
+                corpus.cases.len()
             );
         }
         return Ok(());
@@ -4907,7 +5207,7 @@ mod tests {
     }
 
     #[test]
-    fn posix_divergence_profiles_are_complete_known_and_distinguishable() {
+    fn shell_behavior_profiles_are_complete_known_and_distinguishable() {
         const CORPUS: &str = include_str!("../../contracts/golden/posix-sh-divergence-v1.json");
         let corpus: PosixDivergenceCorpus = serde_json::from_str(CORPUS).unwrap();
         validate_posix_divergence_corpus(&corpus).unwrap();
@@ -4934,6 +5234,37 @@ mod tests {
             case.profiles.insert("zsh".to_owned(), bash);
         }
         let errors = validate_posix_divergence_corpus(&ambiguous).unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("are indistinguishable")),
+            "{errors:#?}"
+        );
+
+        const CASE_CORPUS: &str =
+            include_str!("../../contracts/golden/case-pattern-semantics-v1.json");
+        let case_corpus: CasePatternCorpus = serde_json::from_str(CASE_CORPUS).unwrap();
+        validate_case_pattern_corpus(&case_corpus).unwrap();
+
+        let mut incomplete: CasePatternCorpus = serde_json::from_str(CASE_CORPUS).unwrap();
+        incomplete
+            .profile_variants
+            .get_mut("dash-with-ansi-c-quotes")
+            .unwrap()
+            .remove("ansi-c-newline-match");
+        let errors = validate_case_pattern_corpus(&incomplete).unwrap_err();
+        assert!(errors.iter().any(|error| error.contains("covers")));
+
+        let mut ambiguous: CasePatternCorpus = serde_json::from_str(CASE_CORPUS).unwrap();
+        let baseline = ambiguous
+            .cases
+            .iter()
+            .map(|case| (case.id.clone(), case.dash))
+            .collect();
+        ambiguous
+            .profile_variants
+            .insert("dash-with-ansi-c-quotes".to_owned(), baseline);
+        let errors = validate_case_pattern_corpus(&ambiguous).unwrap_err();
         assert!(
             errors
                 .iter()
@@ -4969,6 +5300,14 @@ mod tests {
             [ObservationEffect::Report; 3]
         );
         assert_eq!(
+            RecordedShellColumn::ALL.map(RecordedShellColumn::name),
+            ["bash", "sh", "zsh", "dash"]
+        );
+        assert_eq!(
+            RecordedShellColumn::ALL.map(RecordedShellColumn::program_is_required),
+            [true, false, false, false]
+        );
+        assert_eq!(
             RecordedShellColumn::ALL.map(RecordedShellColumn::case_pattern_effect),
             [
                 ObservationEffect::Enforce,
@@ -4976,10 +5315,6 @@ mod tests {
                 ObservationEffect::Enforce,
                 ObservationEffect::Enforce,
             ]
-        );
-        assert_eq!(
-            RecordedShellColumn::ALL.map(RecordedShellColumn::name),
-            ["bash", "sh", "zsh", "dash"]
         );
     }
 

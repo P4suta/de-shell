@@ -255,10 +255,11 @@ fall back to an unrelated Windows command or a missing Unix mount.
 
 Program names are not treated as semantic versions. Git for Windows carries a
 dash build with ANSI-C quotes while the Ubuntu and macOS observations carry the
-older behavior. The divergence corpus records both complete dash profiles, and
-an installed program must match exactly one profile across all 12 cases. It is
-never allowed to select convenient answers case by case. Corpus validation
-rejects missing, unknown, duplicate and indistinguishable profiles.
+older behavior. Both the 12-case divergence corpus and the 45-case pattern
+corpus record complete dash profiles, and an installed program must match
+exactly one complete profile. It is never allowed to select convenient answers
+case by case. Corpus validation rejects missing, unknown, duplicate, incomplete
+and indistinguishable profiles.
 
 The mutation task now also names `migration.rs` and `frontend.rs`. A
 reproducible `cargo mutants --list` reports **2,931** mutations in those two
@@ -282,8 +283,8 @@ that shared collection step, so CI and release cannot accidentally measure a
 smaller test surface.
 
 The trusted clean run on 2026-09-20 passed all 525 workspace tests (482
-`deshell`, 43 `xtask`) and finished at **90.23% line coverage**: 54,876 lines,
-5,363 missed. `cargo llvm-cov` enforced `--fail-under-lines 90` on the result.
+`deshell`, 43 `xtask`) and finished at **90.18% line coverage**: 55,108 lines,
+5,413 missed. `cargo llvm-cov` enforced `--fail-under-lines 90` on the result.
 
 ## Next, in the order I would take it
 
