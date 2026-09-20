@@ -2,7 +2,7 @@
  "schema_version": 1,
  "contract": "shell-variable-inventory-v1",
  "purpose": "Conservatively record which names any supported version of a shell answers from itself rather than from the environment, so an expansion of one is not lowered into a program that reads an environment variable nobody set.",
- "note": "A generated program resolves a name through the process environment. That is right for `PATH` and wrong for `RANDOM`: the generated program reads nothing where the shell produced a value. INHERITED means a measurement found the name in its process environment; SHELL means at least one measured supported version of that column supplied a value the environment did not; ABSENT means no measured version supplied it. The live gate rejects any newly supplied name outside this conservative union, while absence on an older version is reported as non-binding drift. A name marked SHELL anywhere is one the frontend must not lower as an ordinary expansion, whatever shell is being lowered.",
+ "note": "A generated program resolves a name through the process environment. That is right for `PATH` and wrong for `RANDOM`: the generated program reads nothing where the shell produced a value. INHERITED means a measurement found the name in its process environment; SHELL means at least one measured supported version of that column supplied a value the environment did not; ABSENT means no measured version supplied it. Git for Windows bash and its sh entry point supply a non-exported SHELL when the parent environment omits it, so SHELL belongs to the conservative union even though Unix measurements commonly inherit it. The live gate rejects any newly supplied name outside this conservative union, while absence on an older version is reported as non-binding drift. A name marked SHELL anywhere is one the frontend must not lower as an ordinary expansion, whatever shell is being lowered.",
  "shells": [
   "bash",
   "sh",
@@ -239,8 +239,8 @@
    "dash": "ABSENT"
   },
   "SHELL": {
-   "bash": "INHERITED",
-   "sh": "INHERITED",
+   "bash": "SHELL",
+   "sh": "SHELL",
    "zsh": "INHERITED",
    "dash": "INHERITED"
   },

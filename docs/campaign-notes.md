@@ -261,6 +261,12 @@ exactly one complete profile. It is never allowed to select convenient answers
 case by case. Corpus validation rejects missing, unknown, duplicate, incomplete
 and indistinguishable profiles.
 
+Git for Windows also supplies a non-exported `SHELL` variable from both its
+bash and sh entry points when the parent environment omits it. The variable
+inventory records that observed behavior in its conservative union, so native
+lowering delegates `$SHELL` instead of silently replacing the shell-provided
+path with an absent process-environment value.
+
 The mutation task now also names `migration.rs` and `frontend.rs`. A
 reproducible `cargo mutants --list` reports **2,931** mutations in those two
 files and **3,176** across all six configured files. The new 2,931 are listed

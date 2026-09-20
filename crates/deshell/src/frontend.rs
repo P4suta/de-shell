@@ -1797,6 +1797,7 @@ const SHELL_SUPPLIED_VARIABLES: &[&str] = &[
     "PS4",
     "RANDOM",
     "SECONDS",
+    "SHELL",
     "SRANDOM",
     "UID",
 ];
