@@ -7,6 +7,32 @@ pub(crate) struct ProjectConfig {
     pub version: u32,
     pub entrypoints: Vec<String>,
     pub location_overrides: Vec<LocationOverride>,
+    /// Shell that is in the repository on purpose and must not be retired.
+    ///
+    /// Not an exclusion and not an `allow`. A declared location is still
+    /// scanned, still counted and still reported — `verify --require shell-free`
+    /// says `0 live, 36 declared` — and it carries the reason it is here and an
+    /// approval digest, so it cannot be added without somebody reviewing it.
+    ///
+    /// The case that made it necessary is de-shell's own: `contracts/golden/*.json`
+    /// records shell behaviour measured from real shells, and `cargo xtask`
+    /// re-measures it by running exactly those bytes. It is not shell waiting to
+    /// be replaced; it is the evidence the oracle rests on. Without a way to say
+    /// so, a repository whose subject matter is shell can never pass its own
+    /// gate, and the only alternatives are deleting the corpus or leaving the
+    /// gate permanently red — neither of which is a true statement about the
+    /// repository.
+    ///
+    /// `#[serde(default)]` so a project written before this field reads
+    /// unchanged and its review digests do not move, and
+    /// `skip_serializing_if` so a project with nothing declared writes the same
+    /// bytes it wrote before the field existed. Without that, `deshell init`
+    /// emits `declared_shell = []` and appending the obvious
+    /// `[[declared_shell]]` block underneath is a duplicate key — a TOML error
+    /// naming the line the reader just wrote rather than the empty array three
+    /// hundred lines above it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub declared_shell: Vec<DeclaredShell>,
     pub interpreter_overrides: Vec<InterpreterOverride>,
     pub platform_cells: Vec<PlatformCell>,
     pub validation_commands: Vec<ValidationCommand>,
@@ -40,6 +66,23 @@ pub(crate) enum MigrationTarget {
     Agent,
 }
 
+impl MigrationTarget {
+    /// Whether this target rewrites the source file in place rather than
+    /// writing a program beside it.
+    ///
+    /// A method rather than `== MigrationTarget::Host` at each site: `==` is
+    /// outside the exhaustiveness check a `match` gets, so a target added later
+    /// compiles everywhere and answers "no" everywhere. Asking here means the
+    /// question is answered once, and a new target does not compile until it
+    /// is.
+    pub(crate) fn rewrites_the_source_in_place(self) -> bool {
+        match self {
+            Self::Host => true,
+            Self::Rust | Self::Go | Self::Agent => false,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ExternalGenerator {
@@ -66,6 +109,24 @@ pub(crate) struct IntegrationTargets {
 #[serde(deny_unknown_fields)]
 pub(crate) struct LanguageIntegration {
     pub module_root: String,
+}
+
+/// One shell location that stays, with the reason it stays.
+///
+/// The span is exact rather than a path or a glob: declaring a file would let
+/// shell added to it later inherit the declaration, which is the loophole this
+/// is built to avoid. A span that no longer matches a scanned location is
+/// reported as stale rather than ignored.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DeclaredShell {
+    pub path: String,
+    pub start_byte: u64,
+    pub end_byte: u64,
+    /// Why this shell is here. Read by a human reviewing the approval, and by
+    /// anybody who later wonders whether it can go.
+    pub reason: String,
+    pub approval: Approval,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -225,7 +286,7 @@ pub(crate) enum DelegationPolicy {
     Pinned,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum UnknownInterpreter {
     TraceOnly,
@@ -412,13 +473,13 @@ fn validate_migration_config(config: &ProjectConfig, errors: &mut Vec<String>) {
             ));
         }
     }
-    validate_generator_selection(
-        "migration",
-        &config.migration.generator,
-        config.migration.target,
-        &config.migration.external_generators,
+    validate_generator_selection(ValidateGeneratorSelectionArgs {
+        label: "migration",
+        generator: &config.migration.generator,
+        target: config.migration.target,
+        external: &config.migration.external_generators,
         errors,
-    );
+    });
     let mut overrides = std::collections::BTreeSet::new();
     for location in &config.location_overrides {
         validate_contract_path("location override", &location.path, errors);
@@ -441,13 +502,13 @@ fn validate_migration_config(config: &ProjectConfig, errors: &mut Vec<String>) {
                 location.path
             ));
         }
-        validate_generator_selection(
-            "location override",
-            &location.generator,
-            location.target,
-            &config.migration.external_generators,
+        validate_generator_selection(ValidateGeneratorSelectionArgs {
+            label: "location override",
+            generator: &location.generator,
+            target: location.target,
+            external: &config.migration.external_generators,
             errors,
-        );
+        });
         if !overrides.insert((
             location.path.as_str(),
             location.start_byte,
@@ -455,6 +516,32 @@ fn validate_migration_config(config: &ProjectConfig, errors: &mut Vec<String>) {
         )) {
             errors.push(format!(
                 "duplicate exact location override: {}@{}..{}",
+                location.path, location.start_byte, location.end_byte
+            ));
+        }
+    }
+    let mut declared = std::collections::BTreeSet::new();
+    for location in &config.declared_shell {
+        validate_contract_path("declared shell", &location.path, errors);
+        if location.end_byte <= location.start_byte {
+            errors.push(format!(
+                "declared shell span must be non-empty and ordered: {}@{}..{}",
+                location.path, location.start_byte, location.end_byte
+            ));
+        }
+        if location.reason.trim().is_empty() {
+            errors.push(format!(
+                "declared shell must say why it stays: {}@{}..{}",
+                location.path, location.start_byte, location.end_byte
+            ));
+        }
+        if !declared.insert((
+            location.path.as_str(),
+            location.start_byte,
+            location.end_byte,
+        )) {
+            errors.push(format!(
+                "duplicate declared shell: {}@{}..{}",
                 location.path, location.start_byte, location.end_byte
             ));
         }
@@ -557,13 +644,29 @@ fn validate_migration_config(config: &ProjectConfig, errors: &mut Vec<String>) {
     }
 }
 
-fn validate_generator_selection(
-    label: &str,
-    generator: &str,
+/// The inputs of [`validate_generator_selection`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`validate_generator_selection`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct ValidateGeneratorSelectionArgs<'a> {
+    label: &'a str,
+    generator: &'a str,
     target: MigrationTarget,
-    external: &[ExternalGenerator],
-    errors: &mut Vec<String>,
-) {
+    external: &'a [ExternalGenerator],
+    errors: &'a mut Vec<String>,
+}
+
+fn validate_generator_selection(parts: ValidateGeneratorSelectionArgs<'_>) {
+    // Destructured without `..`: see `ValidateGeneratorSelectionArgs`.
+    let ValidateGeneratorSelectionArgs {
+        label,
+        generator,
+        target,
+        external,
+        errors,
+    } = parts;
     if let Some(name) = generator.strip_prefix("external:") {
         let Some(registration) = external.iter().find(|entry| entry.name == name) else {
             errors.push(format!(
@@ -1291,7 +1394,8 @@ mod tests {
         );
         assert_eq!(config.limits, ResourceLimits::DEFAULT);
         assert!(!config.sandbox.allow_local);
-        assert!(ProjectConfig::decode(&(text + "future = true\n")).is_err());
+        let extended = format!("{text}future = true\n");
+        assert!(ProjectConfig::decode(&extended).is_err());
     }
 
     #[test]
@@ -1415,7 +1519,8 @@ mod tests {
             assert!(parser.starts_with("sha256:"));
         }
         assert!(Lockfile::decode(&text.replacen("version = 1", "version = 2", 1)).is_err());
-        assert!(Lockfile::decode(&(text.clone() + "migrated_from = 0\n")).is_err());
+        let migrated = format!("{text}migrated_from = 0\n");
+        assert!(Lockfile::decode(&migrated).is_err());
         let stale_parser =
             text.replacen(&lock.parsers.bash, &format!("sha256:{}", "a".repeat(64)), 1);
         assert!(
@@ -1484,11 +1589,15 @@ mod tests {
 
     #[test]
     fn scenario_rejects_fixture_traversal_and_bad_digest() {
-        let traversal = Scenario::default_text()
-            + "\n[[fixtures]]\npath = \"../outside\"\ncontents = { utf8 = \"bad\" }\n";
+        let traversal = format!(
+            "{}\n[[fixtures]]\npath = \"../outside\"\ncontents = {{ utf8 = \"bad\" }}\n",
+            Scenario::default_text()
+        );
         assert!(Scenario::decode(&traversal).is_err());
-        let digest =
-            Scenario::default_text() + "\n[[expect.files]]\npath = \"out.txt\"\nsha256 = \"abc\"\n";
+        let digest = format!(
+            "{}\n[[expect.files]]\npath = \"out.txt\"\nsha256 = \"abc\"\n",
+            Scenario::default_text()
+        );
         assert!(Scenario::decode(&digest).is_err());
     }
 
@@ -1703,7 +1812,13 @@ mod tests {
             ),
         ] {
             let mut errors = Vec::new();
-            validate_generator_selection("test", generator, target, &[], &mut errors);
+            validate_generator_selection(ValidateGeneratorSelectionArgs {
+                label: "test",
+                generator,
+                target,
+                external: &[],
+                errors: &mut errors,
+            });
             assert!(errors.join("; ").contains(expected));
         }
     }

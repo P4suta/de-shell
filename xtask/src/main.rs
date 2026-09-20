@@ -1,6 +1,14 @@
+#![expect(
+    clippy::disallowed_methods,
+    reason = "xtask is the repository's own build and conformance tooling. It works in build outputs and temporary corpora, never in a project `de-shell` is migrating, so the transactional layer in `deshell::patch` — staging, rollback, digest expectations — has nothing to protect here. Until this crate inherited the workspace lints it was never checked at all."
+)]
+
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+use syn::spanned::Spanned as _;
+use syn::visit::Visit as _;
 
 const PERFORMANCE_WARMUPS: usize = 5;
 const PERFORMANCE_SAMPLES: usize = 20;
@@ -9,6 +17,7 @@ const REQUIRED_CONTRACTS: &[&str] = &[
     "contracts/README.md",
     "contracts/canonical-json-v1.md",
     "contracts/diagnostics-v1.md",
+    "contracts/trace-v1.md",
     "contracts/effect-ir-v1.md",
     "contracts/json-rpc-v1.md",
     "contracts/project-v1.md",
@@ -21,6 +30,7 @@ const REQUIRED_CONTRACTS: &[&str] = &[
     "contracts/schema/bundle-v1.schema.json",
     "contracts/schema/evidence-v1.schema.json",
     "contracts/schema/diagnostic-v1.schema.json",
+    "contracts/schema/trace-v1.schema.json",
     "contracts/schema/approval-v1.schema.json",
     "contracts/schema/migration-index-v1.schema.json",
     "contracts/schema/init-report-v1.schema.json",
@@ -95,11 +105,3598 @@ struct CliCase {
     fixture: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PosixDivergenceCorpus {
+    schema_version: u32,
+    contract: String,
+    purpose: String,
+    note: String,
+    programs: Vec<PosixDivergenceProgram>,
+    cases: Vec<PosixDivergenceCase>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PosixDivergenceProgram {
+    name: String,
+    profiles: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PosixDivergenceCase {
+    name: String,
+    script: String,
+    note: String,
+    profiles: BTreeMap<String, PosixDivergenceObservation>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct PosixDivergenceObservation {
+    stdout: String,
+    exit: i32,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CasePatternCorpus {
+    schema_version: u32,
+    contract: String,
+    purpose: String,
+    note: String,
+    shells: Vec<String>,
+    programs: Vec<CasePatternProgram>,
+    profile_variants: BTreeMap<String, BTreeMap<String, CasePatternOutcome>>,
+    cases: Vec<CasePatternCase>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CasePatternProgram {
+    name: String,
+    profiles: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CasePatternCase {
+    id: String,
+    pattern: String,
+    word_base64: String,
+    script: String,
+    #[serde(rename = "note")]
+    _note: String,
+    bash: CasePatternOutcome,
+    sh: CasePatternOutcome,
+    zsh: CasePatternOutcome,
+    dash: CasePatternOutcome,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+enum CasePatternOutcome {
+    #[serde(rename = "MATCH")]
+    Match,
+    #[serde(rename = "NOMATCH")]
+    NoMatch,
+    #[serde(rename = "ERROR")]
+    Error,
+}
+
+impl CasePatternOutcome {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Match => "MATCH",
+            Self::NoMatch => "NOMATCH",
+            Self::Error => "ERROR",
+        }
+    }
+}
+
+impl CasePatternCase {
+    const fn base_outcome(&self, profile: &str) -> Option<CasePatternOutcome> {
+        match profile.as_bytes() {
+            b"bash" => Some(self.bash),
+            b"sh" => Some(self.sh),
+            b"zsh" => Some(self.zsh),
+            b"dash" => Some(self.dash),
+            _ => None,
+        }
+    }
+}
+
+impl CasePatternCorpus {
+    fn outcome(&self, case: &CasePatternCase, profile: &str) -> Option<CasePatternOutcome> {
+        case.base_outcome(profile).or_else(|| {
+            self.profile_variants
+                .get(profile)
+                .and_then(|outcomes| outcomes.get(&case.id))
+                .copied()
+        })
+    }
+}
+
 fn repository_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("..")
+}
+
+/// POSIX programs used by an observation.
+///
+/// Windows searches its system directories before `PATH`. Consequently, a
+/// bare `bash` launched through `std::process::Command` resolves to the WSL
+/// launcher in `System32` even when the calling workflow is already running in
+/// Git Bash. Git Bash's `sh`, however, resolves POSIX program names and paths
+/// inside the MSYS installation. Ask it for the native absolute path once,
+/// then launch that path directly for every observation. Other hosts retain
+/// the supplied name or path, including its ordinary not-found error.
+#[derive(Debug)]
+struct PosixPrograms {
+    programs: BTreeMap<String, Result<PathBuf, String>>,
+}
+
+impl PosixPrograms {
+    fn discover<'a>(names: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut programs = BTreeMap::new();
+        for name in names {
+            let _resolution = programs
+                .entry(name.to_owned())
+                .or_insert_with(|| resolve_posix_program(name).map_err(|error| error.to_string()));
+        }
+        Self { programs }
+    }
+
+    fn path(&self, name: &str) -> std::io::Result<&Path> {
+        match self.programs.get(name) {
+            Some(Ok(program)) => Ok(program),
+            Some(Err(error)) => Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                error.clone(),
+            )),
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("POSIX program {name:?} was not discovered"),
+            )),
+        }
+    }
+
+    fn command(&self, name: &str) -> std::io::Result<std::process::Command> {
+        Ok(std::process::Command::new(self.path(name)?))
+    }
+
+    fn output(&self, name: &str, script: &str) -> std::io::Result<std::process::Output> {
+        let mut command = self.command(name)?;
+        let mut child = command
+            .arg("-s")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        write_posix_script(&mut child, script)?;
+        child.wait_with_output()
+    }
+
+    /// Run exact script and positional-argument bytes without exposing either
+    /// to the host's native command-line parser.
+    fn output_with_positional_arguments(
+        &self,
+        name: &str,
+        script: &str,
+        arguments: &[&str],
+    ) -> std::io::Result<std::process::Output> {
+        let mut input = String::new();
+        let mut variables = Vec::with_capacity(arguments.len());
+        for (index, argument) in arguments.iter().enumerate() {
+            let variable = format!("__deshell_xtask_argument_{index}");
+            let encoded = encode_posix_shell_argument(argument)?;
+            input.push_str(&variable);
+            input.push_str("=$(printf '");
+            input.push_str(&encoded);
+            input.push_str("')\n");
+            input.push_str(&variable);
+            input.push_str("=${");
+            input.push_str(&variable);
+            input.push_str("%x}\n");
+            variables.push(variable);
+        }
+        input.push_str("set --");
+        for variable in &variables {
+            input.push_str(" \"${");
+            input.push_str(variable);
+            input.push_str("}\"");
+        }
+        input.push('\n');
+        if !variables.is_empty() {
+            input.push_str("unset");
+            for variable in &variables {
+                input.push(' ');
+                input.push_str(variable);
+            }
+            input.push('\n');
+        }
+        input.push_str(script);
+        self.output(name, &input)
+    }
+
+    /// Preserve `-c` invocation semantics while keeping measured script bytes
+    /// on standard input. The fixed wrapper decodes one generated octal line;
+    /// no corpus data or host-dependent `/dev/stdin` path crosses argv.
+    fn bash_command_string_status(
+        &self,
+        script: &str,
+    ) -> std::io::Result<std::process::ExitStatus> {
+        const DECODE_AND_EVAL: &str = "IFS= read -r __deshell_xtask_encoded || exit 125
+__deshell_xtask_command=$(printf '%b' \"$__deshell_xtask_encoded\")
+__deshell_xtask_command=${__deshell_xtask_command%x}
+unset __deshell_xtask_encoded
+eval \"$__deshell_xtask_command\"";
+
+        let encoded = encode_posix_shell_argument(script)?;
+        let mut command = self.command("bash")?;
+        let mut child = command
+            .args(["-c", DECODE_AND_EVAL])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+        write_posix_script(&mut child, &format!("{encoded}\n"))?;
+        child.wait()
+    }
+
+    fn status(&self, name: &str, script: &str) -> std::io::Result<std::process::ExitStatus> {
+        let mut command = self.command(name)?;
+        let mut child = command
+            .arg("-s")
+            .stdin(std::process::Stdio::piped())
+            .spawn()?;
+        write_posix_script(&mut child, script)?;
+        child.wait()
+    }
+}
+
+/// Supply observation programs as exact bytes on standard input.
+///
+/// Passing the program as the value after `-c` adds the host's native command
+/// line parser before the POSIX shell. On Windows, the MSYS boundary can consume
+/// a layer of backslashes, so the harness would be measuring argv conversion
+/// instead of the shell program recorded in the corpus.
+fn write_posix_script(child: &mut std::process::Child, script: &str) -> std::io::Result<()> {
+    let mut stdin = child.stdin.take().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "POSIX observation child has no piped standard input",
+        )
+    })?;
+    if let Err(error) = std::io::Write::write_all(&mut stdin, script.as_bytes()) {
+        drop(stdin);
+        let _kill_result = child.kill();
+        let _wait_result = child.wait();
+        return Err(error);
+    }
+    drop(stdin);
+    Ok(())
+}
+
+/// Encode one non-NUL shell argument without placing its raw bytes in source.
+///
+/// The final `x` survives command substitution even when the value ends in a
+/// newline. The generated prelude removes that sentinel after `printf` has
+/// reconstructed every original UTF-8 byte from fixed-width octal escapes.
+fn encode_posix_shell_argument(value: &str) -> std::io::Result<String> {
+    if value.contains('\0') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "POSIX shell text cannot contain NUL",
+        ));
+    }
+    let mut encoded = String::with_capacity((value.len() + 1) * 4);
+    for byte in value.bytes().chain(std::iter::once(b'x')) {
+        encoded.push('\\');
+        encoded.push(char::from(b'0' + ((byte >> 6) & 0b11)));
+        encoded.push(char::from(b'0' + ((byte >> 3) & 0b111)));
+        encoded.push(char::from(b'0' + (byte & 0b111)));
+    }
+    Ok(encoded)
+}
+
+fn resolve_posix_program(name: &str) -> std::io::Result<PathBuf> {
+    if !cfg!(windows) {
+        return Ok(PathBuf::from(name));
+    }
+
+    let resolution = std::process::Command::new("sh")
+        .args([
+            "-c",
+            "candidate=$(command -v \"$1\") || exit 127; cygpath -w -- \"$candidate\"",
+            "deshell-shell-resolution",
+            name,
+        ])
+        .output()?;
+    if !resolution.status.success() {
+        let stderr = String::from_utf8_lossy(&resolution.stderr);
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "cannot resolve POSIX program {name:?} through Git/MSYS sh (exit {:?}): {stderr}",
+                resolution.status.code()
+            ),
+        ));
+    }
+    let stdout = String::from_utf8(resolution.stdout).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("native path for POSIX program {name:?} is not UTF-8: {error}"),
+        )
+    })?;
+    let path = stdout.trim_end_matches(['\r', '\n']);
+    if path.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("Git/MSYS sh returned no native path for POSIX program {name:?}"),
+        ));
+    }
+    Ok(PathBuf::from(path))
+}
+
+const POWERSHELL_POSIX_PROGRAMS: [(&str, &str); 4] = [
+    ("__DESHELL_POSIX_ECHO__", "/bin/echo"),
+    ("__DESHELL_POSIX_FALSE__", "/usr/bin/false"),
+    ("__DESHELL_POSIX_SH__", "/bin/sh"),
+    ("__DESHELL_POSIX_TRUE__", "/usr/bin/true"),
+];
+
+/// Replace the deliberately host-neutral program markers in a PowerShell
+/// observation with paths PowerShell can launch on this host.
+///
+/// The corpus is about PowerShell's treatment of native commands, not about
+/// whether a Unix filesystem happens to be mounted at `/bin`. Keeping the
+/// markers outside quotes also forces every path through this one escaping
+/// rule. Any marker the harness does not know is an invalid corpus rather than
+/// a command PowerShell may interpret in a surprising way.
+fn render_powershell_posix_template(
+    template: &str,
+    programs: &PosixPrograms,
+) -> Result<String, String> {
+    let mut rendered = template.to_owned();
+    for (marker, name) in POWERSHELL_POSIX_PROGRAMS {
+        if !rendered.contains(marker) {
+            continue;
+        }
+        let path = programs
+            .path(name)
+            .map_err(|error| format!("cannot resolve {marker}: {error}"))?;
+        let literal = powershell_path_literal(path)
+            .map_err(|error| format!("cannot render {marker}: {error}"))?;
+        rendered = rendered.replace(marker, &literal);
+    }
+    if rendered.contains("__DESHELL_POSIX_") {
+        return Err(format!(
+            "PowerShell observation contains an unknown POSIX program marker: {rendered:?}"
+        ));
+    }
+    Ok(rendered)
+}
+
+fn powershell_path_literal(path: &Path) -> Result<String, String> {
+    let path = path
+        .to_str()
+        .ok_or_else(|| format!("path is not Unicode: {}", path.display()))?;
+    Ok(format!("'{}'", path.replace('\'', "''")))
+}
+
+fn powershell_posix_programs() -> PosixPrograms {
+    PosixPrograms::discover(POWERSHELL_POSIX_PROGRAMS.map(|(_, name)| name))
+}
+
+/// Measure what the host's shell actually does with `set -e`, `set -u` and
+/// `set -o pipefail`, and print every case that disagrees with the recorded
+/// measurement.
+///
+/// A disagreement is reported, not failed. The corpus was measured on the bash
+/// Apple ships (3.2.57) and the CI matrix also runs Linux and Windows builds;
+/// where they differ is exactly the list of places where a model of these
+/// options cannot be written without naming the interpreter version. Failing
+/// here would only encourage someone to delete the case.
+///
+/// Being unable to measure at all *is* a failure: a corpus that silently
+/// measures nothing is worse than no corpus.
+fn run_bash_semantics(root: &Path) -> Result<(), Vec<String>> {
+    let path = root.join("contracts/golden/bash-set-semantics-v1.json");
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|error| vec![format!("cannot read {}: {error}", path.display())])?;
+    let corpus: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|error| vec![format!("malformed corpus: {error}")])?;
+    let cases = corpus["cases"]
+        .as_array()
+        .ok_or_else(|| vec!["corpus has no cases array".to_owned()])?;
+    if cases.is_empty() {
+        return Err(vec!["corpus is empty".to_owned()]);
+    }
+
+    let shells = PosixPrograms::discover(["bash"]);
+    let version = shells
+        .command("bash")
+        .map_err(|error| vec![format!("cannot resolve bash: {error}")])?
+        .arg("--version")
+        .output()
+        .map_err(|error| vec![format!("cannot run bash: {error}")])?;
+    let banner = String::from_utf8_lossy(&version.stdout)
+        .lines()
+        .next()
+        .unwrap_or("unknown")
+        .to_owned();
+    println!("interpreter: {banner}");
+
+    let mut differences = 0_usize;
+    for case in cases {
+        let name = case["name"]
+            .as_str()
+            .ok_or_else(|| vec!["case has no name".to_owned()])?;
+        let script = case["script"]
+            .as_str()
+            .ok_or_else(|| vec!["case has no script".to_owned()])?;
+        let expected = case["expected"]
+            .as_i64()
+            .ok_or_else(|| vec!["case has no expected".to_owned()])?;
+        let status = shells
+            .bash_command_string_status(script)
+            .map_err(|error| vec![format!("cannot run case {name}: {error}")])?;
+        let actual = i64::from(status.code().unwrap_or(-1));
+        if actual == expected {
+            continue;
+        }
+        differences += 1;
+        println!("differs  {name}: expected {expected}, measured {actual}");
+        println!("         {script}");
+    }
+
+    if differences == 0 {
+        println!(
+            "{} case(s) agree with the recorded measurement",
+            cases.len()
+        );
+    } else {
+        println!(
+            "{differences} of {} case(s) differ on this interpreter; each one is a place where an option model has to name the version",
+            cases.len()
+        );
+    }
+    Ok(())
+}
+
+/// A shell column in the checked-in builtin recordings.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShellColumn {
+    Bash,
+    Sh,
+    Zsh,
+}
+
+impl ShellColumn {
+    const ALL: [Self; 3] = [Self::Bash, Self::Sh, Self::Zsh];
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Bash => "bash",
+            Self::Sh => "sh",
+            Self::Zsh => "zsh",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ObservationEffect {
+    Enforce,
+    Report,
+}
+
+/// A named shell column in a checked-in recording.
+///
+/// `sh` deliberately remains distinct from `dash`: the former names an
+/// implementation-selected family while the latter names the interpreter that
+/// produced its column. Only an executable with that same identity can
+/// invalidate an interpreter-specific recording.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum RecordedShellColumn {
+    Bash,
+    Sh,
+    Zsh,
+    Dash,
+}
+
+impl RecordedShellColumn {
+    const ALL: [Self; 4] = [Self::Bash, Self::Sh, Self::Zsh, Self::Dash];
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Bash => "bash",
+            Self::Sh => "sh",
+            Self::Zsh => "zsh",
+            Self::Dash => "dash",
+        }
+    }
+
+    fn parse(name: &str) -> Option<Self> {
+        match name {
+            "bash" => Some(Self::Bash),
+            "sh" => Some(Self::Sh),
+            "zsh" => Some(Self::Zsh),
+            "dash" => Some(Self::Dash),
+            _ => None,
+        }
+    }
+
+    const fn program_is_required(self) -> bool {
+        match self {
+            Self::Bash => true,
+            Self::Sh | Self::Zsh | Self::Dash => false,
+        }
+    }
+
+    const fn case_pattern_effect(self) -> ObservationEffect {
+        match self {
+            Self::Sh => ObservationEffect::Report,
+            Self::Bash | Self::Zsh | Self::Dash => ObservationEffect::Enforce,
+        }
+    }
+}
+
+/// Require a recording to name every supported shell column exactly once.
+fn recorded_shell_columns(
+    corpus: &serde_json::Value,
+    label: &str,
+) -> Result<Vec<RecordedShellColumn>, Vec<String>> {
+    let values = corpus["shells"]
+        .as_array()
+        .ok_or_else(|| vec![format!("{label} corpus has no shells array")])?;
+    let mut shells = Vec::with_capacity(values.len());
+    for value in values {
+        let name = value
+            .as_str()
+            .ok_or_else(|| vec![format!("{label} shell name is not a string")])?;
+        let shell = RecordedShellColumn::parse(name)
+            .ok_or_else(|| vec![format!("{label} corpus names unknown shell {name:?}")])?;
+        if shells.contains(&shell) {
+            return Err(vec![format!("{label} corpus repeats shell {name:?}")]);
+        }
+        shells.push(shell);
+    }
+    let recorded = shells
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let expected = RecordedShellColumn::ALL.into_iter().collect();
+    if recorded != expected {
+        return Err(vec![format!(
+            "{label} corpus shell set is {recorded:?}, expected {expected:?}"
+        )]);
+    }
+    Ok(shells)
+}
+
+/// Where a variable value came from during a shell inventory observation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VariableOrigin {
+    Absent,
+    Inherited,
+    Shell,
+}
+
+impl VariableOrigin {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "ABSENT" => Some(Self::Absent),
+            "INHERITED" => Some(Self::Inherited),
+            "SHELL" => Some(Self::Shell),
+            _ => None,
+        }
+    }
+
+    const fn is_shell_supplied(self) -> bool {
+        matches!(self, Self::Shell)
+    }
+}
+
+const fn echo_observation_effect(shell: ShellColumn, modelled: bool) -> ObservationEffect {
+    match (shell, modelled) {
+        (ShellColumn::Bash, true) => ObservationEffect::Enforce,
+        (ShellColumn::Bash | ShellColumn::Sh | ShellColumn::Zsh, false)
+        | (ShellColumn::Sh | ShellColumn::Zsh, true) => ObservationEffect::Report,
+    }
+}
+
+/// Decide whether an ambient executable can invalidate the recorded claim.
+///
+/// `bash` and `zsh` identify the recording's interpreter families for the
+/// modelled numeric domain. `sh` is an alias for several implementations; its
+/// live result is useful drift evidence, but is not the identity of the shell
+/// recorded in the contract. The contract's cross-shell reduction is checked
+/// separately and remains fatal.
+const fn exit_observation_effect(shell: ShellColumn, modelled: bool) -> ObservationEffect {
+    match (shell, modelled) {
+        (ShellColumn::Bash | ShellColumn::Zsh, true) => ObservationEffect::Enforce,
+        (ShellColumn::Bash | ShellColumn::Sh | ShellColumn::Zsh, false)
+        | (ShellColumn::Sh, true) => ObservationEffect::Report,
+    }
+}
+
+/// Check each shell's `echo` builtin against the recording, and check the
+/// frontend's native rule against bash.
+///
+/// The shells disagree, so the recording has a column per shell rather than one
+/// expected value. A case marked `modelled` is one the frontend lowers, and the
+/// only rule it implements is "the arguments joined by a single space and a
+/// newline" — so bash's measured output has to be exactly that, or the lowering
+/// writes different bytes than the shell it replaced.
+fn run_echo_semantics(root: &Path) -> Result<(), Vec<String>> {
+    let path = root.join("contracts/golden/echo-builtin-semantics-v1.json");
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|error| vec![format!("cannot read {}: {error}", path.display())])?;
+    let corpus: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|error| vec![format!("malformed corpus: {error}")])?;
+    let cases = corpus["cases"]
+        .as_array()
+        .ok_or_else(|| vec!["corpus has no cases array".to_owned()])?;
+    if cases.is_empty() {
+        return Err(vec!["corpus is empty".to_owned()]);
+    }
+    let shells = PosixPrograms::discover(ShellColumn::ALL.iter().copied().map(ShellColumn::name));
+    let mut errors = Vec::new();
+    let mut checked = 0_usize;
+    let mut reported_differences = 0_usize;
+    for case in cases {
+        let name = case["name"].as_str().unwrap_or("<unnamed>");
+        let Some(modelled) = case["modelled"].as_bool() else {
+            errors.push(format!("{name} does not say whether it is modelled"));
+            continue;
+        };
+        let arguments = case["arguments"]
+            .as_array()
+            .ok_or_else(|| vec![format!("{name} has no arguments array")])?
+            .iter()
+            .map(|value| value.as_str().unwrap_or_default().to_owned())
+            .collect::<Vec<_>>();
+        let argument_refs = arguments.iter().map(String::as_str).collect::<Vec<_>>();
+        // Bash is the only shell the frontend models, so its absence is fatal
+        // rather than a column to skip.
+        for shell_column in ShellColumn::ALL {
+            let shell = shell_column.name();
+            let Some(recorded) = case[shell].as_str() else {
+                errors.push(format!("{name} has no {shell} column"));
+                continue;
+            };
+            let output =
+                shells.output_with_positional_arguments(shell, "echo \"$@\"", &argument_refs);
+            let output = match output {
+                Ok(output) => output,
+                Err(error) if shell != "bash" => {
+                    println!("skipped  {name}/{shell}: {error}");
+                    continue;
+                }
+                Err(error) => {
+                    errors.push(format!("cannot run {shell} for {name}: {error}"));
+                    continue;
+                }
+            };
+            let actual = String::from_utf8_lossy(&output.stdout).into_owned();
+            checked += 1;
+            if actual != recorded {
+                let difference =
+                    format!("{name}/{shell}: recorded {recorded:?}, observed {actual:?}");
+                match echo_observation_effect(shell_column, modelled) {
+                    ObservationEffect::Enforce => errors.push(difference),
+                    ObservationEffect::Report => {
+                        reported_differences += 1;
+                        println!("differs  {difference}");
+                    }
+                }
+            }
+        }
+        if !modelled {
+            continue;
+        }
+        let rule = format!("{}\n", arguments.join(" "));
+        let recorded = case["bash"].as_str().unwrap_or_default();
+        if recorded != rule {
+            errors.push(format!(
+                "{name} is modelled, but bash writes {recorded:?} where the rule gives {rule:?}"
+            ));
+        }
+    }
+    if errors.is_empty() {
+        if reported_differences == 0 {
+            println!(
+                "{} echo case(s) match the recording across {checked} shell observation(s)",
+                cases.len()
+            );
+        } else {
+            println!(
+                "{} echo case(s) preserve every native claim; {reported_differences} non-binding shell observation(s) differ from the recording",
+                cases.len()
+            );
+        }
+        return Ok(());
+    }
+    Err(errors)
+}
+
+/// Check each shell's `exit` builtin against the recording, and check the
+/// frontend's native rule against all three.
+///
+/// A modelled status is one every shell reduces the same way, so unlike the
+/// `echo` gate this one requires the three columns to agree — and to agree with
+/// the reduction the runner and the generators perform.
+/// What each PowerShell command form actually invokes.
+///
+/// The frontend lowers `& 'path' args` and `./path args` to the same `Exec`, and
+/// a bare name to nothing. That is a claim about PowerShell, so it is measured
+/// here rather than read out of the documentation.
+///
+/// The harness writes each command into a wrapper script and runs `pwsh -File`,
+/// with `exit $LASTEXITCODE` after it. `pwsh -Command` reports 0 or 1 and not
+/// the status the script left — which is the same reason a workflow's pwsh step
+/// carries that line.
+/// How a workflow's pwsh step differs from its text handed to `pwsh -Command`.
+///
+/// The verification baseline runs the original the way the host runs it, and
+/// for a pwsh step that is a file carrying `$ErrorActionPreference = 'stop'`
+/// and `exit $LASTEXITCODE`, dot-sourced. No end-to-end case reaches the
+/// difference today — the PowerShell frontend lowers external command
+/// invocations, and those behave the same under both forms — so this is what
+/// checks the rule instead.
+/// The names PowerShell defines before a script runs.
+///
+/// The frontend models `$name = 'literal'` as a plain assignment, and that is
+/// only true for a name the script owns. `$ErrorActionPreference` changes how
+/// errors are handled and `$LASTEXITCODE` changes what a later `exit` reports;
+/// neither is a value the IR can carry as text. Which names those are is a fact
+/// about PowerShell, so it is measured.
+/// What `$ErrorActionPreference` changes.
+///
+/// The frontend skips the statement, and that is sound exactly while it reaches
+/// nothing the frontend lowers. Both halves are measured: a failing external
+/// command is unaffected by it, and a failing cmdlet is not.
+fn run_powershell_preference(root: &Path) -> Result<(), Vec<String>> {
+    let path = root.join("contracts/golden/powershell-preference-semantics-v1.json");
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|error| vec![format!("cannot read {}: {error}", path.display())])?;
+    let corpus: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|error| vec![format!("malformed corpus: {error}")])?;
+    let cases = corpus["cases"]
+        .as_array()
+        .ok_or_else(|| vec!["corpus has no cases array".to_owned()])?;
+    if cases.is_empty() {
+        return Err(vec!["corpus is empty".to_owned()]);
+    }
+    let programs = powershell_posix_programs();
+    let directory = root.join(format!("target/deshell-pwsh-pref-{}", std::process::id()));
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| vec![format!("cannot create {}: {error}", directory.display())])?;
+    let mut errors = Vec::new();
+    let mut checked = 0_usize;
+    for case in cases {
+        let name = case["name"].as_str().unwrap_or("<unnamed>");
+        let Some(body_template) = case["body_template"].as_str() else {
+            errors.push(format!("{name} has no body_template"));
+            continue;
+        };
+        let body = match render_powershell_posix_template(body_template, &programs) {
+            Ok(body) => body,
+            Err(error) => {
+                errors.push(format!("{name} has an invalid body_template: {error}"));
+                continue;
+            }
+        };
+        for (form, preamble) in [
+            ("with_stop", "$ErrorActionPreference = 'Stop'\n"),
+            ("without", ""),
+        ] {
+            let script = directory.join("case.ps1");
+            if let Err(error) = std::fs::write(&script, format!("{preamble}{body}")) {
+                errors.push(format!("cannot write {name}: {error}"));
+                continue;
+            }
+            let observed = std::process::Command::new("pwsh")
+                .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-File"])
+                .arg("./case.ps1")
+                .current_dir(&directory)
+                .output();
+            let observed = match observed {
+                Ok(observed) => observed,
+                Err(error) => {
+                    println!("skipped  {name}/{form}: {error}");
+                    continue;
+                }
+            };
+            checked += 1;
+            let stdout = String::from_utf8_lossy(&observed.stdout).replace("\r\n", "\n");
+            let exit = i64::from(observed.status.code().unwrap_or(-1));
+            if case[form]["stdout"].as_str() != Some(stdout.as_str()) {
+                errors.push(format!(
+                    "{name}/{form}/stdout: recorded {:?}, observed {stdout:?}",
+                    case[form]["stdout"].as_str()
+                ));
+            }
+            if case[form]["exit"].as_i64() != Some(exit) {
+                errors.push(format!(
+                    "{name}/{form}/exit: recorded {:?}, observed {exit}",
+                    case[form]["exit"].as_i64()
+                ));
+            }
+        }
+        let differs = case["differs"].as_bool().unwrap_or(false);
+        let same = case["with_stop"] == case["without"];
+        if differs == same {
+            errors.push(format!(
+                "{name}: recorded differs={differs} but the two settings are {}",
+                if same { "identical" } else { "different" }
+            ));
+        }
+    }
+    let _cleanup_result = std::fs::remove_dir_all(&directory);
+    if checked == 0 {
+        println!("skipped  no PowerShell runtime answered");
+        return Ok(());
+    }
+    if errors.is_empty() {
+        println!("{checked} PowerShell preference case(s) match the recording");
+        return Ok(());
+    }
+    Err(errors)
+}
+
+fn run_powershell_variables(root: &Path) -> Result<(), Vec<String>> {
+    let path = root.join("contracts/golden/powershell-variable-inventory-v1.json");
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|error| vec![format!("cannot read {}: {error}", path.display())])?;
+    let corpus: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|error| vec![format!("malformed corpus: {error}")])?;
+    let conditions = corpus["conditions"]
+        .as_array()
+        .ok_or_else(|| vec!["corpus has no conditions array".to_owned()])?;
+    if conditions.is_empty() {
+        return Err(vec!["corpus has no observation conditions".to_owned()]);
+    }
+    let recorded = corpus["names"]
+        .as_array()
+        .ok_or_else(|| vec!["corpus has no names array".to_owned()])?
+        .iter()
+        .map(|name| name.as_str().unwrap_or_default().to_owned())
+        .collect::<Vec<_>>();
+    if recorded.is_empty() {
+        return Err(vec!["corpus is empty".to_owned()]);
+    }
+    let programs = powershell_posix_programs();
+    // Two conditions, because one of them is not a detail: `LASTEXITCODE` does
+    // not exist until a native command sets it, and a list measured only at
+    // startup let `$LASTEXITCODE = '0'` through as an ordinary assignment.
+    let mut observed = Vec::new();
+    let mut errors = Vec::new();
+    for condition in conditions {
+        let name = condition["name"].as_str().unwrap_or("<unnamed>");
+        let Some(command_template) = condition["command_template"].as_str() else {
+            errors.push(format!("{name} has no command_template"));
+            continue;
+        };
+        let command = render_powershell_posix_template(command_template, &programs)
+            .map_err(|error| vec![format!("invalid {name} observation: {error}")])?;
+        let run = std::process::Command::new("pwsh")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &command,
+            ])
+            .output();
+        let run = match run {
+            Ok(run) => run,
+            Err(error) => {
+                println!("skipped  no PowerShell runtime answered: {error}");
+                return Ok(());
+            }
+        };
+        let mut condition_observed = Vec::new();
+        for line in String::from_utf8_lossy(&run.stdout).lines() {
+            let line = line.trim_end_matches('\r').trim().to_owned();
+            if !line.is_empty() && !condition_observed.contains(&line) {
+                condition_observed.push(line);
+            }
+        }
+        let recorded_count = condition["count"]
+            .as_u64()
+            .and_then(|count| usize::try_from(count).ok());
+        if recorded_count != Some(condition_observed.len()) {
+            errors.push(format!(
+                "{name}/count: recorded {recorded_count:?}, observed {}",
+                condition_observed.len()
+            ));
+        }
+        for name in condition_observed {
+            if !observed.contains(&name) {
+                observed.push(name);
+            }
+        }
+    }
+    for name in &observed {
+        if !recorded.contains(name) {
+            errors.push(format!(
+                "{name} is defined by PowerShell and is not recorded"
+            ));
+        }
+    }
+    for name in &recorded {
+        if !observed.contains(name) {
+            errors.push(format!(
+                "{name} is recorded and PowerShell does not define it"
+            ));
+        }
+    }
+    if errors.is_empty() {
+        println!(
+            "{} PowerShell variable name(s) match the recording",
+            recorded.len()
+        );
+        return Ok(());
+    }
+    Err(errors)
+}
+
+fn run_powershell_step_invocation(root: &Path) -> Result<(), Vec<String>> {
+    let path = root.join("contracts/golden/powershell-step-invocation-semantics-v1.json");
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|error| vec![format!("cannot read {}: {error}", path.display())])?;
+    let corpus: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|error| vec![format!("malformed corpus: {error}")])?;
+    let cases = corpus["cases"]
+        .as_array()
+        .ok_or_else(|| vec!["corpus has no cases array".to_owned()])?;
+    if cases.is_empty() {
+        return Err(vec!["corpus is empty".to_owned()]);
+    }
+    let programs = powershell_posix_programs();
+    // Under `target/` and not the system temporary root: a version-manager shim
+    // resolves its version from the configuration nearest the working directory.
+    let directory = root.join(format!("target/deshell-pwsh-step-{}", std::process::id()));
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| vec![format!("cannot create {}: {error}", directory.display())])?;
+    let mut errors = Vec::new();
+    let mut checked = 0_usize;
+    for case in cases {
+        let name = case["name"].as_str().unwrap_or("<unnamed>");
+        let Some(step_template) = case["step_template"].as_str() else {
+            errors.push(format!("{name} has no step_template"));
+            continue;
+        };
+        let step = match render_powershell_posix_template(step_template, &programs) {
+            Ok(step) => step,
+            Err(error) => {
+                errors.push(format!("{name} has an invalid step_template: {error}"));
+                continue;
+            }
+        };
+        let file = directory.join("step.ps1");
+        if let Err(error) = std::fs::write(
+            &file,
+            format!(
+                "$ErrorActionPreference = 'stop'\n{step}\nif ((Test-Path -LiteralPath variable:/LASTEXITCODE)) {{ exit $LASTEXITCODE }}\n"
+            ),
+        ) {
+            errors.push(format!("cannot write the step for {name}: {error}"));
+            continue;
+        }
+        let quoted = match powershell_path_literal(&file) {
+            Ok(quoted) => quoted,
+            Err(error) => {
+                errors.push(format!("cannot quote the step path for {name}: {error}"));
+                continue;
+            }
+        };
+        for (form, argument) in [
+            ("command_form", step),
+            ("runner_form", format!(". {quoted}")),
+        ] {
+            let observed = std::process::Command::new("pwsh")
+                .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
+                .arg(&argument)
+                .current_dir(&directory)
+                .output();
+            let observed = match observed {
+                Ok(observed) => observed,
+                Err(error) => {
+                    println!("skipped  {name}/{form}: {error}");
+                    continue;
+                }
+            };
+            checked += 1;
+            let stdout = String::from_utf8_lossy(&observed.stdout).replace("\r\n", "\n");
+            let exit = i64::from(observed.status.code().unwrap_or(-1));
+            if case[form]["stdout"].as_str() != Some(stdout.as_str()) {
+                errors.push(format!(
+                    "{name}/{form}/stdout: recorded {:?}, observed {stdout:?}",
+                    case[form]["stdout"].as_str()
+                ));
+            }
+            if case[form]["exit"].as_i64() != Some(exit) {
+                errors.push(format!(
+                    "{name}/{form}/exit: recorded {:?}, observed {exit}",
+                    case[form]["exit"].as_i64()
+                ));
+            }
+        }
+        // The recording says whether the two forms disagree, and a case that
+        // stopped disagreeing would leave the baseline rule resting on nothing.
+        let differs = case["differs"].as_bool().unwrap_or(false);
+        let same = case["command_form"] == case["runner_form"];
+        if differs == same {
+            errors.push(format!(
+                "{name}: recorded differs={differs} but the two forms are {}",
+                if same { "identical" } else { "different" }
+            ));
+        }
+    }
+    let _cleanup_result = std::fs::remove_dir_all(&directory);
+    if checked == 0 {
+        println!("skipped  no PowerShell runtime answered");
+        return Ok(());
+    }
+    if errors.is_empty() {
+        println!("{checked} PowerShell step invocation(s) match the recording");
+        return Ok(());
+    }
+    Err(errors)
+}
+
+fn run_powershell_invocation(root: &Path) -> Result<(), Vec<String>> {
+    let path = root.join("contracts/golden/powershell-invocation-semantics-v1.json");
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|error| vec![format!("cannot read {}: {error}", path.display())])?;
+    let corpus: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|error| vec![format!("malformed corpus: {error}")])?;
+    let subject = corpus["subject"]
+        .as_str()
+        .ok_or_else(|| vec!["corpus has no subject script".to_owned()])?;
+    let cases = corpus["cases"]
+        .as_array()
+        .ok_or_else(|| vec!["corpus has no cases array".to_owned()])?;
+    if cases.is_empty() {
+        return Err(vec!["corpus is empty".to_owned()]);
+    }
+    // Under `target/` and not the system temporary root. A version-manager
+    // shim resolves its version from the configuration nearest the working
+    // directory, and there is none above `/tmp` — the same thing that made
+    // de-shell unable to use a shimmed interpreter until 331bb8e. Writing this
+    // gate repeated it.
+    let directory = root.join(format!("target/deshell-powershell-{}", std::process::id()));
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| vec![format!("cannot create {}: {error}", directory.display())])?;
+    std::fs::write(directory.join("deshell-corpus.ps1"), subject)
+        .map_err(|error| vec![format!("cannot write the subject script: {error}")])?;
+    let mut errors = Vec::new();
+    let mut checked = 0_usize;
+    for case in cases {
+        let name = case["name"].as_str().unwrap_or("<unnamed>");
+        let Some(command) = case["command"].as_str() else {
+            errors.push(format!("{name} has no command"));
+            continue;
+        };
+        let wrapper = directory.join("deshell-wrapper.ps1");
+        if let Err(error) = std::fs::write(&wrapper, format!("{command}\nexit $LASTEXITCODE\n")) {
+            errors.push(format!("cannot write the wrapper for {name}: {error}"));
+            continue;
+        }
+        let observed = std::process::Command::new("pwsh")
+            .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-File"])
+            .arg("./deshell-wrapper.ps1")
+            .current_dir(&directory)
+            .output();
+        let observed = match observed {
+            Ok(observed) => observed,
+            Err(error) => {
+                println!("skipped  {name}: {error}");
+                continue;
+            }
+        };
+        checked += 1;
+        let stdout = String::from_utf8_lossy(&observed.stdout).replace("\r\n", "\n");
+        for (what, recorded, seen) in [
+            (
+                "stdout",
+                case["stdout"].as_str().unwrap_or("<missing>").to_owned(),
+                stdout,
+            ),
+            (
+                "exit",
+                case["exit"].as_i64().unwrap_or(-1).to_string(),
+                i64::from(observed.status.code().unwrap_or(-1)).to_string(),
+            ),
+            (
+                "stderr_empty",
+                case["stderr_empty"].as_bool().unwrap_or(false).to_string(),
+                observed.stderr.is_empty().to_string(),
+            ),
+        ] {
+            if recorded != seen {
+                errors.push(format!(
+                    "{name}/{what}: recorded {recorded:?}, observed {seen:?}"
+                ));
+            }
+        }
+    }
+    let _cleanup_result = std::fs::remove_dir_all(&directory);
+    if checked == 0 {
+        println!("skipped  no PowerShell runtime answered");
+        return Ok(());
+    }
+    if errors.is_empty() {
+        println!("{checked} PowerShell invocation form(s) match the recording");
+        return Ok(());
+    }
+    Err(errors)
+}
+
+fn run_exit_semantics(root: &Path) -> Result<(), Vec<String>> {
+    let path = root.join("contracts/golden/exit-builtin-semantics-v1.json");
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|error| vec![format!("cannot read {}: {error}", path.display())])?;
+    let corpus: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|error| vec![format!("malformed corpus: {error}")])?;
+    let cases = corpus["cases"]
+        .as_array()
+        .ok_or_else(|| vec!["corpus has no cases array".to_owned()])?;
+    if cases.is_empty() {
+        return Err(vec!["corpus is empty".to_owned()]);
+    }
+    let shells = PosixPrograms::discover(ShellColumn::ALL.iter().copied().map(ShellColumn::name));
+    let mut errors = Vec::new();
+    let mut checked = 0_usize;
+    let mut reported_differences = 0_usize;
+    for case in cases {
+        let name = case["name"].as_str().unwrap_or("<unnamed>");
+        let Some(modelled) = case["modelled"].as_bool() else {
+            errors.push(format!("{name} does not say whether it is modelled"));
+            continue;
+        };
+        let Some(status) = case["status"].as_str() else {
+            errors.push(format!("{name} has no status"));
+            continue;
+        };
+        for shell_column in ShellColumn::ALL {
+            let shell = shell_column.name();
+            let Some(recorded) = case[shell].as_i64() else {
+                errors.push(format!("{name} has no {shell} column"));
+                continue;
+            };
+            let observed = shells.status(shell, &format!("exit {status}"));
+            let observed = match observed {
+                Ok(observed) => observed,
+                Err(error) if shell != "bash" => {
+                    println!("skipped  {name}/{shell}: {error}");
+                    continue;
+                }
+                Err(error) => {
+                    errors.push(format!("cannot run {shell} for {name}: {error}"));
+                    continue;
+                }
+            };
+            let code = i64::from(observed.code().unwrap_or(-1));
+            checked += 1;
+            if code != recorded {
+                let difference = format!("{name}/{shell}: recorded {recorded}, observed {code}");
+                match exit_observation_effect(shell_column, modelled) {
+                    ObservationEffect::Enforce => errors.push(difference),
+                    ObservationEffect::Report => {
+                        reported_differences += 1;
+                        println!("differs  {difference}");
+                    }
+                }
+            }
+        }
+        if !modelled {
+            continue;
+        }
+        let Ok(parsed) = status.trim().parse::<i64>() else {
+            errors.push(format!(
+                "{name} is modelled, but {status:?} is not a decimal integer"
+            ));
+            continue;
+        };
+        let reduced = parsed.rem_euclid(256);
+        for shell_column in ShellColumn::ALL {
+            let shell = shell_column.name();
+            let recorded = case[shell].as_i64().unwrap_or(-1);
+            if recorded != reduced {
+                errors.push(format!(
+                    "{name} is modelled, but {shell} ends with {recorded} where the reduction gives {reduced}"
+                ));
+            }
+        }
+    }
+    if errors.is_empty() {
+        if reported_differences == 0 {
+            println!(
+                "{} exit case(s) match the recording across {checked} shell observation(s)",
+                cases.len()
+            );
+        } else {
+            println!(
+                "{} exit case(s) preserve every native claim; {reported_differences} non-binding shell observation(s) differ from the recording",
+                cases.len()
+            );
+        }
+        return Ok(());
+    }
+    Err(errors)
+}
+
+/// Ask the shells on this runner for their own builtins and require the
+/// frontend's table to answer for each one.
+///
+/// A builtin never reaches the `PATH` lookup, so a name the table does not
+/// mention is lowered to an `Exec` of whatever program `PATH` holds — `which`
+/// is a zsh builtin and a program in `/usr/bin`, and they do not answer the
+/// same way. Checking against a hand-written list would only restate the list.
+///
+/// One direction only. A runner carrying bash 3.2 does not report `mapfile`,
+/// which bash 5 does, so a name in the recording that this shell does not have
+/// is printed rather than failed; a name this shell has that the recording does
+/// not is the failure.
+fn run_builtin_table(root: &Path) -> Result<(), Vec<String>> {
+    let path = root.join("contracts/golden/shell-builtin-inventory-v1.json");
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|error| vec![format!("cannot read {}: {error}", path.display())])?;
+    let corpus: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|error| vec![format!("malformed corpus: {error}")])?;
+    let treatments = corpus["treatments"]
+        .as_object()
+        .ok_or_else(|| vec!["corpus has no treatments object".to_owned()])?;
+    if treatments.is_empty() {
+        return Err(vec!["corpus answers for no builtin".to_owned()]);
+    }
+    let shells = PosixPrograms::discover(["bash", "sh", "zsh"]);
+    let mut errors = Vec::new();
+    let mut observed_total = 0_usize;
+    for (shell, argument) in [
+        ("bash", "compgen -b"),
+        ("sh", "compgen -b"),
+        ("zsh", "print -l ${(k)builtins}"),
+    ] {
+        let output = shells.output(shell, argument);
+        let output = match output {
+            Ok(output) if output.status.success() => output,
+            Ok(output) => {
+                // A `/bin/sh` that is dash has no `compgen`, and a shell that
+                // cannot list its builtins is one this gate cannot check — which
+                // is worth printing and is not a disagreement.
+                println!(
+                    "skipped  {shell}: cannot list builtins (exit {:?})",
+                    output.status.code()
+                );
+                continue;
+            }
+            Err(error) => {
+                println!("skipped  {shell}: {error}");
+                continue;
+            }
+        };
+        let listing = String::from_utf8_lossy(&output.stdout).into_owned();
+        let observed: std::collections::BTreeSet<&str> = listing.split_whitespace().collect();
+        if observed.is_empty() {
+            println!("skipped  {shell}: reported no builtins");
+            continue;
+        }
+        observed_total += observed.len();
+        for name in &observed {
+            if !treatments.contains_key(*name) {
+                errors.push(format!(
+                    "{shell} resolves {name} as a builtin and the table does not answer for it"
+                ));
+            }
+        }
+        let recorded = corpus["shells"][shell].as_array();
+        if let Some(recorded) = recorded {
+            let recorded: std::collections::BTreeSet<&str> =
+                recorded.iter().filter_map(|value| value.as_str()).collect();
+            for name in recorded.difference(&observed) {
+                println!("absent   {shell}: the recording has {name} and this build does not");
+            }
+            for name in observed.difference(&recorded) {
+                println!("added    {shell}: this build has {name} and the recording does not");
+            }
+        }
+    }
+    if observed_total == 0 {
+        return Err(vec![
+            "no shell on this runner could list its builtins, so nothing was checked".to_owned(),
+        ]);
+    }
+    if errors.is_empty() {
+        println!(
+            "{} builtin name(s) answered for across {observed_total} observation(s)",
+            treatments.len()
+        );
+        return Ok(());
+    }
+    Err(errors)
+}
+
+fn validate_posix_divergence_corpus(corpus: &PosixDivergenceCorpus) -> Result<(), Vec<String>> {
+    let mut errors = Vec::new();
+    if corpus.schema_version != 1 {
+        errors.push(format!(
+            "corpus schema_version is {}, expected 1",
+            corpus.schema_version
+        ));
+    }
+    if corpus.contract != "posix-sh-divergence-v1" {
+        errors.push(format!(
+            "corpus contract is {:?}, expected posix-sh-divergence-v1",
+            corpus.contract
+        ));
+    }
+    for (field, value) in [("purpose", &corpus.purpose), ("note", &corpus.note)] {
+        if value.trim().is_empty() {
+            errors.push(format!("corpus {field} is empty"));
+        }
+    }
+    if corpus.programs.is_empty() || corpus.cases.is_empty() {
+        errors.push("corpus must name at least one program and one case".to_owned());
+    }
+
+    let mut program_names = BTreeSet::new();
+    let mut profile_names = BTreeSet::new();
+    for program in &corpus.programs {
+        if program.name.is_empty() {
+            errors.push("corpus has a program with an empty name".to_owned());
+        } else if !program_names.insert(program.name.as_str()) {
+            errors.push(format!("corpus repeats program {:?}", program.name));
+        }
+        if program.profiles.is_empty() {
+            errors.push(format!("program {:?} has no profiles", program.name));
+        }
+        for profile in &program.profiles {
+            if profile.is_empty() {
+                errors.push(format!("program {:?} has an empty profile", program.name));
+            } else if !profile_names.insert(profile.as_str()) {
+                errors.push(format!("corpus repeats profile {profile:?}"));
+            }
+        }
+    }
+
+    let mut case_names = BTreeSet::new();
+    for case in &corpus.cases {
+        if case.name.is_empty() {
+            errors.push("corpus has a case with an empty name".to_owned());
+        } else if !case_names.insert(case.name.as_str()) {
+            errors.push(format!("corpus repeats case {:?}", case.name));
+        }
+        if case.script.is_empty() || case.note.trim().is_empty() {
+            errors.push(format!("case {:?} has an empty script or note", case.name));
+        }
+        let case_profiles = case
+            .profiles
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        for profile in profile_names.difference(&case_profiles) {
+            errors.push(format!("case {:?} omits profile {profile:?}", case.name));
+        }
+        for profile in case_profiles.difference(&profile_names) {
+            errors.push(format!(
+                "case {:?} has unknown profile {profile:?}",
+                case.name
+            ));
+        }
+    }
+
+    let profiles = profile_names.into_iter().collect::<Vec<_>>();
+    for (index, left) in profiles.iter().enumerate() {
+        for right in &profiles[index + 1..] {
+            let indistinguishable = corpus.cases.iter().all(|case| {
+                case.profiles
+                    .get(*left)
+                    .zip(case.profiles.get(*right))
+                    .is_some_and(|(left, right)| left == right)
+            });
+            if indistinguishable {
+                errors.push(format!(
+                    "profiles {left:?} and {right:?} are indistinguishable across the corpus"
+                ));
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+fn posix_profile_differences<'a>(
+    cases: &'a [PosixDivergenceCase],
+    profile: &str,
+    observed: &[PosixDivergenceObservation],
+) -> Vec<&'a str> {
+    cases
+        .iter()
+        .zip(observed)
+        .filter(|(case, seen)| case.profiles.get(profile) != Some(*seen))
+        .map(|(case, _)| case.name.as_str())
+        .collect()
+}
+
+/// Re-measure constructs outside the common POSIX-shell subset, select one
+/// complete recorded profile for each installed program, and classify
+/// `/bin/sh` by the same observations.
+///
+/// A program name is not a stable semantic version. In particular, dash builds
+/// exist both with and without ANSI-C quote support. A build must match exactly
+/// one whole-corpus profile: accepting alternatives per case would fabricate a
+/// shell that no runner was observed to provide.
+fn run_posix_divergence(root: &Path) -> Result<(), Vec<String>> {
+    let path = root.join("contracts/golden/posix-sh-divergence-v1.json");
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|error| vec![format!("cannot read {}: {error}", path.display())])?;
+    let corpus: PosixDivergenceCorpus =
+        serde_json::from_str(&raw).map_err(|error| vec![format!("malformed corpus: {error}")])?;
+    validate_posix_divergence_corpus(&corpus)?;
+
+    let shell_programs = PosixPrograms::discover(
+        corpus
+            .programs
+            .iter()
+            .map(|program| program.name.as_str())
+            .chain(std::iter::once("/bin/sh")),
+    );
+    let observe = |program: &str, script: &str| -> std::io::Result<PosixDivergenceObservation> {
+        let output = shell_programs.output(program, script)?;
+        let exit = output.status.code().unwrap_or(-1);
+        let stdout = String::from_utf8(output.stdout).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{program} wrote non-UTF-8 observation output: {error}"),
+            )
+        })?;
+        Ok(PosixDivergenceObservation { stdout, exit })
+    };
+
+    let mut errors = Vec::new();
+    let present = corpus
+        .programs
+        .iter()
+        .filter(|program| match observe(&program.name, "exit 0") {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                println!("skipped  {}: {error}", program.name);
+                false
+            }
+            Err(error) => {
+                errors.push(format!("cannot probe {}: {error}", program.name));
+                false
+            }
+        })
+        .collect::<Vec<_>>();
+    if present.is_empty() {
+        errors.push("no recorded POSIX program is on this runner".to_owned());
+        return Err(errors);
+    }
+
+    let mut checked = 0_usize;
+    let mut selected_profiles = Vec::new();
+    for program in present {
+        let mut observations = Vec::with_capacity(corpus.cases.len());
+        for case in &corpus.cases {
+            match observe(&program.name, &case.script) {
+                Ok(observation) => {
+                    checked += 1;
+                    observations.push(observation);
+                }
+                Err(error) => errors.push(format!(
+                    "{}/{:?}: cannot run observation: {error}",
+                    program.name, case.name
+                )),
+            }
+        }
+        if observations.len() != corpus.cases.len() {
+            continue;
+        }
+        let matching = program
+            .profiles
+            .iter()
+            .filter(|profile| {
+                posix_profile_differences(&corpus.cases, profile, &observations).is_empty()
+            })
+            .collect::<Vec<_>>();
+        match matching.as_slice() {
+            [profile] => {
+                println!("{} matches recorded profile {profile}", program.name);
+                selected_profiles.push((program.name.as_str(), profile.as_str()));
+            }
+            [] => {
+                errors.push(format!(
+                    "{} matches no complete recorded profile",
+                    program.name
+                ));
+                for profile in &program.profiles {
+                    let differences =
+                        posix_profile_differences(&corpus.cases, profile, &observations);
+                    errors.push(format!(
+                        "{} differs from {profile} on: {}",
+                        program.name,
+                        differences.join(", ")
+                    ));
+                }
+            }
+            profiles => errors.push(format!(
+                "{} ambiguously matches profiles {}",
+                program.name,
+                profiles
+                    .iter()
+                    .map(|profile| profile.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        }
+    }
+
+    let mut sh_observations = Vec::with_capacity(corpus.cases.len());
+    for case in &corpus.cases {
+        match observe("/bin/sh", &case.script) {
+            Ok(observation) => sh_observations.push(observation),
+            Err(error) => errors.push(format!(
+                "/bin/sh/{:?}: cannot run observation: {error}",
+                case.name
+            )),
+        }
+    }
+    if sh_observations.len() == corpus.cases.len() {
+        let differences = selected_profiles
+            .iter()
+            .map(|(program, profile)| {
+                let label = if program == profile {
+                    (*program).to_owned()
+                } else {
+                    format!("{program} ({profile})")
+                };
+                (
+                    label,
+                    posix_profile_differences(&corpus.cases, profile, &sh_observations),
+                )
+            })
+            .collect::<Vec<_>>();
+        match differences.iter().find(|(_, differs)| differs.is_empty()) {
+            Some((profile, _)) => println!("/bin/sh here behaves like {profile}"),
+            None => {
+                println!("/bin/sh here behaves like none of the selected profiles");
+                for (profile, differs) in &differences {
+                    println!("  unlike {profile} on: {}", differs.join(", "));
+                }
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        println!(
+            "{} construct(s) match one complete profile across {checked} program observation(s)",
+            corpus.cases.len()
+        );
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+/// Check each shell's `printf` builtin against the recording.
+///
+/// Unlike `echo`, every shell measured writes the same bytes for every case
+/// here, which is why the frontend models `printf` for all of them. A column
+/// that starts to disagree is the reason that stops being true, so it fails
+/// rather than reports.
+fn run_printf_semantics(root: &Path) -> Result<(), Vec<String>> {
+    let path = root.join("contracts/golden/printf-builtin-semantics-v1.json");
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|error| vec![format!("cannot read {}: {error}", path.display())])?;
+    let corpus: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|error| vec![format!("malformed corpus: {error}")])?;
+    let shells: Vec<&str> = corpus["shells"]
+        .as_array()
+        .ok_or_else(|| vec!["corpus has no shells array".to_owned()])?
+        .iter()
+        .filter_map(|value| value.as_str())
+        .collect();
+    let cases = corpus["cases"]
+        .as_array()
+        .ok_or_else(|| vec!["corpus has no cases array".to_owned()])?;
+    if cases.is_empty() || shells.is_empty() {
+        return Err(vec!["corpus is empty".to_owned()]);
+    }
+    let shell_programs = PosixPrograms::discover(shells.iter().copied());
+    let mut errors = Vec::new();
+    let mut checked = 0_usize;
+    for case in cases {
+        let name = case["name"].as_str().unwrap_or("<unnamed>");
+        let arguments: Vec<String> = case["arguments"]
+            .as_array()
+            .ok_or_else(|| vec![format!("{name} has no arguments")])?
+            .iter()
+            .map(|value| value.as_str().unwrap_or_default().to_owned())
+            .collect();
+        let argument_refs = arguments.iter().map(String::as_str).collect::<Vec<_>>();
+        for shell in &shells {
+            let Some(recorded) = case[*shell].as_str() else {
+                errors.push(format!("{name} has no {shell} column"));
+                continue;
+            };
+            let output = shell_programs.output_with_positional_arguments(
+                shell,
+                "printf \"$@\"",
+                &argument_refs,
+            );
+            let output = match output {
+                Ok(output) => output,
+                Err(error) => {
+                    println!("skipped  {name}/{shell}: {error}");
+                    continue;
+                }
+            };
+            let actual = String::from_utf8_lossy(&output.stdout).into_owned();
+            checked += 1;
+            if actual != recorded {
+                errors.push(format!(
+                    "{name}/{shell}: recorded {recorded:?}, observed {actual:?}"
+                ));
+            }
+        }
+    }
+    if errors.is_empty() {
+        println!(
+            "{} printf case(s) match the recording across {checked} shell observation(s)",
+            cases.len()
+        );
+        return Ok(());
+    }
+    Err(errors)
+}
+
+fn validate_case_pattern_corpus(corpus: &CasePatternCorpus) -> Result<(), Vec<String>> {
+    const PROGRAMS: [(&str, &[&str]); 3] = [
+        ("bash", &["bash"]),
+        ("zsh", &["zsh"]),
+        ("dash", &["dash", "dash-with-ansi-c-quotes"]),
+    ];
+
+    let mut errors = Vec::new();
+    if corpus.schema_version != 1 {
+        errors.push(format!(
+            "case-pattern schema version is {}, expected 1",
+            corpus.schema_version
+        ));
+    }
+    if corpus.contract != "case-pattern-semantics-v1" {
+        errors.push(format!(
+            "case-pattern contract is {:?}, expected case-pattern-semantics-v1",
+            corpus.contract
+        ));
+    }
+    if corpus.purpose.trim().is_empty() || corpus.note.trim().is_empty() {
+        errors.push("case-pattern purpose and note must be non-empty".to_owned());
+    }
+
+    let mut shell_columns = BTreeSet::new();
+    for name in &corpus.shells {
+        let Some(shell) = RecordedShellColumn::parse(name) else {
+            errors.push(format!("case-pattern corpus names unknown shell {name:?}"));
+            continue;
+        };
+        if !shell_columns.insert(shell) {
+            errors.push(format!("case-pattern corpus repeats shell {name:?}"));
+        }
+    }
+    let expected_shells = RecordedShellColumn::ALL.into_iter().collect();
+    if shell_columns != expected_shells {
+        errors.push(format!(
+            "case-pattern corpus shell set is {shell_columns:?}, expected {expected_shells:?}"
+        ));
+    }
+
+    let mut case_ids = BTreeSet::new();
+    for case in &corpus.cases {
+        if case.id.is_empty() || !case_ids.insert(case.id.as_str()) {
+            errors.push(format!(
+                "case-pattern case id is empty or repeated: {:?}",
+                case.id
+            ));
+        }
+        if case.pattern.is_empty() || case.script.is_empty() {
+            errors.push(format!(
+                "case-pattern case {:?} has an empty pattern or script",
+                case.id
+            ));
+        }
+        match decode_base64(&case.word_base64) {
+            Some(word) if std::str::from_utf8(&word).is_ok() => {}
+            _ => errors.push(format!(
+                "case-pattern case {:?} has a word that is not base64 UTF-8",
+                case.id
+            )),
+        }
+    }
+    if corpus.cases.is_empty() {
+        errors.push("case-pattern corpus has no cases".to_owned());
+    }
+
+    let mut program_names = BTreeSet::new();
+    for program in &corpus.programs {
+        if !program_names.insert(program.name.as_str()) {
+            errors.push(format!(
+                "case-pattern corpus repeats program {:?}",
+                program.name
+            ));
+        }
+        let expected = PROGRAMS
+            .iter()
+            .find_map(|(name, profiles)| (*name == program.name).then_some(*profiles));
+        match expected {
+            Some(expected)
+                if program
+                    .profiles
+                    .iter()
+                    .map(String::as_str)
+                    .eq(expected.iter().copied()) => {}
+            Some(expected) => errors.push(format!(
+                "case-pattern program {:?} has profiles {:?}, expected {expected:?}",
+                program.name, program.profiles
+            )),
+            None => errors.push(format!(
+                "case-pattern corpus names unknown program {:?}",
+                program.name
+            )),
+        }
+    }
+    let expected_programs = PROGRAMS.into_iter().map(|(name, _)| name).collect();
+    if program_names != expected_programs {
+        errors.push(format!(
+            "case-pattern program set is {program_names:?}, expected {expected_programs:?}"
+        ));
+    }
+
+    let variant_names = corpus
+        .programs
+        .iter()
+        .flat_map(|program| program.profiles.iter())
+        .filter(|profile| !matches!(profile.as_str(), "bash" | "sh" | "zsh" | "dash"))
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let recorded_variants = corpus
+        .profile_variants
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if recorded_variants != variant_names {
+        errors.push(format!(
+            "case-pattern profile variants are {recorded_variants:?}, expected {variant_names:?}"
+        ));
+    }
+    for (profile, outcomes) in &corpus.profile_variants {
+        let outcome_ids = outcomes.keys().map(String::as_str).collect::<BTreeSet<_>>();
+        if outcome_ids != case_ids {
+            errors.push(format!(
+                "case-pattern profile {profile:?} covers {outcome_ids:?}, expected {case_ids:?}"
+            ));
+        }
+    }
+
+    for program in &corpus.programs {
+        for (index, left) in program.profiles.iter().enumerate() {
+            for right in program.profiles.iter().skip(index + 1) {
+                let distinguishable = corpus
+                    .cases
+                    .iter()
+                    .any(|case| corpus.outcome(case, left) != corpus.outcome(case, right));
+                if !distinguishable {
+                    errors.push(format!(
+                        "case-pattern profiles {left:?} and {right:?} are indistinguishable"
+                    ));
+                }
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+fn case_pattern_profile_differences(
+    corpus: &CasePatternCorpus,
+    profile: &str,
+    observations: &[CasePatternOutcome],
+) -> Vec<String> {
+    corpus
+        .cases
+        .iter()
+        .zip(observations)
+        .filter_map(|(case, observed)| match corpus.outcome(case, profile) {
+            Some(expected) if expected == *observed => None,
+            Some(expected) => Some(format!(
+                "{} (expected {}, observed {})",
+                case.id,
+                expected.label(),
+                observed.label()
+            )),
+            None => Some(format!("{} (profile has no outcome)", case.id)),
+        })
+        .collect()
+}
+
+/// Re-measure what each shell matches for the recorded `case` patterns.
+///
+/// The word is base64 so a newline survives the file, and the answer is an
+/// ASCII token the shell prints, so nothing here depends on how bytes are
+/// decoded. A shell that refuses the pattern is `ERROR` and nothing more — the
+/// message names the interpreter's own path, which is not a property of the
+/// pattern. `bash`, `zsh`, and `dash` must each match exactly one complete
+/// profile. Ambient `sh` is an implementation-selected family; its drift is
+/// reported while the checked-in cross-shell reduction remains strict in the
+/// frontend test.
+fn run_case_patterns(root: &Path) -> Result<(), Vec<String>> {
+    let path = root.join("contracts/golden/case-pattern-semantics-v1.json");
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|error| vec![format!("cannot read {}: {error}", path.display())])?;
+    let corpus: CasePatternCorpus =
+        serde_json::from_str(&raw).map_err(|error| vec![format!("malformed corpus: {error}")])?;
+    validate_case_pattern_corpus(&corpus)?;
+
+    let mut words = Vec::with_capacity(corpus.cases.len());
+    for case in &corpus.cases {
+        let word = decode_base64(&case.word_base64)
+            .ok_or_else(|| vec![format!("{} has a word that is not base64", case.id)])?;
+        let word = String::from_utf8(word)
+            .map_err(|error| vec![format!("{} has a word that is not UTF-8: {error}", case.id)])?;
+        words.push(word);
+    }
+
+    let shell_programs = PosixPrograms::discover(corpus.shells.iter().map(String::as_str));
+    let mut errors = Vec::new();
+    let mut checked = 0_usize;
+    let mut reported_differences = 0_usize;
+    for shell in RecordedShellColumn::ALL {
+        let shell_name = shell.name();
+        match shell_programs.output(shell_name, "exit 0") {
+            Ok(_) => {}
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound && !shell.program_is_required() =>
+            {
+                println!("skipped  {shell_name}: {error}");
+                continue;
+            }
+            Err(error) => {
+                errors.push(format!("cannot probe {shell_name}: {error}"));
+                continue;
+            }
+        }
+
+        let mut observations = Vec::with_capacity(corpus.cases.len());
+        for (case, word) in corpus.cases.iter().zip(&words) {
+            let output = shell_programs.output_with_positional_arguments(
+                shell_name,
+                &case.script,
+                &[word.as_str()],
+            );
+            let output = match output {
+                Ok(output) => output,
+                Err(error) => {
+                    errors.push(format!(
+                        "{}/{shell_name}: cannot run observation: {error}",
+                        case.id
+                    ));
+                    continue;
+                }
+            };
+            let observed = match (output.status.success(), output.stdout.as_slice()) {
+                (true, b"MATCH") => CasePatternOutcome::Match,
+                (true, b"NOMATCH") => CasePatternOutcome::NoMatch,
+                _ => CasePatternOutcome::Error,
+            };
+            checked += 1;
+            observations.push(observed);
+        }
+        if observations.len() != corpus.cases.len() {
+            continue;
+        }
+
+        match shell.case_pattern_effect() {
+            ObservationEffect::Report => {
+                let differences = case_pattern_profile_differences(&corpus, "sh", &observations);
+                reported_differences += differences.len();
+                for difference in differences {
+                    println!("differs  sh/{difference}");
+                }
+                continue;
+            }
+            ObservationEffect::Enforce => {}
+        }
+
+        let Some(program) = corpus
+            .programs
+            .iter()
+            .find(|program| program.name == shell_name)
+        else {
+            errors.push(format!("{shell_name} has no profile declaration"));
+            continue;
+        };
+        let matching = program
+            .profiles
+            .iter()
+            .filter(|profile| {
+                case_pattern_profile_differences(&corpus, profile, &observations).is_empty()
+            })
+            .collect::<Vec<_>>();
+        match matching.as_slice() {
+            [profile] => println!("{shell_name} matches recorded profile {profile}"),
+            [] => {
+                errors.push(format!(
+                    "{shell_name} matches no complete case-pattern profile"
+                ));
+                for profile in &program.profiles {
+                    let differences =
+                        case_pattern_profile_differences(&corpus, profile, &observations);
+                    errors.push(format!(
+                        "{shell_name} differs from {profile} on: {}",
+                        differences.join(", ")
+                    ));
+                }
+            }
+            profiles => errors.push(format!(
+                "{shell_name} ambiguously matches case-pattern profiles {}",
+                profiles
+                    .iter()
+                    .map(|profile| profile.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        }
+    }
+    if errors.is_empty() {
+        if reported_differences == 0 {
+            println!(
+                "{} case pattern(s) match one complete profile across {checked} shell observation(s)",
+                corpus.cases.len()
+            );
+        } else {
+            println!(
+                "{} case pattern(s) match one complete interpreter profile across {checked} shell observation(s); {reported_differences} non-binding sh observation(s) differ",
+                corpus.cases.len()
+            );
+        }
+        return Ok(());
+    }
+    Err(errors)
+}
+
+/// Decode the base64 a corpus stores a word in.
+///
+/// Written out rather than pulled in: `xtask` is a build tool the workspace
+/// lock has to stay small for, and this is the only place that needs it.
+fn decode_base64(encoded: &str) -> Option<Vec<u8>> {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut bits = 0_u32;
+    let mut count = 0_u32;
+    let mut output = Vec::new();
+    for byte in encoded.bytes() {
+        if byte == b'=' {
+            break;
+        }
+        let value = ALPHABET.iter().position(|candidate| *candidate == byte)?;
+        bits = (bits << 6) | u32::try_from(value).ok()?;
+        count += 6;
+        if count >= 8 {
+            count -= 8;
+            output.push(u8::try_from((bits >> count) & 0xff).ok()?);
+        }
+    }
+    Some(output)
+}
+
+/// Re-measure which names a shell answers from itself.
+///
+/// A generated program resolves a name through the process environment, so a
+/// name the shell supplies is one the program would read as empty. The
+/// conservative union is what the frontend's table has to keep up with: if any
+/// supported version supplies a name, every frontend must delegate it. A newer
+/// shell supplying a name outside that union is fatal. An older version not
+/// supplying a protected name is useful drift evidence, but cannot make the
+/// frontend unsafe and is therefore reported rather than rejected.
+fn run_shell_variables(root: &Path) -> Result<(), Vec<String>> {
+    let path = root.join("contracts/golden/shell-variable-inventory-v1.json");
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|error| vec![format!("cannot read {}: {error}", path.display())])?;
+    let corpus: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|error| vec![format!("malformed corpus: {error}")])?;
+    let shells = recorded_shell_columns(&corpus, "shell-variable")?;
+    let names = corpus["names"]
+        .as_object()
+        .ok_or_else(|| vec!["corpus has no names object".to_owned()])?;
+    if names.is_empty() || shells.is_empty() {
+        return Err(vec!["corpus is empty".to_owned()]);
+    }
+    let shell_programs =
+        PosixPrograms::discover(shells.iter().copied().map(RecordedShellColumn::name));
+    let mut errors = Vec::new();
+    let mut checked = 0_usize;
+    let mut reported_differences = 0_usize;
+    for (name, recorded) in names {
+        let mut recorded_origins = std::collections::BTreeMap::new();
+        for shell in RecordedShellColumn::ALL {
+            let shell_name = shell.name();
+            let Some(value) = recorded[shell_name].as_str() else {
+                errors.push(format!("{name} has no {shell_name} column"));
+                continue;
+            };
+            let Some(origin) = VariableOrigin::parse(value) else {
+                errors.push(format!(
+                    "{name}/{shell_name} has unknown variable origin {value:?}"
+                ));
+                continue;
+            };
+            recorded_origins.insert(shell, origin);
+        }
+        if recorded_origins.len() != shells.len() {
+            continue;
+        }
+        let protected = recorded_origins
+            .values()
+            .copied()
+            .any(VariableOrigin::is_shell_supplied);
+        for shell in &shells {
+            let shell_name = shell.name();
+            let expected = recorded_origins[shell];
+            let script = format!(
+                "if env | grep -q \"^{name}=\"; then printf INHERITED; \
+                 elif [ -n \"${{{name}+x}}\" ]; then printf SHELL; else printf ABSENT; fi"
+            );
+            let output = shell_programs.output(shell_name, &script);
+            let output = match output {
+                Ok(output) if output.status.success() => output,
+                Ok(output) => {
+                    errors.push(format!(
+                        "{name}/{shell_name}: inventory command exited {:?}",
+                        output.status.code()
+                    ));
+                    continue;
+                }
+                Err(error) => {
+                    println!("skipped  {name}/{shell_name}: {error}");
+                    continue;
+                }
+            };
+            let raw_observed = String::from_utf8_lossy(&output.stdout);
+            let Some(observed) = VariableOrigin::parse(&raw_observed) else {
+                errors.push(format!(
+                    "{name}/{shell_name}: inventory command returned {raw_observed:?}"
+                ));
+                continue;
+            };
+            checked += 1;
+            if observed.is_shell_supplied() && !protected {
+                errors.push(format!(
+                    "{name}/{shell_name}: this shell supplies the name, but the conservative frontend table does not protect it"
+                ));
+                continue;
+            }
+            // `INHERITED` versus `ABSENT` belongs to the runner environment.
+            // Only a move into or out of `SHELL` is interpreter drift.
+            if observed.is_shell_supplied() != expected.is_shell_supplied() {
+                reported_differences += 1;
+                println!(
+                    "differs  {name}/{shell_name}: recorded {expected:?}, observed {observed:?}"
+                );
+            }
+        }
+    }
+    if errors.is_empty() {
+        if reported_differences == 0 {
+            println!(
+                "{} variable name(s) match the conservative recording across {checked} shell observation(s)",
+                names.len()
+            );
+        } else {
+            println!(
+                "{} variable name(s) protect every observed shell-supplied name across {checked} shell observation(s); {reported_differences} version or alias observation(s) differ",
+                names.len()
+            );
+        }
+        return Ok(());
+    }
+    Err(errors)
+}
+
+/// Refuse `==` against an enum that has more than two variants.
+///
+/// A `match` is checked for exhaustiveness and `==` is not, so a variant added
+/// later compiles at every comparison and answers "no" at every one of them.
+/// With two variants the two forms say the same thing, because `!= A` is `== B`
+/// and there is nowhere for a third answer to hide. With three there is, and
+/// the compiler stops helping exactly when the question gets harder.
+///
+/// The remedy is not to rewrite the comparison but to ask the question once, in
+/// a method whose body is a `match` — which is what `MigrationTarget` does.
+fn run_enum_equality(root: &Path) -> Result<(), Vec<String>> {
+    let mut variants: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut comparisons: Vec<(String, String, usize)> = Vec::new();
+    for entry in walk_rust_sources(root)? {
+        let text = std::fs::read_to_string(&entry)
+            .map_err(|error| vec![format!("cannot read {}: {error}", entry.display())])?;
+        let mut current: Option<(String, usize)> = None;
+        // A comparison inside a test module is a test comparing a value against
+        // an expected variant. A new variant makes such a test weaker, not
+        // wrong: the behaviour it guards is in the code above, which is what
+        // this gate is about.
+        let tests_begin = text
+            .find("\n#[cfg(test)]\n")
+            .map_or(usize::MAX, |index| text[..index].lines().count());
+        for (number, line) in text.lines().enumerate() {
+            if number >= tests_begin {
+                break;
+            }
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed
+                .strip_prefix("pub(crate) enum ")
+                .or_else(|| trimmed.strip_prefix("enum "))
+                && let Some(name) = rest.split_whitespace().next()
+                && trimmed.ends_with('{')
+            {
+                current = Some((name.trim_end_matches('{').trim().to_owned(), 0));
+                continue;
+            }
+            if let Some((name, count)) = current.as_mut() {
+                if trimmed == "}" {
+                    variants.insert(name.clone(), *count);
+                    current = None;
+                    continue;
+                }
+                // A variant line is an identifier that starts a line, with or
+                // without a payload. Anything else is a field or an attribute.
+                let head = trimmed.trim_end_matches(&[',', '{'][..]).trim();
+                if !head.is_empty()
+                    && head
+                        .chars()
+                        .next()
+                        .is_some_and(|character| character.is_ascii_uppercase())
+                    && head
+                        .chars()
+                        .all(|character| character.is_ascii_alphanumeric() || character == '_')
+                {
+                    *count += 1;
+                }
+            }
+            // A comment mentioning `==` is talking about the rule, not
+            // branching on one; an assertion compares a value against an
+            // expected variant, which is what a test is for and where a third
+            // answer cannot hide — the assertion fails either way.
+            if trimmed.starts_with("//")
+                || trimmed.starts_with("///")
+                || trimmed.contains("assert_eq!")
+                || trimmed.contains("assert_ne!")
+            {
+                continue;
+            }
+            for marker in ["== ", "!= "] {
+                let Some(position) = line.find(marker) else {
+                    continue;
+                };
+                let rest = line[position + marker.len()..].trim();
+                let Some(path) = rest
+                    .split(|character: char| {
+                        !character.is_ascii_alphanumeric() && character != '_' && character != ':'
+                    })
+                    .next()
+                else {
+                    continue;
+                };
+                let segments: Vec<&str> = path.split("::").collect();
+                if segments.len() < 2 {
+                    continue;
+                }
+                let type_name = segments[segments.len() - 2];
+                let variant = segments[segments.len() - 1];
+                if !type_name
+                    .chars()
+                    .next()
+                    .is_some_and(|character| character.is_ascii_uppercase())
+                    || !variant
+                        .chars()
+                        .next()
+                        .is_some_and(|character| character.is_ascii_uppercase())
+                {
+                    continue;
+                }
+                comparisons.push((
+                    type_name.to_owned(),
+                    format!("{}:{}", entry.display(), number + 1),
+                    0,
+                ));
+            }
+        }
+    }
+    let mut errors = Vec::new();
+    let mut checked = 0_usize;
+    for (type_name, where_, _) in &comparisons {
+        let Some(count) = variants.get(type_name) else {
+            // A type declared elsewhere — `std`, a dependency — is not this
+            // repository's to answer for.
+            continue;
+        };
+        checked += 1;
+        if *count > 2 {
+            errors.push(format!(
+                "{where_}: `==` against {type_name}, which has {count} variants; ask the question in a method whose body is a `match`"
+            ));
+        }
+    }
+    if errors.is_empty() {
+        println!(
+            "{checked} enum comparison(s) are against a type with two variants, where `==` and a `match` say the same thing"
+        );
+        return Ok(());
+    }
+    Err(errors)
+}
+
+/// The fuzz crate is compiled from the same modules as the binary.
+///
+/// `fuzz/src/lib.rs` re-declares every module of `crates/deshell/src/main.rs`
+/// with a `#[path]`, and nothing built it: `cargo clippy --workspace` does not
+/// reach it, and the nightly fuzz job is the only thing that does. Adding
+/// `host` and `trace` to the binary broke the fuzz build and the break was
+/// invisible for a day.
+///
+/// Upstream holds the identity and downstream drops it — the same shape as a
+/// span, a digest and a `shell:` key before it. The lists are compared here so
+/// the next module is either in both or in neither.
+fn run_fuzz_modules(root: &Path) -> Result<(), Vec<String>> {
+    let declared = |text: &str| {
+        text.lines()
+            .filter_map(|line| line.trim().strip_prefix("mod ")?.strip_suffix(';'))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let main = std::fs::read_to_string(root.join("crates/deshell/src/main.rs"))
+        .map_err(|error| vec![format!("cannot read main.rs: {error}")])?;
+    let fuzz = std::fs::read_to_string(root.join("fuzz/src/lib.rs"))
+        .map_err(|error| vec![format!("cannot read fuzz/src/lib.rs: {error}")])?;
+    // A module can belong to exactly one of them, and when it does the fuzz
+    // crate says so and says why. Named there rather than here, so the decision
+    // sits with the code it is about and an addition is visible in review.
+    let omitted = fuzz
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("// deshell-fuzz omits:"))
+        .map(|names| {
+            names
+                .split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut binary = declared(&main)
+        .into_iter()
+        .filter(|name| !omitted.contains(name))
+        .collect::<Vec<_>>();
+    let mut fuzzed = declared(&fuzz);
+    binary.sort();
+    fuzzed.sort();
+    if binary.is_empty() {
+        return Err(vec!["main.rs declares no modules".to_owned()]);
+    }
+    if binary == fuzzed {
+        println!(
+            "the fuzz crate is compiled from the same {} modules as the binary, omitting {}",
+            binary.len(),
+            if omitted.is_empty() {
+                "none".to_owned()
+            } else {
+                omitted.join(", ")
+            }
+        );
+        return Ok(());
+    }
+    let mut failures = Vec::new();
+    for name in &binary {
+        if !fuzzed.contains(name) {
+            failures.push(format!("fuzz/src/lib.rs does not compile `{name}`"));
+        }
+    }
+    for name in &fuzzed {
+        if !binary.contains(name) {
+            failures.push(format!(
+                "fuzz/src/lib.rs compiles `{name}`, which the binary does not"
+            ));
+        }
+    }
+    Err(failures)
+}
+
+/// `trace::Event` and `contracts/schema/trace-v1.schema.json` name the same
+/// events, in the same order.
+///
+/// A trace is read by something that is not de-shell — that is the whole point
+/// of writing it down — so the vocabulary has to be a contract rather than an
+/// implementation detail. The same rule as `report-item-kinds`, for the same
+/// reason.
+fn run_trace_events(root: &Path) -> Result<(), Vec<String>> {
+    let source = std::fs::read_to_string(root.join("crates/deshell/src/trace.rs"))
+        .map_err(|error| vec![format!("cannot read trace.rs: {error}")])?;
+    let declared = source
+        .split_once("pub(crate) const NAMES: [&'static str; ")
+        .and_then(|(_, rest)| rest.split_once(']'))
+        .and_then(|(count, _)| count.parse::<usize>().ok())
+        .ok_or_else(|| vec!["trace.rs has no Event::NAMES".to_owned()])?;
+    let names = source
+        .split_once("pub(crate) const NAMES: [&'static str; ")
+        .and_then(|(_, rest)| rest.split_once("];"))
+        .map(|(body, _)| body)
+        .ok_or_else(|| vec!["trace.rs has no Event::NAMES body".to_owned()])?
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix('"')?.split_once('"'))
+        .map(|(name, _)| name.to_owned())
+        .collect::<Vec<_>>();
+    let mut failures = Vec::new();
+    if declared != names.len() {
+        failures.push(format!(
+            "Event::NAMES is declared to hold {declared} names and holds {}",
+            names.len()
+        ));
+    }
+    // Every variant carries its name, so the enum and the list must agree too.
+    let variants = source
+        .split_once("pub(crate) enum Event {")
+        .and_then(|(_, rest)| rest.split_once("\n}\n"))
+        .map(|(body, _)| body)
+        .ok_or_else(|| vec!["trace.rs has no Event enum".to_owned()])?
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let name = line.split([' ', '{', ',']).next()?;
+            (!name.is_empty()
+                && !line.starts_with("///")
+                && !line.starts_with("//")
+                && name.starts_with(|letter: char| letter.is_ascii_uppercase()))
+            .then(|| {
+                let mut snake = String::new();
+                for (index, letter) in name.char_indices() {
+                    if letter.is_ascii_uppercase() {
+                        if index != 0 {
+                            snake.push('_');
+                        }
+                        snake.push(letter.to_ascii_lowercase());
+                    } else {
+                        snake.push(letter);
+                    }
+                }
+                snake
+            })
+        })
+        .collect::<Vec<_>>();
+    if variants != names {
+        failures.push(format!(
+            "Event has variants {variants:?}; Event::NAMES holds {names:?}"
+        ));
+    }
+
+    let path = root.join("contracts/schema/trace-v1.schema.json");
+    let schema = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .ok_or_else(|| vec![format!("cannot read {}", path.display())])?;
+    let Some(records) = schema["oneOf"].as_array() else {
+        failures.push("trace-v1.schema.json must be a oneOf over its records".to_owned());
+        return Err(failures);
+    };
+    let contracted = records
+        .iter()
+        .map(|record| {
+            record["properties"]["event"]["const"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    if contracted != names {
+        failures.push(format!(
+            "trace-v1.schema.json contracts {contracted:?}; Event::NAMES holds {names:?}"
+        ));
+    }
+
+    if failures.is_empty() {
+        println!(
+            "the trace contract and `trace::Event` name the same {} events, in the same order",
+            names.len()
+        );
+        return Ok(());
+    }
+    Err(failures)
+}
+
+/// `ItemKind` and every report contract name the same kinds, in the same order.
+///
+/// `details.items[].kind` was `"type": "string"` in all fifteen report schemas,
+/// and the structured report is built by re-reading the command's human output,
+/// so `scan` took whatever token stood in a line's first tab-separated field
+/// and called it a kind. A consumer branching on `kind` — the corpus audit
+/// does, and so does any agent reading a report — had nothing to branch over.
+///
+/// The set is closed in `crates/deshell/src/report.rs` now. This keeps the
+/// contracts closed over the same set: a variant added to the enum without a
+/// contract, or named differently in one of them, fails here rather than
+/// reaching a reader.
+fn run_report_item_kinds(root: &Path) -> Result<(), Vec<String>> {
+    let source = std::fs::read_to_string(root.join("crates/deshell/src/report.rs"))
+        .map_err(|error| vec![format!("cannot read report.rs: {error}")])?;
+    let body = source
+        .split_once("    pub(crate) fn as_str(self) -> &'static str {")
+        .and_then(|(_, rest)| rest.split_once("\n    }\n"))
+        .map(|(body, _)| body)
+        .ok_or_else(|| vec!["report.rs has no ItemKind::as_str".to_owned()])?;
+    // The arm order is the contract's order, so the two are compared as
+    // sequences rather than as sets: a reader diffing them sees one list.
+    let kinds = body
+        .lines()
+        .filter_map(|line| line.split_once("=> \"")?.1.split_once('"'))
+        .map(|(kind, _)| kind.to_owned())
+        .collect::<Vec<_>>();
+    if kinds.is_empty() {
+        return Err(vec!["ItemKind::as_str named no kinds".to_owned()]);
+    }
+    let declared = source
+        .split_once("    pub(crate) const ALL: [Self; ")
+        .and_then(|(_, rest)| rest.split_once(']'))
+        .and_then(|(count, _)| count.parse::<usize>().ok())
+        .ok_or_else(|| vec!["report.rs has no ItemKind::ALL".to_owned()])?;
+    let mut failures = Vec::new();
+    if declared != kinds.len() {
+        failures.push(format!(
+            "ItemKind::ALL holds {declared} kinds and ItemKind::as_str names {}",
+            kinds.len()
+        ));
+    }
+
+    let mut checked = 0;
+    let directory = root.join("contracts/schema");
+    let entries = std::fs::read_dir(&directory)
+        .map_err(|error| vec![format!("cannot read {}: {error}", directory.display())])?;
+    let mut paths = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with("-report-v1.schema.json"))
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    for path in paths {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            failures.push(format!("{name}: cannot read"));
+            continue;
+        };
+        let Ok(schema) = serde_json::from_str::<serde_json::Value>(&text) else {
+            failures.push(format!("{name}: is not JSON"));
+            continue;
+        };
+        let kind = &schema["$defs"]["item"]["properties"]["kind"];
+        let Some(values) = kind["enum"].as_array() else {
+            failures.push(format!(
+                "{name}: $defs.item.properties.kind must be an enum, not {kind}"
+            ));
+            continue;
+        };
+        let contracted = values
+            .iter()
+            .map(|value| value.as_str().unwrap_or_default().to_owned())
+            .collect::<Vec<_>>();
+        if contracted != kinds {
+            failures.push(format!(
+                "{name}: contracts {contracted:?}; ItemKind names {kinds:?}"
+            ));
+        }
+        checked += 1;
+    }
+    if checked == 0 {
+        failures.push("no report schema was checked".to_owned());
+    }
+    if failures.is_empty() {
+        println!(
+            "{checked} report contract(s) name the same {} item kinds as `ItemKind`, in the same order",
+            kinds.len()
+        );
+        return Ok(());
+    }
+    Err(failures)
+}
+
+/// The inputs of [`run_corpus_audit`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to
+/// a many-argument function stays invisible to every call site that already
+/// compiles. [`run_corpus_audit`] takes this apart without `..`.
+struct CorpusAuditArgs<'a> {
+    root: &'a Path,
+    corpus_root: PathBuf,
+    excluded_repositories: Vec<String>,
+    excluded_patterns: Vec<String>,
+    deshell: PathBuf,
+    json: bool,
+    output: Option<PathBuf>,
+}
+
+/// A non-executing audit of every repository under a corpus directory.
+///
+/// This was `scripts/audit-corpus.ps1`, 661 lines of PowerShell that de-shell
+/// refuses. It is a 0.1.0 release gate, so every release runner needed a
+/// PowerShell to run it; now none does.
+///
+/// Ported rather than reimplemented, and checked by running both against the
+/// same fourteen repositories and comparing the reports they produce.
+fn run_corpus_audit(parts: CorpusAuditArgs<'_>) -> Result<(), Vec<String>> {
+    // Destructured without `..`: see `CorpusAuditArgs`.
+    let CorpusAuditArgs {
+        root,
+        corpus_root,
+        excluded_repositories,
+        excluded_patterns,
+        deshell,
+        json,
+        output,
+    } = parts;
+    let corpus_root = corpus_root
         .canonicalize()
-        .expect("repository root")
+        .map_err(|error| vec![format!("CorpusRoot is not a directory: {error}")])?;
+    if !corpus_root.is_dir() {
+        return Err(vec![format!(
+            "CorpusRoot is not a directory: {}",
+            corpus_root.display()
+        )]);
+    }
+
+    let mut candidates = Vec::new();
+    for entry in std::fs::read_dir(&corpus_root)
+        .map_err(|error| vec![format!("cannot read {}: {error}", corpus_root.display())])?
+    {
+        let entry = entry.map_err(|error| vec![format!("cannot read an entry: {error}")])?;
+        if entry.path().is_dir() {
+            candidates.push(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    candidates.sort();
+    // An exact exclusion that names nothing fails closed rather than silently
+    // broadening the audit.
+    for name in &excluded_repositories {
+        if !candidates.contains(name) {
+            return Err(vec![format!(
+                "Exact repository exclusion '{name}' did not match an immediate child of {}",
+                corpus_root.display()
+            )]);
+        }
+    }
+    let repositories = candidates
+        .into_iter()
+        .filter(|name| {
+            !excluded_repositories.contains(name)
+                && !excluded_patterns
+                    .iter()
+                    .any(|pattern| wildcard_matches(pattern, name))
+        })
+        .collect::<Vec<_>>();
+
+    let temporary = tempfile::Builder::new()
+        .prefix("deshell-corpus-audit-")
+        .tempdir()
+        .map_err(|error| vec![format!("cannot create the audit directory: {error}")])?;
+
+    let mut findings: Vec<AuditFinding> = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
+
+    for repository in &repositories {
+        let repository_root = corpus_root.join(repository);
+        let scan = audit_deshell(
+            &deshell,
+            &[
+                "scan".into(),
+                "--root".into(),
+                repository_root.to_string_lossy().into_owned(),
+                "--format".into(),
+                "json".into(),
+            ],
+        );
+        let Some(scan) = scan else {
+            failures.push(format!("{repository}: scan failed to start"));
+            continue;
+        };
+        if !scan.0 {
+            failures.push(format!("{repository}: scan failed: {}", scan.1.trim()));
+            continue;
+        }
+        let report: serde_json::Value = match serde_json::from_str(&scan.1) {
+            Ok(report) => report,
+            Err(error) => {
+                failures.push(format!("{repository}: scan emitted invalid JSON: {error}"));
+                continue;
+            }
+        };
+        if report["schema_version"].as_i64() != Some(1) {
+            failures.push(format!(
+                "{repository}: Scan Report schema_version must be 1"
+            ));
+            continue;
+        }
+        let Some(items) = report["details"]["items"].as_array() else {
+            failures.push(format!("{repository}: Scan Report has no details.items"));
+            continue;
+        };
+        // The same scan twice, byte for byte. A report that moves between two
+        // runs of the same bytes is not evidence about the repository.
+        let repeat = audit_deshell(
+            &deshell,
+            &[
+                "scan".into(),
+                "--root".into(),
+                repository_root.to_string_lossy().into_owned(),
+                "--format".into(),
+                "json".into(),
+            ],
+        );
+        if repeat.is_none_or(|repeat| !repeat.0 || repeat.1 != scan.1) {
+            failures.push(format!(
+                "{repository}: repeated Inventory v1 scan was not byte-identical"
+            ));
+            continue;
+        }
+        for item in items {
+            let kind = item["kind"].as_str().unwrap_or_default();
+            let path = item["path"].as_str().unwrap_or_default();
+            let message = item["message"].as_str().unwrap_or_default();
+            match kind {
+                "error" => failures.push(format!(
+                    "{repository}: scan {} error at {path}: {message}",
+                    item["name"].as_str().unwrap_or_default()
+                )),
+                "skipped" => {
+                    failures.push(format!("{repository}: scan skipped {path}: {message}"));
+                }
+                // Named, not defaulted. `scan_details` in `crates/deshell` emits
+                // exactly these five kinds; the script treated "not an error and
+                // not a skip" as a location, so a sixth kind would have been
+                // silently counted as shell to migrate.
+                "shell_file" | "embedded_shell" | "candidate" => {
+                    let digest = item["digest"].as_str().unwrap_or_default();
+                    if kind.is_empty() || path.is_empty() || digest.is_empty() {
+                        failures.push(format!(
+                            "{repository}: Scan Report holds a location with no kind, path or digest"
+                        ));
+                        continue;
+                    }
+                    findings.push(AuditFinding {
+                        root: repository_root.clone(),
+                        path: path.to_owned(),
+                        location: format!("{repository}/{path}"),
+                        kind: kind.to_owned(),
+                        interpreter: item["name"].as_str().unwrap_or_default().to_owned(),
+                        locator: message.to_owned(),
+                        content_hash: digest.to_owned(),
+                    });
+                }
+                unknown => failures.push(format!(
+                    "{repository}: Scan Report holds an unknown location kind '{unknown}' at {path}"
+                )),
+            }
+        }
+    }
+
+    let mut shell_files = findings
+        .iter()
+        .filter(|finding| finding.kind == "shell_file")
+        .cloned()
+        .collect::<Vec<_>>();
+    shell_files.sort_by(|left, right| left.location.cmp(&right.location));
+
+    let mut results = Vec::new();
+    for (index, file) in shell_files.iter().enumerate() {
+        let case_root = temporary.path().join(format!("case-{:06}", index + 1));
+        let failed = |message: String, failures: &mut Vec<String>| {
+            failures.push(message.clone());
+            audit_result(
+                file,
+                AuditOutcome {
+                    native: 0,
+                    delegated: 0,
+                    observations: 0,
+                    residual_reasons: Vec::new(),
+                    error: Some(message),
+                },
+            )
+        };
+        if let Err(message) = std::fs::create_dir_all(&case_root) {
+            results.push(failed(
+                format!("{}: cannot stage: {message}", file.location),
+                &mut failures,
+            ));
+            continue;
+        }
+        let source = file.root.join(&file.path);
+        // The scanner reported this path; reading it must stay inside the
+        // repository it came from.
+        if !source.starts_with(&file.root) {
+            results.push(failed(
+                format!(
+                    "{}: scanner returned a path outside its repository",
+                    file.location
+                ),
+                &mut failures,
+            ));
+            continue;
+        }
+        let bytes = match std::fs::read(&source) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                results.push(failed(
+                    format!("{}: cannot read: {error}", file.location),
+                    &mut failures,
+                ));
+                continue;
+            }
+        };
+        if sha256_hex(&bytes) != file.content_hash {
+            results.push(failed(
+                format!("{}: content changed after scan", file.location),
+                &mut failures,
+            ));
+            continue;
+        }
+        let destination = case_root.join(&file.path);
+        if let Some(parent) = destination.parent()
+            && let Err(error) = std::fs::create_dir_all(parent)
+        {
+            results.push(failed(
+                format!("{}: cannot stage: {error}", file.location),
+                &mut failures,
+            ));
+            continue;
+        }
+        if let Err(error) = std::fs::write(&destination, &bytes) {
+            results.push(failed(
+                format!("{}: cannot stage: {error}", file.location),
+                &mut failures,
+            ));
+            continue;
+        }
+        // The isolated copy holds one shell file and no project markers, so
+        // `init` cannot infer a migration target and refuses — correctly. The
+        // audit only lowers, and the target does not reach the IR.
+        let initialize = audit_deshell(
+            &deshell,
+            &[
+                "init".into(),
+                "--root".into(),
+                case_root.to_string_lossy().into_owned(),
+                "--target".into(),
+                "rust".into(),
+            ],
+        );
+        if initialize.as_ref().is_none_or(|run| !run.0) {
+            let text = initialize.map(|run| run.1).unwrap_or_default();
+            results.push(failed(
+                format!("{}: init failed: {}", file.location, text.trim()),
+                &mut failures,
+            ));
+            continue;
+        }
+        let analysis = audit_deshell(
+            &deshell,
+            &[
+                "analyze".into(),
+                "--root".into(),
+                case_root.to_string_lossy().into_owned(),
+                "--entry".into(),
+                file.path.clone(),
+            ],
+        );
+        if analysis.as_ref().is_none_or(|run| !run.0) {
+            let text = analysis.map(|run| run.1).unwrap_or_default();
+            results.push(failed(
+                format!("{}: analyze failed: {}", file.location, text.trim()),
+                &mut failures,
+            ));
+            continue;
+        }
+        let manifest = std::fs::read_to_string(case_root.join(".deshell/manifest.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+        let evidence_path = manifest
+            .as_ref()
+            .and_then(|manifest| manifest["entries"].as_array())
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter(|entry| entry["entrypoint"].as_str() == Some(file.path.as_str()))
+                    .collect::<Vec<_>>()
+            })
+            .filter(|entries| entries.len() == 1)
+            .and_then(|entries| entries[0]["evidence_path"].as_str().map(str::to_owned));
+        let Some(evidence_path) = evidence_path else {
+            results.push(failed(
+                format!("{}: manifest has no unique active entry", file.location),
+                &mut failures,
+            ));
+            continue;
+        };
+        let evidence = std::fs::read_to_string(case_root.join(&evidence_path))
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+        let Some(evidence) = evidence else {
+            results.push(failed(
+                format!("{}: evidence is unreadable", file.location),
+                &mut failures,
+            ));
+            continue;
+        };
+        let nodes = evidence["nodes"].as_array().cloned().unwrap_or_default();
+        let level = |wanted: &str| {
+            nodes
+                .iter()
+                .filter(|node| node["guarantee"]["level"].as_str() == Some(wanted))
+                .count()
+        };
+        let residual_reasons = nodes
+            .iter()
+            .filter(|node| node["guarantee"]["level"].as_str() == Some("residual"))
+            .map(|node| {
+                node["guarantee"]["reason"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        if !residual_reasons.is_empty() {
+            failures.push(format!(
+                "{}: residual nodes remain: {}",
+                file.location,
+                residual_reasons.join("; ")
+            ));
+        }
+        let observations = evidence["observations"]
+            .as_array()
+            .map_or(0, |values| values.len());
+        results.push(audit_result(
+            file,
+            AuditOutcome {
+                native: level("native"),
+                delegated: level("delegated"),
+                observations,
+                residual_reasons,
+                error: None,
+            },
+        ));
+    }
+
+    if results.len() != shell_files.len() {
+        failures.push(format!(
+            "audit produced {} file results for {} shell files",
+            results.len(),
+            shell_files.len()
+        ));
+    }
+    let report = audit_report(AuditReportArgs {
+        excluded_repositories: &excluded_repositories,
+        excluded_patterns: &excluded_patterns,
+        repositories: &repositories,
+        findings: &findings,
+        results: &results,
+        failures: &failures,
+    });
+    let text = serde_json::to_string_pretty(&report)
+        .map_err(|error| vec![format!("cannot render the report: {error}")])?;
+    if let Some(output) = output {
+        let parent = output.parent().unwrap_or(root);
+        if !parent.is_dir() {
+            return Err(vec![format!(
+                "OutputPath parent does not exist: {}",
+                parent.display()
+            )]);
+        }
+        std::fs::write(&output, format!("{text}\n"))
+            .map_err(|error| vec![format!("cannot write {}: {error}", output.display())])?;
+    }
+    if json {
+        println!("{text}");
+    } else {
+        print_audit_summary(&report);
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures)
+    }
+}
+
+/// One shell location the scan reported.
+#[derive(Clone, Debug)]
+struct AuditFinding {
+    root: PathBuf,
+    path: String,
+    location: String,
+    kind: String,
+    interpreter: String,
+    locator: String,
+    content_hash: String,
+}
+
+/// Whether `name` matches a PowerShell-style wildcard pattern.
+///
+/// `*` and `?`, which is what `-like` offered and what the exclusions in
+/// `docs/corpus-audit.md` use.
+fn wildcard_matches(pattern: &str, name: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let name: Vec<char> = name.chars().collect();
+    fn walk(pattern: &[char], name: &[char]) -> bool {
+        match pattern.split_first() {
+            None => name.is_empty(),
+            Some(('*', rest)) => (0..=name.len()).any(|split| walk(rest, &name[split..])),
+            Some(('?', rest)) => !name.is_empty() && walk(rest, &name[1..]),
+            Some((first, rest)) => {
+                name.first().is_some_and(|next| next == first) && walk(rest, &name[1..])
+            }
+        }
+    }
+    walk(&pattern, &name)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(bytes);
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Run `deshell` and return whether it succeeded and what it wrote.
+///
+/// Both streams together, the way the script read them: a failure's message is
+/// as likely to be on one as the other.
+fn audit_deshell(deshell: &Path, arguments: &[String]) -> Option<(bool, String)> {
+    let output = std::process::Command::new(deshell)
+        .args(arguments)
+        .output()
+        .ok()?;
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    Some((output.status.success(), text))
+}
+
+/// What the audit learned about one shell file.
+///
+/// `fully_non_residual` and the residual count are not fields: both follow from
+/// the reasons and the error, and a caller that could state them separately
+/// could state them wrongly.
+struct AuditOutcome {
+    native: usize,
+    delegated: usize,
+    observations: usize,
+    residual_reasons: Vec<String>,
+    error: Option<String>,
+}
+
+fn audit_result(file: &AuditFinding, outcome: AuditOutcome) -> serde_json::Value {
+    // Destructured without `..`: see `AuditOutcome`.
+    let AuditOutcome {
+        native,
+        delegated,
+        observations,
+        residual_reasons,
+        error,
+    } = outcome;
+    serde_json::json!({
+        "location": file.location,
+        "interpreter": file.interpreter,
+        "content_hash": file.content_hash,
+        "fully_non_residual": error.is_none() && residual_reasons.is_empty(),
+        "nodes": {
+            "native": native,
+            "delegated": delegated,
+            "observations": observations,
+            "residual": residual_reasons.len(),
+        },
+        "residual_reasons": residual_reasons,
+        "error": error,
+    })
+}
+
+/// Where a location came from, as the inventory groups say it.
+fn audit_origin(kind: &str, locator: &str) -> String {
+    if kind == "shell_file" {
+        return "shell-file".into();
+    }
+    if locator.trim().is_empty() {
+        return "repository-format".into();
+    }
+    if let Some(rest) = locator.strip_prefix("source:")
+        && let Some(first) = rest.split(':').next()
+        && !first.trim().is_empty()
+    {
+        return first.to_owned();
+    }
+    match locator.find(':') {
+        Some(0) | None => locator.to_owned(),
+        Some(index) => locator[..index].to_owned(),
+    }
+}
+
+/// The inputs of [`audit_report`].
+#[derive(Clone, Copy)]
+struct AuditReportArgs<'a> {
+    excluded_repositories: &'a [String],
+    excluded_patterns: &'a [String],
+    repositories: &'a [String],
+    findings: &'a [AuditFinding],
+    results: &'a [serde_json::Value],
+    failures: &'a [String],
+}
+
+fn audit_report(parts: AuditReportArgs<'_>) -> serde_json::Value {
+    // Destructured without `..`: see `AuditReportArgs`.
+    let AuditReportArgs {
+        excluded_repositories,
+        excluded_patterns,
+        repositories,
+        findings,
+        results,
+        failures,
+    } = parts;
+    let mut sorted = results.to_vec();
+    sorted.sort_by(|left, right| {
+        left["location"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(right["location"].as_str().unwrap_or_default())
+    });
+    let successful = sorted
+        .iter()
+        .filter(|result| result["error"].is_null())
+        .collect::<Vec<_>>();
+    let sum = |field: &str| -> u64 {
+        successful
+            .iter()
+            .map(|result| result["nodes"][field].as_u64().unwrap_or_default())
+            .sum()
+    };
+    let fully_non_residual = successful
+        .iter()
+        .filter(|result| result["fully_non_residual"].as_bool().unwrap_or_default())
+        .map(|result| result["location"].as_str().unwrap_or_default().to_owned())
+        .collect::<Vec<_>>();
+
+    let mut reason_counts: BTreeMap<(String, String), usize> = BTreeMap::new();
+    for result in &successful {
+        let interpreter = result["interpreter"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        for reason in result["residual_reasons"].as_array().into_iter().flatten() {
+            *reason_counts
+                .entry((
+                    interpreter.clone(),
+                    reason.as_str().unwrap_or_default().to_owned(),
+                ))
+                .or_default() += 1;
+        }
+    }
+    let mut reason_groups = reason_counts
+        .into_iter()
+        .map(|((interpreter, reason), count)| (count, interpreter, reason))
+        .collect::<Vec<_>>();
+    // Most frequent first, then by interpreter and reason, the way the script
+    // sorted them.
+    reason_groups.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.2.cmp(&right.2))
+    });
+
+    let mut inventory_counts: BTreeMap<(String, String, String), usize> = BTreeMap::new();
+    for finding in findings {
+        let interpreter = if finding.interpreter.trim().is_empty() {
+            "unknown".to_owned()
+        } else {
+            finding.interpreter.clone()
+        };
+        *inventory_counts
+            .entry((
+                finding.kind.clone(),
+                audit_origin(&finding.kind, &finding.locator),
+                interpreter,
+            ))
+            .or_default() += 1;
+    }
+    let kind_count = |wanted: &str| {
+        findings
+            .iter()
+            .filter(|finding| finding.kind == wanted)
+            .count()
+    };
+
+    serde_json::json!({
+        "schema_version": 1,
+        "selection_date": "2026-08-25",
+        "analysis_scope": "shell_files",
+        "selection": {
+            "repository_scope": "immediate_children",
+            "excluded_repositories": excluded_repositories,
+            "excluded_patterns": excluded_patterns,
+            "source_execution": false,
+        },
+        "repositories": repositories,
+        "summary": {
+            "repositories_scanned": repositories.len(),
+            "locations": {
+                "total": findings.len(),
+                "shell_files": kind_count("shell_file"),
+                "embedded_shell": kind_count("embedded_shell"),
+                "candidates": kind_count("candidate"),
+            },
+            "analysis_failures": failures.len(),
+            "fully_non_residual": fully_non_residual.len(),
+            "nodes": {
+                "native": sum("native"),
+                "delegated": sum("delegated"),
+                "observations": sum("observations"),
+                "residual": sum("residual"),
+            },
+        },
+        "fully_non_residual_files": fully_non_residual,
+        "inventory_groups": inventory_counts
+            .into_iter()
+            .map(|((kind, origin, interpreter), count)| serde_json::json!({
+                "count": count,
+                "kind": kind,
+                "origin": origin,
+                "interpreter": interpreter,
+            }))
+            .collect::<Vec<_>>(),
+        "residual_reason_groups": reason_groups
+            .into_iter()
+            .map(|(count, interpreter, reason)| serde_json::json!({
+                "count": count,
+                "interpreter": interpreter,
+                "reason": reason,
+            }))
+            .collect::<Vec<_>>(),
+        "files": sorted,
+        "failures": failures,
+    })
+}
+
+fn print_audit_summary(report: &serde_json::Value) {
+    let selection = &report["selection"];
+    println!(
+        "selection scope={} excluded_repositories={} excluded_patterns={} source_execution={}",
+        selection["repository_scope"].as_str().unwrap_or_default(),
+        selection["excluded_repositories"]
+            .as_array()
+            .map_or(0, Vec::len),
+        selection["excluded_patterns"]
+            .as_array()
+            .map_or(0, Vec::len),
+        selection["source_execution"].as_bool().unwrap_or_default()
+    );
+    let summary = &report["summary"];
+    let locations = &summary["locations"];
+    println!(
+        "repositories={} locations={} shell_files={} embedded_shell={} candidates={} fully_non_residual={}",
+        summary["repositories_scanned"],
+        locations["total"],
+        locations["shell_files"],
+        locations["embedded_shell"],
+        locations["candidates"],
+        summary["fully_non_residual"]
+    );
+    let nodes = &summary["nodes"];
+    println!(
+        "nodes native={} delegated={} observations={} residual={}",
+        nodes["native"], nodes["delegated"], nodes["observations"], nodes["residual"]
+    );
+    for location in report["fully_non_residual_files"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        println!("classified file: {}", location.as_str().unwrap_or_default());
+    }
+    for group in report["residual_reason_groups"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        println!(
+            "residual {}x [{}] {}",
+            group["count"],
+            group["interpreter"].as_str().unwrap_or_default(),
+            group["reason"].as_str().unwrap_or_default()
+        );
+    }
+    for failure in report["failures"].as_array().into_iter().flatten() {
+        eprintln!("audit failure: {}", failure.as_str().unwrap_or_default());
+    }
+}
+
+/// No tracked file is larger than the limit, and no tracked path is longer.
+///
+/// This was `scripts/repository-guardrails.ps1`, 57 lines of PowerShell that
+/// de-shell refuses: it reads `.NET` types, uses `Set-StrictMode`, and formats
+/// its output with `-f`. de-shell's answer to a file like that is
+/// `DESHELL_BLOCKER_UNIMPLEMENTED_SEMANTIC` — it cannot be migrated — and the
+/// answer to that is to write it in the project's own language, which is what
+/// the tool exists to prompt.
+///
+/// Measured against the script it replaces before it replaced it: same count,
+/// same limits, same sentence.
+fn run_repository_guardrails(root: &Path) -> Result<(), Vec<String>> {
+    const MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
+    const MAX_PATH_CHARACTERS: usize = 240;
+
+    let tracked = std::process::Command::new("git")
+        .args(["-C"])
+        .arg(root)
+        .args(["ls-files", "-z"])
+        .output()
+        .map_err(|error| vec![format!("cannot run git: {error}")])?;
+    if !tracked.status.success() {
+        return Err(vec![format!(
+            "unable to enumerate tracked repository files: {}",
+            String::from_utf8_lossy(&tracked.stderr).trim()
+        )]);
+    }
+    // `-z` rather than lines: a tracked path may hold a newline, and splitting
+    // on one would read a single file as two that are each short enough.
+    let paths = tracked
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| String::from_utf8_lossy(entry).into_owned())
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        return Err(vec!["the repository tracks no files".to_owned()]);
+    }
+    let mut violations = Vec::new();
+    for path in &paths {
+        // Characters, not bytes: the limit is about what a filesystem and a
+        // checkout can carry, and the script this replaces counted `.Length` of
+        // a .NET string.
+        let characters = path.chars().count();
+        if characters > MAX_PATH_CHARACTERS {
+            violations.push(format!(
+                "{path} has {characters} characters; maximum is {MAX_PATH_CHARACTERS}"
+            ));
+        }
+        let absolute = root.join(path);
+        // A tracked path whose file is not there is not a size violation. The
+        // scanner learned the same thing: `git ls-files` names a path the tree
+        // no longer holds during a retirement.
+        let Ok(metadata) = absolute.symlink_metadata() else {
+            continue;
+        };
+        if !metadata.file_type().is_file() {
+            continue;
+        }
+        let size = metadata.len();
+        if size > MAX_FILE_BYTES {
+            violations.push(format!(
+                "{path} is {size} bytes; maximum is {MAX_FILE_BYTES} bytes"
+            ));
+        }
+    }
+    if !violations.is_empty() {
+        let mut errors = vec!["repository push guardrails failed".to_owned()];
+        errors.extend(violations);
+        return Err(errors);
+    }
+    println!(
+        "Repository guardrails passed for {} tracked files (max {} MiB, {MAX_PATH_CHARACTERS} characters).",
+        paths.len(),
+        MAX_FILE_BYTES / (1024 * 1024)
+    );
+    Ok(())
+}
+
+/// Every lint suppression is narrow, conditional on not being a test, and
+/// attached to the item it is about.
+///
+/// Three rules, each from something that actually happened in this repository.
+///
+/// `allow` is banned outright. It silences without recording why, and an
+/// `expect` at least fails when the lint stops firing — a suppression that has
+/// outlived its reason is a suppression that is now hiding something else.
+///
+/// A `dead_code` expectation must be `cfg_attr(not(test), ...)`. Code that not
+/// even a test constructs is code nobody has looked at; the conditional form
+/// says "the tests reach this and the release build does not", which is a fact
+/// the compiler then checks in both directions.
+///
+/// A `dead_code` expectation must not sit on a `mod` declaration. `mod lab`
+/// carried one reading "constructed by contract paths that are exercised only
+/// under specific platforms or feature gates". Exactly one item in that
+/// nine-hundred-line module was dead — `validate_provider`, a fail-closed
+/// provider check with no caller — and the blanket covered it along with
+/// everything else, so nothing could say how much it was hiding or when that
+/// grew.
+fn run_lint_expectations(root: &Path) -> Result<(), Vec<String>> {
+    let mut failures = Vec::new();
+    for entry in walk_rust_sources(root)? {
+        let text = std::fs::read_to_string(&entry)
+            .map_err(|error| vec![format!("cannot read {}: {error}", entry.display())])?;
+        let display = entry
+            .strip_prefix(root)
+            .unwrap_or(&entry)
+            .display()
+            .to_string();
+        let lines: Vec<&str> = text.lines().collect();
+        let mut index = 0;
+        while index < lines.len() {
+            let trimmed = lines[index].trim_start();
+            if !(trimmed.starts_with("#[") || trimmed.starts_with("#![")) {
+                index += 1;
+                continue;
+            }
+            // Accumulate the attribute until its brackets balance, so that a
+            // multi-line `cfg_attr(not(test), expect(...))` is read whole.
+            let start = index;
+            let mut attribute = String::new();
+            let mut depth = 0i32;
+            loop {
+                let line = lines[index];
+                attribute.push_str(line);
+                attribute.push('\n');
+                for character in line.chars() {
+                    match character {
+                        '[' | '(' => depth += 1,
+                        ']' | ')' => depth -= 1,
+                        _ => {}
+                    }
+                }
+                index += 1;
+                if depth <= 0 || index >= lines.len() {
+                    break;
+                }
+            }
+            if attribute.contains("#[allow(") || attribute.contains("#![allow(") {
+                failures.push(format!(
+                    "{display}:{}: `allow` is banned; use `expect` so the suppression fails when the lint stops firing",
+                    start + 1
+                ));
+            }
+            if !attribute.contains("dead_code") {
+                continue;
+            }
+            if !attribute.contains("not(test)") {
+                failures.push(format!(
+                    "{display}:{}: a `dead_code` expectation must be `cfg_attr(not(test), ...)`; code no test constructs is code nobody has looked at",
+                    start + 1
+                ));
+            }
+            // The item the attribute is about is the next line that is not
+            // another attribute, a comment, or blank.
+            let subject = lines[index..]
+                .iter()
+                .map(|line| line.trim_start())
+                .find(|line| {
+                    !line.is_empty()
+                        && !line.starts_with("#[")
+                        && !line.starts_with("#![")
+                        && !line.starts_with("//")
+                });
+            if subject.is_some_and(|line| {
+                line.starts_with("mod ")
+                    || line.starts_with("pub mod ")
+                    || line.starts_with("pub(crate) mod ")
+            }) {
+                failures.push(format!(
+                    "{display}:{}: a `dead_code` expectation on a `mod` covers every item in it; put it on the item that is actually dead",
+                    start + 1
+                ));
+            }
+        }
+    }
+    if failures.is_empty() {
+        println!(
+            "lint suppressions are narrow, conditional on not(test), and attached to an item, not a module"
+        );
+        return Ok(());
+    }
+    Err(failures)
+}
+
+/// Reject dynamic dispatch throughout the repository.
+///
+/// A trait object hides the concrete set of implementations, allocates or
+/// indirects at the call site, and lets a new implementation change runtime
+/// behaviour without making the caller's match exhaustive. This repository
+/// uses generics when the set is open and an enum when it is closed. The AST
+/// visitor catches ordinary Rust types; the token walk additionally closes the
+/// macro-token loophole, where `syn` deliberately treats a macro body as opaque.
+fn run_rust_policy(root: &Path) -> Result<(), Vec<String>> {
+    let mut failures = Vec::new();
+    let mut checked = 0_usize;
+    for entry in walk_rust_sources(root)? {
+        let source = std::fs::read_to_string(&entry)
+            .map_err(|error| vec![format!("cannot read {}: {error}", entry.display())])?;
+        let display = entry
+            .strip_prefix(root)
+            .unwrap_or(&entry)
+            .display()
+            .to_string();
+        let syntax = syn::parse_file(&source)
+            .map_err(|error| vec![format!("cannot parse {display}: {error}")])?;
+        let mut visitor = TraitObjectVisitor::default();
+        visitor.visit_file(&syntax);
+        for &line in &visitor.lines {
+            failures.push(format!(
+                "{display}:{line}: trait objects are forbidden; use a generic for an open implementation set or an exhaustive enum for a closed set"
+            ));
+        }
+
+        let tokens = source
+            .parse::<proc_macro2::TokenStream>()
+            .map_err(|error| {
+                vec![format!(
+                    "cannot tokenize {display} while checking macro bodies: {error}"
+                )]
+            })?;
+        let mut macro_lines = Vec::new();
+        collect_dyn_tokens(tokens, &mut macro_lines);
+        macro_lines.sort_unstable();
+        macro_lines.dedup();
+        for line in macro_lines {
+            if !visitor.lines.contains(&line) {
+                failures.push(format!(
+                    "{display}:{line}: `dyn` is forbidden, including inside macro input; use static dispatch or an exhaustive enum"
+                ));
+            }
+        }
+        checked += 1;
+    }
+    if failures.is_empty() {
+        println!(
+            "Rust policy passed for {checked} source file(s): no trait objects or hidden macro `dyn` tokens"
+        );
+        return Ok(());
+    }
+    Err(failures)
+}
+
+#[derive(Default)]
+struct TraitObjectVisitor {
+    lines: Vec<usize>,
+}
+
+impl<'ast> syn::visit::Visit<'ast> for TraitObjectVisitor {
+    fn visit_type_trait_object(&mut self, node: &'ast syn::TypeTraitObject) {
+        self.lines.push(node.span().start().line);
+        syn::visit::visit_type_trait_object(self, node);
+    }
+}
+
+fn collect_dyn_tokens(tokens: proc_macro2::TokenStream, lines: &mut Vec<usize>) {
+    for token in tokens {
+        match token {
+            proc_macro2::TokenTree::Group(group) => collect_dyn_tokens(group.stream(), lines),
+            proc_macro2::TokenTree::Ident(identifier) if identifier == "dyn" => {
+                lines.push(identifier.span().start().line);
+            }
+            proc_macro2::TokenTree::Ident(_)
+            | proc_macro2::TokenTree::Punct(_)
+            | proc_macro2::TokenTree::Literal(_) => {}
+        }
+    }
+}
+
+/// Every `.rs` file this repository owns.
+fn walk_rust_sources(root: &Path) -> Result<Vec<std::path::PathBuf>, Vec<String>> {
+    let mut sources = Vec::new();
+    for directory in ["crates", "xtask"] {
+        let mut stack = vec![root.join(directory)];
+        while let Some(path) = stack.pop() {
+            let entries = std::fs::read_dir(&path)
+                .map_err(|error| vec![format!("cannot read {}: {error}", path.display())])?;
+            for entry in entries {
+                let entry =
+                    entry.map_err(|error| vec![format!("cannot read an entry: {error}")])?;
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|extension| extension == "rs") {
+                    sources.push(path);
+                }
+            }
+        }
+    }
+    sources.sort();
+    Ok(sources)
+}
+
+/// Measure the modelled `test` operators against the shell builtin and the
+/// external utility, and report every case where either disagrees with the
+/// recording or with the other.
+///
+/// The builtin is what de-shell models, since `[` never reaches the PATH lookup.
+/// The external utility is measured alongside it because an operator where the
+/// two disagree is a difference this tool exists to report rather than model
+/// away — and because a table checked only against its author's reading of the
+/// specification is not checked at all.
+fn run_test_semantics(root: &Path) -> Result<(), Vec<String>> {
+    let path = root.join("contracts/golden/test-builtin-semantics-v1.json");
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|error| vec![format!("cannot read {}: {error}", path.display())])?;
+    let corpus: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|error| vec![format!("malformed corpus: {error}")])?;
+    let cases = corpus["cases"]
+        .as_array()
+        .ok_or_else(|| vec!["corpus has no cases array".to_owned()])?;
+    if cases.is_empty() {
+        return Err(vec!["corpus is empty".to_owned()]);
+    }
+    let shells = PosixPrograms::discover(["bash"]);
+    let mut differences = 0_usize;
+    for case in cases {
+        let name = case["name"]
+            .as_str()
+            .ok_or_else(|| vec!["case has no name".to_owned()])?;
+        let expected = case["expected"]
+            .as_i64()
+            .ok_or_else(|| vec!["case has no expected".to_owned()])?;
+        let operands = case["operands"]
+            .as_array()
+            .ok_or_else(|| vec!["case has no operands".to_owned()])?
+            .iter()
+            .map(|value| value.as_str().unwrap_or_default().to_owned())
+            .collect::<Vec<_>>();
+        let operand_refs = operands.iter().map(String::as_str).collect::<Vec<_>>();
+        let builtin = shells
+            .output_with_positional_arguments("bash", "[ \"$@\" ]", &operand_refs)
+            .map_err(|error| vec![format!("cannot run bash for {name}: {error}")])?;
+        let external = std::process::Command::new("test")
+            .args(&operands)
+            .status()
+            .map_err(|error| vec![format!("cannot run test for {name}: {error}")])?;
+        let builtin_code = i64::from(builtin.status.code().unwrap_or(-1));
+        let external_code = i64::from(external.code().unwrap_or(-1));
+        if builtin_code == expected && external_code == expected {
+            continue;
+        }
+        differences += 1;
+        println!(
+            "differs  {name}: expected {expected}, builtin {builtin_code}, external {external_code}"
+        );
+    }
+    if differences == 0 {
+        println!(
+            "{} operator case(s) agree between the builtin, the external utility and the recording",
+            cases.len()
+        );
+        return Ok(());
+    }
+    Err(vec![format!(
+        "{differences} of {} operator case(s) disagree; the table does not describe what runs",
+        cases.len()
+    )])
 }
 
 fn validate_contract_tree(_root: &Path) -> Result<CliContract, Vec<String>> {
@@ -508,12 +4105,19 @@ fn prepare_simple_run_project(binary: &Path, root: &Path) -> Result<(), String> 
     std::fs::create_dir_all(root)
         .map_err(|error| format!("cannot create {}: {error}", root.display()))?;
     let entry = "benchmark.sh";
+    // An absolute path, because the frontend refuses one resolved through
+    // `PATH` — and one that is there, which `/bin/true` is not on macOS. The
+    // benchmark measured a run that could not start until this was checked.
     let source = if cfg!(windows) {
-        b"cmd.exe /d /c exit 0\n".as_slice()
+        "cmd.exe /d /c exit 0\n".to_owned()
     } else {
-        b"/bin/true\n".as_slice()
+        let program = ["/usr/bin/true", "/bin/true"]
+            .into_iter()
+            .find(|candidate| std::path::Path::new(candidate).is_file())
+            .ok_or("no `true` to benchmark a simple run with")?;
+        format!("{program}\n")
     };
-    std::fs::write(root.join(entry), source)
+    std::fs::write(root.join(entry), source.as_bytes())
         .map_err(|error| format!("cannot write simple-run entrypoint: {error}"))?;
     command_success(
         binary,
@@ -523,6 +4127,12 @@ fn prepare_simple_run_project(binary: &Path, root: &Path) -> Result<(), String> 
             root.to_string_lossy().into_owned(),
             "--entry".to_owned(),
             entry.to_owned(),
+            // A directory holding one shell script and nothing else has no
+            // unique target — `deshell init` refuses to choose between rust, go
+            // and host, which is right, and a benchmark has to say which it is
+            // measuring rather than depend on that refusal not happening.
+            "--target".to_owned(),
+            "rust".to_owned(),
         ],
         "simple-run init",
     )?;
@@ -575,15 +4185,18 @@ fn measure_command(
     }
     samples.sort_unstable();
     let middle = samples.len() / 2;
-    let median_ns = (samples[middle - 1] as f64 + samples[middle] as f64) / 2.0;
     let p95_index = (samples.len() * 95).div_ceil(100) - 1;
     Ok(PerformanceMetric {
-        median_ms: median_ns / 1_000_000.0,
-        p95_ms: samples[p95_index] as f64 / 1_000_000.0,
+        median_ms: (samples[middle - 1].as_secs_f64() + samples[middle].as_secs_f64()) * 500.0,
+        p95_ms: samples[p95_index].as_secs_f64() * 1_000.0,
     })
 }
 
-fn timed_command(binary: &Path, arguments: &[String], label: &str) -> Result<u128, Vec<String>> {
+fn timed_command(
+    binary: &Path,
+    arguments: &[String],
+    label: &str,
+) -> Result<std::time::Duration, Vec<String>> {
     let start = Instant::now();
     let status = std::process::Command::new(binary)
         .args(arguments)
@@ -591,7 +4204,7 @@ fn timed_command(binary: &Path, arguments: &[String], label: &str) -> Result<u12
         .stderr(std::process::Stdio::null())
         .status()
         .map_err(|error| vec![format!("cannot execute performance {label}: {error}")])?;
-    let elapsed = start.elapsed().as_nanos();
+    let elapsed = start.elapsed();
     if !status.success() {
         return Err(vec![format!(
             "performance {label} failed with status {status}"
@@ -618,7 +4231,7 @@ fn migration_fixture(interpreter: &str) -> Result<MigrationFixture, String> {
             source: concat!(
                 "#!/bin/sh\n",
                 "/usr/bin/printf '%s:%s\\n' \"$1\" \"$CORPUS_ENV\"\n",
-                "/usr/bin/test \"$1\" = pass && /usr/bin/printf '%s\\n' branch\n",
+                "/bin/test \"$1\" = pass && /usr/bin/printf '%s\\n' branch\n",
             )
             .as_bytes(),
         }),
@@ -627,7 +4240,7 @@ fn migration_fixture(interpreter: &str) -> Result<MigrationFixture, String> {
             source: concat!(
                 "#!/usr/bin/env bash\n",
                 "/usr/bin/printf '%s:%s\\n' \"$1\" \"$CORPUS_ENV\"\n",
-                "/usr/bin/test \"$1\" = pass && /usr/bin/printf '%s\\n' branch\n",
+                "/bin/test \"$1\" = pass && /usr/bin/printf '%s\\n' branch\n",
             )
             .as_bytes(),
         }),
@@ -636,7 +4249,7 @@ fn migration_fixture(interpreter: &str) -> Result<MigrationFixture, String> {
             source: concat!(
                 "#!/usr/bin/env zsh\n",
                 "/usr/bin/printf '%s:%s\\n' \"$1\" \"$CORPUS_ENV\"\n",
-                "/usr/bin/test \"$1\" = pass && /usr/bin/printf '%s\\n' branch\n",
+                "/bin/test \"$1\" = pass && /usr/bin/printf '%s\\n' branch\n",
             )
             .as_bytes(),
         }),
@@ -645,7 +4258,7 @@ fn migration_fixture(interpreter: &str) -> Result<MigrationFixture, String> {
             source: concat!(
                 "#!/usr/bin/env fish\n",
                 "command /usr/bin/printf '%s:%s\\n' \"$argv[1]\" \"$CORPUS_ENV\"\n",
-                "command /usr/bin/test \"$argv[1]\" = pass && command /usr/bin/printf '%s\\n' branch\n",
+                "command /bin/test \"$argv[1]\" = pass && command /usr/bin/printf '%s\\n' branch\n",
             )
             .as_bytes(),
         }),
@@ -681,7 +4294,7 @@ fn migration_fixture(interpreter: &str) -> Result<MigrationFixture, String> {
             source: concat!(
                 "def main [value: string] {\n",
                 "  ^/usr/bin/printf '%s:%s\\n' $value $env.CORPUS_ENV\n",
-                "  ^/usr/bin/test $value '=' pass\n",
+                "  ^/bin/test $value '=' pass\n",
                 "  if $env.LAST_EXIT_CODE == 0 {\n",
                 "    ^/usr/bin/printf '%s\\n' branch\n",
                 "  } else {\n",
@@ -792,14 +4405,14 @@ fn powershell_runtime_path() -> Result<String, String> {
     }) else {
         return current
             .into_string()
-            .map_err(|_| "PATH is not valid Unicode".into());
+            .map_err(|_error| "PATH is not valid Unicode".into());
     };
     let runtime = paths.remove(index);
     paths.insert(0, runtime);
     std::env::join_paths(paths)
         .map_err(|error| format!("cannot construct PowerShell runtime PATH: {error}"))?
         .into_string()
-        .map_err(|_| "PowerShell runtime PATH is not valid Unicode".into())
+        .map_err(|_error| "PowerShell runtime PATH is not valid Unicode".into())
 }
 
 fn migration_interpreter_supported_on(interpreter: &str, operating_system: &str) -> bool {
@@ -811,11 +4424,276 @@ fn migration_interpreter_supported_on(interpreter: &str, operating_system: &str)
     }
 }
 
-fn run_migration_e2e(
-    repository: &Path,
-    interpreter: &str,
+fn migration_table<'a>(
+    value: &'a mut toml::Value,
+    field: &str,
+    context: &str,
+) -> Result<&'a mut toml::Table, String> {
+    value
+        .get_mut(field)
+        .and_then(toml::Value::as_table_mut)
+        .ok_or_else(|| format!("{context} omitted table '{field}'"))
+}
+
+fn migration_array<'a>(
+    value: &'a mut toml::Value,
+    field: &str,
+    context: &str,
+) -> Result<&'a mut Vec<toml::Value>, String> {
+    value
+        .get_mut(field)
+        .and_then(toml::Value::as_array_mut)
+        .ok_or_else(|| format!("{context} omitted array '{field}'"))
+}
+
+fn read_migration_toml(path: &Path, context: &str) -> Result<toml::Value, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    toml::from_str(&text).map_err(|error| format!("invalid {context} TOML: {error}"))
+}
+
+fn write_migration_toml(path: &Path, value: &toml::Value, context: &str) -> Result<(), String> {
+    let text = toml::to_string_pretty(value)
+        .map_err(|error| format!("cannot encode {context} TOML: {error}"))?;
+    std::fs::write(path, text).map_err(|error| format!("cannot write {}: {error}", path.display()))
+}
+
+fn approve_migration_config(
+    path: &Path,
     generator: &str,
+    embedded_path: &str,
+) -> Result<(), String> {
+    let mut config = read_migration_toml(path, "migration config")?;
+    let migration = migration_table(&mut config, "migration", "migration config")?;
+    for field in ["generator", "target"] {
+        let actual = migration.get(field).and_then(toml::Value::as_str);
+        if actual != Some(generator) {
+            return Err(format!(
+                "initialized migration config {field} was {actual:?}, expected {generator:?}"
+            ));
+        }
+    }
+
+    let overrides = migration_array(&mut config, "location_overrides", "migration config")?;
+    let embedded = overrides
+        .iter()
+        .filter_map(toml::Value::as_table)
+        .find(|entry| entry.get("path").and_then(toml::Value::as_str) == Some(embedded_path))
+        .ok_or_else(|| {
+            format!("initialized migration config omitted host override for {embedded_path}")
+        })?;
+    for (field, expected) in [
+        ("generator", "host"),
+        ("target", "host"),
+        ("module_root", ".deshell/host"),
+    ] {
+        let actual = embedded.get(field).and_then(toml::Value::as_str);
+        if actual != Some(expected) {
+            return Err(format!(
+                "initialized host override {field} was {actual:?}, expected {expected:?}"
+            ));
+        }
+    }
+
+    let cells = migration_array(&mut config, "platform_cells", "migration config")?;
+    let count = cells.len();
+    let [cell] = cells.as_mut_slice() else {
+        return Err(format!(
+            "initialized migration config must contain exactly one platform cell, found {count}"
+        ));
+    };
+    let cell = cell
+        .as_table_mut()
+        .ok_or("initialized migration platform cell is not a table")?;
+    cell.insert("id".into(), toml::Value::String("host".into()));
+    write_migration_toml(path, &config, "migration config")
+}
+
+fn set_scenario_named_value(
+    scenario: &mut toml::Value,
+    field: &str,
+    name: &str,
+    value: &str,
+) -> Result<(), String> {
+    let values = migration_array(scenario, field, "migration scenario")?;
+    let mut found = false;
+    for entry in &mut *values {
+        let entry = entry
+            .as_table_mut()
+            .ok_or_else(|| format!("migration scenario {field} entry is not a table"))?;
+        if entry.get("name").and_then(toml::Value::as_str) == Some(name) {
+            entry.insert("value".into(), toml::Value::String(value.into()));
+            found = true;
+        }
+    }
+    if !found {
+        values.push(toml::Value::Table(toml::Table::from_iter([
+            ("name".into(), toml::Value::String(name.into())),
+            ("value".into(), toml::Value::String(value.into())),
+        ])));
+    }
+    Ok(())
+}
+
+fn set_scenario_argv(scenario: &mut toml::Value, value: &str) -> Result<(), String> {
+    let table = scenario
+        .as_table_mut()
+        .ok_or("migration scenario root is not a table")?;
+    table.insert(
+        "argv".into(),
+        toml::Value::Array(vec![toml::Value::String(value.into())]),
+    );
+    Ok(())
+}
+
+fn configure_migration_scenarios(
+    directory: &Path,
+    interpreter: &str,
+) -> Result<Vec<String>, String> {
+    let scenario_directory = directory.join(".deshell/scenarios");
+    let mut paths = std::fs::read_dir(&scenario_directory)
+        .map_err(|error| format!("cannot read {}: {error}", scenario_directory.display()))?
+        .map(|entry| {
+            entry
+                .map(|entry| entry.path())
+                .map_err(|error| format!("cannot read migration scenario entry: {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    paths.sort();
+
+    let success_name = "synthesized-corpus";
+    let mut success = None;
+    let mut success_names = Vec::new();
+    for path in paths {
+        let mut scenario = read_migration_toml(&path, "migration scenario")?;
+        let table = scenario
+            .as_table_mut()
+            .ok_or("migration scenario root is not a table")?;
+        let name = table
+            .get("name")
+            .and_then(toml::Value::as_str)
+            .ok_or("migration scenario omitted its name")?
+            .to_owned();
+        set_scenario_named_value(&mut scenario, "arguments", "1", "pass")?;
+        set_scenario_named_value(&mut scenario, "environment", "CORPUS_ENV", "matrix")?;
+        set_scenario_argv(&mut scenario, "pass")?;
+        if interpreter == "powershell" {
+            let table = scenario
+                .as_table_mut()
+                .ok_or("migration scenario root is not a table")?;
+            let limits = table
+                .get_mut("limits")
+                .and_then(toml::Value::as_table_mut)
+                .ok_or("PowerShell migration scenario omitted limits")?;
+            limits.insert("memory_bytes".into(), toml::Value::Integer(8_589_934_592));
+            let runtime_path = powershell_runtime_path()?;
+            set_scenario_named_value(&mut scenario, "environment", "PATH", &runtime_path)?;
+        }
+        if name == success_name {
+            success = Some(scenario.clone());
+        }
+        success_names.push(name);
+        write_migration_toml(&path, &scenario, "migration scenario")?;
+    }
+
+    let mut failure = success
+        .ok_or_else(|| format!("initialized project omitted migration scenario {success_name}"))?;
+    let table = failure
+        .as_table_mut()
+        .ok_or("migration scenario root is not a table")?;
+    table.insert("name".into(), toml::Value::String("failure".into()));
+    set_scenario_named_value(&mut failure, "arguments", "1", "fail")?;
+    set_scenario_argv(&mut failure, "fail")?;
+    write_migration_toml(
+        &scenario_directory.join("failure.toml"),
+        &failure,
+        "failure migration scenario",
+    )?;
+    Ok(success_names)
+}
+
+#[derive(Clone, Copy)]
+enum MigrationApprovalSubject {
+    Scenario,
+    Matrix,
+}
+
+impl MigrationApprovalSubject {
+    fn command(self) -> &'static str {
+        match self {
+            Self::Scenario => "scenario",
+            Self::Matrix => "matrix",
+        }
+    }
+
+    fn identifier_flag(self) -> &'static str {
+        match self {
+            Self::Scenario => "--name",
+            Self::Matrix => "--cell",
+        }
+    }
+}
+
+fn approve_migration_reviews(
+    binary: &Path,
+    directory: &Path,
+    subject: MigrationApprovalSubject,
 ) -> Result<(), Vec<String>> {
+    let command = subject.command();
+    let reviews = run_deshell(
+        binary,
+        directory,
+        &[command, "list", "--root", ".", "--format", "json"],
+    )?;
+    let reviews: serde_json::Value = serde_json::from_str(&reviews)
+        .map_err(|error| vec![format!("invalid {command} review JSON: {error}")])?;
+    let reviews = reviews["details"]["items"].as_array().ok_or_else(|| {
+        vec![format!(
+            "{command} review report omitted details.items: {reviews}"
+        )]
+    })?;
+    if reviews.is_empty() {
+        return Err(vec![format!("{command} review output was empty")]);
+    }
+    for review in reviews {
+        let name = review["name"]
+            .as_str()
+            .ok_or_else(|| vec![format!("{command} review omitted its name")])?;
+        let digest = review["digest"]
+            .as_str()
+            .ok_or_else(|| vec![format!("{command} review {name} omitted its digest")])?;
+        run_deshell(
+            binary,
+            directory,
+            &[
+                command,
+                "approve",
+                "--root",
+                ".",
+                subject.identifier_flag(),
+                name,
+                "--digest",
+                digest,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+struct MigrationE2eArgs<'a> {
+    repository: &'a Path,
+    interpreter: &'a str,
+    generator: &'a str,
+    binary: Option<&'a Path>,
+}
+
+fn run_migration_e2e(parts: MigrationE2eArgs<'_>) -> Result<(), Vec<String>> {
+    let MigrationE2eArgs {
+        repository,
+        interpreter,
+        generator,
+        binary,
+    } = parts;
     if !matches!(generator, "rust" | "go") {
         return Err(vec![format!(
             "unsupported migration E2E generator: {generator}"
@@ -830,7 +4708,10 @@ fn run_migration_e2e(
     let embedded = migration_embedded_fixture(interpreter).map_err(|error| vec![error])?;
     let directory = tempfile::tempdir()
         .map_err(|error| vec![format!("cannot create migration E2E project: {error}")])?;
-    let mut binary = repository.join("target/debug/deshell");
+    let mut binary = binary.map_or_else(
+        || repository.join("target/debug/deshell"),
+        Path::to_path_buf,
+    );
     if cfg!(windows) {
         binary.set_extension("exe");
     }
@@ -850,97 +4731,40 @@ fn run_migration_e2e(
     run_deshell(
         &binary,
         directory.path(),
-        &["init", "--root", ".", "--entry", fixture.path],
+        &[
+            "init",
+            "--root",
+            ".",
+            "--entry",
+            fixture.path,
+            "--target",
+            generator,
+        ],
     )?;
     let config_path = directory.path().join(".deshell/project.toml");
-    let mut config = std::fs::read_to_string(&config_path)
-        .map_err(|error| vec![format!("cannot read {}: {error}", config_path.display())])?;
-    let embedded_start = embedded
-        .source
-        .find("        run: |-")
-        .ok_or_else(|| vec!["embedded migration fixture omitted its run span".into()])?;
     let encoded_command = embedded.command.replace('\n', "\n          ");
     if !embedded.source.contains(&encoded_command) {
         return Err(vec![
             "embedded migration fixture source map omitted its decoded command".into(),
         ]);
     }
-    let embedded_end = embedded
-        .source
-        .strip_suffix('\n')
-        .map_or(embedded.source.len(), str::len);
-    config = config.replace(
-        "location_overrides = []",
-        &format!(
-            "location_overrides = [{{ path = \"{}\", start_byte = {embedded_start}, end_byte = {embedded_end}, generator = \"host\", target = \"host\", module_root = \"host\" }}]",
-            embedded.path,
-        ),
-    );
-    config = config.replace(
-        "platform_cells = []",
-        &format!(
-            "platform_cells = [{{ id = \"host\", operating_system = \"{}\", architecture = \"{}\", runtime = \"native\", approval = \"approved\" }}]",
-            std::env::consts::OS,
-            std::env::consts::ARCH
-        ),
-    );
+    approve_migration_config(&config_path, generator, embedded.path)
+        .map_err(|error| vec![error])?;
     let module_root = if generator == "go" { "cmd" } else { "src/bin" };
-    if generator == "go" {
-        config = config
-            .replacen("generator = \"rust\"", "generator = \"go\"", 1)
-            .replacen("target = \"rust\"", "target = \"go\"", 1)
-            .replacen("module_root = \"src/bin\"", "module_root = \"cmd\"", 1);
-    }
-    std::fs::write(&config_path, config)
-        .map_err(|error| vec![format!("cannot write {}: {error}", config_path.display())])?;
     std::fs::create_dir_all(directory.path().join(module_root))
         .map_err(|error| vec![format!("cannot create {module_root}: {error}")])?;
-    let scenario_path = directory.path().join(".deshell/scenarios/default.toml");
-    let mut scenario_template = std::fs::read_to_string(&scenario_path)
-        .map_err(|error| vec![format!("cannot read {}: {error}", scenario_path.display())])?;
-    if interpreter == "powershell" {
-        scenario_template =
-            scenario_template.replace("memory_bytes = 1073741824", "memory_bytes = 8589934592");
-    }
     let rich_matrix = matches!(
         interpreter,
         "sh" | "bash" | "zsh" | "fish" | "powershell" | "cmd" | "nu"
     );
-    let scenario_environment = if interpreter == "powershell" {
-        let runtime_path =
-            serde_json::to_string(&powershell_runtime_path().map_err(|error| vec![error])?)
-                .map_err(|error| vec![format!("cannot encode PowerShell runtime PATH: {error}")])?;
-        format!(
-            "environment = [{{ name = \"CORPUS_ENV\", value = \"matrix\" }}, {{ name = \"PATH\", value = {runtime_path} }}]"
-        )
-    } else {
-        "environment = [{ name = \"CORPUS_ENV\", value = \"matrix\" }]".into()
-    };
-    let mut scenario = scenario_template.replace("approval = \"draft\"", "approval = \"approved\"");
-    if rich_matrix {
-        scenario = scenario
-            .replace(
-                "arguments = []",
-                "arguments = [{ name = \"1\", value = \"pass\" }]",
-            )
-            .replace("argv = []", "argv = [\"pass\"]")
-            .replace("environment = []", &scenario_environment);
-
-        let failure = scenario_template
-            .replace("name = \"default\"", "name = \"failure\"")
-            .replace("approval = \"draft\"", "approval = \"approved\"")
-            .replace(
-                "arguments = []",
-                "arguments = [{ name = \"1\", value = \"fail\" }]",
-            )
-            .replace("argv = []", "argv = [\"fail\"]")
-            .replace("environment = []", &scenario_environment);
-        let failure_path = directory.path().join(".deshell/scenarios/failure.toml");
-        std::fs::write(&failure_path, failure)
-            .map_err(|error| vec![format!("cannot write {}: {error}", failure_path.display())])?;
-    }
-    std::fs::write(&scenario_path, scenario)
-        .map_err(|error| vec![format!("cannot write {}: {error}", scenario_path.display())])?;
+    let success_scenarios = configure_migration_scenarios(directory.path(), interpreter)
+        .map_err(|error| vec![error])?;
+    approve_migration_reviews(
+        &binary,
+        directory.path(),
+        MigrationApprovalSubject::Scenario,
+    )?;
+    approve_migration_reviews(&binary, directory.path(), MigrationApprovalSubject::Matrix)?;
 
     let planned = run_deshell(
         &binary,
@@ -996,10 +4820,11 @@ fn run_migration_e2e(
                 ))
             })
             .collect::<std::collections::BTreeSet<_>>();
-        let expected = std::collections::BTreeSet::from([
-            ("default".to_owned(), 0),
-            ("failure".to_owned(), 1),
-        ]);
+        let mut expected = success_scenarios
+            .into_iter()
+            .map(|name| (name, 0))
+            .collect::<std::collections::BTreeSet<_>>();
+        expected.insert(("failure".to_owned(), 1));
         if outcomes != expected {
             return Err(vec![format!(
                 "{interpreter}/{generator} Evidence omitted success/failure branch outcomes: {outcomes:?}"
@@ -1053,7 +4878,8 @@ fn run_migration_e2e(
             "{interpreter}/{generator} archive manifest did not contain exactly the shell file and embedded snippet"
         )]);
     }
-    let archive_path = embedded_entry.unwrap()["archive_path"]
+    let archive_path = embedded_entry
+        .ok_or_else(|| vec!["embedded archive entry disappeared".into()])?["archive_path"]
         .as_str()
         .ok_or_else(|| vec!["embedded archive entry omitted its path".into()])?;
     let archived = std::fs::read(directory.path().join(archive_path)).map_err(|error| {
@@ -1090,10 +4916,11 @@ fn run_deshell(binary: &Path, root: &Path, arguments: &[&str]) -> Result<String,
         })?;
     if !output.status.success() {
         return Err(vec![format!(
-            "{} {} failed with {}: {}",
+            "{} {} failed with {}; stdout={}; stderr={}",
             binary.display(),
             arguments.join(" "),
             output.status,
+            String::from_utf8_lossy(&output.stdout).trim(),
             String::from_utf8_lossy(&output.stderr).trim()
         )]);
     }
@@ -1101,14 +4928,137 @@ fn run_deshell(binary: &Path, root: &Path, arguments: &[&str]) -> Result<String,
         .map_err(|error| vec![format!("deshell stdout is not UTF-8: {error}")])
 }
 
+/// Exercise every real-process contract that contributes to the release
+/// coverage measurement.
+///
+/// This goes through the same dispatcher as a developer invocation. Keeping the
+/// list here gives CI, release qualification, and a local `mise run coverage`
+/// one definition instead of three drifting shell-script copies.
+fn run_coverage_exercise(root: &Path, binary: &Path) -> Result<(), Vec<String>> {
+    for command in [
+        "bash-semantics",
+        "test-semantics",
+        "echo-semantics",
+        "exit-semantics",
+        "powershell-invocation",
+        "powershell-step-invocation",
+        "powershell-variables",
+        "powershell-preference",
+        "builtin-table",
+        "posix-divergence",
+        "printf-semantics",
+        "case-patterns",
+        "shell-variables",
+        "enum-equality",
+        "report-item-kinds",
+        "trace-events",
+        "fuzz-modules",
+        "lint-expectations",
+        "rust-policy",
+        "repository-guardrails",
+        "validate-contracts",
+    ] {
+        dispatch(root, &[command.into()])?;
+    }
+    for command in ["conformance", "performance"] {
+        dispatch(root, &[command.into(), binary.as_os_str().to_owned()])?;
+    }
+    for (interpreter, generator) in [("bash", "rust"), ("powershell", "go"), ("nu", "rust")] {
+        dispatch(
+            root,
+            &[
+                "migration-e2e".into(),
+                interpreter.into(),
+                generator.into(),
+                binary.as_os_str().to_owned(),
+            ],
+        )?;
+    }
+    Ok(())
+}
+
 fn dispatch(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Vec<String>> {
     match arguments.first().and_then(|value| value.to_str()) {
+        Some("coverage-exercise") => {
+            let binary = arguments
+                .get(1)
+                .map(PathBuf::from)
+                .ok_or_else(|| vec!["coverage-exercise requires DESHELL_BINARY".into()])?;
+            run_coverage_exercise(root, &binary)
+        }
         Some("conformance") => {
             let binary = arguments
                 .get(1)
                 .map(PathBuf::from)
                 .unwrap_or_else(|| root.join("target/debug/deshell"));
             run_conformance(root, &binary)
+        }
+        Some("bash-semantics") => run_bash_semantics(root),
+        Some("test-semantics") => run_test_semantics(root),
+        Some("echo-semantics") => run_echo_semantics(root),
+        Some("exit-semantics") => run_exit_semantics(root),
+        Some("powershell-invocation") => run_powershell_invocation(root),
+        Some("powershell-step-invocation") => run_powershell_step_invocation(root),
+        Some("powershell-variables") => run_powershell_variables(root),
+        Some("powershell-preference") => run_powershell_preference(root),
+        Some("builtin-table") => run_builtin_table(root),
+        Some("posix-divergence") => run_posix_divergence(root),
+        Some("printf-semantics") => run_printf_semantics(root),
+        Some("case-patterns") => run_case_patterns(root),
+        Some("shell-variables") => run_shell_variables(root),
+        Some("enum-equality") => run_enum_equality(root),
+        Some("report-item-kinds") => run_report_item_kinds(root),
+        Some("trace-events") => run_trace_events(root),
+        Some("fuzz-modules") => run_fuzz_modules(root),
+        Some("lint-expectations") => run_lint_expectations(root),
+        Some("rust-policy") => run_rust_policy(root),
+        Some("repository-guardrails") => run_repository_guardrails(root),
+        Some("corpus-audit") => {
+            let option = |name: &str| {
+                arguments
+                    .iter()
+                    .position(|value| value == name)
+                    .and_then(|index| arguments.get(index + 1))
+                    .map(|value| value.to_string_lossy().into_owned())
+            };
+            let list = |name: &str| {
+                option(name).map_or_else(Vec::new, |value: String| {
+                    let mut names = value
+                        .split([',', ';'])
+                        .map(str::trim)
+                        .filter(|entry| !entry.is_empty())
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>();
+                    names.sort();
+                    names.dedup();
+                    names
+                })
+            };
+            let deshell = option("--deshell").map_or_else(
+                || root.join("target/debug/deshell"),
+                PathBuf::from,
+            );
+            // Named, not defaulted: `--format xml` must not quietly print a
+            // human summary and exit 0.
+            let json = match option("--format").as_deref() {
+                None | Some("text") => Ok(false),
+                Some("json") => Ok(true),
+                Some(other) => Err(vec![format!(
+                    "corpus-audit --format must be text or json, not '{other}'"
+                )]),
+            };
+            json.and_then(|json| {
+                run_corpus_audit(CorpusAuditArgs {
+                    root,
+                    corpus_root: option("--corpus-root")
+                        .map_or_else(|| root.join(".."), PathBuf::from),
+                    excluded_repositories: list("--exclude-repository"),
+                    excluded_patterns: list("--exclude-pattern"),
+                    deshell,
+                    json,
+                    output: option("--output").map(PathBuf::from),
+                })
+            })
         }
         Some("validate-contracts") => validate_contract_tree(root).map(|_| ()),
         Some("performance") => {
@@ -1128,9 +5078,12 @@ fn dispatch(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Vec<Str
                 .and_then(|value| value.to_str())
                 .ok_or_else(|| vec!["migration-e2e requires GENERATOR".into()]);
             match (interpreter, generator) {
-                (Ok(interpreter), Ok(generator)) => {
-                    run_migration_e2e(root, interpreter, generator)
-                }
+                (Ok(interpreter), Ok(generator)) => run_migration_e2e(MigrationE2eArgs {
+                    repository: root,
+                    interpreter,
+                    generator,
+                    binary: arguments.get(3).map(PathBuf::from).as_deref(),
+                }),
                 (Err(mut left), Err(right)) => {
                     left.extend(right);
                     Err(left)
@@ -1139,7 +5092,7 @@ fn dispatch(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Vec<Str
             }
         }
         _ => Err(vec![
-            "usage: cargo run -p xtask -- conformance [DESHELL_BINARY] | migration-e2e INTERPRETER GENERATOR | performance [DESHELL_BINARY] | validate-contracts".into(),
+            "usage: cargo run -p xtask -- conformance [DESHELL_BINARY] | coverage-exercise DESHELL_BINARY | migration-e2e INTERPRETER GENERATOR [DESHELL_BINARY] | performance [DESHELL_BINARY] | validate-contracts".into(),
         ]),
     }
 }
@@ -1159,6 +5112,868 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn posix_program_resolution_runs_named_and_absolute_programs_fail_closed() {
+        let programs = PosixPrograms::discover(["bash", "/bin/echo"]);
+        let output = programs
+            .output("bash", "printf 'deshell-bash:%s' \"$BASH_VERSION\"")
+            .expect("the Bash used by the build must resolve");
+        assert!(output.status.success(), "{output:#?}");
+        assert!(
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .starts_with("deshell-bash:"),
+            "the executable must be Bash, not a platform command sharing its name"
+        );
+
+        let output = programs
+            .output("bash", r"printf '%s' $'a\\b'")
+            .expect("the script must cross the native process boundary unchanged");
+        assert!(output.status.success(), "{output:#?}");
+        assert_eq!(output.stdout, b"a\\b");
+
+        let argument = "line one\nline two\rc\\d'$`\"é\n";
+        let output = programs
+            .output_with_positional_arguments("bash", "printf '%s' \"$1\"", &[argument])
+            .expect("positional data must cross the native process boundary unchanged");
+        assert!(output.status.success(), "{output:#?}");
+        assert_eq!(output.stdout, argument.as_bytes());
+
+        let status = programs
+            .bash_command_string_status("value='a\\\\b'; [ \"$value\" = 'a\\\\b' ]")
+            .expect("command-string input must cross the native process boundary unchanged");
+        assert!(status.success(), "{status:#?}");
+
+        let error = programs
+            .output_with_positional_arguments("bash", "exit 0", &["not\0a-word"])
+            .expect_err("NUL cannot be represented as a POSIX shell word");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+
+        let output = programs
+            .command("/bin/echo")
+            .expect("the POSIX path must resolve to a native executable")
+            .arg("deshell-posix-path")
+            .output()
+            .expect("the resolved echo executable must run");
+        assert!(output.status.success(), "{output:#?}");
+        assert_eq!(
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .replace("\r\n", "\n"),
+            "deshell-posix-path\n"
+        );
+
+        let error = programs
+            .command("a-shell-that-was-not-discovered")
+            .expect_err("an unregistered name must not fall back to PATH");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+
+        let missing = PosixPrograms::discover(["deshell-shell-that-does-not-exist"]);
+        let error = missing
+            .output("deshell-shell-that-does-not-exist", "exit 0")
+            .expect_err("a missing executable must remain missing");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn powershell_posix_templates_quote_paths_and_reject_unknown_markers() {
+        let programs = PosixPrograms {
+            programs: BTreeMap::from([(
+                "/bin/echo".to_owned(),
+                Ok(PathBuf::from(r"C:\Program Files\O'Brien\echo.exe")),
+            )]),
+        };
+        assert_eq!(
+            render_powershell_posix_template(
+                "& __DESHELL_POSIX_ECHO__ one\n& __DESHELL_POSIX_ECHO__ two\n",
+                &programs,
+            )
+            .unwrap(),
+            "& 'C:\\Program Files\\O''Brien\\echo.exe' one\n& 'C:\\Program Files\\O''Brien\\echo.exe' two\n"
+        );
+        assert_eq!(
+            render_powershell_posix_template("Write-Output before", &programs).unwrap(),
+            "Write-Output before"
+        );
+
+        let error =
+            render_powershell_posix_template("& __DESHELL_POSIX_UNKNOWN__", &programs).unwrap_err();
+        assert!(error.contains("unknown POSIX program marker"), "{error}");
+
+        let error =
+            render_powershell_posix_template("& __DESHELL_POSIX_TRUE__", &programs).unwrap_err();
+        assert!(error.contains("was not discovered"), "{error}");
+    }
+
+    #[test]
+    fn shell_behavior_profiles_are_complete_known_and_distinguishable() {
+        const CORPUS: &str = include_str!("../../contracts/golden/posix-sh-divergence-v1.json");
+        let corpus: PosixDivergenceCorpus = serde_json::from_str(CORPUS).unwrap();
+        validate_posix_divergence_corpus(&corpus).unwrap();
+
+        let mut missing: PosixDivergenceCorpus = serde_json::from_str(CORPUS).unwrap();
+        missing.cases[0].profiles.remove("bash");
+        let errors = validate_posix_divergence_corpus(&missing).unwrap_err();
+        assert!(errors.iter().any(|error| error.contains("omits profile")));
+
+        let mut unknown: PosixDivergenceCorpus = serde_json::from_str(CORPUS).unwrap();
+        unknown.cases[0].profiles.insert(
+            "invented-shell".to_owned(),
+            PosixDivergenceObservation {
+                stdout: String::new(),
+                exit: 0,
+            },
+        );
+        let errors = validate_posix_divergence_corpus(&unknown).unwrap_err();
+        assert!(errors.iter().any(|error| error.contains("unknown profile")));
+
+        let mut ambiguous: PosixDivergenceCorpus = serde_json::from_str(CORPUS).unwrap();
+        for case in &mut ambiguous.cases {
+            let bash = case.profiles["bash"].clone();
+            case.profiles.insert("zsh".to_owned(), bash);
+        }
+        let errors = validate_posix_divergence_corpus(&ambiguous).unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("are indistinguishable")),
+            "{errors:#?}"
+        );
+
+        const CASE_CORPUS: &str =
+            include_str!("../../contracts/golden/case-pattern-semantics-v1.json");
+        let case_corpus: CasePatternCorpus = serde_json::from_str(CASE_CORPUS).unwrap();
+        validate_case_pattern_corpus(&case_corpus).unwrap();
+
+        let mut incomplete: CasePatternCorpus = serde_json::from_str(CASE_CORPUS).unwrap();
+        incomplete
+            .profile_variants
+            .get_mut("dash-with-ansi-c-quotes")
+            .unwrap()
+            .remove("ansi-c-newline-match");
+        let errors = validate_case_pattern_corpus(&incomplete).unwrap_err();
+        assert!(errors.iter().any(|error| error.contains("covers")));
+
+        let mut ambiguous: CasePatternCorpus = serde_json::from_str(CASE_CORPUS).unwrap();
+        let baseline = ambiguous
+            .cases
+            .iter()
+            .map(|case| (case.id.clone(), case.dash))
+            .collect();
+        ambiguous
+            .profile_variants
+            .insert("dash-with-ansi-c-quotes".to_owned(), baseline);
+        let errors = validate_case_pattern_corpus(&ambiguous).unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("are indistinguishable")),
+            "{errors:#?}"
+        );
+    }
+
+    #[test]
+    fn live_shell_drift_enforces_only_applicable_recorded_claims() {
+        assert_eq!(
+            ShellColumn::ALL.map(|shell| echo_observation_effect(shell, true)),
+            [
+                ObservationEffect::Enforce,
+                ObservationEffect::Report,
+                ObservationEffect::Report,
+            ]
+        );
+        assert_eq!(
+            ShellColumn::ALL.map(|shell| echo_observation_effect(shell, false)),
+            [ObservationEffect::Report; 3]
+        );
+        assert_eq!(
+            ShellColumn::ALL.map(|shell| exit_observation_effect(shell, true)),
+            [
+                ObservationEffect::Enforce,
+                ObservationEffect::Report,
+                ObservationEffect::Enforce,
+            ]
+        );
+        assert_eq!(
+            ShellColumn::ALL.map(|shell| exit_observation_effect(shell, false)),
+            [ObservationEffect::Report; 3]
+        );
+        assert_eq!(
+            RecordedShellColumn::ALL.map(RecordedShellColumn::name),
+            ["bash", "sh", "zsh", "dash"]
+        );
+        assert_eq!(
+            RecordedShellColumn::ALL.map(RecordedShellColumn::program_is_required),
+            [true, false, false, false]
+        );
+        assert_eq!(
+            RecordedShellColumn::ALL.map(RecordedShellColumn::case_pattern_effect),
+            [
+                ObservationEffect::Enforce,
+                ObservationEffect::Report,
+                ObservationEffect::Enforce,
+                ObservationEffect::Enforce,
+            ]
+        );
+    }
+
+    #[test]
+    fn rust_policy_rejects_trait_objects_without_matching_comments_or_strings() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        for component in ["crates/example/src", "xtask/src"] {
+            std::fs::create_dir_all(root.join(component)).unwrap();
+        }
+        std::fs::write(
+            root.join("crates/example/src/lib.rs"),
+            r#"
+                // `dyn Trait` in documentation is not code.
+                const MESSAGE: &str = "Box<dyn Trait>";
+                fn static_dispatch<T: Send>(value: &T) { let _ = value; }
+            "#,
+        )
+        .unwrap();
+        std::fs::write(root.join("xtask/src/main.rs"), "fn main() {}\n").unwrap();
+        run_rust_policy(root).expect("comments, strings, and generics pass");
+
+        std::fs::write(
+            root.join("crates/example/src/lib.rs"),
+            "fn erased(value: &dyn Send) { let _ = value; }\n",
+        )
+        .unwrap();
+        let errors = run_rust_policy(root).expect_err("an ordinary trait object fails");
+        assert_eq!(errors.len(), 1, "{errors:#?}");
+        assert!(errors[0].contains("lib.rs:1: trait objects are forbidden"));
+
+        std::fs::write(
+            root.join("crates/example/src/lib.rs"),
+            "macro_rules! hidden { () => { type Erased = Box<dyn Send>; } }\n",
+        )
+        .unwrap();
+        let errors = run_rust_policy(root).expect_err("a macro cannot hide a trait object");
+        assert_eq!(errors.len(), 1, "{errors:#?}");
+        assert!(errors[0].contains("including inside macro input"));
+    }
+
+    /// The guardrails see a long path and a large file, and say which.
+    ///
+    /// The PowerShell script this replaces was refused by de-shell, so the
+    /// replacement is checked against what the script did rather than against
+    /// the sentence in its name: the same two limits, one violation each, and a
+    /// clean repository passing.
+    #[test]
+    fn the_repository_guardrails_name_a_long_path_and_a_large_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                // Test repositories must not inherit the developer's signing,
+                // hooks, aliases or other machine-global policy. The local
+                // repository remains real; only ambient configuration is
+                // removed from the fixture.
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", root.join("unused-global-config"))
+                .args(args)
+                .output()
+                .expect("git");
+            assert!(
+                status.status.success(),
+                "git {args:?}\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&status.stdout),
+                String::from_utf8_lossy(&status.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        std::fs::write(root.join("small.txt"), b"x").unwrap();
+        git(&["add", "-A"]);
+        git(&[
+            "-c",
+            "user.email=a@b",
+            "-c",
+            "user.name=a",
+            "commit",
+            "-qm",
+            "i",
+        ]);
+        run_repository_guardrails(root).expect("a clean repository passes");
+
+        // A path over the limit. Add the empty blob directly to the index:
+        // constructing a worktree path longer than 240 characters would make
+        // this repository policy test depend on the host's absolute temp-path
+        // length and Windows long-path configuration.
+        let deep = format!("{}{}.txt", "d/".repeat(110), "x".repeat(60));
+        let empty_blob = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", root.join("unused-global-config"))
+            .args(["hash-object", "-w", "--stdin"])
+            .output()
+            .unwrap();
+        assert!(empty_blob.status.success());
+        let empty_blob = String::from_utf8(empty_blob.stdout).unwrap();
+        git(&[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            "100644",
+            empty_blob.trim(),
+            &deep,
+        ]);
+        // A file over the limit.
+        std::fs::write(root.join("big.bin"), vec![0_u8; 11 * 1024 * 1024]).unwrap();
+        git(&["add", "big.bin"]);
+        git(&[
+            "-c",
+            "user.email=a@b",
+            "-c",
+            "user.name=a",
+            "commit",
+            "-qm",
+            "two",
+        ]);
+
+        let errors = run_repository_guardrails(root).expect_err("two violations");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("characters; maximum is 240")),
+            "{errors:#?}"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("bytes; maximum is 10485760 bytes")),
+            "{errors:#?}"
+        );
+    }
+
+    /// The fuzz-module gate reads both lists and the exclusions the fuzz crate
+    /// names for itself.
+    #[test]
+    fn the_fuzz_modules_gate_catches_a_module_only_one_crate_compiles() {
+        run_fuzz_modules(&repository_root()).expect("the repository agrees with itself");
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::create_dir_all(root.join("crates/deshell/src")).unwrap();
+        std::fs::create_dir_all(root.join("fuzz/src")).unwrap();
+        let binary = |text: &str| {
+            std::fs::write(root.join("crates/deshell/src/main.rs"), text).unwrap();
+        };
+        let fuzz = |text: &str| std::fs::write(root.join("fuzz/src/lib.rs"), text).unwrap();
+
+        binary("mod ir;\nmod cli;\nmod trace;\n");
+        fuzz("// deshell-fuzz omits: cli\nmod ir;\nmod trace;\n");
+        run_fuzz_modules(root).expect("two lists that agree, with a named omission, pass");
+
+        // A module the binary gained and the fuzz crate did not: the break this
+        // gate exists for.
+        binary("mod ir;\nmod cli;\nmod trace;\nmod host;\n");
+        let errors = run_fuzz_modules(root).expect_err("a missing module fails");
+        assert_eq!(
+            errors,
+            vec!["fuzz/src/lib.rs does not compile `host`".to_owned()]
+        );
+
+        // An omission that is not declared is not an omission.
+        binary("mod ir;\nmod cli;\nmod trace;\n");
+        fuzz("mod ir;\nmod trace;\n");
+        let errors = run_fuzz_modules(root).expect_err("an undeclared omission fails");
+        assert_eq!(
+            errors,
+            vec!["fuzz/src/lib.rs does not compile `cli`".to_owned()]
+        );
+
+        // And a module only the fuzz crate has.
+        fuzz("// deshell-fuzz omits: cli\nmod ir;\nmod trace;\nmod ghost;\n");
+        let errors = run_fuzz_modules(root).expect_err("an extra module fails");
+        assert_eq!(
+            errors,
+            vec!["fuzz/src/lib.rs compiles `ghost`, which the binary does not".to_owned()]
+        );
+
+        // An empty binary list is a gate that would pass for the wrong reason.
+        binary("// deshell\n");
+        let errors = run_fuzz_modules(root).expect_err("an empty binary list fails");
+        assert_eq!(errors, vec!["main.rs declares no modules".to_owned()]);
+    }
+
+    /// The trace vocabulary gate reads both sides and fails when either moves.
+    #[test]
+    fn the_trace_events_gate_catches_a_contract_that_lost_an_event() {
+        run_trace_events(&repository_root()).expect("the repository agrees with itself");
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::create_dir_all(root.join("crates/deshell/src")).unwrap();
+        std::fs::create_dir_all(root.join("contracts/schema")).unwrap();
+        let source = |count: usize, names: &str, variants: &str| {
+            format!(
+                concat!(
+                    "pub(crate) enum Event {{\n",
+                    "{variants}",
+                    "}}\n",
+                    "    pub(crate) const NAMES: [&'static str; {count}] = [\n",
+                    "{names}",
+                    "    ];\n",
+                ),
+                count = count,
+                names = names,
+                variants = variants,
+            )
+        };
+        let write = |text: String| {
+            std::fs::write(root.join("crates/deshell/src/trace.rs"), text).unwrap();
+        };
+        let schema = |events: &[&str]| {
+            let records = events
+                .iter()
+                .map(|event| format!(r#"{{"properties":{{"event":{{"const":"{event}"}}}}}}"#))
+                .collect::<Vec<_>>()
+                .join(",");
+            std::fs::write(
+                root.join("contracts/schema/trace-v1.schema.json"),
+                format!(r#"{{"oneOf":[{records}]}}"#),
+            )
+            .unwrap();
+        };
+
+        write(source(
+            2,
+            "        \"clock_read\",\n        \"file_remove\",\n",
+            "    ClockRead,\n    FileRemove { path: String },\n",
+        ));
+        schema(&["clock_read", "file_remove"]);
+        run_trace_events(root).expect("three lists that agree pass");
+
+        // A variant the list forgot.
+        write(source(
+            2,
+            "        \"clock_read\",\n        \"file_remove\",\n",
+            "    ClockRead,\n    FileRemove { path: String },\n    FileStage { path: String },\n",
+        ));
+        let errors = run_trace_events(root).expect_err("an unlisted variant fails");
+        assert!(
+            errors.iter().any(|error| error.contains("file_stage")),
+            "{errors:#?}"
+        );
+
+        // A contract the list outgrew.
+        write(source(
+            2,
+            "        \"clock_read\",\n        \"file_remove\",\n",
+            "    ClockRead,\n    FileRemove { path: String },\n",
+        ));
+        schema(&["clock_read"]);
+        let errors = run_trace_events(root).expect_err("a short contract fails");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("trace-v1.schema.json contracts")),
+            "{errors:#?}"
+        );
+
+        // The same events in a different order.
+        schema(&["file_remove", "clock_read"]);
+        run_trace_events(root).expect_err("a reordered contract fails");
+
+        // A declared count that does not match the list.
+        write(source(
+            9,
+            "        \"clock_read\",\n        \"file_remove\",\n",
+            "    ClockRead,\n    FileRemove { path: String },\n",
+        ));
+        schema(&["clock_read", "file_remove"]);
+        let errors = run_trace_events(root).expect_err("a miscounted list fails");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("declared to hold 9")),
+            "{errors:#?}"
+        );
+    }
+
+    /// The gate reads both sides and fails when either moves.
+    #[test]
+    fn the_report_item_kinds_gate_catches_a_contract_that_lost_a_kind() {
+        run_report_item_kinds(&repository_root()).expect("the repository agrees with itself");
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::create_dir_all(root.join("crates/deshell/src")).unwrap();
+        std::fs::create_dir_all(root.join("contracts/schema")).unwrap();
+        std::fs::write(
+            root.join("crates/deshell/src/report.rs"),
+            concat!(
+                "    pub(crate) const ALL: [Self; 2] = [Self::Blocker, Self::Matrix];\n",
+                "    pub(crate) fn as_str(self) -> &'static str {\n",
+                "        match self {\n",
+                "            Self::Blocker => \"blocker\",\n",
+                "            Self::Matrix => \"matrix\",\n",
+                "        }\n",
+                "    }\n",
+            ),
+        )
+        .unwrap();
+        let schema = |kinds: &str| {
+            format!(r#"{{"$defs":{{"item":{{"properties":{{"kind":{{"enum":[{kinds}]}}}}}}}}}}"#)
+        };
+        let path = root.join("contracts/schema/scan-report-v1.schema.json");
+        std::fs::write(&path, schema(r#""blocker","matrix""#)).unwrap();
+        run_report_item_kinds(root).expect("a contract that names the same kinds passes");
+
+        // One kind short.
+        std::fs::write(&path, schema(r#""blocker""#)).unwrap();
+        let errors = run_report_item_kinds(root).expect_err("a missing kind fails");
+        assert!(
+            errors[0].contains("scan-report-v1.schema.json"),
+            "{errors:#?}"
+        );
+
+        // The same kinds in a different order: a reader diffing the two lists
+        // should not have to sort them first.
+        std::fs::write(&path, schema(r#""matrix","blocker""#)).unwrap();
+        run_report_item_kinds(root).expect_err("a reordered contract fails");
+
+        // A free string, which is what all fifteen contracts said before.
+        std::fs::write(
+            &path,
+            r#"{"$defs":{"item":{"properties":{"kind":{"type":"string"}}}}}"#,
+        )
+        .unwrap();
+        let errors = run_report_item_kinds(root).expect_err("a free string fails");
+        assert!(errors[0].contains("must be an enum"), "{errors:#?}");
+
+        // No report schema at all is not a pass.
+        std::fs::remove_file(&path).unwrap();
+        let errors = run_report_item_kinds(root).expect_err("an empty contract tree fails");
+        assert_eq!(errors, vec!["no report schema was checked".to_owned()]);
+    }
+
+    /// A `deshell` that answers only what the corpus audit asks.
+    ///
+    /// `scan` replays a report the test wrote, so the test owns the exact
+    /// bytes — including the digests the audit re-checks against the file it
+    /// stages. `analyze` reads the staged copy and reports a residual node
+    /// when the file says so.
+    fn compile_audit_deshell(path: &Path) {
+        let source = path.with_extension("rs");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &source,
+            r###"
+use std::path::PathBuf;
+
+fn option(args: &[String], name: &str) -> Option<String> {
+    args.iter()
+        .position(|value| value == name)
+        .and_then(|index| args.get(index + 1))
+        .cloned()
+}
+
+fn main() {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    match args.first().map(String::as_str) {
+        Some("scan") => {
+            let root = PathBuf::from(option(&args, "--root").unwrap());
+            let counter = root.join(".audit-fixture/scans");
+            let runs = std::fs::read_to_string(&counter)
+                .ok()
+                .and_then(|text| text.trim().parse::<u32>().ok())
+                .unwrap_or(0);
+            std::fs::write(&counter, (runs + 1).to_string()).unwrap();
+            let report =
+                std::fs::read_to_string(root.join(".audit-fixture/scan.json")).unwrap();
+            // A repository named `unstable` moves between two runs of the
+            // same bytes, which is what the audit must catch.
+            if root.file_name().unwrap() == "unstable" {
+                println!("{}", report.replace("RUNS", &runs.to_string()));
+            } else {
+                println!("{report}");
+            }
+        }
+        Some("init") => {
+            let root = PathBuf::from(option(&args, "--root").unwrap());
+            std::fs::create_dir_all(root.join(".deshell")).unwrap();
+        }
+        Some("analyze") => {
+            let root = PathBuf::from(option(&args, "--root").unwrap());
+            let entry = option(&args, "--entry").unwrap();
+            let staged = std::fs::read_to_string(root.join(&entry)).unwrap();
+            let nodes = if staged.contains("RESIDUAL") {
+                concat!(
+                    r#"{"guarantee":{"level":"native","reason":""}},"#,
+                    r#"{"guarantee":{"level":"residual","reason":"dynamic command"}}"#,
+                )
+                .to_owned()
+            } else {
+                concat!(
+                    r#"{"guarantee":{"level":"native","reason":""}},"#,
+                    r#"{"guarantee":{"level":"native","reason":""}},"#,
+                    r#"{"guarantee":{"level":"delegated","reason":"awk"}}"#,
+                )
+                .to_owned()
+            };
+            std::fs::write(
+                root.join(".deshell/evidence.json"),
+                format!(r#"{{"nodes":[{nodes}],"observations":[]}}"#),
+            )
+            .unwrap();
+            std::fs::write(
+                root.join(".deshell/manifest.json"),
+                format!(
+                    r#"{{"entries":[{{"entrypoint":"{entry}","evidence_path":".deshell/evidence.json"}}]}}"#
+                ),
+            )
+            .unwrap();
+        }
+        _ => {
+            eprintln!("unsupported audit invocation: {args:?}");
+            std::process::exit(64);
+        }
+    }
+}
+"###,
+        )
+        .unwrap();
+        let output = std::process::Command::new("rustc")
+            .args(["--edition=2024", "-o"])
+            .arg(path)
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Write one repository into the corpus and return its scan report bytes.
+    fn audit_repository(corpus: &Path, name: &str, files: &[(&str, &str)], items: &str) -> String {
+        let root = corpus.join(name);
+        std::fs::create_dir_all(root.join(".audit-fixture")).unwrap();
+        let mut rendered = items.to_owned();
+        for (path, contents) in files {
+            let file = root.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, contents).unwrap();
+            rendered = rendered.replace(
+                &format!("<digest:{path}>"),
+                &sha256_hex(contents.as_bytes()),
+            );
+        }
+        assert!(!rendered.contains("<digest:"), "{rendered}");
+        let report = format!(
+            r#"{{"schema_version":1,"command":"scan","status":"ok","summary":"s","next_actions":[],"details":{{"counts":{{}},"values":{{}},"paths":[],"output":[],"items":[{rendered}]}}}}"#
+        );
+        std::fs::write(root.join(".audit-fixture/scan.json"), &report).unwrap();
+        report
+    }
+
+    /// The audit over a whole corpus, excluding nothing and keeping no report.
+    /// Each test narrows it by naming the fields it cares about.
+    fn audit_arguments<'a>(root: &'a Path, corpus: &Path, deshell: &Path) -> CorpusAuditArgs<'a> {
+        CorpusAuditArgs {
+            root,
+            corpus_root: corpus.to_path_buf(),
+            excluded_repositories: Vec::new(),
+            excluded_patterns: Vec::new(),
+            deshell: deshell.to_path_buf(),
+            json: false,
+            output: None,
+        }
+    }
+
+    /// The audit reports every shell location, and fails on a residual node.
+    ///
+    /// `alpha` holds a shell file that lowers clean plus an embedded `RUN` and
+    /// a workflow `run`, which differ only in case. `beta` holds a shell file
+    /// that keeps a residual node.
+    #[test]
+    fn the_corpus_audit_counts_every_location_and_refuses_a_residual_node() {
+        let directory = tempfile::tempdir().unwrap();
+        let deshell = directory.path().join(if cfg!(windows) {
+            "audit-deshell.exe"
+        } else {
+            "audit-deshell"
+        });
+        compile_audit_deshell(&deshell);
+        let corpus = directory.path().join("corpus");
+        std::fs::create_dir_all(&corpus).unwrap();
+
+        audit_repository(
+            &corpus,
+            "alpha",
+            &[
+                ("scripts/build.sh", "#!/bin/sh\nexec cargo build\n"),
+                ("Dockerfile", "RUN set -eu; make\n"),
+                (".github/workflows/ci.yml", "jobs: {}\n"),
+                ("Makefile", "all:\n\tcargo build\n"),
+            ],
+            concat!(
+                r#"{"kind":"shell_file","path":"scripts/build.sh","name":"sh","#,
+                r#""message":"","digest":"<digest:scripts/build.sh>"},"#,
+                r#"{"kind":"embedded_shell","path":"Dockerfile","name":"sh","#,
+                r#""message":"RUN:1","digest":"<digest:Dockerfile>"},"#,
+                r#"{"kind":"embedded_shell","path":".github/workflows/ci.yml","name":"bash","#,
+                r#""message":"run:3","digest":"<digest:.github/workflows/ci.yml>"},"#,
+                r#"{"kind":"candidate","path":"Makefile","name":"sh","#,
+                r#""message":"line:7","digest":"<digest:Makefile>"}"#,
+            ),
+        );
+        audit_repository(
+            &corpus,
+            "beta",
+            &[("deploy.sh", "#!/bin/sh\nRESIDUAL=1\neval \"$1\"\n")],
+            concat!(
+                r#"{"kind":"shell_file","path":"deploy.sh","name":"bash","#,
+                r#""message":"","digest":"<digest:deploy.sh>"}"#,
+            ),
+        );
+        audit_repository(&corpus, "vendor-skipped", &[], "");
+
+        let root = directory.path();
+        let mut arguments = audit_arguments(root, &corpus, &deshell);
+        arguments.excluded_patterns = vec!["vendor-*".into()];
+        let failures = run_corpus_audit(arguments).expect_err("a residual node fails the audit");
+        assert_eq!(
+            failures,
+            vec!["beta/deploy.sh: residual nodes remain: dynamic command".to_owned()],
+            "{failures:#?}"
+        );
+
+        // The same run again, this time keeping the report.
+        let output = root.join("audit.json");
+        let mut arguments = audit_arguments(root, &corpus, &deshell);
+        arguments.excluded_patterns = vec!["vendor-*".into()];
+        arguments.output = Some(output.clone());
+        run_corpus_audit(arguments).expect_err("a residual node fails the audit");
+        let text = std::fs::read_to_string(&output).unwrap();
+        let report: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        // The persistence the PowerShell auditor hand-rolled: keys sorted, two
+        // spaces, one trailing LF and no CR anywhere, on every platform.
+        assert!(text.ends_with("}\n") && !text.ends_with("}\n\n"), "{text}");
+        assert!(!text.contains('\r'), "{text}");
+        assert!(
+            text.contains("\n  \"analysis_scope\": \"shell_files\",\n"),
+            "{text}"
+        );
+        let keys = report
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut sorted = keys.clone();
+        sorted.sort();
+        assert_eq!(keys, sorted);
+
+        assert_eq!(report["repositories"], serde_json::json!(["alpha", "beta"]));
+        assert_eq!(report["summary"]["locations"]["total"], 5);
+        assert_eq!(report["summary"]["locations"]["shell_files"], 2);
+        assert_eq!(report["summary"]["locations"]["embedded_shell"], 2);
+        assert_eq!(report["summary"]["locations"]["candidates"], 1);
+        assert_eq!(report["summary"]["analysis_failures"], 1);
+        assert_eq!(report["summary"]["fully_non_residual"], 1);
+        assert_eq!(report["summary"]["nodes"]["native"], 3);
+        assert_eq!(report["summary"]["nodes"]["delegated"], 1);
+        assert_eq!(report["summary"]["nodes"]["residual"], 1);
+        assert_eq!(
+            report["fully_non_residual_files"],
+            serde_json::json!(["alpha/scripts/build.sh"])
+        );
+
+        // `RUN` and `run` are different origins. PowerShell's `Sort-Object`
+        // and `Group-Object` are case-insensitive by default, so the script
+        // ordered these two by whichever happened to come first and would have
+        // merged them outright had their interpreters matched.
+        let groups = report["inventory_groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|group| {
+                format!(
+                    "{}/{}/{}x{}",
+                    group["kind"].as_str().unwrap(),
+                    group["origin"].as_str().unwrap(),
+                    group["interpreter"].as_str().unwrap(),
+                    group["count"],
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            groups,
+            vec![
+                "candidate/line/shx1",
+                "embedded_shell/RUN/shx1",
+                "embedded_shell/run/bashx1",
+                "shell_file/shell-file/bashx1",
+                "shell_file/shell-file/shx1",
+            ]
+        );
+    }
+
+    /// Every way the audit refuses before it reports.
+    #[test]
+    fn the_corpus_audit_fails_closed_on_a_moving_scan_and_an_empty_exclusion() {
+        let directory = tempfile::tempdir().unwrap();
+        let deshell = directory.path().join(if cfg!(windows) {
+            "audit-deshell.exe"
+        } else {
+            "audit-deshell"
+        });
+        compile_audit_deshell(&deshell);
+        let corpus = directory.path().join("corpus");
+        std::fs::create_dir_all(&corpus).unwrap();
+        let root = directory.path();
+
+        // An exact exclusion that names nothing broadens the audit silently.
+        let mut arguments = audit_arguments(root, &corpus, &deshell);
+        arguments.excluded_repositories = vec!["never-cloned".into()];
+        let failures =
+            run_corpus_audit(arguments).expect_err("an exclusion that matches nothing fails");
+        assert!(
+            failures[0].contains("Exact repository exclusion 'never-cloned'"),
+            "{failures:#?}"
+        );
+
+        audit_repository(
+            &corpus,
+            "unstable",
+            &[("run.sh", "#!/bin/sh\necho hi\n")],
+            concat!(
+                r#"{"kind":"shell_file","path":"run.sh","name":"sh","#,
+                r#""message":"RUNS","digest":"<digest:run.sh>"}"#,
+            ),
+        );
+        audit_repository(
+            &corpus,
+            "unknown-kind",
+            &[("odd.txt", "x\n")],
+            r#"{"kind":"future_kind","path":"odd.txt","name":"sh","message":"","digest":"d"}"#,
+        );
+
+        let failures = run_corpus_audit(audit_arguments(root, &corpus, &deshell))
+            .expect_err("a moving scan and an unknown kind both fail");
+        assert!(
+            failures
+                .iter()
+                .any(|failure| failure
+                    == "unstable: repeated Inventory v1 scan was not byte-identical"),
+            "{failures:#?}"
+        );
+        assert!(
+            failures.iter().any(|failure| failure
+                == "unknown-kind: Scan Report holds an unknown location kind 'future_kind' at odd.txt"),
+            "{failures:#?}"
+        );
+    }
 
     fn compile_fake_deshell(path: &Path) {
         let source = path.with_extension("rs");
@@ -1200,28 +6015,32 @@ fn corpus_path() -> PathBuf {
 
 fn initialize(args: &[String]) {
     let root = project_root(args);
+    let target = option(args, "--target").unwrap_or_else(|| "rust".into());
+    let module_root = if target == "go" { "cmd" } else { "src/bin" };
     std::fs::create_dir_all(root.join(".deshell/scenarios")).unwrap();
     std::fs::write(
         root.join(".deshell/project.toml"),
-        concat!(
+        format!(concat!(
             "entrypoints = []\n",
-            "generator = \"rust\"\n",
-            "target = \"rust\"\n",
-            "module_root = \"src/bin\"\n",
-            "location_overrides = []\n",
-            "platform_cells = []\n",
+            "location_overrides = [{{ path = \".github/workflows/embedded.yml\", start_byte = 0, end_byte = 1, generator = \"host\", target = \"host\", module_root = \".deshell/host\" }}]\n",
+            "platform_cells = [{{ id = \"fixture\", operating_system = \"fixture\", architecture = \"fixture\", runtime = \"native\", approval = \"draft\" }}]\n",
             "allow_local = false\n",
-        ),
+            "[migration]\n",
+            "generator = \"{}\"\n",
+            "target = \"{}\"\n",
+            "module_root = \"{}\"\n",
+        ), target, target, module_root),
     )
     .unwrap();
     std::fs::write(
-        root.join(".deshell/scenarios/default.toml"),
+        root.join(".deshell/scenarios/synthesized-corpus.toml"),
         concat!(
-            "name = \"default\"\n",
+            "name = \"synthesized-corpus\"\n",
             "approval = \"draft\"\n",
             "arguments = []\n",
             "argv = []\n",
             "environment = []\n",
+            "[limits]\n",
             "memory_bytes = 1073741824\n",
         ),
     )
@@ -1233,7 +6052,7 @@ fn write_evidence(args: &[String]) {
     let source = corpus_path();
     let source = source.file_name().unwrap().to_string_lossy();
     let evidence = format!(
-        "{{\"checks\":[{{\"comparisons\":[{{\"original\":{{\"exit_code\":0}}}}],\"scenario\":\"default\",\"source\":{{\"path\":\"{source}\"}}}},{{\"comparisons\":[{{\"original\":{{\"exit_code\":1}}}}],\"scenario\":\"failure\",\"source\":{{\"path\":\"{source}\"}}}}]}}"
+        "{{\"checks\":[{{\"comparisons\":[{{\"original\":{{\"exit_code\":0}}}}],\"scenario\":\"synthesized-corpus\",\"source\":{{\"path\":\"{source}\"}}}},{{\"comparisons\":[{{\"original\":{{\"exit_code\":1}}}}],\"scenario\":\"failure\",\"source\":{{\"path\":\"{source}\"}}}}]}}"
     );
     std::fs::write(output, evidence).unwrap();
 }
@@ -1289,6 +6108,15 @@ fn main() {
             println!("{{}}");
         }
         Some("init") => initialize(&args),
+        Some("scenario") if args.get(1).map(String::as_str) == Some("list") => println!(
+            "{{\"details\":{{\"items\":[{{\"name\":\"synthesized-corpus\",\"digest\":\"sha256:success\"}},{{\"name\":\"failure\",\"digest\":\"sha256:failure\"}}]}}}}"
+        ),
+        Some("matrix") if args.get(1).map(String::as_str) == Some("list") => {
+            println!(
+                "{{\"details\":{{\"items\":[{{\"name\":\"host\",\"digest\":\"sha256:host\"}}]}}}}"
+            );
+        }
+        Some("scenario" | "matrix") if args.get(1).map(String::as_str) == Some("approve") => {}
         Some("analyze") if option(&args, "--entry").as_deref() == Some("unknown.ext") => {
             println!("{{\"command\":\"analyze\",\"schema_version\":1}}");
             std::process::exit(4);
@@ -1525,12 +6353,16 @@ fn main() {
         assert!(ci.contains("cargo deny --locked check"));
         assert!(ci.contains("mise run test:schema-validator"));
         assert!(!ci.contains("--fail-under-lines 74"));
-        assert!(ci.contains(
-            "cargo llvm-cov --locked --workspace --all-targets --summary-only --fail-under-lines 90 -- --test-threads=1"
-        ));
+        assert!(ci.contains("run: mise run coverage"));
         assert!(!mise.contains("--fail-under-lines 74"));
         assert!(mise.contains(
-            "cargo llvm-cov --locked --workspace --all-targets --summary-only --fail-under-lines 90 -- --test-threads=1"
+            "cargo llvm-cov --locked --workspace --all-targets --no-report -- --test-threads=1"
+        ));
+        assert!(mise.contains(
+            "cargo llvm-cov report -p deshell -p xtask --summary-only --fail-under-lines 90"
+        ));
+        assert!(mise.contains(
+            "cargo llvm-cov --locked --no-report run -p xtask -- coverage-exercise target/llvm-cov-target/debug/deshell"
         ));
         assert!(ci.contains("MISE_AUTO_INSTALL: \"false\""));
     }
@@ -1802,13 +6634,15 @@ fn main() {
     #[test]
     fn executable_corpus_fixtures_use_portable_system_paths() {
         let root = repository_root();
+        let non_portable_test = ["/usr/bin", "/test"].concat();
         for relative in [
             "crates/deshell/src/cli.rs",
             "crates/deshell/src/frontend.rs",
+            "xtask/src/main.rs",
         ] {
             let source = std::fs::read_to_string(root.join(relative)).unwrap();
             assert!(
-                !source.contains("/usr/bin/test"),
+                !source.contains(&non_portable_test),
                 "{relative} contains a fixture path absent on macOS"
             );
         }
@@ -1827,14 +6661,17 @@ fn main() {
 
     #[test]
     fn final_release_requires_ninety_percent_coverage_and_the_seven_interpreter_corpus() {
-        let workflow =
-            std::fs::read_to_string(repository_root().join(".github/workflows/release.yml"))
-                .unwrap();
+        let root = repository_root();
+        let workflow = std::fs::read_to_string(root.join(".github/workflows/release.yml")).unwrap();
+        let mise = std::fs::read_to_string(root.join("mise.toml")).unwrap();
         assert!(workflow.contains("release-qualification:"));
         assert!(workflow.contains("migration-e2e:"));
         assert!(workflow.contains("--fail-under-lines 90"));
         assert!(!workflow.contains("--fail-under-lines 74"));
-        assert!(workflow.contains("-- --test-threads=1"));
+        assert!(workflow.contains("mise run coverage"));
+        assert!(workflow.contains("mise run coverage:collect"));
+        assert!(mise.contains("-- --test-threads=1"));
+        assert!(mise.contains("coverage-exercise"));
         assert!(workflow.contains("scripts/check-release-coverage.py"));
         assert!(workflow.contains("cargo run --locked -p xtask -- migration-e2e"));
         for interpreter in ["sh", "bash", "zsh", "fish", "powershell", "cmd", "nu"] {
@@ -2242,14 +7079,30 @@ fn main() {
         }
         compile_fake_deshell(&binary);
         let interpreter = if cfg!(windows) { "cmd" } else { "sh" };
-        run_migration_e2e(repository.path(), interpreter, "rust").unwrap();
-        run_migration_e2e(repository.path(), "powershell", "go").unwrap();
-        assert!(run_migration_e2e(repository.path(), interpreter, "unknown").is_err());
+        let run = |interpreter, generator| {
+            run_migration_e2e(MigrationE2eArgs {
+                repository: repository.path(),
+                interpreter,
+                generator,
+                binary: None,
+            })
+        };
+        run(interpreter, "rust").unwrap();
+        run("powershell", "go").unwrap();
+        assert!(run(interpreter, "unknown").is_err());
         let wrong_platform = if cfg!(windows) { "sh" } else { "cmd" };
-        assert!(run_migration_e2e(repository.path(), wrong_platform, "rust").is_err());
+        assert!(run(wrong_platform, "rust").is_err());
 
         let missing = tempfile::tempdir().unwrap();
-        assert!(run_migration_e2e(missing.path(), interpreter, "rust").is_err());
+        assert!(
+            run_migration_e2e(MigrationE2eArgs {
+                repository: missing.path(),
+                interpreter,
+                generator: "rust",
+                binary: None,
+            })
+            .is_err()
+        );
         assert!(migration_embedded_fixture("unknown").is_err());
         assert!(!powershell_runtime_path().unwrap().is_empty());
     }
@@ -2302,6 +7155,10 @@ fn main() {
         let root = repository_root();
         assert!(dispatch(&root, &[OsString::from("validate-contracts")]).is_ok());
         assert!(dispatch(&root, &[]).unwrap_err()[0].contains("usage:"));
+        assert_eq!(
+            dispatch(&root, &[OsString::from("coverage-exercise")]).unwrap_err(),
+            ["coverage-exercise requires DESHELL_BINARY"]
+        );
         assert_eq!(
             dispatch(&root, &[OsString::from("migration-e2e")])
                 .unwrap_err()

@@ -14,9 +14,28 @@ pub(crate) struct TextExpression {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "snake_case", tag = "kind")]
 pub(crate) enum TextPart {
-    Literal { value: String },
-    Variable { name: String },
-    Argument { name: String },
+    Literal {
+        value: String,
+    },
+    Variable {
+        name: String,
+    },
+    Argument {
+        name: String,
+    },
+    /// `${name:-fallback}` and `${name-fallback}`.
+    ///
+    /// The fallback is a literal. An expansion nested inside it is delegated
+    /// rather than represented, because this exists to carry the exception table
+    /// `set -u` needs, and that table is written over literals.
+    DefaultValue {
+        name: String,
+        fallback: String,
+        /// `:-` substitutes when the name is unset *or* empty; `-` only when it
+        /// is unset. The two are not interchangeable — `${x:-d}` with `x=""`
+        /// yields `d`, and `${x-d}` yields the empty string.
+        empty_is_unset: bool,
+    },
 }
 
 impl TextExpression {
@@ -32,17 +51,30 @@ impl TextExpression {
         &self,
         variables: &BTreeMap<String, String>,
         arguments: &BTreeMap<String, String>,
+        unset: UnsetPolicy,
     ) -> Result<String, String> {
         validate_expression(self, None)?;
         let mut output = String::new();
         for part in &self.parts {
             match part {
                 TextPart::Literal { value } => output.push_str(value),
-                TextPart::Variable { name } => output.push_str(
-                    variables
-                        .get(name)
-                        .ok_or_else(|| format!("runtime variable is not defined: {name}"))?,
-                ),
+                TextPart::Variable { name } => match (variables.get(name), unset) {
+                    (Some(value), _) => output.push_str(value),
+                    (None, UnsetPolicy::Empty) => {}
+                    (None, UnsetPolicy::Refuse) => {
+                        return Err(format!("runtime variable is not defined: {name}"));
+                    }
+                },
+                TextPart::DefaultValue {
+                    name,
+                    fallback,
+                    empty_is_unset,
+                } => output.push_str(match variables.get(name) {
+                    // `:-` substitutes an empty value as well as an unset one;
+                    // `-` substitutes only an unset one.
+                    Some(value) if !(*empty_is_unset && value.is_empty()) => value,
+                    _ => fallback,
+                }),
                 TextPart::Argument { name } => output.push_str(
                     arguments
                         .get(name)
@@ -81,11 +113,113 @@ pub(crate) enum PrimitiveType {
     Bytes,
 }
 
+impl PrimitiveType {
+    /// Whether a value of this type is plain text.
+    ///
+    /// Asked in a `match` rather than with `== PrimitiveType::Text`, so that a
+    /// primitive added to the value model has to state its answer here instead
+    /// of inheriting `false` from an equality test that still compiles.
+    pub(crate) fn is_text(&self) -> bool {
+        match self {
+            Self::Text => true,
+            Self::Bool | Self::Int | Self::Path | Self::Bytes => false,
+        }
+    }
+}
+
+impl ValueType {
+    /// Whether this is plain text with no normalisation attached to it.
+    ///
+    /// A list, a record and a secret each carry rules about the bytes they
+    /// hold; text carries none. See [`PrimitiveType::is_text`] for why this is
+    /// a `match`.
+    pub(crate) fn is_plain_text(&self) -> bool {
+        match self {
+            Self::Primitive(primitive) => primitive.is_text(),
+            Self::List { list: _ } | Self::Record { record: _ } | Self::Secret { secret: _ } => {
+                false
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum PipelineStatus {
     Last,
     Pipefail,
+}
+
+/// What an expansion of a name with no value produces.
+///
+/// The shell substitutes an empty string and carries on; `set -u` makes it an
+/// error instead, and the measured exit status for that is 127 rather than 1.
+///
+/// de-shell used to refuse unconditionally, which is stricter than the source it
+/// claims equivalence with. Stricter is safer than looser, but a tool whose
+/// output is a report of observed differences should not be one of them.
+///
+/// `${name:-fallback}` and `${name-fallback}` are unaffected: substituting is
+/// what they are for, and they are exactly what `set -u` excepts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UnsetPolicy {
+    /// The shell's default: an unset name expands to nothing.
+    Empty,
+    /// `set -u`: an unset name is an error.
+    Refuse,
+}
+
+/// What a sequence does when one of its statements fails.
+///
+/// `Continue` is the shell's default: a failing statement is reported and the
+/// next one runs anyway. `Stop` is what `set -e` selects.
+///
+/// The choice belongs to the sequence rather than to each statement because
+/// `set -e` stops only on commands that are *not tested*. Of the tested
+/// positions, `&&` and `||` lower into their own node and so never reach a
+/// sequence's statement list; `if`, `while`, `until` and `!` are not in the
+/// native subset at all and are delegated whole. Either way the only untested
+/// position that reaches this loop is a statement of a sequence. Shell function definitions,
+/// where the option's meaning would depend on the call site, are delegated
+/// before they reach the lowering.
+/// What an `exit` does when its status is not a decimal integer.
+///
+/// Every measured shell reduces a decimal status modulo 256 and agrees on the
+/// result. Outside that they do not agree at all: bash and `/bin/sh` end with
+/// 255 and write a message naming the interpreter's own path and a line number;
+/// zsh ends with 0 in silence. There is no behaviour to reproduce, because
+/// reproducing one would mean impersonating a shell the script may not run
+/// under. `contracts/golden/exit-builtin-semantics-v1.json` records it.
+///
+/// So the two cases are separate values. `Unreachable` says the lowering read
+/// the status and it is a number, which is the whole claim.
+///
+/// `Ends` says the status arrives at run time and carries what the pinned
+/// interpreter does with a value that is not a number. There is no choosing
+/// between the shells here: a plan names the interpreter its source runs
+/// under, so the answer is that interpreter's — 255 for bash and `/bin/sh`, 0
+/// for zsh, measured. A caller reading `$?` sees what it would have seen.
+///
+/// What cannot be reproduced is the message. bash writes one naming its own
+/// path and a line number; zsh writes none. The generated program writes one
+/// that names the value, which is a difference in bytes a person reads on a
+/// path that ends the script either way.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NonNumericStatus {
+    /// The lowering proved the status is a decimal integer.
+    #[default]
+    Unreachable,
+    /// The status is read at run time, and this is what the pinned interpreter
+    /// ends with when it is not a number.
+    Ends { status: u8 },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SequenceFailure {
+    Continue,
+    Stop,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -150,10 +284,183 @@ impl SourceBytes {
     }
 }
 
+/// A POSIX `test` predicate, as written with `test` or `[`.
+///
+/// Only the string operators are modelled. The file predicates (`-e`, `-f`,
+/// `-d`) are not, because the runner has no way to ask about a path: the
+/// `FileMetadata` operation reports that the capability is unavailable, and
+/// answering from the host would be the wrong filesystem for a disposable run.
+/// Every other operator — `-nt`, `-ef`, the arithmetic comparisons, `!`, `-a`,
+/// `-o` — is likewise left to delegation rather than approximated by a
+/// neighbouring one, which would answer a different question.
+///
+/// `[` is a shell builtin, not the external `test` utility, and lowering it to
+/// an `Exec` of `/bin/test` would be a rewrite rather than a lowering: the two
+/// are separate programs that agree on exit status and differ in everything
+/// else, including whether a process is created at all.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, rename_all = "snake_case", tag = "kind")]
+pub(crate) enum TestPredicate {
+    /// `-n STRING`: the string has non-zero length.
+    NonEmpty { value: TextExpression },
+    /// `-z STRING`: the string has zero length.
+    Empty { value: TextExpression },
+    /// `STRING = STRING`.
+    StringEqual {
+        left: TextExpression,
+        right: TextExpression,
+    },
+    /// `STRING != STRING`.
+    StringNotEqual {
+        left: TextExpression,
+        right: TextExpression,
+    },
+    /// `[[ STRING == PREFIX* ]]`.
+    ///
+    /// Only the three anchored shapes of a glob are modelled — a trailing `*`, a
+    /// leading one, and both. A pattern with `?`, a bracket class, or an interior
+    /// `*` is delegated: matching it with a neighbouring rule would answer a
+    /// different question, and these three cover what a release workflow asks.
+    StartsWith {
+        value: TextExpression,
+        prefix: String,
+    },
+    /// `[[ STRING == *SUFFIX ]]`.
+    EndsWith {
+        value: TextExpression,
+        suffix: String,
+    },
+    /// `[[ STRING == *INFIX* ]]`.
+    Contains {
+        value: TextExpression,
+        infix: String,
+    },
+}
+
+/// One piece of a `case` pattern.
+///
+/// A pattern is a sequence of these rather than a string with a flag saying
+/// whether it is a glob, because quoting is resolved during word expansion,
+/// before any matching happens — so what decides is which character positions
+/// survived unquoted, not what the pattern as a whole looks like. Measured:
+/// `'a*c'` matches only `a*c`, `"a"*"c"` matches both `abc` and `a*c`, and a
+/// flag on the pattern gets the second one wrong whichever way it guesses.
+/// `contracts/golden/case-pattern-semantics-v1.json` records this.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case", tag = "kind")]
+pub(crate) enum PatternPiece {
+    /// Characters that have to appear as they are. An expansion that was
+    /// quoted contributes here, whatever it holds at run time.
+    Literal { value: TextExpression },
+    /// An unquoted `*`: any run of characters, including none. In a `case` this
+    /// crosses a `/`, unlike the same character in a filename glob.
+    AnyRun,
+    /// An unquoted `?`: exactly one character.
+    AnyCharacter,
+}
+
+/// A `case` pattern.
+///
+/// `[...]` is absent on purpose. Measured: `[^a]` negates the set in bash and
+/// is the two-member set `{^, a}` in dash, so the two answer the same for `^bc`
+/// by opposite rules and differently for `bac`. A bracket expression has no
+/// single meaning to lower.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub(crate) struct PatternExpression {
+    pub pieces: Vec<PatternPiece>,
+}
+
+impl PatternExpression {
+    /// A pattern that matches one exact string.
+    ///
+    /// The frontend reads pieces out of the source rather than building one
+    /// from a string, so this is here for the tests that need a fixture.
+    #[cfg(test)]
+    pub(crate) fn literal(value: &str) -> Self {
+        Self {
+            pieces: vec![PatternPiece::Literal {
+                value: TextExpression::literal(value),
+            }],
+        }
+    }
+
+    /// The one string this matches, if it matches exactly one.
+    ///
+    /// A pattern of literal pieces whose expansions are all literal text is an
+    /// equality test; anything with an `AnyRun` or an `AnyCharacter` is not.
+    pub(crate) fn exact(&self) -> Option<String> {
+        let mut exact = String::new();
+        for piece in &self.pieces {
+            match piece {
+                PatternPiece::Literal { value } => exact.push_str(&literal_text(value)?),
+                PatternPiece::AnyRun | PatternPiece::AnyCharacter => return None,
+            }
+        }
+        Some(exact)
+    }
+
+    /// Whether `subject` matches, given each literal piece's expanded text.
+    ///
+    /// Written here rather than in the runner so that the runner and the two
+    /// generators are checked against one definition. `*` is greedy-free: the
+    /// walk tries every split, which is what the shell's matcher does and what
+    /// a left-to-right scan would get wrong for `*a*a`.
+    pub(crate) fn matches(pieces: &[MatchPiece<'_>], subject: &str) -> bool {
+        let Some((first, rest)) = pieces.split_first() else {
+            return subject.is_empty();
+        };
+        match first {
+            MatchPiece::Literal(text) => match subject.strip_prefix(text.as_ref() as &str) {
+                Some(remainder) => Self::matches(rest, remainder),
+                None => false,
+            },
+            MatchPiece::AnyCharacter => match subject.chars().next() {
+                Some(character) => Self::matches(rest, &subject[character.len_utf8()..]),
+                None => false,
+            },
+            // Every split, shortest first, so `*` can cover nothing.
+            MatchPiece::AnyRun => std::iter::once(0)
+                .chain(
+                    subject
+                        .char_indices()
+                        .map(|(index, ch)| index + ch.len_utf8()),
+                )
+                .any(|split| Self::matches(rest, &subject[split..])),
+        }
+    }
+}
+
+/// A pattern piece with its literal text already expanded.
+///
+/// The IR carries expressions; matching needs the strings they became. Keeping
+/// the two apart is what lets the matcher be one function that the runner and
+/// the generators' tests both call.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum MatchPiece<'a> {
+    Literal(std::borrow::Cow<'a, str>),
+    AnyRun,
+    AnyCharacter,
+}
+
+/// The text of an expression whose parts are all literal, if they all are.
+fn literal_text(expression: &TextExpression) -> Option<String> {
+    let mut text = String::new();
+    for part in &expression.parts {
+        match part {
+            TextPart::Literal { value } => text.push_str(value),
+            TextPart::Variable { .. }
+            | TextPart::Argument { .. }
+            | TextPart::DefaultValue { .. } => return None,
+        }
+    }
+    Some(text)
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
 pub(crate) struct MatchCase {
-    pub pattern: TextExpression,
+    pub pattern: PatternExpression,
     pub body: Node,
 }
 
@@ -242,14 +549,81 @@ pub(crate) enum Operation {
     },
     Sequence {
         nodes: Vec<Node>,
+        /// Whether a failing statement ends the sequence. See [`SequenceFailure`].
+        on_failure: SequenceFailure,
     },
     Parallel {
         nodes: Vec<Node>,
     },
+    /// Write bytes to the task's standard output.
+    ///
+    /// `echo` is a shell builtin, so lowering it to an `Exec` of `/bin/echo`
+    /// would substitute a different program. The three builtins do not agree:
+    /// measured on macOS, `/bin/sh` and `zsh` interpret backslash escapes while
+    /// `/bin/bash` does not, and `/bin/sh` prints `-n` instead of consuming it.
+    /// `contracts/golden/echo-builtin-semantics-v1.json` records the measurement
+    /// and the frontend lowers only the domain where all of them agree.
+    WriteStdout {
+        contents: TextExpression,
+    },
+    /// End the task with a status.
+    ///
+    /// A bare `exit` ends with the last command's status, which this cannot say:
+    /// the IR has no term for `$?`, and a node that reported 0 would overwrite
+    /// the status it was meant to carry. So the status is required and the
+    /// frontend delegates a bare `exit` rather than inventing one.
+    ///
+    /// The status is a decimal integer reduced modulo 256, which every measured
+    /// shell agrees on — including a negative one and one above 255. They do not
+    /// agree on anything else: measured on macOS, bash and `/bin/sh` exit 255
+    /// and write a message naming the interpreter's own path and a line number,
+    /// while zsh exits 0 in silence. Nothing native can reproduce a message that
+    /// names the interpreter, so the frontend lowers a literal integer only and
+    /// delegates a status it cannot read.
+    /// `contracts/golden/exit-builtin-semantics-v1.json` records the
+    /// measurement.
+    Exit {
+        status: TextExpression,
+        /// What happens when the status is not a decimal integer.
+        ///
+        /// Carried as a value rather than settled by the lowering, because the
+        /// two cases are different claims: see [`NonNumericStatus`].
+        #[serde(default)]
+        non_numeric: NonNumericStatus,
+    },
+    /// Runs nothing and succeeds.
+    ///
+    /// Distinct from an empty [`Operation::Sequence`], which the validator
+    /// rejects: a sequence that lost its nodes is a lowering defect, while doing
+    /// nothing is what `case a) ;; esac` and `if ...; then :; fi` actually mean.
+    /// Keeping them apart is what lets the validator reject the first.
+    NoOp,
     Condition {
         predicate: Box<Node>,
         if_true: Box<Node>,
         if_false: Option<Box<Node>>,
+    },
+    /// A `test` / `[` predicate. Succeeds with exit status 0, fails with 1.
+    Test {
+        predicate: TestPredicate,
+    },
+    /// `while COND; do BODY; done`.
+    ///
+    /// The loop's exit status is the body's last run, or 0 if the condition was
+    /// false on the first test — which is what the shell reports. Termination is
+    /// not proven here: a loop that never ends is bounded by the run's timeout the
+    /// same way the original script is, and no claim is made that the two stop at
+    /// the same moment.
+    While {
+        condition: Box<Node>,
+        body: Box<Node>,
+    },
+    /// `! COMMAND`: the body's exit status inverted to 0 or 1.
+    ///
+    /// The inversion is to a boolean, not an arithmetic negation: a body that
+    /// exits 2 makes this exit 0, the same as one that exits 1.
+    Not {
+        body: Box<Node>,
     },
     Match {
         value: TextExpression,
@@ -274,6 +648,12 @@ pub(crate) enum Operation {
     TaskCall {
         task: String,
         arguments: Vec<NamedExpression>,
+        /// The positional arguments the callee reads as `$1`, `$2` and so on.
+        ///
+        /// A shell function takes these and nothing else, so a call with none
+        /// is a call with an empty list rather than a different operation.
+        #[serde(default)]
+        positional: Vec<TextExpression>,
     },
     SetVariable {
         name: String,
@@ -355,6 +735,53 @@ pub(crate) enum Operation {
 }
 
 impl Operation {
+    /// Every `type` string an operation can carry.
+    ///
+    /// Beside [`Operation::name`] so the two are read together: the schema that
+    /// describes the IR has to name each of these, and a test compares the two
+    /// lists. The schema was six operations behind the enum before it did.
+    ///
+    /// The comparison is the gate, so the list is built for it rather than
+    /// carried into the binary unused.
+    #[cfg(test)]
+    pub(crate) const ALL_NAMES: &'static [&'static str] = &[
+        "capture_stdout",
+        "clock_read",
+        "condition",
+        "exec",
+        "exit",
+        "expand_words",
+        "file_metadata",
+        "file_read",
+        "file_remove",
+        "file_set_metadata",
+        "file_write",
+        "foreach",
+        "interpreter_call",
+        "match",
+        "network_request",
+        "no_op",
+        "not",
+        "opaque_capsule",
+        "parallel",
+        "pipeline",
+        "random_bytes",
+        "redirect",
+        "scope",
+        "send_signal",
+        "sequence",
+        "set_environment",
+        "set_variable",
+        "set_working_directory",
+        "spawn",
+        "task_call",
+        "test",
+        "try_finally",
+        "wait",
+        "while",
+        "write_stdout",
+    ];
+
     pub(crate) fn name(&self) -> &'static str {
         match self {
             Self::Exec { .. } => "exec",
@@ -362,6 +789,12 @@ impl Operation {
             Self::Redirect { .. } => "redirect",
             Self::Pipeline { .. } => "pipeline",
             Self::Sequence { .. } => "sequence",
+            Self::NoOp => "no_op",
+            Self::Exit { .. } => "exit",
+            Self::WriteStdout { .. } => "write_stdout",
+            Self::Test { .. } => "test",
+            Self::Not { .. } => "not",
+            Self::While { .. } => "while",
             Self::Parallel { .. } => "parallel",
             Self::Condition { .. } => "condition",
             Self::Match { .. } => "match",
@@ -458,6 +891,9 @@ pub(crate) struct Task {
     pub secrets: Vec<String>,
     pub platform_capabilities: Vec<String>,
     pub cacheable: bool,
+    /// Whether `set -u` is in effect: an expansion of a name with no value is an
+    /// error rather than an empty string. See [`UnsetPolicy`].
+    pub nounset: bool,
     pub invocation: Option<Invocation>,
     pub body: Node,
 }
@@ -526,7 +962,13 @@ impl Plan {
         let mut seen_ids = BTreeSet::new();
         let mut preorder = 0_u64;
         for task in &self.tasks {
-            validate_task(task, &task_table, &mut seen_ids, &mut preorder, &mut errors);
+            validate_task(ValidateTaskArgs {
+                task,
+                task_table: &task_table,
+                seen_ids: &mut seen_ids,
+                preorder: &mut preorder,
+                errors: &mut errors,
+            });
         }
 
         if errors.is_empty() {
@@ -537,13 +979,30 @@ impl Plan {
     }
 }
 
-pub(crate) fn node_id(
-    normalized_path: &str,
-    start_byte: u64,
-    end_byte: u64,
-    operation: &str,
-    preorder: u64,
-) -> Result<String, String> {
+/// The inputs of [`node_id`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`node_id`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+#[derive(Clone, Copy)]
+pub(crate) struct NodeIdArgs<'a> {
+    pub(crate) normalized_path: &'a str,
+    pub(crate) start_byte: u64,
+    pub(crate) end_byte: u64,
+    pub(crate) operation: &'a str,
+    pub(crate) preorder: u64,
+}
+
+pub(crate) fn node_id(parts: NodeIdArgs<'_>) -> Result<String, String> {
+    // Destructured without `..`: see `NodeIdArgs`.
+    let NodeIdArgs {
+        normalized_path,
+        start_byte,
+        end_byte,
+        operation,
+        preorder,
+    } = parts;
     if end_byte < start_byte {
         return Err("node ID byte span is reversed".into());
     }
@@ -613,7 +1072,13 @@ fn assign_node_id(node: &mut Node, preorder: &mut u64) -> Result<(), String> {
         Some(span) => (span.file.as_str(), span.start_byte, span.end_byte),
         None => ("", 0, 0),
     };
-    node.id = node_id(path, start, end, node.operation.name(), *preorder)?;
+    node.id = node_id(NodeIdArgs {
+        normalized_path: path,
+        start_byte: start,
+        end_byte: end,
+        operation: node.operation.name(),
+        preorder: *preorder,
+    })?;
     *preorder = preorder
         .checked_add(1)
         .ok_or_else(|| "node preorder overflow".to_owned())?;
@@ -625,8 +1090,9 @@ fn visit_children_mut<E>(
     mut visit: impl FnMut(&mut Node) -> Result<(), E>,
 ) -> Result<(), E> {
     match operation {
+        Operation::NoOp | Operation::WriteStdout { .. } | Operation::Exit { .. } => {}
         Operation::Pipeline { nodes, .. }
-        | Operation::Sequence { nodes }
+        | Operation::Sequence { nodes, .. }
         | Operation::Parallel { nodes } => {
             for node in nodes {
                 visit(node)?;
@@ -653,10 +1119,15 @@ fn visit_children_mut<E>(
         }
         Operation::Foreach { body, .. }
         | Operation::Scope { body, .. }
+        | Operation::Not { body }
         | Operation::Redirect { body, .. }
         | Operation::CaptureStdout { body, .. }
         | Operation::Spawn { body, .. } => visit(body)?,
-        Operation::TryFinally { body, finalizer } => {
+        Operation::While {
+            condition: body,
+            body: finalizer,
+        }
+        | Operation::TryFinally { body, finalizer } => {
             visit(body)?;
             visit(finalizer)?;
         }
@@ -668,6 +1139,7 @@ fn visit_children_mut<E>(
         | Operation::SetWorkingDirectory { .. }
         | Operation::Wait { .. }
         | Operation::SendSignal { .. }
+        | Operation::Test { .. }
         | Operation::FileRead { .. }
         | Operation::FileWrite { .. }
         | Operation::FileRemove { .. }
@@ -682,13 +1154,29 @@ fn visit_children_mut<E>(
     Ok(())
 }
 
-fn validate_task<'a>(
-    task: &Task,
-    task_table: &BTreeMap<&'a str, &'a Task>,
-    seen_ids: &mut BTreeSet<String>,
-    preorder: &mut u64,
-    errors: &mut Vec<String>,
-) {
+/// The inputs of [`validate_task`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`validate_task`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct ValidateTaskArgs<'a> {
+    task: &'a Task,
+    task_table: &'a BTreeMap<&'a str, &'a Task>,
+    seen_ids: &'a mut BTreeSet<String>,
+    preorder: &'a mut u64,
+    errors: &'a mut Vec<String>,
+}
+
+fn validate_task(parts: ValidateTaskArgs<'_>) {
+    // Destructured without `..`: see `ValidateTaskArgs`.
+    let ValidateTaskArgs {
+        task,
+        task_table,
+        seen_ids,
+        preorder,
+        errors,
+    } = parts;
     let input_names = duplicate_strings(
         "input",
         task.inputs.iter().map(|binding| binding.name.as_str()),
@@ -772,24 +1260,41 @@ fn validate_task<'a>(
             }
         }
     }
-    validate_node(
-        &task.body,
-        &input_names,
+    validate_node(ValidateNodeArgs {
+        node: &task.body,
+        inputs: &input_names,
+        task_table,
+        seen_ids: &mut *seen_ids,
+        preorder: &mut *preorder,
+        errors: &mut *errors,
+    });
+}
+
+/// The inputs of [`validate_node`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`validate_node`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct ValidateNodeArgs<'a> {
+    node: &'a Node,
+    inputs: &'a BTreeSet<String>,
+    task_table: &'a BTreeMap<&'a str, &'a Task>,
+    seen_ids: &'a mut BTreeSet<String>,
+    preorder: &'a mut u64,
+    errors: &'a mut Vec<String>,
+}
+
+fn validate_node(parts: ValidateNodeArgs<'_>) {
+    // Destructured without `..`: see `ValidateNodeArgs`.
+    let ValidateNodeArgs {
+        node,
+        inputs,
         task_table,
         seen_ids,
         preorder,
         errors,
-    );
-}
-
-fn validate_node<'a>(
-    node: &Node,
-    inputs: &BTreeSet<String>,
-    task_table: &BTreeMap<&'a str, &'a Task>,
-    seen_ids: &mut BTreeSet<String>,
-    preorder: &mut u64,
-    errors: &mut Vec<String>,
-) {
+    } = parts;
     if !seen_ids.insert(node.id.clone()) {
         errors.push(format!("duplicate node id: {}", node.id));
     }
@@ -816,7 +1321,13 @@ fn validate_node<'a>(
         }
         None => ("", 0, 0),
     };
-    match node_id(path, start, end, node.operation.name(), *preorder) {
+    match node_id(NodeIdArgs {
+        normalized_path: path,
+        start_byte: start,
+        end_byte: end,
+        operation: node.operation.name(),
+        preorder: *preorder,
+    }) {
         Ok(expected) if node.id != expected => errors.push(format!(
             "node id {} is not deterministic; expected {expected}",
             node.id
@@ -851,7 +1362,39 @@ fn validate_node<'a>(
                 node.operation.name()
             ));
         }
-        _ => {}
+        Operation::Exec { .. }
+        | Operation::ExpandWords { .. }
+        | Operation::Redirect { .. }
+        | Operation::Pipeline { .. }
+        | Operation::Sequence { .. }
+        | Operation::Parallel { .. }
+        | Operation::WriteStdout { .. }
+        | Operation::Exit { .. }
+        | Operation::NoOp
+        | Operation::Condition { .. }
+        | Operation::Test { .. }
+        | Operation::While { .. }
+        | Operation::Not { .. }
+        | Operation::Match { .. }
+        | Operation::Foreach { .. }
+        | Operation::Scope { .. }
+        | Operation::TryFinally { .. }
+        | Operation::TaskCall { .. }
+        | Operation::SetVariable { .. }
+        | Operation::SetEnvironment { .. }
+        | Operation::SetWorkingDirectory { .. }
+        | Operation::CaptureStdout { .. }
+        | Operation::Spawn { .. }
+        | Operation::Wait { .. }
+        | Operation::SendSignal { .. }
+        | Operation::FileRead { .. }
+        | Operation::FileWrite { .. }
+        | Operation::FileRemove { .. }
+        | Operation::FileMetadata { .. }
+        | Operation::FileSetMetadata { .. }
+        | Operation::NetworkRequest { .. }
+        | Operation::ClockRead { .. }
+        | Operation::RandomBytes { .. } => {}
     }
 
     let expression = |value: &TextExpression, errors: &mut Vec<String>| {
@@ -860,6 +1403,23 @@ fn validate_node<'a>(
         }
     };
     match &node.operation {
+        // Children are validated by the walk over them; nothing here is its own.
+        Operation::NoOp | Operation::Not { .. } | Operation::While { .. } => {}
+        Operation::WriteStdout { contents } => expression(contents, errors),
+        Operation::Exit { status, .. } => expression(status, errors),
+        Operation::Test { predicate } => match predicate {
+            TestPredicate::NonEmpty { value } | TestPredicate::Empty { value } => {
+                expression(value, errors);
+            }
+            TestPredicate::StringEqual { left, right }
+            | TestPredicate::StringNotEqual { left, right } => {
+                expression(left, errors);
+                expression(right, errors);
+            }
+            TestPredicate::StartsWith { value, .. }
+            | TestPredicate::EndsWith { value, .. }
+            | TestPredicate::Contains { value, .. } => expression(value, errors),
+        },
         Operation::Exec {
             argv,
             environment,
@@ -871,7 +1431,7 @@ fn validate_node<'a>(
             for value in argv {
                 expression(value, errors);
             }
-            let names = duplicate_strings(
+            duplicate_strings(
                 "Exec environment name",
                 environment.iter().map(|value| value.name.as_str()),
                 errors,
@@ -882,7 +1442,6 @@ fn validate_node<'a>(
                 }
                 expression(&value.value, errors);
             }
-            let _ = names;
             if let Some(directory) = working_directory {
                 expression(directory, errors);
             }
@@ -926,7 +1485,14 @@ fn validate_node<'a>(
                     }
                 }
             }
-            validate_node(body, inputs, task_table, seen_ids, preorder, errors);
+            validate_node(ValidateNodeArgs {
+                node: body,
+                inputs,
+                task_table,
+                seen_ids: &mut *seen_ids,
+                preorder: &mut *preorder,
+                errors: &mut *errors,
+            });
         }
         Operation::Pipeline { nodes, .. } | Operation::Parallel { nodes } => {
             if nodes.is_empty() {
@@ -942,15 +1508,29 @@ fn validate_node<'a>(
                 ));
             }
             for child in nodes {
-                validate_node(child, inputs, task_table, seen_ids, preorder, errors);
+                validate_node(ValidateNodeArgs {
+                    node: child,
+                    inputs,
+                    task_table,
+                    seen_ids: &mut *seen_ids,
+                    preorder: &mut *preorder,
+                    errors: &mut *errors,
+                });
             }
         }
-        Operation::Sequence { nodes } => {
+        Operation::Sequence { nodes, .. } => {
             if nodes.is_empty() {
                 errors.push("sequence must contain at least one node".into());
             }
             for child in nodes {
-                validate_node(child, inputs, task_table, seen_ids, preorder, errors);
+                validate_node(ValidateNodeArgs {
+                    node: child,
+                    inputs,
+                    task_table,
+                    seen_ids: &mut *seen_ids,
+                    preorder: &mut *preorder,
+                    errors: &mut *errors,
+                });
             }
         }
         Operation::Condition {
@@ -958,10 +1538,31 @@ fn validate_node<'a>(
             if_true,
             if_false,
         } => {
-            validate_node(predicate, inputs, task_table, seen_ids, preorder, errors);
-            validate_node(if_true, inputs, task_table, seen_ids, preorder, errors);
+            validate_node(ValidateNodeArgs {
+                node: predicate,
+                inputs,
+                task_table,
+                seen_ids: &mut *seen_ids,
+                preorder: &mut *preorder,
+                errors: &mut *errors,
+            });
+            validate_node(ValidateNodeArgs {
+                node: if_true,
+                inputs,
+                task_table,
+                seen_ids: &mut *seen_ids,
+                preorder: &mut *preorder,
+                errors: &mut *errors,
+            });
             if let Some(child) = if_false {
-                validate_node(child, inputs, task_table, seen_ids, preorder, errors);
+                validate_node(ValidateNodeArgs {
+                    node: child,
+                    inputs,
+                    task_table,
+                    seen_ids: &mut *seen_ids,
+                    preorder: &mut *preorder,
+                    errors: &mut *errors,
+                });
             }
         }
         Operation::Match {
@@ -972,16 +1573,37 @@ fn validate_node<'a>(
             expression(value, errors);
             let mut patterns = BTreeSet::new();
             for case in cases {
-                expression(&case.pattern, errors);
-                if let Some(pattern) = literal_value(&case.pattern)
+                for piece in &case.pattern.pieces {
+                    if let PatternPiece::Literal { value } = piece {
+                        expression(value, errors);
+                    }
+                }
+                if case.pattern.pieces.is_empty() {
+                    errors.push("match case pattern has no pieces".into());
+                }
+                if let Some(pattern) = case.pattern.exact()
                     && !patterns.insert(pattern)
                 {
                     errors.push("duplicate literal match case".into());
                 }
-                validate_node(&case.body, inputs, task_table, seen_ids, preorder, errors);
+                validate_node(ValidateNodeArgs {
+                    node: &case.body,
+                    inputs,
+                    task_table,
+                    seen_ids: &mut *seen_ids,
+                    preorder: &mut *preorder,
+                    errors: &mut *errors,
+                });
             }
             if let Some(child) = default {
-                validate_node(child, inputs, task_table, seen_ids, preorder, errors);
+                validate_node(ValidateNodeArgs {
+                    node: child,
+                    inputs,
+                    task_table,
+                    seen_ids: &mut *seen_ids,
+                    preorder: &mut *preorder,
+                    errors: &mut *errors,
+                });
             }
         }
         Operation::Foreach {
@@ -995,7 +1617,14 @@ fn validate_node<'a>(
             for item in items {
                 expression(item, errors);
             }
-            validate_node(body, inputs, task_table, seen_ids, preorder, errors);
+            validate_node(ValidateNodeArgs {
+                node: body,
+                inputs,
+                task_table,
+                seen_ids: &mut *seen_ids,
+                preorder: &mut *preorder,
+                errors: &mut *errors,
+            });
         }
         Operation::Scope {
             variables,
@@ -1034,17 +1663,45 @@ fn validate_node<'a>(
             if let Some(directory) = working_directory {
                 expression(directory, errors);
             }
-            validate_node(body, inputs, task_table, seen_ids, preorder, errors);
+            validate_node(ValidateNodeArgs {
+                node: body,
+                inputs,
+                task_table,
+                seen_ids: &mut *seen_ids,
+                preorder: &mut *preorder,
+                errors: &mut *errors,
+            });
         }
         Operation::TryFinally { body, finalizer } => {
             if contains_state_mutation(body) || contains_state_mutation(finalizer) {
                 errors.push("try/finally state mutation is undefined across failure paths".into());
             }
-            validate_node(body, inputs, task_table, seen_ids, preorder, errors);
-            validate_node(finalizer, inputs, task_table, seen_ids, preorder, errors);
+            validate_node(ValidateNodeArgs {
+                node: body,
+                inputs,
+                task_table,
+                seen_ids: &mut *seen_ids,
+                preorder: &mut *preorder,
+                errors: &mut *errors,
+            });
+            validate_node(ValidateNodeArgs {
+                node: finalizer,
+                inputs,
+                task_table,
+                seen_ids: &mut *seen_ids,
+                preorder: &mut *preorder,
+                errors: &mut *errors,
+            });
         }
-        Operation::TaskCall { task, arguments } => {
+        Operation::TaskCall {
+            task,
+            arguments,
+            positional,
+        } => {
             require_nonempty("task call target", task, errors);
+            for value in positional {
+                expression(value, errors);
+            }
             let names = duplicate_strings(
                 "task argument",
                 arguments.iter().map(|argument| argument.name.as_str()),
@@ -1054,9 +1711,20 @@ fn validate_node<'a>(
                 expression(&argument.value, errors);
             }
             if let Some(target) = task_table.get(task.as_str()) {
+                // An input named `1`, `2` and so on is supplied by position, not
+                // by name: that is what a shell function takes. Counting it as a
+                // named argument would demand a name the caller has no way to
+                // write.
                 let expected: BTreeSet<String> = target
                     .inputs
                     .iter()
+                    .filter(|input| {
+                        input
+                            .name
+                            .parse::<usize>()
+                            .map(|position| position == 0 || position > positional.len())
+                            .unwrap_or(true)
+                    })
                     .map(|input| input.name.clone())
                     .collect();
                 for unknown in names.difference(&expected) {
@@ -1064,6 +1732,18 @@ fn validate_node<'a>(
                 }
                 for missing in expected.difference(&names) {
                     errors.push(format!("missing argument {missing} for task {task}"));
+                }
+                let positions = target
+                    .inputs
+                    .iter()
+                    .filter_map(|input| input.name.parse::<usize>().ok())
+                    .max()
+                    .unwrap_or(0);
+                if positional.len() > positions {
+                    errors.push(format!(
+                        "task {task} was given {} positional argument(s) and reads {positions}",
+                        positional.len()
+                    ));
                 }
             } else if !task.is_empty() {
                 errors.push(format!("task not found: {task}"));
@@ -1097,10 +1777,17 @@ fn validate_node<'a>(
             if !valid_identifier(name) {
                 errors.push(format!("runtime variable name is invalid: {name}"));
             }
-            if *value_type != PrimitiveType::Text {
+            if !matches!(value_type, PrimitiveType::Text) {
                 errors.push("stdout capture value_type must be text".into());
             }
-            validate_node(body, inputs, task_table, seen_ids, preorder, errors);
+            validate_node(ValidateNodeArgs {
+                node: body,
+                inputs,
+                task_table,
+                seen_ids: &mut *seen_ids,
+                preorder: &mut *preorder,
+                errors: &mut *errors,
+            });
         }
         Operation::Spawn { handle, body } => {
             if !valid_identifier(handle) {
@@ -1109,7 +1796,14 @@ fn validate_node<'a>(
             if contains_state_mutation(body) {
                 errors.push("spawned state mutation is undefined".into());
             }
-            validate_node(body, inputs, task_table, seen_ids, preorder, errors);
+            validate_node(ValidateNodeArgs {
+                node: body,
+                inputs,
+                task_table,
+                seen_ids: &mut *seen_ids,
+                preorder: &mut *preorder,
+                errors: &mut *errors,
+            });
         }
         Operation::Wait { handle } => {
             if !valid_identifier(handle) {
@@ -1225,6 +1919,12 @@ fn validate_node<'a>(
 
 fn contains_state_mutation(node: &Node) -> bool {
     match &node.operation {
+        Operation::NoOp => false,
+        Operation::WriteStdout { .. } | Operation::Exit { .. } => true,
+        Operation::Not { body } => contains_state_mutation(body),
+        Operation::While { condition, body } => {
+            contains_state_mutation(condition) || contains_state_mutation(body)
+        }
         Operation::ExpandWords { .. }
         | Operation::SetVariable { .. }
         | Operation::SetEnvironment { .. }
@@ -1236,7 +1936,7 @@ fn contains_state_mutation(node: &Node) -> bool {
         | Operation::ClockRead { .. }
         | Operation::RandomBytes { .. } => true,
         Operation::Pipeline { nodes, .. }
-        | Operation::Sequence { nodes }
+        | Operation::Sequence { nodes, .. }
         | Operation::Parallel { nodes } => nodes.iter().any(contains_state_mutation),
         Operation::Condition {
             predicate,
@@ -1260,6 +1960,7 @@ fn contains_state_mutation(node: &Node) -> bool {
         }
         Operation::Exec { .. }
         | Operation::TaskCall { .. }
+        | Operation::Test { .. }
         | Operation::FileRead { .. }
         | Operation::FileWrite { .. }
         | Operation::FileRemove { .. }
@@ -1287,6 +1988,11 @@ fn validate_expression(
                     return Err("adjacent literal expression parts must be merged".into());
                 }
             }
+            TextPart::DefaultValue { name, .. } => {
+                if !valid_identifier(name) {
+                    return Err(format!("variable name is invalid: {name}"));
+                }
+            }
             TextPart::Variable { name } => {
                 if !valid_identifier(name) {
                     return Err(format!("variable name is invalid: {name}"));
@@ -1307,6 +2013,11 @@ fn validate_expression(
     Ok(())
 }
 
+/// The text of an expression that is one literal.
+///
+/// `PatternExpression::exact` replaced the use this had in validation; the
+/// tests below still measure it.
+#[cfg(test)]
 fn literal_value(expression: &TextExpression) -> Option<String> {
     match expression.parts.as_slice() {
         [TextPart::Literal { value }] => Some(value.clone()),
@@ -1406,6 +2117,7 @@ mod tests {
                 secrets: vec![],
                 platform_capabilities: vec![],
                 cacheable: false,
+                nounset: false,
                 invocation: None,
                 body: Node {
                     id: String::new(),
@@ -1486,6 +2198,56 @@ mod tests {
         })
     }
 
+    /// `ALL_NAMES` is every name `Operation::name` can return.
+    ///
+    /// Two statements of one fact, so they are compared: the `match` in
+    /// `name` is exhaustive and the list is not, and a variant added without a
+    /// line here would leave the schema gate checking a shorter list than the
+    /// IR can produce.
+    #[test]
+    fn all_names_holds_every_name_an_operation_can_carry() {
+        let every = [
+            Operation::Exec {
+                argv: vec![],
+                environment: vec![],
+                working_directory: None,
+            },
+            Operation::NoOp,
+            Operation::WriteStdout {
+                contents: TextExpression::literal(""),
+            },
+            Operation::Exit {
+                status: TextExpression::literal("0"),
+                non_numeric: NonNumericStatus::Unreachable,
+            },
+            Operation::Not {
+                body: Box::new(Node::default()),
+            },
+            Operation::While {
+                condition: Box::new(Node::default()),
+                body: Box::new(Node::default()),
+            },
+            Operation::Test {
+                predicate: TestPredicate::Empty {
+                    value: TextExpression::literal(""),
+                },
+            },
+        ];
+        for operation in every {
+            assert!(
+                Operation::ALL_NAMES.contains(&operation.name()),
+                "{} is not in ALL_NAMES",
+                operation.name()
+            );
+        }
+        // Sorted and unique, so a name added out of order reads as one line.
+        let mut sorted = Operation::ALL_NAMES.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(Operation::ALL_NAMES, sorted.as_slice());
+        sorted.dedup();
+        assert_eq!(sorted.len(), Operation::ALL_NAMES.len());
+    }
+
     #[test]
     fn expression_evaluation_never_reparses_expanded_text() {
         let expression = expression(vec![
@@ -1502,7 +2264,9 @@ mod tests {
         ]);
         let arguments = BTreeMap::from([("name".into(), "-${SECOND}".into())]);
         assert_eq!(
-            expression.evaluate(&variables, &arguments).unwrap(),
+            expression
+                .evaluate(&variables, &arguments, UnsetPolicy::Empty)
+                .unwrap(),
             "$SECOND-${SECOND}"
         );
     }
@@ -1510,10 +2274,26 @@ mod tests {
     #[test]
     fn deterministic_node_id_has_a_fixed_vector() {
         assert_eq!(
-            node_id("scripts/build.sh", 12, 34, "exec", 5).unwrap(),
+            node_id(NodeIdArgs {
+                normalized_path: "scripts/build.sh",
+                start_byte: 12,
+                end_byte: 34,
+                operation: "exec",
+                preorder: 5,
+            })
+            .unwrap(),
             "680482a635998b2ac7bb4bd0782fb5a8"
         );
-        assert!(node_id("scripts/../escape.sh", 0, 1, "exec", 0).is_err());
+        assert!(
+            node_id(NodeIdArgs {
+                normalized_path: "scripts/../escape.sh",
+                start_byte: 0,
+                end_byte: 1,
+                operation: "exec",
+                preorder: 0,
+            })
+            .is_err()
+        );
     }
 
     #[test]
@@ -1577,13 +2357,13 @@ mod tests {
         assert_eq!(Plan::decode(&encoded).unwrap(), plan);
 
         let ValueType::Secret { secret } = &mut plan.tasks[0].inputs[0].value_type else {
-            unreachable!()
+            panic!("expected secret value type")
         };
         let ValueType::List { list } = secret.as_mut() else {
-            unreachable!()
+            panic!("expected list value type")
         };
         let ValueType::Record { record } = list.as_mut() else {
-            unreachable!()
+            panic!("expected record value type")
         };
         record.push(record[0].clone());
         assert!(
@@ -1702,6 +2482,7 @@ mod tests {
                     length: 16,
                 }),
             ],
+            on_failure: crate::ir::SequenceFailure::Continue,
         });
         plan.assign_node_ids().unwrap();
         let encoded = plan.encode_pretty().unwrap();
@@ -1772,7 +2553,14 @@ mod tests {
             ("build.sh", 0, 1, "", "operation name"),
             ("build.sh", 0, 1, "Exec", "operation name"),
         ] {
-            let error = node_id(path, start, end, operation, 0).unwrap_err();
+            let error = node_id(NodeIdArgs {
+                normalized_path: path,
+                start_byte: start,
+                end_byte: end,
+                operation,
+                preorder: 0,
+            })
+            .unwrap_err();
             assert!(error.contains(expected), "unexpected {error:?}");
         }
 
@@ -1824,19 +2612,42 @@ mod tests {
             literal_value(&expression(vec![TextPart::Variable { name: "A".into() }])),
             None
         );
+        // An undefined expansion is an empty string in the shell and an error only
+        // under `set -u`. de-shell used to fail either way, which made it stricter
+        // than the source it claims equivalence with.
+        assert_eq!(
+            expression(vec![TextPart::Variable {
+                name: "MISSING".into()
+            }])
+            .evaluate(&BTreeMap::new(), &BTreeMap::new(), UnsetPolicy::Empty)
+            .unwrap(),
+            ""
+        );
         assert!(
             expression(vec![TextPart::Variable {
                 name: "MISSING".into()
             }])
-            .evaluate(&BTreeMap::new(), &BTreeMap::new())
+            .evaluate(&BTreeMap::new(), &BTreeMap::new(), UnsetPolicy::Refuse)
             .unwrap_err()
             .contains("runtime variable")
+        );
+        // `${MISSING:-fallback}` is what `set -u` excepts, so it stays defined
+        // under either policy.
+        assert_eq!(
+            expression(vec![TextPart::DefaultValue {
+                name: "MISSING".into(),
+                fallback: "fallback".into(),
+                empty_is_unset: true,
+            }])
+            .evaluate(&BTreeMap::new(), &BTreeMap::new(), UnsetPolicy::Refuse)
+            .unwrap(),
+            "fallback"
         );
         assert!(
             expression(vec![TextPart::Argument {
                 name: "missing".into()
             }])
-            .evaluate(&BTreeMap::new(), &BTreeMap::new())
+            .evaluate(&BTreeMap::new(), &BTreeMap::new(), UnsetPolicy::Empty)
             .unwrap_err()
             .contains("task argument")
         );
@@ -2053,7 +2864,7 @@ mod tests {
                 interpreter: "sh".into(),
                 interpreter_pin: format!("sha256:{}", "a".repeat(64)),
                 source: SourceBytes::from_bytes(b"true"),
-                source_span: source_span.clone(),
+                source_span,
                 capabilities: vec![],
                 reason: "pinned".into(),
             })
@@ -2132,7 +2943,10 @@ mod tests {
                     status: PipelineStatus::Last,
                 }),
                 native(Operation::Parallel { nodes: vec![] }),
-                native(Operation::Sequence { nodes: vec![] }),
+                native(Operation::Sequence {
+                    nodes: vec![],
+                    on_failure: SequenceFailure::Continue,
+                }),
                 native(Operation::Condition {
                     predicate: Box::new(exec()),
                     if_true: Box::new(exec()),
@@ -2142,11 +2956,11 @@ mod tests {
                     value: invalid_expression(),
                     cases: vec![
                         MatchCase {
-                            pattern: TextExpression::literal("same"),
+                            pattern: crate::ir::PatternExpression::literal("same"),
                             body: exec(),
                         },
                         MatchCase {
-                            pattern: TextExpression::literal("same"),
+                            pattern: crate::ir::PatternExpression::literal("same"),
                             body: exec(),
                         },
                     ],
@@ -2192,9 +3006,11 @@ mod tests {
                 native(Operation::TaskCall {
                     task: String::new(),
                     arguments: vec![],
+                    positional: vec![],
                 }),
                 native(Operation::TaskCall {
                     task: "missing".into(),
+                    positional: vec![],
                     arguments: vec![
                         NamedExpression {
                             name: "arg".into(),
@@ -2296,6 +3112,7 @@ mod tests {
                 invalid_interpreter_guarantee,
                 invalid_capsule_guarantee,
             ],
+            on_failure: crate::ir::SequenceFailure::Continue,
         });
         let mut worker = Task {
             name: "worker".into(),
@@ -2308,19 +3125,21 @@ mod tests {
             secrets: vec![],
             platform_capabilities: vec![],
             cacheable: false,
+            nounset: false,
             invocation: None,
             body: exec(),
         };
-        if let Operation::Sequence { nodes } = &mut plan.tasks[0].body.operation {
+        if let Operation::Sequence { nodes, .. } = &mut plan.tasks[0].body.operation {
             nodes.push(native(Operation::TaskCall {
                 task: "worker".into(),
                 arguments: vec![NamedExpression {
                     name: "unknown".into(),
                     value: TextExpression::literal("value"),
                 }],
+                positional: vec![],
             }));
         } else {
-            unreachable!()
+            panic!("expected sequence body")
         }
         worker.body = exec();
         plan.tasks.push(worker);

@@ -31,7 +31,14 @@ highlight = "all"
 workspace-default-features = "allow"
 external-default-features = "allow"
 allow = []
-deny = []
+# RUSTSEC-2026-0173: proc-macro-error2 is unmaintained and has no patched release.
+# It entered the graph only through the nu-* crates that the Nushell adapter used
+# to link (removed in dcba51b). Relinking any nu-* crate would silently restore the
+# advisory, so the reintroduction is rejected mechanically instead of by review.
+deny = [
+  { crate = "proc-macro-error", reason = "unmaintained; reintroduces RUSTSEC-2026-0173 (see also proc-macro-error2)" },
+  { crate = "proc-macro-error2", reason = "unmaintained, no patched release; RUSTSEC-2026-0173. Nushell parsing is delegated to a pinned `nu` executable instead of linking nu-* crates" },
+]
 skip = []
 skip-tree = []
 

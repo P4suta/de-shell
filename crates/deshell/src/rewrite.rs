@@ -33,10 +33,12 @@ pub(crate) fn equivalent(path: &str, source: &str) -> RewriteResult {
             state = QuoteState::Normal;
             continue;
         }
-        let character = source[index..]
-            .chars()
-            .next()
-            .expect("valid UTF-8 boundary");
+        let Some(character) = source.get(index..).and_then(|rest| rest.chars().next()) else {
+            return RewriteResult {
+                output: source.to_owned(),
+                edits: Vec::new(),
+            };
+        };
         let width = character.len_utf8();
         match (state, character) {
             (QuoteState::Single, '\'') => {
@@ -52,7 +54,13 @@ pub(crate) fn equivalent(path: &str, source: &str) -> RewriteResult {
                 output.push(character);
                 index += width;
                 if index < source.len() {
-                    let escaped = source[index..].chars().next().unwrap();
+                    let Some(escaped) = source.get(index..).and_then(|rest| rest.chars().next())
+                    else {
+                        return RewriteResult {
+                            output: source.to_owned(),
+                            edits: Vec::new(),
+                        };
+                    };
                     output.push(escaped);
                     index += escaped.len_utf8();
                 }
@@ -261,7 +269,10 @@ fn heredoc_delimiters(line: &str) -> Vec<(String, bool)> {
                 } else if value.is_ascii() {
                     delimiter.push(value as char);
                 } else {
-                    let character = line[index..].chars().next().expect("UTF-8 line");
+                    let Some(character) = line.get(index..).and_then(|rest| rest.chars().next())
+                    else {
+                        break;
+                    };
                     delimiter.push(character);
                     index += character.len_utf8() - 1;
                 }

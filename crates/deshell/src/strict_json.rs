@@ -159,7 +159,7 @@ impl<'de> Visitor<'de> for StrictValueVisitor {
         E: de::Error,
     {
         let signed = i64::try_from(value)
-            .map_err(|_| E::custom("JSON integer is outside signed 64-bit range"))?;
+            .map_err(|_error| E::custom("JSON integer is outside signed 64-bit range"))?;
         Ok(StrictValue(Value::Number(signed.into())))
     }
 

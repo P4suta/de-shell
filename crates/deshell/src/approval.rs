@@ -7,8 +7,20 @@ const ZERO_PINNED_DIGEST: &str =
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum Subject {
-    Scenario { name: String, path: String },
-    Matrix { id: String },
+    Scenario {
+        name: String,
+        path: String,
+    },
+    Matrix {
+        id: String,
+    },
+    /// A shell location declared to stay. Identified by its exact span, so a
+    /// declaration cannot drift onto shell added later.
+    DeclaredShell {
+        path: String,
+        start_byte: u64,
+        end_byte: u64,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -26,6 +38,21 @@ pub(crate) enum ReviewStatus {
     Draft,
     Approved,
     Stale,
+}
+
+impl ReviewStatus {
+    /// Whether the review stands: approved, and not left behind by a change to
+    /// what it approved.
+    ///
+    /// A method rather than `== ReviewStatus::Approved` at each site: `==` is
+    /// outside the exhaustiveness check a `match` gets, so a status added later
+    /// compiles everywhere and answers "no" everywhere.
+    pub(crate) fn is_current(self) -> bool {
+        match self {
+            Self::Approved => true,
+            Self::Draft | Self::Stale => false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -68,6 +95,19 @@ impl Approval {
             Subject::Matrix { id } => {
                 if !portable_id(id) {
                     return Err("approval matrix id is not portable".into());
+                }
+            }
+            Subject::DeclaredShell {
+                path,
+                start_byte,
+                end_byte,
+            } => {
+                let normalized = crate::ir::normalize_path(path)?;
+                if normalized != *path {
+                    return Err("approval declared shell path is not canonical".into());
+                }
+                if end_byte <= start_byte {
+                    return Err("approval declared shell span must be non-empty and ordered".into());
                 }
             }
         }
@@ -132,6 +172,86 @@ pub(crate) fn matrix_reviews(root: &Path) -> Result<Vec<Review>, String> {
     }
     output.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(output)
+}
+
+pub(crate) fn declared_shell_reviews(root: &Path) -> Result<Vec<Review>, String> {
+    let approvals = load_approvals(root)?;
+    let config = crate::project::load_config(root).map_err(|errors| errors.join("; "))?;
+    let mut output = Vec::new();
+    for location in config.declared_shell {
+        let subject = Subject::DeclaredShell {
+            path: location.path.clone(),
+            start_byte: location.start_byte,
+            end_byte: location.end_byte,
+        };
+        let digest = declared_shell_review_digest(&location)?;
+        let (status, approval_digest) = review_state(
+            &approvals,
+            &subject,
+            &digest,
+            cfg!(test) && location.approval == crate::config::Approval::Approved,
+        )?;
+        output.push(Review {
+            kind: "declared".into(),
+            name: declared_shell_name(&location.path, location.start_byte, location.end_byte),
+            path: Some(location.path),
+            digest,
+            status,
+            approval_digest,
+        });
+    }
+    output.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(output)
+}
+
+/// How a declared location is named on the command line.
+///
+/// The same `path@start..end` every other location is printed as, so a name
+/// copied out of a gate failure is the name that approves it.
+pub(crate) fn declared_shell_name(path: &str, start_byte: u64, end_byte: u64) -> String {
+    format!("{path}@{start_byte}..{end_byte}")
+}
+
+pub(crate) fn approve_declared_shell(
+    root: &Path,
+    name: &str,
+    supplied_digest: &str,
+) -> Result<Approval, String> {
+    let config = crate::project::load_config(root).map_err(|errors| errors.join("; "))?;
+    let location = config
+        .declared_shell
+        .iter()
+        .find(|location| {
+            declared_shell_name(&location.path, location.start_byte, location.end_byte) == name
+        })
+        .ok_or_else(|| format!("declared shell not found: {name}"))?;
+    persist_approval(
+        root,
+        Subject::DeclaredShell {
+            path: location.path.clone(),
+            start_byte: location.start_byte,
+            end_byte: location.end_byte,
+        },
+        declared_shell_review_digest(location)?,
+        supplied_digest,
+    )
+}
+
+/// Whether this declared location is approved as it currently reads.
+pub(crate) fn declared_shell_approval(
+    root: &Path,
+    location: &crate::config::DeclaredShell,
+) -> Result<Option<String>, String> {
+    current_approval(
+        root,
+        &Subject::DeclaredShell {
+            path: location.path.clone(),
+            start_byte: location.start_byte,
+            end_byte: location.end_byte,
+        },
+        &declared_shell_review_digest(location)?,
+        cfg!(test) && location.approval == crate::config::Approval::Approved,
+    )
 }
 
 pub(crate) fn approve_scenario(
@@ -223,7 +343,46 @@ fn current_approval(
     Ok(approval)
 }
 
+impl Subject {
+    /// What this review is about, as the trace names it.
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Scenario { .. } => "scenario",
+            Self::Matrix { .. } => "matrix",
+            Self::DeclaredShell { .. } => "declared_shell",
+        }
+    }
+}
+
+impl ReviewStatus {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Draft => "draft",
+            Self::Approved => "approved",
+            Self::Stale => "stale",
+        }
+    }
+}
+
 fn review_state(
+    approvals: &[Approval],
+    subject: &Subject,
+    digest: &str,
+    inline_approved: bool,
+) -> Result<(ReviewStatus, Option<String>), String> {
+    let decided = review_status(approvals, subject, digest, inline_approved)?;
+    // One place, because this is the only place the answer is produced. A
+    // stale approval and a missing one both come back "not current", and the
+    // difference between them is the whole question a reviewer is asking.
+    crate::trace::record(|| crate::trace::Event::ApprovalDecision {
+        subject: subject.kind().to_owned(),
+        digest: digest.to_owned(),
+        status: decided.0.name().to_owned(),
+    });
+    Ok(decided)
+}
+
+fn review_status(
     approvals: &[Approval],
     subject: &Subject,
     digest: &str,
@@ -267,54 +426,19 @@ fn persist_approval(
     let raw_digest = approval
         .approval_digest
         .strip_prefix("sha256:")
-        .expect("validated pinned digest");
+        .ok_or("approval digest lost its validated sha256 prefix")?;
     let root = canonical_root(root)?;
     let deshell = safe_existing_directory(&root.join(".deshell"))?;
     let approvals = ensure_child_directory(&deshell, "approvals")?;
     let sha256 = ensure_child_directory(&approvals, "sha256")?;
     let path = sha256.join(format!("{raw_digest}.json"));
     let bytes = pretty_bytes(&approval)?;
-    match path.symlink_metadata() {
-        Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {
-            let current = std::fs::read(&path)
-                .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-            if current != bytes {
-                return Err(format!(
-                    "content-addressed approval differs at {}",
-                    path.display()
-                ));
-            }
-        }
-        Ok(_) => {
-            return Err(format!(
-                "approval target is not a regular file: {}",
-                path.display()
-            ));
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let proposal = crate::patch::prepare_create(&path, bytes, 0o644)?;
-            if let Err(error) = crate::patch::apply_all(&[proposal]) {
-                let mut matched_concurrent_write = false;
-                for _ in 0..32 {
-                    match std::fs::read(&path) {
-                        Ok(current) if current == pretty_bytes(&approval)? => {
-                            matched_concurrent_write = true;
-                            break;
-                        }
-                        Ok(_) => break,
-                        Err(read_error) if read_error.kind() == std::io::ErrorKind::NotFound => {
-                            std::thread::yield_now();
-                        }
-                        Err(_) => break,
-                    }
-                }
-                if !matched_concurrent_write {
-                    return Err(error);
-                }
-            }
-        }
-        Err(error) => return Err(format!("cannot inspect {}: {error}", path.display())),
-    }
+    // The path is `<approval digest>.json`, so any writer that reached it wrote
+    // these same bytes. Declaring that intent lets the patch layer settle the race
+    // once; this function cannot re-check the path and therefore cannot reintroduce
+    // the time-of-check/time-of-use window that made concurrent approval fail.
+    let proposal = crate::patch::prepare_create_idempotent(&path, bytes, 0o644)?;
+    crate::patch::apply_all(&[proposal])?;
     Ok(approval)
 }
 
@@ -356,7 +480,7 @@ fn load_scenarios(root: &Path) -> Result<Vec<(String, crate::config::Scenario)>,
             crate::config::Scenario::decode(&input).map_err(|errors| errors.join("; "))?;
         let relative = path
             .strip_prefix(&root)
-            .map_err(|_| "scenario escaped project root".to_owned())?
+            .map_err(|_error| "scenario escaped project root".to_owned())?
             .to_str()
             .ok_or("scenario path is not UTF-8")?
             .replace('\\', "/");
@@ -367,18 +491,21 @@ fn load_scenarios(root: &Path) -> Result<Vec<(String, crate::config::Scenario)>,
 
 fn load_approvals(root: &Path) -> Result<Vec<Approval>, String> {
     let root = canonical_root(root)?;
-    let directory = root.join(".deshell/approvals/sha256");
-    let metadata = match directory.symlink_metadata() {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(format!("cannot inspect {}: {error}", directory.display())),
-        Ok(metadata) => metadata,
+    // Inspect every component independently. Windows reports `NotFound` for a
+    // descendant of a regular file, while Unix reports `NotADirectory`; looking
+    // only at the leaf would therefore mistake an unsafe approval parent for an
+    // absent approval store on one platform.
+    let Some(deshell) = optional_approval_directory(&root, ".deshell", "approval root")? else {
+        return Ok(Vec::new());
     };
-    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
-        return Err(format!(
-            "approval directory is unsafe: {}",
-            directory.display()
-        ));
-    }
+    let Some(approvals) = optional_approval_directory(&deshell, "approvals", "approval parent")?
+    else {
+        return Ok(Vec::new());
+    };
+    let Some(directory) = optional_approval_directory(&approvals, "sha256", "approval directory")?
+    else {
+        return Ok(Vec::new());
+    };
     let mut paths = std::fs::read_dir(&directory)
         .map_err(|error| format!("cannot read {}: {error}", directory.display()))?
         .map(|entry| {
@@ -404,13 +531,11 @@ fn load_approvals(root: &Path) -> Result<Vec<Approval>, String> {
                 .map_err(|error| format!("cannot read {}: {error}", path.display()))?,
         )?;
         approval.validate()?;
-        let expected = format!(
-            "{}.json",
-            approval
-                .approval_digest
-                .strip_prefix("sha256:")
-                .expect("validated approval digest")
-        );
+        let raw_digest = approval
+            .approval_digest
+            .strip_prefix("sha256:")
+            .ok_or("approval digest lost its validated sha256 prefix")?;
+        let expected = format!("{}.json", raw_digest);
         if path.file_name().and_then(|value| value.to_str()) != Some(expected.as_str()) {
             return Err(format!(
                 "approval filename does not match digest: {}",
@@ -422,6 +547,28 @@ fn load_approvals(root: &Path) -> Result<Vec<Approval>, String> {
     Ok(output)
 }
 
+fn optional_approval_directory(
+    parent: &Path,
+    name: &str,
+    label: &str,
+) -> Result<Option<PathBuf>, String> {
+    let path = parent.join(name);
+    let metadata = match path.symlink_metadata() {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "cannot inspect {label} {}: {error}",
+                path.display()
+            ));
+        }
+        Ok(metadata) => metadata,
+    };
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+        return Err(format!("{label} is unsafe: {}", path.display()));
+    }
+    Ok(Some(path))
+}
+
 fn scenario_review_digest(
     path: &str,
     scenario: &crate::config::Scenario,
@@ -430,6 +577,14 @@ fn scenario_review_digest(
         "contract": "deshell-scenario-review-v1",
         "path": path,
         "scenario": scenario,
+    });
+    Ok(format!("sha256:{}", canonical_value_digest(&value)?))
+}
+
+fn declared_shell_review_digest(location: &crate::config::DeclaredShell) -> Result<String, String> {
+    let value = serde_json::json!({
+        "contract": "deshell-declared-shell-review-v1",
+        "location": location,
     });
     Ok(format!("sha256:{}", canonical_value_digest(&value)?))
 }
@@ -485,21 +640,16 @@ fn safe_existing_directory(path: &Path) -> Result<PathBuf, String> {
 
 fn ensure_child_directory(parent: &Path, name: &str) -> Result<PathBuf, String> {
     let path = parent.join(name);
-    match path.symlink_metadata() {
-        Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
+    match crate::patch::ensure_directory(&path) {
+        Ok(crate::patch::DirectoryState::Created | crate::patch::DirectoryState::Existing) => {
             Ok(path)
         }
-        Ok(_) => Err(format!("path is not a safe directory: {}", path.display())),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            match std::fs::create_dir(&path) {
-                Ok(()) => Ok(path),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    safe_existing_directory(&path)
-                }
-                Err(error) => Err(format!("cannot create {}: {error}", path.display())),
-            }
+        Err(crate::patch::DirectoryError::Occupied) => {
+            Err(format!("path is not a safe directory: {}", path.display()))
         }
-        Err(error) => Err(format!("cannot inspect {}: {error}", path.display())),
+        Err(crate::patch::DirectoryError::Io(error)) => {
+            Err(format!("cannot create {}: {error}", path.display()))
+        }
     }
 }
 
@@ -512,7 +662,173 @@ fn portable_id(value: &str) -> bool {
 }
 
 #[cfg(test)]
+// Tests reach for the raw APIs on purpose: they stage corrupt trees, race two
+// writers against one path, and assert on what the transactional layer does with
+// the result. Constructing those situations is precisely what the production ban
+// exists to prevent, so the ban is lifted here and nowhere else.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "tests construct the races and corrupt trees the production ban prevents"
+)]
 mod tests {
+
+    /// Every way a stored approval can be wrong is a way it is refused.
+    ///
+    /// `Approval::validate` is what makes an approval artifact trustworthy: it
+    /// is read back from `.deshell/approvals/sha256/`, which is a directory on
+    /// disk that anything can write to. Mutation testing replaced the whole
+    /// function with `Ok(())` and the suite passed, so the checks below were
+    /// load-bearing for nothing.
+    ///
+    /// Each case changes one thing about an approval that is otherwise valid,
+    /// and names the refusal it should produce.
+    #[test]
+    fn a_stored_approval_is_refused_for_each_way_it_can_be_wrong() {
+        let scenario = || Subject::Scenario {
+            name: "default".into(),
+            path: ".deshell/scenarios/default.toml".into(),
+        };
+        let signed = |subject: Subject| {
+            signed_approval(subject, format!("sha256:{}", "a".repeat(64))).unwrap()
+        };
+        let refusal = |approval: Approval| {
+            approval
+                .validate()
+                .expect_err("this approval must be refused")
+        };
+
+        // The one that is right, so a refusal below is about the change and not
+        // about the shape.
+        signed(scenario()).validate().expect("a signed approval");
+
+        let mut wrong = signed(scenario());
+        wrong.schema_version = 2;
+        assert!(refusal(wrong).contains("schema_version must be 1"));
+
+        // A digest that is not a pinned sha256, on either side. The `||` between
+        // the two checks was mutated to `&&` and nothing noticed, so both sides
+        // are named here.
+        for (approval_digest, subject_digest) in [
+            ("sha256:short", format!("sha256:{}", "a".repeat(64))),
+            (
+                &"a".repeat(64) as &str,
+                format!("sha256:{}", "a".repeat(64)),
+            ),
+            (&format!("sha256:{}", "a".repeat(64)), "sha256:short".into()),
+            (&format!("sha256:{}", "a".repeat(64)), "a".repeat(64)),
+            // Uppercase hex is not the canonical form.
+            (
+                &format!("sha256:{}", "A".repeat(64)),
+                format!("sha256:{}", "a".repeat(64)),
+            ),
+        ] {
+            let mut wrong = signed(scenario());
+            wrong.approval_digest = approval_digest.to_owned();
+            wrong.subject_digest = subject_digest.clone();
+            assert!(
+                refusal(wrong).contains("digests must use sha256:"),
+                "{approval_digest} {subject_digest:?}"
+            );
+        }
+
+        let mut wrong = signed(scenario());
+        wrong.subject = Subject::Scenario {
+            name: "   ".into(),
+            path: ".deshell/scenarios/default.toml".into(),
+        };
+        assert!(refusal(wrong).contains("scenario name must not be empty"));
+
+        // A path that normalizes to something else, and one that normalizes to
+        // itself but is not under the scenario directory. The `||` between those
+        // two checks was mutated to `&&` and nothing noticed either.
+        for path in [
+            ".deshell/scenarios/../scenarios/default.toml",
+            "scenarios/default.toml",
+            ".deshell/default.toml",
+        ] {
+            let mut wrong = signed(scenario());
+            wrong.subject = Subject::Scenario {
+                name: "default".into(),
+                path: path.into(),
+            };
+            let message = wrong.validate().expect_err("this path must be refused");
+            assert!(
+                message.contains("scenario path is not canonical") || message.contains("path"),
+                "{path}: {message}"
+            );
+        }
+
+        let mut wrong = signed(scenario());
+        wrong.subject = Subject::Matrix {
+            id: "not a portable id".into(),
+        };
+        assert!(refusal(wrong).contains("matrix id is not portable"));
+
+        let mut wrong = signed(scenario());
+        wrong.subject = Subject::DeclaredShell {
+            path: "./scripts/build.sh".into(),
+            start_byte: 0,
+            end_byte: 4,
+        };
+        assert!(
+            wrong
+                .validate()
+                .expect_err("a non-canonical path must be refused")
+                .contains("path")
+        );
+
+        // An empty span names nothing, and a reversed one names it backwards.
+        for (start_byte, end_byte) in [(4, 4), (9, 4)] {
+            let mut wrong = signed(scenario());
+            wrong.subject = Subject::DeclaredShell {
+                path: "scripts/build.sh".into(),
+                start_byte,
+                end_byte,
+            };
+            assert!(
+                refusal(wrong).contains("span must be non-empty and ordered"),
+                "{start_byte}..{end_byte}"
+            );
+        }
+
+        // The signature itself: every field above is inside the digest, so
+        // changing any of them without re-signing must be caught here even when
+        // the changed value is otherwise valid.
+        let mut wrong = signed(scenario());
+        wrong.subject_digest = format!("sha256:{}", "b".repeat(64));
+        assert!(refusal(wrong).contains("does not match its canonical content"));
+
+        let mut wrong = signed(scenario());
+        wrong.subject = Subject::Scenario {
+            name: "other".into(),
+            path: ".deshell/scenarios/other.toml".into(),
+        };
+        assert!(refusal(wrong).contains("does not match its canonical content"));
+    }
+
+    /// A declared shell is named by its exact span, so the name carries it.
+    ///
+    /// Mutation testing replaced the whole function with an empty string and
+    /// with a constant, and nothing failed — two different declarations would
+    /// then share one name, which is what identifying them by span exists to
+    /// prevent.
+    #[test]
+    fn a_declared_shell_name_carries_the_span_that_identifies_it() {
+        assert_eq!(
+            declared_shell_name("scripts/build.sh", 12, 40),
+            "scripts/build.sh@12..40"
+        );
+        // Two declarations in one file are two names.
+        assert_ne!(
+            declared_shell_name("a.ps1", 0, 10),
+            declared_shell_name("a.ps1", 10, 20)
+        );
+        // And the same span in two files is two names.
+        assert_ne!(
+            declared_shell_name("a.ps1", 0, 10),
+            declared_shell_name("b.ps1", 0, 10)
+        );
+    }
     use super::*;
 
     fn initialized_project() -> tempfile::TempDir {
@@ -532,6 +848,228 @@ mod tests {
     }
 
     #[test]
+    fn draft_inline_reviews_do_not_become_current_without_an_artifact() {
+        let directory = initialized_project();
+        let root = directory.path();
+
+        let (path, scenario) = load_scenarios(root).unwrap().remove(0);
+        assert_eq!(scenario.approval, crate::config::ScenarioApproval::Draft);
+        assert_eq!(scenario_approval(root, &path, &scenario).unwrap(), None);
+
+        let config = crate::project::load_config(root).unwrap();
+        let cell = config.platform_cells.first().unwrap();
+        assert_eq!(cell.approval, crate::config::Approval::Draft);
+        assert_eq!(matrix_approval(root, cell).unwrap(), None);
+
+        let mut location = crate::config::DeclaredShell {
+            path: "scripts/build.sh".into(),
+            start_byte: 10,
+            end_byte: 20,
+            reason: "fixture".into(),
+            approval: crate::config::Approval::Draft,
+        };
+        assert_eq!(declared_shell_approval(root, &location).unwrap(), None);
+
+        location.approval = crate::config::Approval::Approved;
+        let subject = Subject::DeclaredShell {
+            path: location.path.clone(),
+            start_byte: location.start_byte,
+            end_byte: location.end_byte,
+        };
+        let expected = signed_approval(subject, declared_shell_review_digest(&location).unwrap())
+            .unwrap()
+            .approval_digest;
+        assert_eq!(
+            declared_shell_approval(root, &location).unwrap(),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn review_status_and_declared_shell_helpers_name_every_current_state() {
+        assert!(!ReviewStatus::Draft.is_current());
+        assert!(ReviewStatus::Approved.is_current());
+        assert!(!ReviewStatus::Stale.is_current());
+
+        let directory = initialized_project();
+        let root = directory.path();
+        let config_path = root.join(".deshell/project.toml");
+        let mut config = std::fs::read_to_string(&config_path).unwrap();
+        config.push_str(
+            "\n[[declared_shell]]\npath = \"build.sh\"\nstart_byte = 0\nend_byte = 4\nreason = \"fixture\"\napproval = \"draft\"\n",
+        );
+        std::fs::write(config_path, config).unwrap();
+
+        let reviews = declared_shell_reviews(root).unwrap();
+        assert_eq!(reviews.len(), 1);
+        let review = &reviews[0];
+        assert_eq!(review.kind, "declared");
+        assert_eq!(review.name, "build.sh@0..4");
+        assert_eq!(review.path.as_deref(), Some("build.sh"));
+        assert_eq!(review.status, ReviewStatus::Draft);
+        assert_eq!(review.approval_digest, None);
+
+        let approval = approve_declared_shell(root, &review.name, &review.digest).unwrap();
+        assert_eq!(
+            approval.subject,
+            Subject::DeclaredShell {
+                path: "build.sh".into(),
+                start_byte: 0,
+                end_byte: 4,
+            }
+        );
+        let approved = declared_shell_reviews(root).unwrap();
+        assert_eq!(approved.len(), 1);
+        assert_eq!(approved[0].status, ReviewStatus::Approved);
+        assert_eq!(
+            approved[0].approval_digest.as_deref(),
+            Some(approval.approval_digest.as_str())
+        );
+    }
+
+    #[test]
+    fn approval_decision_trace_names_every_subject_and_status() {
+        let scenario = Subject::Scenario {
+            name: "scenario".into(),
+            path: ".deshell/scenarios/scenario.toml".into(),
+        };
+        let matrix = Subject::Matrix {
+            id: "linux-x86_64-native".into(),
+        };
+        let declared = Subject::DeclaredShell {
+            path: "scripts/build.sh".into(),
+            start_byte: 10,
+            end_byte: 20,
+        };
+        let current_digest = format!("sha256:{}", "a".repeat(64));
+        let changed_digest = format!("sha256:{}", "b".repeat(64));
+        let approvals = vec![
+            signed_approval(matrix.clone(), current_digest.clone()).unwrap(),
+            signed_approval(declared.clone(), current_digest.clone()).unwrap(),
+        ];
+
+        let trace = crate::trace::testing::recorded(|| {
+            assert_eq!(
+                review_state(&approvals, &scenario, &current_digest, false)
+                    .unwrap()
+                    .0,
+                ReviewStatus::Draft
+            );
+            assert_eq!(
+                review_state(&approvals, &matrix, &current_digest, false)
+                    .unwrap()
+                    .0,
+                ReviewStatus::Approved
+            );
+            assert_eq!(
+                review_state(&approvals, &declared, &changed_digest, false)
+                    .unwrap()
+                    .0,
+                ReviewStatus::Stale
+            );
+        });
+        let decisions = crate::trace::testing::events(&trace)
+            .into_iter()
+            .filter(|event| event["event"] == "approval_decision")
+            .map(|event| {
+                (
+                    event["subject"].as_str().unwrap().to_owned(),
+                    event["digest"].as_str().unwrap().to_owned(),
+                    event["status"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            decisions,
+            vec![
+                ("scenario".into(), current_digest.clone(), "draft".into()),
+                ("matrix".into(), current_digest, "approved".into()),
+                ("declared_shell".into(), changed_digest, "stale".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn approval_loaders_refuse_each_unsafe_filesystem_shape() {
+        let missing = tempfile::tempdir().unwrap();
+        assert!(load_approvals(missing.path()).unwrap().is_empty());
+
+        // A missing store is optional; an inspection failure is not. A NUL is
+        // rejected by every host filesystem before lookup, which makes this a
+        // portable observation of the non-NotFound branch rather than a Unix
+        // permissions trick.
+        let error =
+            optional_approval_directory(missing.path(), "invalid\0component", "approval parent")
+                .unwrap_err();
+        assert!(error.contains("cannot inspect approval parent"), "{error}");
+
+        let scenarios = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(scenarios.path().join(".deshell/scenarios/bad.toml")).unwrap();
+        let error = load_scenarios(scenarios.path()).unwrap_err();
+        assert!(error.contains("unsafe scenario file"), "{error}");
+
+        let broken_parent = tempfile::tempdir().unwrap();
+        std::fs::create_dir(broken_parent.path().join(".deshell")).unwrap();
+        std::fs::write(
+            broken_parent.path().join(".deshell/approvals"),
+            b"not a directory",
+        )
+        .unwrap();
+        let error = load_approvals(broken_parent.path()).unwrap_err();
+        assert!(error.contains("approval parent is unsafe"), "{error}");
+
+        let unsafe_directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(unsafe_directory.path().join(".deshell/approvals")).unwrap();
+        std::fs::write(
+            unsafe_directory.path().join(".deshell/approvals/sha256"),
+            b"not a directory",
+        )
+        .unwrap();
+        let error = load_approvals(unsafe_directory.path()).unwrap_err();
+        assert!(error.contains("approval directory is unsafe"), "{error}");
+
+        let unsafe_artifact = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(
+            unsafe_artifact
+                .path()
+                .join(".deshell/approvals/sha256/not-an-artifact.json"),
+        )
+        .unwrap();
+        let error = load_approvals(unsafe_artifact.path()).unwrap_err();
+        assert!(error.contains("approval artifact is unsafe"), "{error}");
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let error = canonical_root(file.path()).unwrap_err();
+        assert!(
+            error.contains("project root is not a regular non-symlink directory"),
+            "{error}"
+        );
+        let error = safe_existing_directory(file.path()).unwrap_err();
+        assert!(error.contains("path is not a safe directory"), "{error}");
+    }
+
+    #[test]
+    fn portable_ids_cover_every_boundary() {
+        for valid in ["a", "a.b_c-d9"] {
+            assert!(portable_id(valid), "{valid}");
+        }
+        assert!(portable_id(&"a".repeat(128)));
+
+        for invalid in [
+            String::new(),
+            "a".repeat(129),
+            "-leading".into(),
+            ".leading".into(),
+            "_leading".into(),
+            "a/slash".into(),
+            "a space".into(),
+            "non-ascii-é".into(),
+        ] {
+            assert!(!portable_id(&invalid), "{invalid:?}");
+        }
+    }
+
+    #[test]
     fn approval_requires_the_displayed_digest_and_becomes_stale_after_change() {
         let directory = initialized_project();
         let review = scenario_reviews(directory.path()).unwrap().remove(0);
@@ -544,6 +1082,11 @@ mod tests {
         assert!(!directory.path().join(".deshell/approvals").exists());
 
         let approval = approve_scenario(directory.path(), &review.name, &review.digest).unwrap();
+        let (scenario_path, scenario) = load_scenarios(directory.path()).unwrap().remove(0);
+        assert_eq!(
+            scenario_approval(directory.path(), &scenario_path, &scenario).unwrap(),
+            Some(approval.approval_digest.clone())
+        );
         assert_eq!(
             scenario_reviews(directory.path()).unwrap()[0].status,
             ReviewStatus::Approved
@@ -570,10 +1113,16 @@ mod tests {
         );
 
         let matrix = matrix_reviews(directory.path()).unwrap().remove(0);
-        approve_matrix(directory.path(), &matrix.name, &matrix.digest).unwrap();
+        let matrix_approval_record =
+            approve_matrix(directory.path(), &matrix.name, &matrix.digest).unwrap();
         assert_eq!(
             matrix_reviews(directory.path()).unwrap()[0].status,
             ReviewStatus::Approved
+        );
+        let config = crate::project::load_config(directory.path()).unwrap();
+        assert_eq!(
+            matrix_approval(directory.path(), &config.platform_cells[0]).unwrap(),
+            Some(matrix_approval_record.approval_digest)
         );
         let config_path = directory.path().join(".deshell/project.toml");
         let changed = std::fs::read_to_string(&config_path)
@@ -584,35 +1133,56 @@ mod tests {
             matrix_reviews(directory.path()).unwrap()[0].status,
             ReviewStatus::Stale
         );
+        let config = crate::project::load_config(directory.path()).unwrap();
+        assert_eq!(
+            matrix_approval(directory.path(), &config.platform_cells[0]).unwrap(),
+            None
+        );
     }
 
     #[test]
     fn identical_parallel_approval_updates_are_idempotent() {
-        let directory = initialized_project();
-        let review = scenario_reviews(directory.path()).unwrap().remove(0);
-        let root = directory.path().to_path_buf();
-        let handles = (0..8)
-            .map(|_| {
-                let root = root.clone();
-                let name = review.name.clone();
-                let digest = review.digest.clone();
-                std::thread::spawn(move || approve_scenario(&root, &name, &digest))
-            })
-            .collect::<Vec<_>>();
-        let approvals = handles
-            .into_iter()
-            .map(|handle| handle.join().unwrap().unwrap())
-            .collect::<Vec<_>>();
-        assert!(
-            approvals
-                .windows(2)
-                .all(|pair| pair[0].approval_digest == pair[1].approval_digest)
-        );
-        assert_eq!(
-            std::fs::read_dir(root.join(".deshell/approvals/sha256"))
-                .unwrap()
-                .count(),
-            1
-        );
+        // Approving the same review from several workers must converge on one
+        // immutable file. The threads are released from a barrier so they contend
+        // for the same instant rather than drifting apart, and several rounds run
+        // so a pass is evidence rather than luck: the defect this covers survived
+        // because the suite ran under `--test-threads=1`, where the racing writer
+        // never existed.
+        const WORKERS: usize = 64;
+        const ROUNDS: usize = 8;
+
+        for _ in 0..ROUNDS {
+            let directory = initialized_project();
+            let review = scenario_reviews(directory.path()).unwrap().remove(0);
+            let root = directory.path().to_path_buf();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(WORKERS));
+            let handles = (0..WORKERS)
+                .map(|_| {
+                    let root = root.clone();
+                    let name = review.name.clone();
+                    let digest = review.digest.clone();
+                    let barrier = std::sync::Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        approve_scenario(&root, &name, &digest)
+                    })
+                })
+                .collect::<Vec<_>>();
+            let approvals = handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap().unwrap())
+                .collect::<Vec<_>>();
+            assert!(
+                approvals
+                    .windows(2)
+                    .all(|pair| pair[0].approval_digest == pair[1].approval_digest)
+            );
+            assert_eq!(
+                std::fs::read_dir(root.join(".deshell/approvals/sha256"))
+                    .unwrap()
+                    .count(),
+                1
+            );
+        }
     }
 }

@@ -168,7 +168,7 @@ pub(crate) fn plan(root: &Path) -> Result<PlanOutput, String> {
     let mut blockers = Vec::new();
     let mut diffs = Vec::new();
     for finding in findings {
-        if finding.kind != crate::scanner::FindingKind::ShellFile {
+        if !finding.kind.is_a_shell_file() {
             blockers.push(HardenBlocker {
                 code: "DESHELL_HARDEN_STRUCTURED_REVIEW_REQUIRED".into(),
                 message: "embedded or dynamic shell hardening requires a structured host proposal"
@@ -179,7 +179,7 @@ pub(crate) fn plan(root: &Path) -> Result<PlanOutput, String> {
             });
             continue;
         }
-        let source = String::from_utf8(finding.source.clone()).map_err(|_| {
+        let source = String::from_utf8(finding.source.clone()).map_err(|_error| {
             format!(
                 "DESHELL_HARDEN_UNSUPPORTED_ENCODING: {} is not UTF-8",
                 finding.path
@@ -207,12 +207,16 @@ pub(crate) fn plan(root: &Path) -> Result<PlanOutput, String> {
             .interpreter
             .as_deref()
             .ok_or_else(|| format!("DESHELL_HARDEN_INTERPRETER_REQUIRED: {}", finding.path))?;
-        let mut lowered = crate::frontend::lower_with_interpreter(
-            &finding.path,
-            result.output.as_bytes(),
-            config.policy.unknown_interpreter.clone(),
-            interpreter,
-        )?;
+        let mut lowered =
+            crate::frontend::lower_with_interpreter(crate::frontend::LowerWithInterpreterArgs {
+                path: &finding.path,
+                source: result.output.as_bytes(),
+                unknown_policy: config.policy.unknown_interpreter,
+                configured: interpreter,
+                host: crate::frontend::HostShell {
+                    named: finding.host_named_the_shell,
+                },
+            })?;
         crate::frontend::bind_interpreter_pins(&mut lowered, &lock.interpreters)?;
         let rules = result
             .edits
@@ -273,7 +277,7 @@ pub(crate) fn plan(root: &Path) -> Result<PlanOutput, String> {
     Ok(PlanOutput {
         digest: harden_plan.plan_digest.clone(),
         diff,
-        blockers: harden_plan.blockers.clone(),
+        blockers: harden_plan.blockers,
         approval_path,
     })
 }
@@ -293,7 +297,7 @@ pub(crate) fn verify(root: &Path, digest: &str) -> Result<HardenEvidence, String
     if plan.changes.is_empty() {
         return Err("DESHELL_HARDEN_NO_CHANGES: plan contains no hardening proposal".into());
     }
-    let (approval, approval_digest) = load_approved(root, &plan.plan_digest)?;
+    let (_approval, approval_digest) = load_approved(root, &plan.plan_digest)?;
     validate_current_sources(root, &plan)?;
     let config = crate::project::load_config(root).map_err(|errors| errors.join("; "))?;
     ensure_validation_unchanged(&config, &plan)?;
@@ -348,7 +352,6 @@ pub(crate) fn verify(root: &Path, digest: &str) -> Result<HardenEvidence, String
             .collect(),
         validation,
     };
-    let _ = approval;
     evidence.evidence_digest = evidence.computed_digest()?;
     evidence.validate()?;
     persist_evidence(&directory, &evidence)?;
@@ -393,7 +396,7 @@ pub(crate) fn apply(root: &Path, digest: &str) -> Result<(), String> {
         plan_digest: plan.plan_digest.clone(),
         approval_digest,
         evidence_digest: evidence.evidence_digest.clone(),
-        changes: evidence.changes.clone(),
+        changes: evidence.changes,
     };
     let marker = encode_pretty(&applied)?;
     let mut patches = Vec::new();
@@ -727,13 +730,25 @@ fn ensure_child(parent: &Path, child: &str) -> Result<PathBuf, String> {
                 path.display()
             ));
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir(&path)
-            .map_err(|error| {
-                format!(
-                    "cannot create hardening directory {}: {error}",
-                    path.display()
-                )
-            })?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match crate::patch::ensure_directory(&path) {
+                Ok(
+                    crate::patch::DirectoryState::Created | crate::patch::DirectoryState::Existing,
+                ) => {}
+                Err(crate::patch::DirectoryError::Occupied) => {
+                    return Err(format!(
+                        "hardening path is not a regular directory: {}",
+                        path.display()
+                    ));
+                }
+                Err(crate::patch::DirectoryError::Io(error)) => {
+                    return Err(format!(
+                        "cannot create hardening directory {}: {error}",
+                        path.display()
+                    ));
+                }
+            }
+        }
         Err(error) => {
             return Err(format!(
                 "cannot inspect hardening directory {}: {error}",
@@ -796,7 +811,7 @@ fn file_permissions(path: &Path) -> Result<u32, String> {
     }
     #[cfg(not(unix))]
     {
-        let _ = metadata;
+        let _metadata = metadata;
         Ok(0o644)
     }
 }
@@ -826,6 +841,14 @@ fn simple_diff(path: &str, before: &str, after: &str) -> String {
 }
 
 #[cfg(test)]
+// Tests reach for the raw APIs on purpose: they stage corrupt trees, race two
+// writers against one path, and assert on what the transactional layer does with
+// the result. Constructing those situations is precisely what the production ban
+// exists to prevent, so the ban is lifted here and nowhere else.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "tests construct the races and corrupt trees the production ban prevents"
+)]
 mod tests {
     use super::*;
 

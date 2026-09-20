@@ -55,13 +55,13 @@ pub(crate) trait Clock: Sync {
 }
 
 pub(crate) struct SystemClock {
-    start: std::time::Instant,
+    start: crate::host::Stopwatch,
 }
 
 impl SystemClock {
     pub(crate) fn start() -> Self {
         Self {
-            start: std::time::Instant::now(),
+            start: crate::host::Stopwatch::start(),
         }
     }
 }
@@ -89,7 +89,7 @@ struct PollBackoff {
 }
 
 impl PollBackoff {
-    fn pause(&mut self, clock: &dyn Clock, deadline: Duration) {
+    fn pause<C: Clock>(&mut self, clock: &C, deadline: Duration) {
         if self.polls < POLL_YIELDS {
             self.polls += 1;
             clock.yield_now();
@@ -203,7 +203,7 @@ pub(crate) fn execute_pipeline(
         #[cfg(unix)]
         configure_unix_limits(&mut command, limits);
 
-        let mut child = match command.spawn() {
+        let mut child = match crate::host::spawn(&mut command) {
             Ok(child) => child,
             Err(error) => {
                 terminate_children(&mut children);
@@ -233,7 +233,13 @@ pub(crate) fn execute_pipeline(
         if index + 1 == count {
             let exceeded = std::sync::Arc::clone(&exceeded);
             stdout_reader = Some(std::thread::spawn(move || {
-                read_pipe(output, "stdout", limits.stdout_bytes, &exceeded, 1)
+                read_pipe(ReadPipeArgs {
+                    pipe: output,
+                    label: "stdout",
+                    limit: limits.stdout_bytes,
+                    exceeded: &exceeded,
+                    code: 1,
+                })
             }));
         } else {
             previous_stdout = Some(output);
@@ -245,14 +251,14 @@ pub(crate) fn execute_pipeline(
         let exceeded_reader = std::sync::Arc::clone(&exceeded);
         let stderr_total_reader = std::sync::Arc::clone(&stderr_total);
         stderr_readers.push(std::thread::spawn(move || {
-            read_pipe_shared(
-                error,
-                "stderr",
-                limits.stderr_bytes,
-                &stderr_total_reader,
-                &exceeded_reader,
-                2,
-            )
+            read_pipe_shared(ReadPipeSharedArgs {
+                pipe: error,
+                label: "stderr",
+                limit: limits.stderr_bytes,
+                total: &stderr_total_reader,
+                exceeded: &exceeded_reader,
+                code: 2,
+            })
         }));
         children.push(child);
     }
@@ -297,18 +303,18 @@ pub(crate) fn execute_pipeline(
     if let Some(writer) = stdin_writer {
         writer
             .join()
-            .map_err(|_| "pipeline stdin writer panicked".to_owned())??;
+            .map_err(|_error| "pipeline stdin writer panicked".to_owned())??;
     }
     let mut stdout = stdout_reader
         .ok_or("pipeline final stdout reader is unavailable")?
         .join()
-        .map_err(|_| "pipeline stdout reader panicked".to_owned())??;
+        .map_err(|_error| "pipeline stdout reader panicked".to_owned())??;
     let mut stderrs = Vec::with_capacity(count);
     for reader in stderr_readers {
         stderrs.push(
             reader
                 .join()
-                .map_err(|_| "pipeline stderr reader panicked".to_owned())??,
+                .map_err(|_error| "pipeline stderr reader panicked".to_owned())??,
         );
     }
     let limit_exceeded = match exceeded.load(std::sync::atomic::Ordering::Acquire) {
@@ -331,7 +337,7 @@ pub(crate) fn execute_pipeline(
                 } else if limit_exceeded.is_some() {
                     1
                 } else {
-                    exit_code(&status)
+                    exit_code(status)
                 },
                 stdout: if index + 1 == count {
                     std::mem::take(&mut stdout)
@@ -341,16 +347,16 @@ pub(crate) fn execute_pipeline(
                 stderr,
                 timed_out,
                 limit_exceeded: limit_exceeded.clone(),
-                signal: exit_signal(&status),
+                signal: exit_signal(status),
             })
         })
         .collect()
 }
 
-pub(crate) fn execute_with_clock(
+pub(crate) fn execute_with_clock<C: Clock>(
     root: &Path,
     request: Request,
-    clock: &dyn Clock,
+    clock: &C,
 ) -> Result<Outcome, String> {
     if request.argv.first().is_none_or(String::is_empty) {
         return Err("process agent argv must not be empty".into());
@@ -403,8 +409,7 @@ pub(crate) fn execute_with_clock(
     }
     #[cfg(unix)]
     configure_unix_limits(&mut command, request.limits);
-    let mut child = command
-        .spawn()
+    let mut child = crate::host::spawn(&mut command)
         .map_err(|error| format!("failed to start {executable}: {error}"))?;
     let child_stdout = child
         .stdout
@@ -424,10 +429,22 @@ pub(crate) fn execute_with_clock(
     let stdout_limit = request.limits.stdout_bytes;
     let stderr_limit = request.limits.stderr_bytes;
     let stdout_reader = std::thread::spawn(move || {
-        read_pipe(child_stdout, "stdout", stdout_limit, &stdout_exceeded, 1)
+        read_pipe(ReadPipeArgs {
+            pipe: child_stdout,
+            label: "stdout",
+            limit: stdout_limit,
+            exceeded: &stdout_exceeded,
+            code: 1,
+        })
     });
     let stderr_reader = std::thread::spawn(move || {
-        read_pipe(child_stderr, "stderr", stderr_limit, &stderr_exceeded, 2)
+        read_pipe(ReadPipeArgs {
+            pipe: child_stderr,
+            label: "stderr",
+            limit: stderr_limit,
+            exceeded: &stderr_exceeded,
+            code: 2,
+        })
     });
     let input = request.stdin;
     let stdin_writer = std::thread::spawn(move || -> Result<(), String> {
@@ -467,14 +484,14 @@ pub(crate) fn execute_with_clock(
     };
     stdin_writer
         .join()
-        .map_err(|_| "process stdin writer panicked".to_owned())??;
+        .map_err(|_error| "process stdin writer panicked".to_owned())??;
     let stdout = stdout_reader
         .join()
-        .map_err(|_| "process stdout reader panicked".to_owned())??;
+        .map_err(|_error| "process stdout reader panicked".to_owned())??;
     let stderr = stderr_reader
         .join()
-        .map_err(|_| "process stderr reader panicked".to_owned())??;
-    let signal = exit_signal(&status);
+        .map_err(|_error| "process stderr reader panicked".to_owned())??;
+    let signal = exit_signal(status);
     let limit_exceeded = match exceeded.load(std::sync::atomic::Ordering::Acquire) {
         1 => Some("stdout".into()),
         2 => Some("stderr".into()),
@@ -487,7 +504,7 @@ pub(crate) fn execute_with_clock(
         } else if output_limited || limit_exceeded.is_some() {
             1
         } else {
-            exit_code(&status)
+            exit_code(status)
         },
         stdout,
         stderr,
@@ -555,7 +572,7 @@ fn valid_environment_name(name: &str) -> bool {
 
 fn add_essential_environment(command: &mut std::process::Command) {
     let toolchain = msvc_toolchain_environment();
-    add_essential_environment_with(command, |name| std::env::var_os(name), toolchain);
+    add_essential_environment_with(command, crate::host::variable, toolchain);
 }
 
 fn add_essential_environment_with(
@@ -626,7 +643,7 @@ fn discover_msvc_toolchain_environment() -> Vec<(std::ffi::OsString, std::ffi::O
         .iter()
         .find(|(name, _)| name.to_string_lossy().eq_ignore_ascii_case("PATH"))
         .map(|(_, value)| value.clone())
-        .or_else(|| std::env::var_os("PATH"))
+        .or_else(|| crate::host::variable("PATH"))
         .unwrap_or_default();
     let mut paths = tool
         .path()
@@ -658,38 +675,48 @@ fn configure_unix_limits(command: &mut std::process::Command, limits: Limits) {
     // RLIMIT_NPROC or a production-sized RLIMIT_AS there produces false
     // `cannot fork` failures. Ordinary builds still exercise these limits, and
     // disposable providers enforce their own memory and PID boundaries.
+    let apply_limits = move || {
+        let memory_limit = libc::rlimit {
+            rlim_cur: limits.memory_bytes as libc::rlim_t,
+            rlim_max: limits.memory_bytes as libc::rlim_t,
+        };
+        // SAFETY: the pointer names a fully initialized `rlimit` that remains
+        // alive for the duration of this async-signal-safe system call.
+        let memory_result = unsafe { libc::setrlimit(libc::RLIMIT_AS, &raw const memory_limit) };
+        if memory_result != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let process_limit = libc::rlimit {
+            rlim_cur: limits.processes as libc::rlim_t,
+            rlim_max: limits.processes as libc::rlim_t,
+        };
+        // SAFETY: the pointer names a fully initialized `rlimit` that remains
+        // alive for the duration of this async-signal-safe system call.
+        let process_result =
+            unsafe { libc::setrlimit(libc::RLIMIT_NPROC, &raw const process_limit) };
+        if process_result != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    };
     #[cfg(any(
         target_os = "macos",
         coverage,
         deshell_sanitizer_address,
         deshell_sanitizer_undefined
     ))]
-    let _ = limits;
-
+    let _unused_apply_limits = apply_limits;
     #[cfg(all(
         not(target_os = "macos"),
         not(coverage),
         not(deshell_sanitizer_address),
         not(deshell_sanitizer_undefined)
     ))]
+    // SAFETY: `pre_exec` installs only the async-signal-safe `setrlimit` calls
+    // above. The closure allocates nothing and touches no shared Rust state
+    // after `fork`.
     unsafe {
-        command.pre_exec(move || {
-            let memory_limit = libc::rlimit {
-                rlim_cur: limits.memory_bytes as libc::rlim_t,
-                rlim_max: limits.memory_bytes as libc::rlim_t,
-            };
-            if libc::setrlimit(libc::RLIMIT_AS, &memory_limit) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            let process_limit = libc::rlimit {
-                rlim_cur: limits.processes as libc::rlim_t,
-                rlim_max: limits.processes as libc::rlim_t,
-            };
-            if libc::setrlimit(libc::RLIMIT_NPROC, &process_limit) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
+        command.pre_exec(apply_limits);
     }
 }
 
@@ -699,13 +726,29 @@ fn terminate_children(children: &mut [std::process::Child]) {
     }
 }
 
-fn read_pipe(
-    mut pipe: impl std::io::Read,
-    label: &str,
+/// The inputs of [`read_pipe`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`read_pipe`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct ReadPipeArgs<'a, R: std::io::Read> {
+    pipe: R,
+    label: &'a str,
     limit: u64,
-    exceeded: &std::sync::atomic::AtomicU8,
+    exceeded: &'a std::sync::atomic::AtomicU8,
     code: u8,
-) -> Result<Vec<u8>, String> {
+}
+
+fn read_pipe<R: std::io::Read>(parts: ReadPipeArgs<'_, R>) -> Result<Vec<u8>, String> {
+    // Destructured without `..`: see `ReadPipeArgs`.
+    let ReadPipeArgs {
+        mut pipe,
+        label,
+        limit,
+        exceeded,
+        code,
+    } = parts;
     let mut output = Vec::new();
     let mut buffer = [0_u8; 16 * 1024];
     loop {
@@ -715,10 +758,11 @@ fn read_pipe(
         if count == 0 {
             break;
         }
-        let remaining = limit.saturating_sub(output.len() as u64) as usize;
+        let written = u64::try_from(output.len()).unwrap_or(u64::MAX);
+        let remaining = usize::try_from(limit.saturating_sub(written)).unwrap_or(usize::MAX);
         output.extend_from_slice(&buffer[..count.min(remaining)]);
         if count > remaining {
-            let _ = exceeded.compare_exchange(
+            let _first_exceeded_stream = exceeded.compare_exchange(
                 0,
                 code,
                 std::sync::atomic::Ordering::AcqRel,
@@ -730,14 +774,31 @@ fn read_pipe(
     Ok(output)
 }
 
-fn read_pipe_shared(
-    mut pipe: impl std::io::Read,
-    label: &str,
+/// The inputs of [`read_pipe_shared`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`read_pipe_shared`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct ReadPipeSharedArgs<'a, R: std::io::Read> {
+    pipe: R,
+    label: &'a str,
     limit: u64,
-    total: &std::sync::atomic::AtomicU64,
-    exceeded: &std::sync::atomic::AtomicU8,
+    total: &'a std::sync::atomic::AtomicU64,
+    exceeded: &'a std::sync::atomic::AtomicU8,
     code: u8,
-) -> Result<Vec<u8>, String> {
+}
+
+fn read_pipe_shared<R: std::io::Read>(parts: ReadPipeSharedArgs<'_, R>) -> Result<Vec<u8>, String> {
+    // Destructured without `..`: see `ReadPipeSharedArgs`.
+    let ReadPipeSharedArgs {
+        mut pipe,
+        label,
+        limit,
+        total,
+        exceeded,
+        code,
+    } = parts;
     let mut output = Vec::new();
     let mut buffer = [0_u8; 16 * 1024];
     loop {
@@ -747,11 +808,12 @@ fn read_pipe_shared(
         if count == 0 {
             break;
         }
-        let previous = total.fetch_add(count as u64, std::sync::atomic::Ordering::AcqRel);
-        let remaining = limit.saturating_sub(previous) as usize;
+        let count_u64 = u64::try_from(count).unwrap_or(u64::MAX);
+        let previous = total.fetch_add(count_u64, std::sync::atomic::Ordering::AcqRel);
+        let remaining = usize::try_from(limit.saturating_sub(previous)).unwrap_or(usize::MAX);
         output.extend_from_slice(&buffer[..count.min(remaining)]);
         if count > remaining {
-            let _ = exceeded.compare_exchange(
+            let _first_exceeded_stream = exceeded.compare_exchange(
                 0,
                 code,
                 std::sync::atomic::Ordering::AcqRel,
@@ -768,14 +830,18 @@ fn kill_process_tree(child: &mut std::process::Child) {
     {
         // The child starts in its own process group, so a negative PID kills
         // descendants as well as the direct child.
-        unsafe {
-            libc::kill(-(child.id() as i32), libc::SIGKILL);
+        if let Ok(group_leader) = libc::pid_t::try_from(child.id()) {
+            // SAFETY: `group_leader` came from a live OS child, is representable
+            // as `pid_t`, and `kill` does not retain pointers.
+            unsafe {
+                libc::kill(-group_leader, libc::SIGKILL);
+            }
         }
     }
-    let _ = child.kill();
+    let _direct_kill_result = child.kill();
 }
 
-fn exit_code(status: &std::process::ExitStatus) -> i32 {
+fn exit_code(status: std::process::ExitStatus) -> i32 {
     if let Some(code) = status.code() {
         return code;
     }
@@ -790,7 +856,7 @@ fn exit_code(status: &std::process::ExitStatus) -> i32 {
     }
 }
 
-fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
+fn exit_signal(status: std::process::ExitStatus) -> Option<i32> {
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt as _;
@@ -798,12 +864,167 @@ fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
     }
     #[cfg(not(unix))]
     {
-        let _ = status;
+        let _status = status;
         None
     }
 }
 
+/// Why a request to a long-lived agent did not produce an answer.
+///
+/// `TimedOut` is separate from the rest for the same reason `LoweringFailure`
+/// separates `Unmeasured` from `Delegate`: a budget that ran out is not an
+/// answer about the input, and treating it as one makes a guarantee depend on
+/// how busy the machine was.
+#[derive(Debug)]
+pub(crate) enum AgentError {
+    TimedOut,
+    Ended(String),
+}
+
+/// A process that stays alive across requests, one framed line each way.
+///
+/// `execute` starts a process, sends it one thing and waits for it to die. That
+/// is the right shape for running a script and the wrong one for a parser: the
+/// PowerShell adapter has always been a loop over framed requests on stdin — a
+/// long-lived agent — and de-shell started one, sent one request and let it die,
+/// so every parse paid a process start.
+///
+/// Measured on this machine: one `pwsh` start is 0.26 s, and sixteen concurrent
+/// starts are 4.6 s each, because `pwsh` here resolves through a version-manager
+/// shim that serialises. Under the test suite's parallelism that reached the
+/// parser's ten-second budget. It had always been reaching it; before budget
+/// failures stopped being delegated silently, the answer was a block marked
+/// `delegated` instead of a visible failure.
+pub(crate) struct Agent {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    lines: std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    stderr: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+}
+
+impl Agent {
+    /// Start `argv` in `directory`, with the same cleared environment every
+    /// other process here gets.
+    pub(crate) fn start(directory: &Path, argv: &[String]) -> Result<Self, String> {
+        let executable = argv
+            .first()
+            .ok_or_else(|| "agent argv must name an executable".to_owned())?;
+        let mut command = std::process::Command::new(executable);
+        command
+            .args(&argv[1..])
+            .current_dir(directory)
+            .env_clear()
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        add_essential_environment(&mut command);
+        let mut child = crate::host::spawn(&mut command)
+            .map_err(|error| format!("cannot start {executable}: {error}"))?;
+        let stdin = child.stdin.take().ok_or("agent stdin is unavailable")?;
+        let stdout = child.stdout.take().ok_or("agent stdout is unavailable")?;
+        let child_stderr = child.stderr.take().ok_or("agent stderr is unavailable")?;
+
+        // Read on a thread so a request can wait with a budget, and drain stderr
+        // on another so a talkative agent cannot fill its pipe and block.
+        let (sender, lines) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            let mut reader = std::io::BufReader::new(stdout);
+            loop {
+                let mut line = Vec::new();
+                match reader.read_until(b'\n', &mut line) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        while matches!(line.last(), Some(b'\n' | b'\r')) {
+                            line.pop();
+                        }
+                        if sender.send(Ok(line)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        let _send_result = sender.send(Err(error));
+                        break;
+                    }
+                }
+            }
+        });
+        let stderr = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let drain = std::sync::Arc::clone(&stderr);
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut reader = child_stderr;
+            let mut buffer = [0_u8; 4096];
+            while let Ok(read) = reader.read(&mut buffer) {
+                if read == 0 {
+                    break;
+                }
+                if let Ok(mut held) = drain.lock() {
+                    held.extend_from_slice(&buffer[..read]);
+                }
+            }
+        });
+        Ok(Self {
+            child,
+            stdin,
+            lines,
+            stderr,
+        })
+    }
+
+    /// Send one line and wait for one back, for at most `budget`.
+    pub(crate) fn request(&mut self, line: &[u8], budget: Duration) -> Result<Vec<u8>, AgentError> {
+        use std::io::Write;
+        self.stdin
+            .write_all(line)
+            .and_then(|()| self.stdin.write_all(b"\n"))
+            .and_then(|()| self.stdin.flush())
+            .map_err(|error| AgentError::Ended(format!("cannot write to the agent: {error}")))?;
+        match self.lines.recv_timeout(budget) {
+            Ok(Ok(line)) => Ok(line),
+            Ok(Err(error)) => Err(AgentError::Ended(format!(
+                "cannot read from the agent: {error}"
+            ))),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(AgentError::TimedOut),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Err(AgentError::Ended(self.ending()))
+            }
+        }
+    }
+
+    /// What the agent said on its way out, for a message a reader can act on.
+    fn ending(&self) -> String {
+        let stderr = self
+            .stderr
+            .lock()
+            .map(|held| String::from_utf8_lossy(&held).trim().to_owned())
+            .unwrap_or_default();
+        if stderr.is_empty() {
+            "the agent ended without answering".into()
+        } else {
+            format!("the agent ended without answering: {stderr}")
+        }
+    }
+}
+
+impl Drop for Agent {
+    fn drop(&mut self) {
+        // Closing stdin is how the adapter's read loop ends. Killing follows in
+        // case it does not, so a dropped agent never outlives the run.
+        let _kill_result = self.child.kill();
+        let _wait_result = self.child.wait();
+    }
+}
+
 #[cfg(test)]
+// Tests reach for the raw APIs on purpose: they stage corrupt trees, race two
+// writers against one path, and assert on what the transactional layer does with
+// the result. Constructing those situations is precisely what the production ban
+// exists to prevent, so the ban is lifted here and nowhere else.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "tests construct the races and corrupt trees the production ban prevents"
+)]
 mod tests {
     use super::*;
 

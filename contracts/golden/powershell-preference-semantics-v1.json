@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "contract": "powershell-preference-semantics-v1",
+  "purpose": "Pin what `$ErrorActionPreference` changes, so the frontend's decision to skip it is checked against a measurement rather than against a reading of the documentation.",
+  "note": "The frontend lowers external command invocations, assignments of literal text, and `&&` chains. `$ErrorActionPreference` reaches none of them: a failing external command does not stop the script under either setting. It reaches a cmdlet, and there it decides whether the script stops. So skipping the statement is sound exactly while every cmdlet is refused, which `a_powershell_cmdlet_is_still_refused` is what holds. A case marked `differs` is one where the setting changes the program. `__DESHELL_POSIX_*__` markers are replaced with single-quoted paths to the same POSIX utilities on each host; on Windows those are the native Git/MSYS paths, because native PowerShell has no `/bin` mount.",
+  "cases": [
+    {
+      "name": "external-command-failure-is-unaffected",
+      "body_template": "& __DESHELL_POSIX_ECHO__ one\n& __DESHELL_POSIX_FALSE__\n& __DESHELL_POSIX_ECHO__ two\n",
+      "differs": false,
+      "with_stop": {"exit": 0, "stdout": "one\ntwo\n"},
+      "without": {"exit": 0, "stdout": "one\ntwo\n"}
+    },
+    {
+      "name": "cmdlet-failure-is-what-it-reaches",
+      "body_template": "& __DESHELL_POSIX_ECHO__ one\nGet-Item /deshell/definitely/not/there\n& __DESHELL_POSIX_ECHO__ two\n",
+      "differs": true,
+      "with_stop": {"exit": 1, "stdout": "one\n"},
+      "without": {"exit": 0, "stdout": "one\ntwo\n"}
+    }
+  ]
+}

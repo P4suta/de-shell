@@ -3,6 +3,11 @@ use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+#[cfg(test)]
+use std::cell::RefCell;
+#[cfg(test)]
+use std::collections::VecDeque;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Platform {
     Linux,
@@ -83,6 +88,15 @@ pub(crate) enum LaunchSpec {
     AgentRequest(AgentRequest),
 }
 
+/// The platform, as the trace names it.
+fn platform_name(platform: Platform) -> &'static str {
+    match platform {
+        Platform::Linux => "linux",
+        Platform::Macos => "macos",
+        Platform::Windows => "windows",
+    }
+}
+
 pub(crate) fn provider_name(provider: Provider) -> &'static str {
     match provider {
         Provider::Podman => "podman",
@@ -97,13 +111,48 @@ pub(crate) fn execution_connected(provider: Provider) -> bool {
     matches!(provider, Provider::Podman | Provider::DockerRootless)
 }
 
-pub(crate) fn select(platform: Platform, probe: &dyn Probe) -> Result<Provider, String> {
+pub(crate) fn select<P: Probe>(platform: Platform, probe: &P) -> Result<Provider, String> {
+    #[cfg(test)]
+    let chosen = TEST_EXECUTION.with(|execution| {
+        execution.borrow().as_ref().map_or_else(
+            || choose(platform, probe),
+            |execution| Ok(execution.provider),
+        )
+    });
+    #[cfg(not(test))]
+    let chosen = choose(platform, probe);
+    // What the probe saw is what decided this, and a run that ends in exit 6
+    // says only that nothing was available. The record says which platform was
+    // asked and what it answered.
+    crate::trace::record(|| crate::trace::Event::ProviderSelect {
+        platform: platform_name(platform).to_owned(),
+        provider: chosen
+            .as_ref()
+            .ok()
+            .map(|provider| provider_name(*provider).to_owned()),
+    });
+    chosen
+}
+
+fn choose<P: Probe>(platform: Platform, probe: &P) -> Result<Provider, String> {
     match platform {
-        Platform::Linux if probe.command_exists("podman") => Ok(Provider::Podman),
-        Platform::Linux if probe.command_exists("docker") && probe.docker_rootless() => {
+        // The signed helper is preferred on macOS because it observes macOS as
+        // macOS. A container observes Linux, which is the right answer for a step
+        // that will run on a Linux runner and the wrong one for a script whose
+        // `/bin/sh` is bash 3.2 and whose `sed` is BSD.
+        Platform::Macos if probe.command_exists("deshell-vz-agent") => {
+            Ok(Provider::VirtualizationFramework)
+        }
+        // A `podman machine` is a Linux VM running rootless containers: the same
+        // isolation the Linux path relies on, reached the same way. Refusing it
+        // left macOS with only a helper this source tree does not contain.
+        Platform::Linux | Platform::Macos if probe.command_exists("podman") => Ok(Provider::Podman),
+        Platform::Linux | Platform::Macos
+            if probe.command_exists("docker") && probe.docker_rootless() =>
+        {
             Ok(Provider::DockerRootless)
         }
-        Platform::Linux => Err(
+        Platform::Linux | Platform::Macos => Err(
             "no supported rootless OCI runtime is available (install Podman or enable rootless Docker)"
                 .into(),
         ),
@@ -116,33 +165,52 @@ pub(crate) fn select(platform: Platform, probe: &dyn Probe) -> Result<Provider, 
         Platform::Windows => {
             Err("Windows Sandbox or Hyper-V is required for disposable observation".into())
         }
-        Platform::Macos if probe.command_exists("deshell-vz-agent") => {
-            Ok(Provider::VirtualizationFramework)
-        }
-        Platform::Macos => Err(
-            "the signed deshell-vz-agent is required for Virtualization.framework observation"
-                .into(),
-        ),
     }
 }
 
-pub(crate) fn validate_provider(
+/// Whether a *named* provider can run here.
+///
+/// Nothing names one yet: every command calls [`select`], which picks the
+/// provider from what the host has. So this validates a request that no command
+/// makes, which is the whole reason it is unconstructed outside tests — the
+/// module used to carry a blanket `expect(dead_code)` saying the code was
+/// "exercised only under specific platforms or feature gates", and that reason
+/// was false for every other item in the file and hid that exactly one thing
+/// here was dead.
+///
+/// It is kept, and tested against the same `Probe`, because the day a command
+/// takes `--provider` the check it needs must already agree with [`select`]
+/// about what each platform supports.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no command names a provider — `select` picks one — so this validates a request nothing makes yet; the tests keep it from drifting away from `select`"
+    )
+)]
+pub(crate) fn validate_provider<P: Probe>(
     platform: Platform,
-    probe: &dyn Probe,
+    probe: &P,
     provider: Provider,
 ) -> Result<(), String> {
     match (platform, provider) {
-        (Platform::Linux, Provider::Podman) if probe.command_exists("podman") => Ok(()),
-        (Platform::Linux, Provider::Podman) => {
+        (Platform::Linux | Platform::Macos, Provider::Podman) if probe.command_exists("podman") => {
+            Ok(())
+        }
+        (Platform::Linux | Platform::Macos, Provider::Podman) => {
             Err("the requested Podman executable is unavailable".into())
         }
-        (Platform::Linux, Provider::DockerRootless) if !probe.command_exists("docker") => {
+        (Platform::Linux | Platform::Macos, Provider::DockerRootless)
+            if !probe.command_exists("docker") =>
+        {
             Err("the requested Docker executable is unavailable".into())
         }
-        (Platform::Linux, Provider::DockerRootless) if !probe.docker_rootless() => {
+        (Platform::Linux | Platform::Macos, Provider::DockerRootless)
+            if !probe.docker_rootless() =>
+        {
             Err("the requested Docker daemon is not running in rootless mode".into())
         }
-        (Platform::Linux, Provider::DockerRootless) => Ok(()),
+        (Platform::Linux | Platform::Macos, Provider::DockerRootless) => Ok(()),
         (Platform::Windows, Provider::WindowsSandbox)
             if probe.feature_enabled("Containers-DisposableClientVM") =>
         {
@@ -166,7 +234,7 @@ pub(crate) fn validate_provider(
             Err("the signed deshell-vz-agent is unavailable".into())
         }
         (_, Provider::Podman | Provider::DockerRootless) => {
-            Err("the requested OCI provider is supported only on Linux".into())
+            Err("the requested OCI provider is supported only on Linux and macOS".into())
         }
         (_, Provider::WindowsSandbox | Provider::HyperV) => {
             Err("the requested provider is supported only on Windows".into())
@@ -207,10 +275,84 @@ pub(crate) struct ExecutionFailure {
     pub message: String,
 }
 
+#[cfg(test)]
+struct TestExecution {
+    provider: Provider,
+    results: VecDeque<Result<crate::runner::RunResult, ExecutionFailure>>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_EXECUTION: RefCell<Option<TestExecution>> = const { RefCell::new(None) };
+}
+
+/// Runs one synchronous command with exact disposable-provider outcomes.
+///
+/// This hook is deliberately thread-local: Rust's test runner may exercise an
+/// unrelated provider on another thread at the same time. Every supplied result
+/// must be consumed, so a test cannot accidentally pass after observing only a
+/// prefix of the interaction it intended to specify.
+#[cfg(test)]
+pub(crate) fn with_test_execution<T>(
+    provider: Provider,
+    results: Vec<Result<crate::runner::RunResult, ExecutionFailure>>,
+    action: impl FnOnce() -> T,
+) -> T {
+    struct Reset;
+
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_EXECUTION.with(|execution| {
+                execution.borrow_mut().take();
+            });
+        }
+    }
+
+    TEST_EXECUTION.with(|execution| {
+        let mut execution = execution.borrow_mut();
+        assert!(
+            execution.is_none(),
+            "test execution hook is already installed"
+        );
+        *execution = Some(TestExecution {
+            provider,
+            results: results.into(),
+        });
+    });
+    let reset = Reset;
+    let result = action();
+    TEST_EXECUTION.with(|execution| {
+        assert!(
+            execution
+                .borrow()
+                .as_ref()
+                .is_some_and(|execution| execution.results.is_empty()),
+            "test execution hook did not consume every result"
+        );
+    });
+    drop(reset);
+    result
+}
+
 pub(crate) fn execute(
     provider: Provider,
     request: &Request,
 ) -> Result<crate::runner::RunResult, ExecutionFailure> {
+    #[cfg(test)]
+    if let Some(result) = TEST_EXECUTION.with(|execution| {
+        execution.borrow_mut().as_mut().map(|execution| {
+            assert_eq!(
+                provider, execution.provider,
+                "test execution hook received the wrong provider"
+            );
+            execution
+                .results
+                .pop_front()
+                .expect("test execution hook has no result for this call")
+        })
+    }) {
+        return result;
+    }
     execute_with(provider, request, crate::agent_process::execute)
 }
 
@@ -236,7 +378,10 @@ fn execute_with(
         message,
     })?;
     let LaunchSpec::Process(specification) = specification else {
-        unreachable!("connected providers always use the supervised process transport")
+        return Err(ExecutionFailure {
+            kind: ExecutionFailureKind::Unavailable,
+            message: "connected provider did not produce a supervised process launch".into(),
+        });
     };
     let root = Path::new(&request.workspace);
     let outer_stdout = request
@@ -368,7 +513,7 @@ impl Probe for SystemProbe {
         if !cfg!(windows) {
             return false;
         }
-        let root = std::env::var_os("SystemRoot")
+        let root = crate::host::variable("SystemRoot")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
         match feature {
@@ -382,15 +527,17 @@ impl Probe for SystemProbe {
     }
 
     fn docker_rootless(&self) -> bool {
-        std::process::Command::new("docker")
-            .args(["info", "--format", "{{json .SecurityOptions}}"])
-            .output()
-            .is_ok_and(|output| {
-                output.status.success()
-                    && String::from_utf8_lossy(&output.stdout)
-                        .to_ascii_lowercase()
-                        .contains("rootless")
-            })
+        crate::host::output(std::process::Command::new("docker").args([
+            "info",
+            "--format",
+            "{{json .SecurityOptions}}",
+        ]))
+        .is_ok_and(|output| {
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout)
+                    .to_ascii_lowercase()
+                    .contains("rootless")
+        })
     }
 }
 
@@ -786,10 +933,10 @@ fn command_path(command: &str) -> Option<PathBuf> {
     if command.is_empty() || command.contains(['/', '\\', '\0']) {
         return None;
     }
-    let path = std::env::var_os("PATH")?;
+    let path = crate::host::variable("PATH")?;
     let extensions: Vec<String> = if cfg!(windows) {
-        std::env::var("PATHEXT")
-            .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into())
+        crate::host::text_variable("PATHEXT")
+            .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".into())
             .split(';')
             .map(str::to_owned)
             .collect()
@@ -842,6 +989,38 @@ mod tests {
         fn docker_rootless(&self) -> bool {
             self.rootless
         }
+    }
+
+    /// Choosing a provider, and failing to, are both recorded.
+    ///
+    /// A run that ends in exit 6 says only that nothing was available. Which
+    /// platform was asked, and what the probe found, is the part somebody
+    /// debugging it needs, and it was nowhere.
+    #[test]
+    fn selecting_a_provider_records_the_platform_and_the_answer() {
+        let recorded = |platform: Platform, probe: &FakeProbe| {
+            let text = crate::trace::testing::recorded(|| {
+                drop(select(platform, probe));
+            });
+            crate::trace::testing::events(&text)
+                .into_iter()
+                .filter(|event| event["event"] == "provider_select")
+                .map(|event| format!("{} {}", event["platform"], event["provider"]))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            recorded(Platform::Linux, &probe(&["podman"], &[], false)),
+            vec![r#""linux" "podman""#]
+        );
+        assert_eq!(
+            recorded(Platform::Macos, &probe(&["deshell-vz-agent"], &[], false)),
+            vec![r#""macos" "virtualization-framework""#]
+        );
+        // The refusal is a decision too, and the one worth recording most.
+        assert_eq!(
+            recorded(Platform::Windows, &probe(&[], &[], false)),
+            vec![r#""windows" null"#]
+        );
     }
 
     fn probe(commands: &[&'static str], features: &[&'static str], rootless: bool) -> FakeProbe {
@@ -920,6 +1099,48 @@ mod tests {
         assert!(!execution_connected(Provider::WindowsSandbox));
         assert!(!execution_connected(Provider::HyperV));
         assert!(!execution_connected(Provider::VirtualizationFramework));
+    }
+
+    #[test]
+    fn macos_uses_the_rootless_oci_runtimes_it_actually_has() {
+        // A `podman machine` is a Linux VM running rootless containers, which is
+        // the same isolation the Linux path already relies on. Refusing it here
+        // left macOS with only `deshell-vz-agent`, which this source tree does not
+        // contain, so `run` and `observe` could not succeed on the platform at all.
+        assert_eq!(
+            select(Platform::Macos, &probe(&["podman"], &[], false)).unwrap(),
+            Provider::Podman
+        );
+        assert_eq!(
+            select(Platform::Macos, &probe(&["docker"], &[], true)).unwrap(),
+            Provider::DockerRootless
+        );
+        // The signed helper still wins when it is present: it observes macOS as
+        // macOS, where a Linux container observes Linux.
+        assert_eq!(
+            select(
+                Platform::Macos,
+                &probe(&["podman", "deshell-vz-agent"], &[], false)
+            )
+            .unwrap(),
+            Provider::VirtualizationFramework
+        );
+        // Fail-closed is unchanged: nothing present is still an error, and a
+        // Docker that is not rootless is still refused.
+        assert!(select(Platform::Macos, &probe(&[], &[], false)).is_err());
+        assert!(
+            select(Platform::Macos, &probe(&["docker"], &[], false))
+                .unwrap_err()
+                .contains("rootless")
+        );
+        assert!(
+            validate_provider(
+                Platform::Macos,
+                &probe(&["podman"], &[], false),
+                Provider::Podman
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -1311,7 +1532,7 @@ mod tests {
             executable: false,
         }];
         cases.push(value);
-        let mut value = valid_plan.clone();
+        let mut value = valid_plan;
         value.network = Network::Replay {
             proxy: "".into(),
             tape: "tape".into(),

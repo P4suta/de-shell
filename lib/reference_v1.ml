@@ -17,11 +17,12 @@ type span = {
 
 type guarantee = Native of string | Delegated of string | Residual of string
 type source_bytes = Utf8 of string | Base64 of string
+type sequence_failure = Continue | Stop
 
 type operation =
   | Exec of text_expression list
   | Pipeline of { nodes : node list; status : string }
-  | Sequence of node list
+  | Sequence of { nodes : node list; on_failure : sequence_failure }
   | Set_variable of {
       name : string;
       value_type : string;
@@ -47,7 +48,7 @@ and node = {
   source : span option;
 }
 
-type lowered = { body : node; environment : string list }
+type lowered = { body : node; environment : string list; nounset : bool }
 
 type golden_case = {
   name : string;
@@ -215,11 +216,16 @@ let rec json_node preorder node =
             ("nodes", `List (List.map (json_node preorder) nodes));
             ("status", `String status);
           ]
-    | Sequence nodes ->
+    | Sequence { nodes; on_failure } ->
         `Assoc
           [
             ("type", `String "sequence");
             ("nodes", `List (List.map (json_node preorder) nodes));
+            ( "on_failure",
+              `String
+                (match on_failure with
+                | Continue -> "continue"
+                | Stop -> "stop") );
           ]
     | Set_variable { name; value_type; value } ->
         `Assoc
@@ -288,6 +294,7 @@ let json_plan lowered =
                 ("secrets", `List []);
                 ("platform_capabilities", `List []);
                 ("cacheable", `Bool false);
+                ("nounset", `Bool lowered.nounset);
                 ("invocation", `Null);
                 ("body", json_node preorder lowered.body);
               ];
@@ -546,6 +553,7 @@ let lower_posix path source interpreter =
           !environment
           |> List.filter (fun name -> not (List.mem name !locals))
           |> List.sort_uniq String.compare;
+        nounset = false;
       }
   | first :: _ ->
       let last = List.hd (List.rev nodes) in
@@ -557,7 +565,7 @@ let lower_posix path source interpreter =
       {
         body =
           {
-            operation = Sequence nodes;
+            operation = Sequence { nodes; on_failure = Continue };
             guarantee = Native (interpreter ^ "-static-sequence-v1");
             source = Some source;
           };
@@ -565,6 +573,7 @@ let lower_posix path source interpreter =
           !environment
           |> List.filter (fun name -> not (List.mem name !locals))
           |> List.sort_uniq String.compare;
+        nounset = false;
       }
 
 let rewrite_first_literal transform = function
@@ -622,6 +631,7 @@ let lower_literal path source interpreter =
         source = Some (source_span path source source_start_byte end_byte);
       };
     environment = variables argv;
+    nounset = false;
   }
 
 let interpreter path =
@@ -644,6 +654,7 @@ let residual path source source_span_value interpreter reason =
         source = source_span_value;
       };
     environment = [];
+    nounset = false;
   }
 
 let default_interpreter_pin interpreter =
@@ -667,6 +678,7 @@ let delegated path source source_span_value interpreter reason =
         source = Some source_span_value;
       };
     environment = [];
+    nounset = false;
   }
 
 let decoded_base64_length value =
@@ -718,7 +730,7 @@ let rec counts node =
     | Residual _ -> (0, 0, 1)
   in
   match node.operation with
-  | Pipeline { nodes; _ } | Sequence nodes ->
+  | Pipeline { nodes; _ } | Sequence { nodes; _ } ->
       List.fold_left
         (fun (native, delegated, residual) node ->
           let next_native, next_delegated, next_residual = counts node in
@@ -894,7 +906,7 @@ let rec literal_commands node =
                 fail "strict reference exporter received a dynamic expression")
           argv;
       ]
-  | Sequence nodes -> List.concat_map literal_commands nodes
+  | Sequence { nodes; _ } -> List.concat_map literal_commands nodes
   | Pipeline _ | Set_variable _ | Interpreter_call _ | Opaque_capsule _ ->
       fail "strict reference exporter received %s"
         (operation_name node.operation)

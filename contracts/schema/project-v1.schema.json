@@ -56,6 +56,21 @@
       },
       "type": "array"
     },
+    "declared_shell": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "approval": { "enum": ["draft", "approved"] },
+          "end_byte": { "minimum": 1, "type": "integer" },
+          "path": { "$ref": "#/$defs/path" },
+          "reason": { "minLength": 1, "type": "string" },
+          "start_byte": { "minimum": 0, "type": "integer" }
+        },
+        "required": ["path", "start_byte", "end_byte", "reason", "approval"],
+        "type": "object"
+      },
+      "type": "array"
+    },
     "limits": { "$ref": "#/$defs/resourceLimits" },
     "location_overrides": {
       "items": {

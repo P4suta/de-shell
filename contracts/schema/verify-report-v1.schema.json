@@ -140,11 +140,28 @@
           },
           "type": "array"
         },
+        "end_byte": {
+          "minimum": 1,
+          "type": "integer"
+        },
         "digest": {
           "type": "string"
         },
         "kind": {
-          "type": "string"
+          "enum": [
+            "shell_file",
+            "embedded_shell",
+            "candidate",
+            "skipped",
+            "error",
+            "failure",
+            "entrypoint",
+            "matrix_cell",
+            "not_ready",
+            "blocker",
+            "scenario",
+            "matrix"
+          ]
         },
         "message": {
           "type": "string"
@@ -154,6 +171,10 @@
         },
         "path": {
           "type": "string"
+        },
+        "start_byte": {
+          "minimum": 0,
+          "type": "integer"
         },
         "status": {
           "type": "string"

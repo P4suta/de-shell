@@ -80,19 +80,38 @@ pub(crate) fn export(
     if mode == Mode::Bundle {
         return Err("bundle export requires a project context and --output".into());
     }
-    if target == Target::Internal {
-        return Ok(Artifact {
+    match target {
+        Target::Internal => Ok(Artifact {
             filename: "plan.json".into(),
             media_type: "application/vnd.deshell.effect-ir+json".into(),
             content: plan.encode_pretty()?,
-        });
+        }),
+        Target::Dagger => {
+            let commands = strict_commands(plan)?;
+            let image = runtime_image
+                .filter(|image| crate::lab::digest_pinned(image))
+                .ok_or("strict Dagger export requires a digest-pinned target runtime from deshell.lock")?;
+            dagger(&commands, image)
+        }
+        Target::Nushell => nushell(&strict_commands(plan)?),
+        Target::Cwl => {
+            let commands = strict_commands(plan)?;
+            if commands.len() == 1 {
+                cwl(&commands[0])
+            } else {
+                Err("strict CWL CommandLineTool export requires exactly one Exec node".into())
+            }
+        }
     }
+}
+
+fn strict_commands(plan: &Plan) -> Result<Vec<Vec<String>>, String> {
     let task = plan
         .tasks
         .iter()
         .find(|task| task.name == plan.entrypoint)
         .ok_or_else(|| format!("entrypoint task not found: {}", plan.entrypoint))?;
-    let commands = if task.inputs.is_empty()
+    if task.inputs.is_empty()
         && task.outputs.is_empty()
         && task.environment.is_empty()
         && task.secrets.is_empty()
@@ -104,27 +123,12 @@ pub(crate) fn export(
             "strict exporter cannot represent task {} interface",
             task.name
         ))
-    };
-    let commands = commands?;
-    match target {
-        Target::Internal => unreachable!(),
-        Target::Dagger => {
-            let image = runtime_image
-                .filter(|image| crate::lab::digest_pinned(image))
-                .ok_or("strict Dagger export requires a digest-pinned target runtime from deshell.lock")?;
-            Ok(dagger(&commands, image))
-        }
-        Target::Nushell => Ok(nushell(&commands)),
-        Target::Cwl if commands.len() == 1 => cwl(&commands[0]),
-        Target::Cwl => {
-            Err("strict CWL CommandLineTool export requires exactly one Exec node".into())
-        }
     }
 }
 
-pub(crate) fn write_bundle(
+pub(crate) fn write_bundle<W: Write>(
     request: BundleRequest<'_>,
-    writer: &mut dyn Write,
+    writer: &mut W,
 ) -> Result<(), String> {
     request
         .plan
@@ -290,7 +294,35 @@ fn plan_capabilities(plan: &Plan) -> Vec<String> {
                 output.insert("delegation".into());
                 output.extend(capabilities.iter().cloned());
             }
-            _ => {}
+            Operation::ExpandWords { .. }
+            | Operation::Redirect { .. }
+            | Operation::Pipeline { .. }
+            | Operation::Sequence { .. }
+            | Operation::Parallel { .. }
+            | Operation::WriteStdout { .. }
+            | Operation::Exit { .. }
+            | Operation::NoOp
+            | Operation::Condition { .. }
+            | Operation::Test { .. }
+            | Operation::While { .. }
+            | Operation::Not { .. }
+            | Operation::Match { .. }
+            | Operation::Foreach { .. }
+            | Operation::Scope { .. }
+            | Operation::TryFinally { .. }
+            | Operation::TaskCall { .. }
+            | Operation::SetVariable { .. }
+            | Operation::SetEnvironment { .. }
+            | Operation::SetWorkingDirectory { .. }
+            | Operation::CaptureStdout { .. }
+            | Operation::Spawn { .. }
+            | Operation::Wait { .. }
+            | Operation::SendSignal { .. }
+            | Operation::FileMetadata { .. }
+            | Operation::FileSetMetadata { .. }
+            | Operation::ClockRead { .. }
+            | Operation::RandomBytes { .. }
+            | Operation::OpaqueCapsule { .. } => {}
         }
         for child in node_children(node) {
             visit(child, output);
@@ -307,7 +339,7 @@ fn plan_capabilities(plan: &Plan) -> Vec<String> {
 fn node_children(node: &Node) -> Vec<&Node> {
     match &node.operation {
         Operation::Pipeline { nodes, .. }
-        | Operation::Sequence { nodes }
+        | Operation::Sequence { nodes, .. }
         | Operation::Parallel { nodes } => nodes.iter().collect(),
         Operation::Condition {
             predicate,
@@ -329,7 +361,30 @@ fn node_children(node: &Node) -> Vec<&Node> {
         | Operation::CaptureStdout { body, .. }
         | Operation::Spawn { body, .. } => vec![body],
         Operation::TryFinally { body, finalizer } => vec![body, finalizer],
-        _ => Vec::new(),
+        Operation::Exec { .. }
+        | Operation::ExpandWords { .. }
+        | Operation::WriteStdout { .. }
+        | Operation::Exit { .. }
+        | Operation::NoOp
+        | Operation::Test { .. }
+        | Operation::While { .. }
+        | Operation::Not { .. }
+        | Operation::TaskCall { .. }
+        | Operation::SetVariable { .. }
+        | Operation::SetEnvironment { .. }
+        | Operation::SetWorkingDirectory { .. }
+        | Operation::Wait { .. }
+        | Operation::SendSignal { .. }
+        | Operation::FileRead { .. }
+        | Operation::FileWrite { .. }
+        | Operation::FileRemove { .. }
+        | Operation::FileMetadata { .. }
+        | Operation::FileSetMetadata { .. }
+        | Operation::NetworkRequest { .. }
+        | Operation::ClockRead { .. }
+        | Operation::RandomBytes { .. }
+        | Operation::InterpreterCall { .. }
+        | Operation::OpaqueCapsule { .. } => Vec::new(),
     }
 }
 
@@ -343,7 +398,7 @@ fn inspect_bundle_source(source: &BundleSource) -> Result<(u64, String), String>
     }
 }
 
-fn write_tar_file(writer: &mut dyn Write, file: &BundleFile) -> Result<(), String> {
+fn write_tar_file<W: Write>(writer: &mut W, file: &BundleFile) -> Result<(), String> {
     let archive_path = format!("deshell-bundle/{}", file.archive_path);
     let (size, expected_digest) = inspect_bundle_source(&file.source)?;
     let header = tar_header(
@@ -367,10 +422,10 @@ fn write_tar_file(writer: &mut dyn Write, file: &BundleFile) -> Result<(), Strin
             })?;
             let mut remaining = size;
             let mut digest = Sha256::new();
-            let mut buffer = [0_u8; 64 * 1024];
+            let mut buffer = vec![0_u8; 64 * 1024];
             while remaining != 0 {
                 let limit = usize::try_from(remaining.min(buffer.len() as u64))
-                    .expect("bounded bundle read size");
+                    .map_err(|error| format!("bundle read size is not representable: {error}"))?;
                 let count = source.read(&mut buffer[..limit]).map_err(|error| {
                     format!("cannot read bundle source {}: {error}", path.display())
                 })?;
@@ -494,7 +549,39 @@ fn flatten_exec(node: &Node) -> Result<Vec<Vec<String>>, String> {
             "strict exporter cannot preserve shell sequence status semantics for node {}",
             node.id
         )),
-        other => Err(format!(
+        other @ Operation::ExpandWords { .. }
+        | other @ Operation::Redirect { .. }
+        | other @ Operation::Pipeline { .. }
+        | other @ Operation::Parallel { .. }
+        | other @ Operation::WriteStdout { .. }
+        | other @ Operation::Exit { .. }
+        | other @ Operation::NoOp
+        | other @ Operation::Condition { .. }
+        | other @ Operation::Test { .. }
+        | other @ Operation::While { .. }
+        | other @ Operation::Not { .. }
+        | other @ Operation::Match { .. }
+        | other @ Operation::Foreach { .. }
+        | other @ Operation::Scope { .. }
+        | other @ Operation::TryFinally { .. }
+        | other @ Operation::TaskCall { .. }
+        | other @ Operation::SetVariable { .. }
+        | other @ Operation::SetEnvironment { .. }
+        | other @ Operation::SetWorkingDirectory { .. }
+        | other @ Operation::CaptureStdout { .. }
+        | other @ Operation::Spawn { .. }
+        | other @ Operation::Wait { .. }
+        | other @ Operation::SendSignal { .. }
+        | other @ Operation::FileRead { .. }
+        | other @ Operation::FileWrite { .. }
+        | other @ Operation::FileRemove { .. }
+        | other @ Operation::FileMetadata { .. }
+        | other @ Operation::FileSetMetadata { .. }
+        | other @ Operation::NetworkRequest { .. }
+        | other @ Operation::ClockRead { .. }
+        | other @ Operation::RandomBytes { .. }
+        | other @ Operation::InterpreterCall { .. }
+        | other @ Operation::OpaqueCapsule { .. } => Err(format!(
             "strict exporter cannot represent node {} ({})",
             node.id,
             other.name()
@@ -509,12 +596,18 @@ fn literal(expression: &TextExpression) -> Result<String, String> {
     }
 }
 
-fn dagger(commands: &[Vec<String>], image: &str) -> Artifact {
-    let steps = commands.iter().map(|argv| {
-        let argv = serde_json::to_string(argv).expect("argv JSON serialization");
-        format!("    container = container.withExec({argv});\n    output += await container.stdout();")
-    }).collect::<Vec<_>>().join("\n");
-    let image = serde_json::to_string(image).expect("runtime image JSON serialization");
+fn dagger(commands: &[Vec<String>], image: &str) -> Result<Artifact, String> {
+    let steps = commands
+        .iter()
+        .map(|argv| {
+            serde_json::to_string(argv)
+                .map(|argv| format!("    container = container.withExec({argv});\n    output += await container.stdout();"))
+                .map_err(|error| format!("cannot encode Dagger argv: {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .join("\n");
+    let image = serde_json::to_string(image)
+        .map_err(|error| format!("cannot encode Dagger runtime image: {error}"))?;
     let content = format!(
         concat!(
             "import {{ dag, Container, object, func }} from \"@dagger.io/dagger\";\n\n",
@@ -527,31 +620,34 @@ fn dagger(commands: &[Vec<String>], image: &str) -> Artifact {
         ),
         image, steps,
     );
-    Artifact {
+    Ok(Artifact {
         filename: "deshell.dagger.ts".into(),
         media_type: "text/typescript".into(),
         content: content.into_bytes(),
-    }
+    })
 }
 
-fn nushell(commands: &[Vec<String>]) -> Artifact {
+fn nushell(commands: &[Vec<String>]) -> Result<Artifact, String> {
     let lines = commands
         .iter()
         .map(|argv| {
             let values = argv
                 .iter()
-                .map(|value| serde_json::to_string(value).expect("argv string JSON"))
-                .collect::<Vec<_>>()
+                .map(|value| {
+                    serde_json::to_string(value)
+                        .map_err(|error| format!("cannot encode Nushell argv: {error}"))
+                })
+                .collect::<Result<Vec<_>, _>>()?
                 .join(" ");
-            format!("  run-external {values}")
+            Ok(format!("  run-external {values}"))
         })
-        .collect::<Vec<_>>()
+        .collect::<Result<Vec<_>, String>>()?
         .join("\n");
-    Artifact {
+    Ok(Artifact {
         filename: "deshell.nu".into(),
         media_type: "text/x-nushell".into(),
         content: format!("export def main [] {{\n{lines}\n}}\n").into_bytes(),
-    }
+    })
 }
 
 fn cwl(argv: &[String]) -> Result<Artifact, String> {
@@ -575,6 +671,14 @@ fn cwl(argv: &[String]) -> Result<Artifact, String> {
 }
 
 #[cfg(test)]
+// Tests reach for the raw APIs on purpose: they stage corrupt trees, race two
+// writers against one path, and assert on what the transactional layer does with
+// the result. Constructing those situations is precisely what the production ban
+// exists to prevent, so the ban is lifted here and nowhere else.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "tests construct the races and corrupt trees the production ban prevents"
+)]
 mod tests {
     use super::*;
     use crate::ir::{Guarantee, Node, Operation, Task, TextExpression, TextPart};
@@ -617,6 +721,7 @@ mod tests {
                 secrets: vec![],
                 platform_capabilities: vec![],
                 cacheable: false,
+                nounset: false,
                 invocation: None,
                 body,
             }],
@@ -809,6 +914,7 @@ mod tests {
     fn strict_exporters_reject_sequence_status_semantics_they_cannot_preserve() {
         let sequence = plan(node(Operation::Sequence {
             nodes: vec![exec(&["one"]), exec(&["two"])],
+            on_failure: crate::ir::SequenceFailure::Continue,
         }));
         assert!(export(&sequence, Target::Cwl, Mode::Strict, None).is_err());
         assert!(export(&sequence, Target::Nushell, Mode::Strict, None).is_err());
@@ -850,7 +956,7 @@ mod tests {
             }),
             node(Operation::Spawn {
                 handle: "child".into(),
-                body: Box::new(residual.clone()),
+                body: Box::new(residual),
             }),
         ];
         for wrapper in wrappers {
@@ -897,6 +1003,7 @@ mod tests {
                     })),
                 }),
             ],
+            on_failure: crate::ir::SequenceFailure::Continue,
         });
         let mut plan = plan(effects);
         plan.tasks[0].platform_capabilities.push("platform".into());
@@ -1061,7 +1168,7 @@ mod tests {
                 .contains("digest-pinned")
         );
 
-        let mut interface = command.clone();
+        let mut interface = command;
         interface.tasks[0].inputs.push(crate::ir::Binding {
             name: "input".into(),
             value_type: crate::ir::ValueType::Primitive(crate::ir::PrimitiveType::Text),

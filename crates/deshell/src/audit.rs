@@ -1,5 +1,5 @@
 use crate::config::{AuditAcknowledgement, AuditSeverity};
-use crate::scanner::{FindingKind, Inventory};
+use crate::scanner::Inventory;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::LazyLock;
@@ -59,166 +59,177 @@ struct Rule {
     severity: AuditSeverity,
     confidence: Confidence,
     message: &'static str,
-    expression: regex::Regex,
+    expression: &'static str,
 }
 
 static RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
     vec![
-        rule(
-            "shell.dynamic-eval",
-            Category::Injection,
-            AuditSeverity::High,
-            r"\beval\b",
-            "Dynamic evaluation can reinterpret untrusted text as commands.",
-        ),
-        rule(
-            "supply-chain.download-execute",
-            Category::SupplyChain,
-            AuditSeverity::Critical,
-            r"(?m)\b(?:curl|wget)\b[^\r\n|]*\|[ \t]*(?:sh|bash|zsh|pwsh|powershell)\b",
-            "Downloaded bytes are executed without an independently verified artifact digest.",
-        ),
-        rule(
-            "supply-chain.unpinned-reference",
-            Category::SupplyChain,
-            AuditSeverity::Medium,
-            r#"(?i):latest\b|https?://[^[:space:]'"]+\.(?:sh|ps1)\b"#,
-            "Artifact or image reference is mutable or lacks an immutable digest.",
-        ),
-        rule(
-            "filesystem.dangerous-delete",
-            Category::Filesystem,
-            AuditSeverity::High,
-            r"(?m)\brm[ \t]+-[A-Za-z]*r[A-Za-z]*[ \t]+[^\r\n;]+",
-            "Recursive deletion depends on a path whose boundary must be proven.",
-        ),
-        rule(
-            "filesystem.unquoted-expansion",
-            Category::Filesystem,
-            AuditSeverity::High,
-            r"(?m)\b(?:rm|cp|mv|chmod|chown|install|tar)\b[^\r\n#]*?[ \t](?P<risk>\$\{?[A-Za-z_][A-Za-z0-9_]*\}?)(?:/|[ \t;&|]|$)",
-            "An unquoted path expansion can split into multiple arguments.",
-        ),
-        rule(
-            "filesystem.unbounded-glob",
-            Category::Filesystem,
-            AuditSeverity::High,
-            r"(?m)\b(?:rm|cp|mv|chmod|chown|install|tar)\b[^\r\n#]*?[ \t](?P<risk>[^ \t\r\n;|&]*[*?][^ \t\r\n;|&]*)",
-            "A filesystem mutation depends on ambient glob expansion and no-match policy.",
-        ),
-        rule(
-            "filesystem.symlink-race",
-            Category::Race,
-            AuditSeverity::High,
-            r"(?m)(?P<risk>\bln[ \t]+-[A-Za-z]*s[A-Za-z]*\b)",
-            "Symlink creation requires a reviewed boundary against path substitution races.",
-        ),
-        rule(
-            "filesystem.toctou-check",
-            Category::Race,
-            AuditSeverity::High,
-            r"(?m)(?P<risk>\btest[ \t]+-[efL]\b|\[[ \t]+-[efL]\b)",
-            "A path existence or type check can race with a later filesystem operation.",
-        ),
-        rule(
-            "filesystem.world-writable",
-            Category::Filesystem,
-            AuditSeverity::High,
-            r"(?m)\bchmod[ \t]+(?:0?777|a\+w)\b",
-            "World-writable permissions exceed least privilege.",
-        ),
-        rule(
-            "privilege.escalation",
-            Category::Filesystem,
-            AuditSeverity::High,
-            r"(?m)(?:^|[;&|][ \t]*)sudo\b",
-            "Privileged execution requires an explicit reviewed capability boundary.",
-        ),
-        rule(
-            "secret.argv-exposure",
-            Category::Secret,
-            AuditSeverity::High,
-            r"(?i)\$(?:\{)?[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|PRIVATE_KEY)[A-Z0-9_]*(?:\})?",
-            "A secret-like environment value is exposed through process arguments or output.",
-        ),
-        rule(
-            "filesystem.temp-race",
-            Category::Race,
-            AuditSeverity::High,
-            r#"(?m)\bmktemp[ \t]+-u\b|(?:^|[[:space:]'"])/tmp/[^[:space:]'"]+"#,
-            "Predictable or non-atomically reserved temporary paths permit TOCTOU or symlink races.",
-        ),
-        rule(
-            "status.unchecked-cwd",
-            Category::Status,
-            AuditSeverity::Medium,
-            r"(?m)^[ \t]*cd[ \t]+[^\r\n;&|]+$",
-            "Working-directory changes must have explicit failure behavior.",
-        ),
-        rule(
-            "status.pipeline",
-            Category::Status,
-            AuditSeverity::Medium,
-            r"(?m)^[^#\r\n]*[^|]\|[^|][^\r\n]*$",
-            "Pipeline status semantics must be explicit and checked.",
-        ),
-        rule(
-            "nondeterminism.clock",
-            Category::Nondeterminism,
-            AuditSeverity::Low,
-            r"\bdate\b|\bGet-Date\b",
-            "Wall-clock input makes behavior dependent on execution time.",
-        ),
-        rule(
-            "nondeterminism.random",
-            Category::Nondeterminism,
-            AuditSeverity::Medium,
-            r"\$RANDOM\b|\b(?:openssl[ \t]+rand|uuidgen)\b",
-            "Unseeded randomness makes repeated verification unstable.",
-        ),
-        rule(
-            "nondeterminism.ambient-environment",
-            Category::Nondeterminism,
-            AuditSeverity::Low,
-            r"\$(?:\{)?(?:PATH|LANG|LC_ALL|TZ|HOME)(?:\})?\b",
-            "Ambient environment state is not declared as an input.",
-        ),
-        rule(
-            "portability.bashism",
-            Category::Portability,
-            AuditSeverity::Medium,
-            r"\[\[|\]\]",
-            "Interpreter-specific syntax conflicts with a portable shell contract.",
-        ),
+        rule(RuleArgs {
+            id: "shell.dynamic-eval",
+            category: Category::Injection,
+            severity: AuditSeverity::High,
+            expression: r"\beval\b",
+            message: "Dynamic evaluation can reinterpret untrusted text as commands.",
+        }),
+        rule(RuleArgs {
+            id: "supply-chain.download-execute",
+            category: Category::SupplyChain,
+            severity: AuditSeverity::Critical,
+            expression: r"(?m)\b(?:curl|wget)\b[^\r\n|]*\|[ \t]*(?:sh|bash|zsh|pwsh|powershell)\b",
+            message: "Downloaded bytes are executed without an independently verified artifact digest.",
+        }),
+        rule(RuleArgs {
+            id: "supply-chain.unpinned-reference",
+            category: Category::SupplyChain,
+            severity: AuditSeverity::Medium,
+            expression: r#"(?i):latest\b|https?://[^[:space:]'"]+\.(?:sh|ps1)\b"#,
+            message: "Artifact or image reference is mutable or lacks an immutable digest.",
+        }),
+        rule(RuleArgs {
+            id: "filesystem.dangerous-delete",
+            category: Category::Filesystem,
+            severity: AuditSeverity::High,
+            expression: r"(?m)\brm[ \t]+-[A-Za-z]*r[A-Za-z]*[ \t]+[^\r\n;]+",
+            message: "Recursive deletion depends on a path whose boundary must be proven.",
+        }),
+        rule(RuleArgs {
+            id: "filesystem.unquoted-expansion",
+            category: Category::Filesystem,
+            severity: AuditSeverity::High,
+            expression: r"(?m)\b(?:rm|cp|mv|chmod|chown|install|tar)\b[^\r\n#]*?[ \t](?P<risk>\$\{?[A-Za-z_][A-Za-z0-9_]*\}?)(?:/|[ \t;&|]|$)",
+            message: "An unquoted path expansion can split into multiple arguments.",
+        }),
+        rule(RuleArgs {
+            id: "filesystem.unbounded-glob",
+            category: Category::Filesystem,
+            severity: AuditSeverity::High,
+            expression: r"(?m)\b(?:rm|cp|mv|chmod|chown|install|tar)\b[^\r\n#]*?[ \t](?P<risk>[^ \t\r\n;|&]*[*?][^ \t\r\n;|&]*)",
+            message: "A filesystem mutation depends on ambient glob expansion and no-match policy.",
+        }),
+        rule(RuleArgs {
+            id: "filesystem.symlink-race",
+            category: Category::Race,
+            severity: AuditSeverity::High,
+            expression: r"(?m)(?P<risk>\bln[ \t]+-[A-Za-z]*s[A-Za-z]*\b)",
+            message: "Symlink creation requires a reviewed boundary against path substitution races.",
+        }),
+        rule(RuleArgs {
+            id: "filesystem.toctou-check",
+            category: Category::Race,
+            severity: AuditSeverity::High,
+            expression: r"(?m)(?P<risk>\btest[ \t]+-[efL]\b|\[[ \t]+-[efL]\b)",
+            message: "A path existence or type check can race with a later filesystem operation.",
+        }),
+        rule(RuleArgs {
+            id: "filesystem.world-writable",
+            category: Category::Filesystem,
+            severity: AuditSeverity::High,
+            expression: r"(?m)\bchmod[ \t]+(?:0?777|a\+w)\b",
+            message: "World-writable permissions exceed least privilege.",
+        }),
+        rule(RuleArgs {
+            id: "privilege.escalation",
+            category: Category::Filesystem,
+            severity: AuditSeverity::High,
+            expression: r"(?m)(?:^|[;&|][ \t]*)sudo\b",
+            message: "Privileged execution requires an explicit reviewed capability boundary.",
+        }),
+        rule(RuleArgs {
+            id: "secret.argv-exposure",
+            category: Category::Secret,
+            severity: AuditSeverity::High,
+            expression: r"(?i)\$(?:\{)?[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|PRIVATE_KEY)[A-Z0-9_]*(?:\})?",
+            message: "A secret-like environment value is exposed through process arguments or output.",
+        }),
+        rule(RuleArgs {
+            id: "filesystem.temp-race",
+            category: Category::Race,
+            severity: AuditSeverity::High,
+            expression: r#"(?m)\bmktemp[ \t]+-u\b|(?:^|[[:space:]'"])/tmp/[^[:space:]'"]+"#,
+            message: "Predictable or non-atomically reserved temporary paths permit TOCTOU or symlink races.",
+        }),
+        rule(RuleArgs {
+            id: "status.unchecked-cwd",
+            category: Category::Status,
+            severity: AuditSeverity::Medium,
+            expression: r"(?m)^[ \t]*cd[ \t]+[^\r\n;&|]+$",
+            message: "Working-directory changes must have explicit failure behavior.",
+        }),
+        rule(RuleArgs {
+            id: "status.pipeline",
+            category: Category::Status,
+            severity: AuditSeverity::Medium,
+            expression: r"(?m)^[^#\r\n]*[^|]\|[^|][^\r\n]*$",
+            message: "Pipeline status semantics must be explicit and checked.",
+        }),
+        rule(RuleArgs {
+            id: "nondeterminism.clock",
+            category: Category::Nondeterminism,
+            severity: AuditSeverity::Low,
+            expression: r"\bdate\b|\bGet-Date\b",
+            message: "Wall-clock input makes behavior dependent on execution time.",
+        }),
+        rule(RuleArgs {
+            id: "nondeterminism.random",
+            category: Category::Nondeterminism,
+            severity: AuditSeverity::Medium,
+            expression: r"\$RANDOM\b|\b(?:openssl[ \t]+rand|uuidgen)\b",
+            message: "Unseeded randomness makes repeated verification unstable.",
+        }),
+        rule(RuleArgs {
+            id: "nondeterminism.ambient-environment",
+            category: Category::Nondeterminism,
+            severity: AuditSeverity::Low,
+            expression: r"\$(?:\{)?(?:PATH|LANG|LC_ALL|TZ|HOME)(?:\})?\b",
+            message: "Ambient environment state is not declared as an input.",
+        }),
+        rule(RuleArgs {
+            id: "portability.bashism",
+            category: Category::Portability,
+            severity: AuditSeverity::Medium,
+            expression: r"\[\[|\]\]",
+            message: "Interpreter-specific syntax conflicts with a portable shell contract.",
+        }),
     ]
 });
 
-static POWERSHELL_BLOCK_COMMENT: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r"(?s)<#.*?#>").expect("static PowerShell block-comment regex")
-});
-static POWERSHELL_SINGLE_HERE_STRING: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r"(?ms)^[ \t]*@'\r?\n.*?^[ \t]*'@[ \t]*\r?$")
-        .expect("static PowerShell single here-string regex")
-});
-static POWERSHELL_DOUBLE_HERE_STRING: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new("(?ms)^[ \\t]*@\"\\r?\\n.*?^[ \\t]*\"@[ \\t]*\\r?$")
-        .expect("static PowerShell double here-string regex")
-});
+const POWERSHELL_PROTECTED_EXPRESSIONS: [&str; 3] = [
+    r"(?s)<#.*?#>",
+    r"(?ms)^[ \t]*@'\r?\n.*?^[ \t]*'@[ \t]*\r?$",
+    "(?ms)^[ \\t]*@\"\\r?\\n.*?^[ \\t]*\"@[ \\t]*\\r?$",
+];
 
-fn rule(
+/// The inputs of [`rule`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`rule`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+#[derive(Clone, Copy)]
+struct RuleArgs {
     id: &'static str,
     category: Category,
     severity: AuditSeverity,
     expression: &'static str,
     message: &'static str,
-) -> Rule {
+}
+
+fn rule(parts: RuleArgs) -> Rule {
+    // Destructured without `..`: see `RuleArgs`.
+    let RuleArgs {
+        id,
+        category,
+        severity,
+        expression,
+        message,
+    } = parts;
     Rule {
         id,
         category,
         severity,
         confidence: Confidence::High,
         message,
-        expression: regex::Regex::new(expression).expect("static audit regex"),
+        expression,
     }
 }
 
@@ -229,9 +240,31 @@ pub(crate) fn analyze(
     acknowledgement_max_days: u32,
 ) -> Result<Vec<Finding>, String> {
     let mut output = Vec::new();
+    let rules = RULES
+        .iter()
+        .map(|rule| {
+            regex::Regex::new(rule.expression)
+                .map(|expression| (rule, expression))
+                .map_err(|error| {
+                    format!("audit rule {} has an invalid expression: {error}", rule.id)
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     for location in &inventory.findings {
-        if location.kind == FindingKind::Candidate {
+        if location.kind.is_a_candidate() {
             let source = read_host_source(root, &location.path)?;
+            let start = usize::try_from(location.span.start_byte).map_err(|_error| {
+                format!(
+                    "audit span start exceeds this platform's address space: {}@{}",
+                    location.path, location.span.start_byte
+                )
+            })?;
+            let end = usize::try_from(location.span.end_byte).map_err(|_error| {
+                format!(
+                    "audit span end exceeds this platform's address space: {}@{}",
+                    location.path, location.span.end_byte
+                )
+            })?;
             output.push(make_finding(
                 "shell.dynamic-command",
                 Category::Injection,
@@ -240,8 +273,8 @@ pub(crate) fn analyze(
                 "A dynamic process call cannot be proven to avoid shell interpretation.",
                 &location.path,
                 &source,
-                location.span.start_byte as usize,
-                location.span.end_byte as usize,
+                start,
+                end,
                 &location.content_digest,
                 acknowledgements,
                 acknowledgement_max_days,
@@ -252,28 +285,28 @@ pub(crate) fn analyze(
             Ok(value) => value,
             Err(_) => continue,
         };
-        let protected = audit_protected_ranges(location.interpreter.as_deref(), snippet);
-        let host_source = if location.kind == FindingKind::ShellFile {
+        let protected = audit_protected_ranges(location.interpreter.as_deref(), snippet)?;
+        let host_source = if location.kind.is_a_shell_file() {
             snippet.to_owned()
         } else {
             read_host_source(root, &location.path)?
         };
-        for rule in RULES.iter() {
+        for (rule, expression) in &rules {
             if rule.id == "portability.bashism" && location.interpreter.as_deref() != Some("sh") {
                 continue;
             }
-            for captures in rule.expression.captures_iter(snippet) {
+            for captures in expression.captures_iter(snippet) {
                 let matched = captures
                     .name("risk")
                     .or_else(|| captures.get(0))
-                    .expect("every regex capture has a whole match");
+                    .ok_or_else(|| format!("audit rule {} matched without a capture", rule.id))?;
                 if protected
                     .iter()
                     .any(|(start, end)| matched.start() < *end && matched.end() > *start)
                 {
                     continue;
                 }
-                let (start, end) = if location.kind == FindingKind::ShellFile {
+                let (start, end) = if location.kind.is_a_shell_file() {
                     (matched.start(), matched.end())
                 } else {
                     embedded_host_match_span(&host_source, snippet, location, &matched)
@@ -355,11 +388,13 @@ fn embedded_host_match_span(
     location: &crate::scanner::Finding,
     matched: &regex::Match<'_>,
 ) -> (usize, usize) {
-    let fallback = (
-        location.span.start_byte as usize,
-        location.span.end_byte as usize,
-    );
-    let (start, end) = fallback;
+    let (Ok(start), Ok(end)) = (
+        usize::try_from(location.span.start_byte),
+        usize::try_from(location.span.end_byte),
+    ) else {
+        return (0, host.len());
+    };
+    let fallback = (start, end);
     if start > end
         || end > host.len()
         || !host.is_char_boundary(start)
@@ -380,7 +415,10 @@ fn embedded_host_match_span(
         })
 }
 
-fn audit_protected_ranges(interpreter: Option<&str>, source: &str) -> Vec<(usize, usize)> {
+fn audit_protected_ranges(
+    interpreter: Option<&str>,
+    source: &str,
+) -> Result<Vec<(usize, usize)>, String> {
     let mut ranges = match interpreter {
         Some("sh" | "bash" | "zsh" | "fish" | "nu" | "powershell") => {
             crate::rewrite::protected_ranges(source)
@@ -389,11 +427,10 @@ fn audit_protected_ranges(interpreter: Option<&str>, source: &str) -> Vec<(usize
         _ => Vec::new(),
     };
     if interpreter == Some("powershell") {
-        for expression in [
-            &*POWERSHELL_BLOCK_COMMENT,
-            &*POWERSHELL_SINGLE_HERE_STRING,
-            &*POWERSHELL_DOUBLE_HERE_STRING,
-        ] {
+        for source_expression in POWERSHELL_PROTECTED_EXPRESSIONS {
+            let expression = regex::Regex::new(source_expression).map_err(|error| {
+                format!("invalid PowerShell protected-range expression: {error}")
+            })?;
             ranges.extend(
                 expression
                     .find_iter(source)
@@ -402,7 +439,7 @@ fn audit_protected_ranges(interpreter: Option<&str>, source: &str) -> Vec<(usize
         }
     }
     ranges.sort_unstable();
-    ranges
+    Ok(ranges)
 }
 
 fn cmd_comment_ranges(source: &str) -> Vec<(usize, usize)> {
@@ -426,7 +463,10 @@ fn cmd_comment_ranges(source: &str) -> Vec<(usize, usize)> {
     ranges
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the arguments are a contract record; grouping them into a struct would hide which fields the caller must supply"
+)]
 fn make_finding(
     rule_id: &str,
     category: Category,
@@ -495,7 +535,7 @@ fn read_host_source(root: &Path, relative: &str) -> Result<String, String> {
     String::from_utf8(
         std::fs::read(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?,
     )
-    .map_err(|_| format!("audit host source is not UTF-8: {relative}"))
+    .map_err(|_error| format!("audit host source is not UTF-8: {relative}"))
 }
 
 fn position(source: &str, byte: usize) -> (u64, u64) {
@@ -520,9 +560,11 @@ fn acknowledgement_is_active(expires: &str, max_days: u32, today: i64) -> bool {
 }
 
 fn current_unix_days() -> i64 {
-    std::time::SystemTime::now()
+    crate::host::wall_clock()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_secs() / 86_400) as i64
+        .map_or(0, |duration| {
+            i64::try_from(duration.as_secs() / 86_400).unwrap_or(i64::MAX)
+        })
 }
 
 fn parse_date_days(value: &str) -> Option<i64> {
@@ -554,11 +596,11 @@ fn parse_date_days(value: &str) -> Option<i64> {
     let day_of_year = (153 * shifted_month + 2) / 5 + day - 1;
     let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
     let days = era * 146_097 + day_of_era - 719_468;
-    (civil_from_days(days) == (year, month as u32, day as u32)).then_some(days)
+    (civil_from_days(days) == (year, month, day)).then_some(days)
 }
 
 // Howard Hinnant's civil calendar conversion, with Unix epoch day zero.
-fn civil_from_days(days_since_epoch: i64) -> (i64, u32, u32) {
+fn civil_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
     let days = days_since_epoch + 719_468;
     let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
     let day_of_era = days - era * 146_097;
@@ -570,12 +612,21 @@ fn civil_from_days(days_since_epoch: i64) -> (i64, u32, u32) {
     let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
     let month = month_prime + if month_prime < 10 { 3 } else { -9 };
     year += i64::from(month <= 2);
-    (year, month as u32, day as u32)
+    (year, month, day)
 }
 
 #[cfg(test)]
+// Tests reach for the raw APIs on purpose: they stage corrupt trees, race two
+// writers against one path, and assert on what the transactional layer does with
+// the result. Constructing those situations is precisely what the production ban
+// exists to prevent, so the ban is lifted here and nowhere else.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "tests construct the races and corrupt trees the production ban prevents"
+)]
 mod tests {
     use super::*;
+    use crate::scanner::FindingKind;
     use crate::scanner::{
         ByteSpan, Finding as InventoryFinding, InterpreterConfidence, ScanError, Skipped,
     };
@@ -587,6 +638,7 @@ mod tests {
             interpreter: Some("sh".into()),
             interpreter_confidence: InterpreterConfidence::High,
             locator: None,
+            host_named_the_shell: false,
             span: ByteSpan {
                 start_byte: 0,
                 end_byte: source.len() as u64,
@@ -841,6 +893,69 @@ mod tests {
         assert!(acknowledged.acknowledged);
     }
 
+    /// An acknowledgement stops suppressing its finding once it expires.
+    ///
+    /// The property that makes an acknowledgement an exception rather than a
+    /// deletion, and nothing could check it: the expiry is compared against
+    /// `SystemTime::now`, so a test could only pick a date far enough away that
+    /// the real clock would not reach it — which is the same as not testing the
+    /// window at all. The test beside this one uses `2099-01-01` for exactly
+    /// that reason.
+    ///
+    /// `host::wall_clock` is answerable now, so the day can be moved across the
+    /// boundary instead.
+    #[test]
+    fn an_acknowledgement_expires_when_the_day_passes_its_expiry() {
+        let source = "rm -rf target\n";
+        let digest = crate::digest::sha256(source.as_bytes());
+        let finding_on = |day: &str, acknowledgements: &[AuditAcknowledgement]| {
+            let expires = crate::host::Fixed {
+                wall_clock: Some(
+                    std::time::UNIX_EPOCH
+                        + std::time::Duration::from_secs(
+                            u64::try_from(parse_date_days(day).unwrap()).unwrap() * 86_400,
+                        ),
+                ),
+                ..crate::host::Fixed::default()
+            };
+            crate::host::with(expires, || {
+                make_finding(
+                    "filesystem.dangerous-delete",
+                    Category::Filesystem,
+                    AuditSeverity::High,
+                    Confidence::High,
+                    "dangerous",
+                    "build.sh",
+                    source,
+                    0,
+                    13,
+                    &digest,
+                    acknowledgements,
+                    30,
+                )
+                .unwrap()
+            })
+        };
+        let unacknowledged = finding_on("2026-09-19", &[]);
+        let acknowledgement = AuditAcknowledgement {
+            rule: unacknowledged.rule_id.clone(),
+            location_digest: unacknowledged.location_digest,
+            reason: "reviewed".into(),
+            owner: "security".into(),
+            expires: "2026-10-01".into(),
+        };
+        let one = std::slice::from_ref(&acknowledgement);
+
+        // The day before, and the expiry day itself: still an exception.
+        assert!(finding_on("2026-09-30", one).acknowledged);
+        assert!(finding_on("2026-10-01", one).acknowledged);
+        // The day after: the finding is reported again.
+        assert!(!finding_on("2026-10-02", one).acknowledged);
+        // And a window this acknowledgement outruns is refused from either
+        // side, however close the day is.
+        assert!(!finding_on("2026-08-01", one).acknowledged);
+    }
+
     #[test]
     fn span_comment_and_calendar_helpers_reject_ambiguous_boundaries() {
         let source = "éval\nnext";
@@ -885,13 +1000,22 @@ mod tests {
             (0, 2)
         );
 
-        assert!(audit_protected_ranges(None, "eval value").is_empty());
+        assert!(
+            audit_protected_ranges(None, "eval value")
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             cmd_comment_ranges("@REM eval value\r\n:: curl x | sh\n").len(),
             2
         );
         let powershell = "<# eval value #>\n@'\ncurl x | sh\n'@\n@\"\neval x\n\"@\n";
-        assert!(audit_protected_ranges(Some("powershell"), powershell).len() >= 3);
+        assert!(
+            audit_protected_ranges(Some("powershell"), powershell)
+                .unwrap()
+                .len()
+                >= 3
+        );
 
         for invalid in [
             "bad",

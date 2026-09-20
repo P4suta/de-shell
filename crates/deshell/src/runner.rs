@@ -41,10 +41,10 @@ pub(crate) trait Backend: Sync {
         let mut stdin = Vec::new();
         for (index, mut request) in requests.into_iter().enumerate() {
             if index > 0 {
-                request.stdin = stdin;
+                request.stdin = std::mem::take(&mut stdin);
             }
             let result = self.execute(request)?;
-            stdin = result.stdout.clone();
+            stdin.clone_from(&result.stdout);
             results.push(result);
         }
         Ok(results)
@@ -56,12 +56,47 @@ pub(crate) trait Backend: Sync {
     fn network_request(&self, method: &str, uri: &str) -> Result<Vec<u8>, String>;
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Capability {
+    FileRead,
+    FileWrite,
+    Network,
+    Delegation,
+}
+
+impl Capability {
+    const fn mask(self) -> u8 {
+        match self {
+            Self::FileRead => 1,
+            Self::FileWrite => 1 << 1,
+            Self::Network => 1 << 2,
+            Self::Delegation => 1 << 3,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct Policy {
-    pub allow_file_read: bool,
-    pub allow_file_write: bool,
-    pub allow_network: bool,
-    pub allow_delegation: bool,
+    allowed: u8,
+}
+
+impl Policy {
+    pub(crate) const fn allow(mut self, capability: Capability) -> Self {
+        self.allowed |= capability.mask();
+        self
+    }
+
+    pub(crate) const fn allow_if(self, capability: Capability, condition: bool) -> Self {
+        if condition {
+            self.allow(capability)
+        } else {
+            self
+        }
+    }
+
+    const fn allows(self, capability: Capability) -> bool {
+        self.allowed & capability.mask() != 0
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -103,6 +138,39 @@ pub(crate) enum TraceEvent {
     },
 }
 
+/// Whether the task continues after a node.
+///
+/// `exit` does not return to its caller, so a result alone cannot say whether
+/// the statement after it runs. Carrying this beside the result makes every
+/// place that runs a second node decide what to do about the first, instead of
+/// running the second because nothing stopped it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Flow {
+    Continue,
+    Exited,
+}
+
+/// What running one node produced.
+///
+/// Destructured without `..` at every consumer, so a field added here is a
+/// compile error everywhere it matters rather than a value quietly dropped.
+struct Step {
+    result: RunResult,
+    flow: Flow,
+    context: Context,
+}
+
+impl Step {
+    /// A node that finished and left the task running.
+    fn next(result: RunResult, context: Context) -> Self {
+        Self {
+            result,
+            flow: Flow::Continue,
+            context,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RunResult {
     pub exit_code: i32,
@@ -120,14 +188,32 @@ pub(crate) struct RunInputs<'a> {
     pub default_working_directory: Option<&'a str>,
 }
 
-pub(crate) fn run_plan(
-    backend: &dyn Backend,
-    policy: Policy,
-    plan: &Plan,
-    host_environment: &BTreeMap<String, String>,
-    named_inputs: &BTreeMap<String, String>,
-    arguments: &[String],
-) -> Result<RunResult, RunError> {
+/// The inputs of [`run_plan`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`run_plan`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+#[derive(Clone, Copy)]
+pub(crate) struct RunPlanArgs<'a, B: Backend> {
+    pub(crate) backend: &'a B,
+    pub(crate) policy: Policy,
+    pub(crate) plan: &'a Plan,
+    pub(crate) host_environment: &'a BTreeMap<String, String>,
+    pub(crate) named_inputs: &'a BTreeMap<String, String>,
+    pub(crate) arguments: &'a [String],
+}
+
+pub(crate) fn run_plan<B: Backend>(parts: RunPlanArgs<'_, B>) -> Result<RunResult, RunError> {
+    // Destructured without `..`: see `RunPlanArgs`.
+    let RunPlanArgs {
+        backend,
+        policy,
+        plan,
+        host_environment,
+        named_inputs,
+        arguments,
+    } = parts;
     run_plan_with_io(
         backend,
         policy,
@@ -142,8 +228,8 @@ pub(crate) fn run_plan(
     )
 }
 
-pub(crate) fn run_plan_with_io(
-    backend: &dyn Backend,
+pub(crate) fn run_plan_with_io<B: Backend>(
+    backend: &B,
     policy: Policy,
     plan: &Plan,
     inputs: RunInputs<'_>,
@@ -163,13 +249,18 @@ pub(crate) fn run_plan_with_io(
         script_arguments: inputs.arguments,
         default_working_directory: inputs.default_working_directory,
     };
-    executor.run_task(
-        &plan.entrypoint,
-        inputs.named_inputs,
-        inputs.arguments,
-        inputs.stdin.to_vec(),
-        &[],
-    )
+    executor
+        .run_task(RunTaskArgs {
+            name: &plan.entrypoint,
+            provided: inputs.named_inputs,
+            positional: inputs.arguments,
+            stdin: inputs.stdin.to_vec(),
+            stack: &[],
+        })
+        // The entry task's flow has nowhere left to travel: whether the plan
+        // ran off its end or left through an `exit`, the run is over and the
+        // status is the same either way.
+        .map(|(result, _)| result)
 }
 
 #[derive(Clone)]
@@ -179,10 +270,13 @@ struct Context {
     process_environment: BTreeMap<String, String>,
     secret_names: BTreeSet<String>,
     secret_values: Vec<String>,
+    /// From the task's `nounset`. Travels in the context because an expansion is
+    /// evaluated far from the task that set the option.
+    unset: crate::ir::UnsetPolicy,
 }
 
-struct Executor<'a> {
-    backend: &'a dyn Backend,
+struct Executor<'a, B: Backend> {
+    backend: &'a B,
     policy: Policy,
     tasks: BTreeMap<&'a str, &'a Task>,
     host_environment: &'a BTreeMap<String, String>,
@@ -190,15 +284,61 @@ struct Executor<'a> {
     default_working_directory: Option<&'a str>,
 }
 
-impl Executor<'_> {
-    fn run_task(
-        &self,
-        name: &str,
-        provided: &BTreeMap<String, String>,
-        positional: &[String],
-        stdin: Vec<u8>,
-        stack: &[String],
-    ) -> Result<RunResult, RunError> {
+/// The inputs of [`run_parallel`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`run_parallel`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct RunParallelArgs<'a> {
+    nodes: &'a [Node],
+    context: Context,
+    stdin: Vec<u8>,
+    stack: &'a [String],
+}
+
+/// The inputs of [`run_node`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`run_node`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct RunNodeArgs<'a> {
+    node: &'a Node,
+    context: Context,
+    stdin: Vec<u8>,
+    stack: &'a [String],
+}
+
+/// The inputs of [`run_task`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`run_task`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct RunTaskArgs<'a> {
+    name: &'a str,
+    provided: &'a BTreeMap<String, String>,
+    positional: &'a [String],
+    stdin: Vec<u8>,
+    stack: &'a [String],
+}
+
+impl<B: Backend> Executor<'_, B> {
+    /// Run a task, and say whether it ended the whole run.
+    ///
+    /// The flow travels out because `exit` inside a called task ends the script
+    /// that called it: discarding it here would let the statement after a call
+    /// to a function that exits keep running.
+    fn run_task(&self, parts: RunTaskArgs<'_>) -> Result<(RunResult, Flow), RunError> {
+        // Destructured without `..`: see `RunTaskArgs`.
+        let RunTaskArgs {
+            name,
+            provided,
+            positional,
+            stdin,
+            stack,
+        } = parts;
         if stack.iter().any(|item| item == name) {
             return Err(invalid(format!(
                 "recursive task call detected: {} -> {name}",
@@ -258,21 +398,214 @@ impl Executor<'_> {
             process_environment,
             secret_names,
             secret_values,
+            unset: if task.nounset {
+                crate::ir::UnsetPolicy::Refuse
+            } else {
+                crate::ir::UnsetPolicy::Empty
+            },
         };
         let mut next_stack = stack.to_vec();
         next_stack.push(name.to_owned());
-        self.run_node(&task.body, context, stdin, &next_stack)
-            .map(|(result, _)| result)
+        self.run_node(RunNodeArgs {
+            node: &task.body,
+            context,
+            stdin,
+            stack: &next_stack,
+        })
+        .map(|step| {
+            // Destructured without `..`: see `Step`. The context does not leave
+            // the task — a function's variables are its own here — but the flow
+            // does, because `exit` inside one ends the script that called it.
+            let Step {
+                result,
+                flow,
+                context: _,
+            } = step;
+            (result, flow)
+        })
     }
 
-    fn run_node(
-        &self,
-        node: &Node,
-        context: Context,
-        stdin: Vec<u8>,
-        stack: &[String],
-    ) -> Result<(RunResult, Context), RunError> {
+    fn run_node(&self, parts: RunNodeArgs<'_>) -> Result<Step, RunError> {
+        // Destructured without `..`: see `RunNodeArgs`.
+        let RunNodeArgs {
+            node,
+            context,
+            stdin,
+            stack,
+        } = parts;
         match &node.operation {
+            // The loop's status is the body's last run, or 0 if the condition was
+            // false the first time. Termination is not proven: an endless loop is
+            // bounded by the run's timeout the way the original script is, and no
+            // claim is made that the two stop at the same moment.
+            Operation::While { condition, body } => {
+                let mut aggregate = RunResult::empty();
+                let mut next = context;
+                let mut input = stdin;
+                loop {
+                    let Step {
+                        result: test,
+                        flow: test_flow,
+                        context: after_test,
+                    } = self.run_node(RunNodeArgs {
+                        node: condition,
+                        context: next,
+                        stdin: Vec::new(),
+                        stack,
+                    })?;
+                    let passed = test.exit_code == 0;
+                    // An `exit` in the condition ends the task with its own
+                    // status, so unlike a condition that merely failed, this one
+                    // does become the loop's status.
+                    if test_flow == Flow::Exited {
+                        return Ok(Step {
+                            result: combine(aggregate, test),
+                            flow: Flow::Exited,
+                            context: after_test,
+                        });
+                    }
+                    // The condition's own status is not the loop's: a `while` that
+                    // never enters its body reports 0, not the failing test.
+                    let carried = aggregate.exit_code;
+                    aggregate = combine(aggregate, test);
+                    aggregate.exit_code = carried;
+                    next = after_test;
+                    if !passed {
+                        break;
+                    }
+                    let Step {
+                        result,
+                        flow: body_flow,
+                        context: after_body,
+                    } = self.run_node(RunNodeArgs {
+                        node: body,
+                        context: next,
+                        stdin: std::mem::take(&mut input),
+                        stack,
+                    })?;
+                    input = Vec::new();
+                    aggregate = combine(aggregate, result);
+                    next = after_body;
+                    if body_flow == Flow::Exited {
+                        return Ok(Step {
+                            result: aggregate,
+                            flow: Flow::Exited,
+                            context: next,
+                        });
+                    }
+                }
+                Ok(Step::next(aggregate, next))
+            }
+            // `! cmd` inverts the status to a boolean: a body that exits 2 makes
+            // this exit 0, the same as one that exits 1. Output passes through.
+            Operation::Not { body } => {
+                let Step {
+                    result,
+                    flow,
+                    context: next,
+                } = self.run_node(RunNodeArgs {
+                    node: body,
+                    context,
+                    stdin,
+                    stack,
+                })?;
+                // `! exit 1` never reaches the inversion: the shell has already
+                // left. Inverting an exit status would report 0 for a task that
+                // ended with 1.
+                if flow == Flow::Exited {
+                    return Ok(Step {
+                        result,
+                        flow,
+                        context: next,
+                    });
+                }
+                Ok(Step::next(
+                    RunResult {
+                        exit_code: i32::from(result.exit_code == 0),
+                        ..result
+                    },
+                    next,
+                ))
+            }
+            // `test` succeeds with 0 and fails with 1, and produces no output.
+            Operation::NoOp => Ok(Step::next(RunResult::empty(), context)),
+            Operation::Exit {
+                status,
+                // Read to say the two cases are the same here: the runner stops
+                // either way, and the difference is whether the lowering had
+                // already ruled the value out. The generated programs do differ,
+                // because one of them is a constant.
+                non_numeric: _,
+            } => {
+                let text = evaluate(status, &context)?;
+                let parsed = text.trim().parse::<i64>().map_err(|_error| {
+                    // The shells disagree here — bash exits 255 with a message
+                    // naming itself, zsh exits 0 in silence — so there is no
+                    // status to report that is not one shell impersonating
+                    // another.
+                    invalid(format!("exit status is not an integer: {text}"))
+                })?;
+                // Measured: every shell reduces modulo 256, negatives and
+                // values above 255 alike.
+                let code = i32::try_from(parsed.rem_euclid(256))
+                    .map_err(|error| invalid(format!("exit status is out of range: {error}")))?;
+                Ok(Step {
+                    result: RunResult {
+                        exit_code: code,
+                        stdout: vec![],
+                        stderr: vec![],
+                        trace: vec![],
+                    },
+                    flow: Flow::Exited,
+                    context,
+                })
+            }
+            Operation::WriteStdout { contents } => {
+                let text = evaluate(contents, &context)?;
+                Ok(Step::next(
+                    RunResult {
+                        exit_code: 0,
+                        stdout: text.into_bytes(),
+                        stderr: vec![],
+                        trace: vec![],
+                    },
+                    context,
+                ))
+            }
+            Operation::Test { predicate } => {
+                let truth = match predicate {
+                    crate::ir::TestPredicate::NonEmpty { value } => {
+                        !evaluate(value, &context)?.is_empty()
+                    }
+                    crate::ir::TestPredicate::Empty { value } => {
+                        evaluate(value, &context)?.is_empty()
+                    }
+                    crate::ir::TestPredicate::StringEqual { left, right } => {
+                        evaluate(left, &context)? == evaluate(right, &context)?
+                    }
+                    crate::ir::TestPredicate::StringNotEqual { left, right } => {
+                        evaluate(left, &context)? != evaluate(right, &context)?
+                    }
+                    crate::ir::TestPredicate::StartsWith { value, prefix } => {
+                        evaluate(value, &context)?.starts_with(prefix.as_str())
+                    }
+                    crate::ir::TestPredicate::EndsWith { value, suffix } => {
+                        evaluate(value, &context)?.ends_with(suffix.as_str())
+                    }
+                    crate::ir::TestPredicate::Contains { value, infix } => {
+                        evaluate(value, &context)?.contains(infix.as_str())
+                    }
+                };
+                Ok(Step::next(
+                    RunResult {
+                        exit_code: i32::from(!truth),
+                        stdout: vec![],
+                        stderr: vec![],
+                        trace: vec![],
+                    },
+                    context,
+                ))
+            }
             Operation::Exec {
                 argv,
                 environment,
@@ -310,7 +643,7 @@ impl Executor<'_> {
                     .iter()
                     .map(|value| redact(value, &context.secret_values))
                     .collect();
-                Ok((
+                Ok(Step::next(
                     RunResult {
                         exit_code: process.exit_code,
                         stdout: process.stdout,
@@ -337,7 +670,9 @@ impl Executor<'_> {
                             working_directory,
                         } = &child.operation
                         else {
-                            unreachable!("pipeline shape checked above")
+                            return Err(invalid(
+                                "pipeline changed shape after executable-stage validation",
+                            ));
                         };
                         let argv = evaluate_list(argv, &context)?;
                         if argv.first().is_none_or(String::is_empty) {
@@ -396,14 +731,15 @@ impl Executor<'_> {
                             crate::ir::PipelineStatus::Pipefail if result.exit_code != 0 => {
                                 pipeline_exit = result.exit_code;
                             }
-                            _ => {}
+                            crate::ir::PipelineStatus::Last
+                            | crate::ir::PipelineStatus::Pipefail => {}
                         }
                         trace.push(TraceEvent::Process {
                             argv: trace_argv[index].clone(),
                             exit_code: result.exit_code,
                         });
                     }
-                    return Ok((
+                    return Ok(Step::next(
                         RunResult {
                             exit_code: pipeline_exit,
                             stdout,
@@ -419,8 +755,21 @@ impl Executor<'_> {
                 let mut exit_code = 0;
                 let mut stdout = Vec::new();
                 for child in nodes {
-                    let (result, _) = self.run_node(child, context.clone(), input, stack)?;
-                    input = result.stdout.clone();
+                    // A stage runs in its own process, so an `exit` inside one
+                    // ends that stage and not the shell that started it. The
+                    // status it leaves is the stage's, which the loop below
+                    // already reads.
+                    let Step {
+                        result,
+                        flow: _,
+                        context: _,
+                    } = self.run_node(RunNodeArgs {
+                        node: child,
+                        context: context.clone(),
+                        stdin: std::mem::take(&mut input),
+                        stack,
+                    })?;
+                    input.clone_from(&result.stdout);
                     stdout = result.stdout;
                     stderr.extend(result.stderr);
                     trace.extend(result.trace);
@@ -432,7 +781,7 @@ impl Executor<'_> {
                         crate::ir::PipelineStatus::Pipefail => exit_code,
                     };
                 }
-                Ok((
+                Ok(Step::next(
                     RunResult {
                         exit_code,
                         stdout,
@@ -442,38 +791,97 @@ impl Executor<'_> {
                     context,
                 ))
             }
-            Operation::Sequence { nodes } => {
+            Operation::Sequence { nodes, on_failure } => {
                 let mut aggregate = RunResult::empty();
                 let mut next_context = context;
                 let mut input = stdin;
                 for child in nodes {
-                    let (result, child_context) =
-                        self.run_node(child, next_context, input, stack)?;
+                    let Step {
+                        result,
+                        flow,
+                        context: child_context,
+                    } = self.run_node(RunNodeArgs {
+                        node: child,
+                        context: next_context,
+                        stdin: input,
+                        stack,
+                    })?;
+                    let failed = result.exit_code != 0;
                     aggregate = combine(aggregate, result);
                     next_context = child_context;
                     input = Vec::new();
+                    // `exit` ends the task, so nothing later in the list runs —
+                    // whatever `on_failure` says, and whether or not it failed.
+                    if flow == Flow::Exited {
+                        return Ok(Step {
+                            result: aggregate,
+                            flow,
+                            context: next_context,
+                        });
+                    }
+                    // `set -e`. The statements of a sequence are the only untested
+                    // position, so stopping here is the whole of the option: a
+                    // failure inside `&&`, an `if` condition or `!` belongs to
+                    // another node and never reaches this loop.
+                    if failed && *on_failure == crate::ir::SequenceFailure::Stop {
+                        break;
+                    }
                 }
-                Ok((aggregate, next_context))
+                Ok(Step::next(aggregate, next_context))
             }
-            Operation::Parallel { nodes } => self.run_parallel(nodes, context, stdin, stack),
+            Operation::Parallel { nodes } => self.run_parallel(RunParallelArgs {
+                nodes,
+                context,
+                stdin,
+                stack,
+            }),
             Operation::Condition {
                 predicate,
                 if_true,
                 if_false,
             } => {
-                let (condition, predicate_context) =
-                    self.run_node(predicate, context, stdin, stack)?;
+                let Step {
+                    result: condition,
+                    flow: predicate_flow,
+                    context: predicate_context,
+                } = self.run_node(RunNodeArgs {
+                    node: predicate,
+                    context,
+                    stdin,
+                    stack,
+                })?;
+                // An `exit` in the condition ends the task; neither branch runs
+                // and the condition's status is not read as a branch selector.
+                if predicate_flow == Flow::Exited {
+                    return Ok(Step {
+                        result: condition,
+                        flow: predicate_flow,
+                        context: predicate_context,
+                    });
+                }
                 let branch = if condition.exit_code == 0 {
                     Some(if_true.as_ref())
                 } else {
                     if_false.as_deref()
                 };
                 if let Some(branch) = branch {
-                    let (result, branch_context) =
-                        self.run_node(branch, predicate_context, Vec::new(), stack)?;
-                    Ok((combine(condition, result), branch_context))
+                    let Step {
+                        result,
+                        flow,
+                        context: branch_context,
+                    } = self.run_node(RunNodeArgs {
+                        node: branch,
+                        context: predicate_context,
+                        stdin: Vec::new(),
+                        stack,
+                    })?;
+                    Ok(Step {
+                        result: combine(condition, result),
+                        flow,
+                        context: branch_context,
+                    })
                 } else {
-                    Ok((condition, predicate_context))
+                    Ok(Step::next(condition, predicate_context))
                 }
             }
             Operation::Match {
@@ -484,15 +892,36 @@ impl Executor<'_> {
                 let value = evaluate(value, &context)?;
                 let mut selected = None;
                 for case in cases {
-                    if evaluate(&case.pattern, &context)? == value {
+                    // The pieces are expanded first and matched second, which is
+                    // the order the shell uses: quoting is resolved during word
+                    // expansion, so what a `*` means was already decided by the
+                    // time anything is compared.
+                    let mut pieces = Vec::new();
+                    for piece in &case.pattern.pieces {
+                        pieces.push(match piece {
+                            crate::ir::PatternPiece::Literal { value } => {
+                                crate::ir::MatchPiece::Literal(evaluate(value, &context)?.into())
+                            }
+                            crate::ir::PatternPiece::AnyRun => crate::ir::MatchPiece::AnyRun,
+                            crate::ir::PatternPiece::AnyCharacter => {
+                                crate::ir::MatchPiece::AnyCharacter
+                            }
+                        });
+                    }
+                    if crate::ir::PatternExpression::matches(&pieces, &value) {
                         selected = Some(&case.body);
                         break;
                     }
                 }
                 if let Some(branch) = selected.or(default.as_deref()) {
-                    self.run_node(branch, context, stdin, stack)
+                    self.run_node(RunNodeArgs {
+                        node: branch,
+                        context,
+                        stdin,
+                        stack,
+                    })
                 } else {
-                    Ok((RunResult::empty(), context))
+                    Ok(Step::next(RunResult::empty(), context))
                 }
             }
             Operation::Foreach {
@@ -504,12 +933,28 @@ impl Executor<'_> {
                 let previous = context.variables.get(variable).cloned();
                 let mut next_context = context;
                 let mut aggregate = RunResult::empty();
+                let mut exited = false;
                 for value in values {
                     next_context.variables.insert(variable.clone(), value);
-                    let (result, child_context) =
-                        self.run_node(body, next_context, stdin.clone(), stack)?;
+                    let Step {
+                        result,
+                        flow,
+                        context: child_context,
+                    } = self.run_node(RunNodeArgs {
+                        node: body,
+                        context: next_context,
+                        stdin: stdin.clone(),
+                        stack,
+                    })?;
                     aggregate = combine(aggregate, result);
                     next_context = child_context;
+                    // `exit` ends the task, so the remaining items do not run.
+                    // The loop variable is still restored below, because the
+                    // context travels on to whatever reads the result.
+                    if flow == Flow::Exited {
+                        exited = true;
+                        break;
+                    }
                 }
                 match previous {
                     Some(value) => {
@@ -519,11 +964,25 @@ impl Executor<'_> {
                         next_context.variables.remove(variable);
                     }
                 }
-                Ok((aggregate, next_context))
+                Ok(Step {
+                    result: aggregate,
+                    flow: if exited { Flow::Exited } else { Flow::Continue },
+                    context: next_context,
+                })
             }
             Operation::TryFinally { body, finalizer } => {
-                match self.run_node(body, context.clone(), stdin, stack) {
-                    Err(body_error) => match self.run_node(finalizer, context, Vec::new(), stack) {
+                match self.run_node(RunNodeArgs {
+                    node: body,
+                    context: context.clone(),
+                    stdin,
+                    stack,
+                }) {
+                    Err(body_error) => match self.run_node(RunNodeArgs {
+                        node: finalizer,
+                        context,
+                        stdin: Vec::new(),
+                        stack,
+                    }) {
                         Ok(_) => Err(body_error),
                         Err(finalizer_error) => Err(RunError {
                             kind: body_error.kind,
@@ -533,9 +992,21 @@ impl Executor<'_> {
                             ),
                         }),
                     },
-                    Ok((body_result, body_context)) => {
-                        let (finalizer_result, finalizer_context) =
-                            self.run_node(finalizer, body_context, Vec::new(), stack)?;
+                    Ok(Step {
+                        result: body_result,
+                        flow: body_flow,
+                        context: body_context,
+                    }) => {
+                        let Step {
+                            result: finalizer_result,
+                            flow: finalizer_flow,
+                            context: finalizer_context,
+                        } = self.run_node(RunNodeArgs {
+                            node: finalizer,
+                            context: body_context,
+                            stdin: Vec::new(),
+                            stack,
+                        })?;
                         let exit_code = if finalizer_result.exit_code != 0 {
                             finalizer_result.exit_code
                         } else {
@@ -543,14 +1014,39 @@ impl Executor<'_> {
                         };
                         let mut result = combine(body_result, finalizer_result);
                         result.exit_code = exit_code;
-                        Ok((result, finalizer_context))
+                        // The finalizer runs even when the body exited — that is
+                        // what it is for — but the task still ends afterwards.
+                        let flow = match (body_flow, finalizer_flow) {
+                            (Flow::Continue, Flow::Continue) => Flow::Continue,
+                            (Flow::Exited, _) | (_, Flow::Exited) => Flow::Exited,
+                        };
+                        Ok(Step {
+                            result,
+                            flow,
+                            context: finalizer_context,
+                        })
                     }
                 }
             }
-            Operation::TaskCall { task, arguments } => {
+            Operation::TaskCall {
+                task,
+                arguments,
+                positional,
+            } => {
                 let provided = evaluate_named(arguments, &context)?;
-                let result = self.run_task(task, &provided, &[], Vec::new(), stack)?;
-                Ok((result, context))
+                let positional = evaluate_list(positional, &context)?;
+                let (result, flow) = self.run_task(RunTaskArgs {
+                    name: task,
+                    provided: &provided,
+                    positional: &positional,
+                    stdin: Vec::new(),
+                    stack,
+                })?;
+                Ok(Step {
+                    result,
+                    flow,
+                    context,
+                })
             }
             Operation::SetVariable {
                 name,
@@ -571,14 +1067,26 @@ impl Executor<'_> {
                         context.secret_values.dedup();
                     }
                 }
-                Ok((RunResult::empty(), context))
+                Ok(Step::next(RunResult::empty(), context))
             }
             Operation::CaptureStdout {
                 name,
                 value_type,
                 body,
             } => {
-                let (mut captured, _) = self.run_node(body, context.clone(), stdin, stack)?;
+                // A substitution runs in its own process, so `$(exit 3)` ends
+                // that process and leaves 3 as its status; the shell reading it
+                // carries on.
+                let Step {
+                    result: mut captured,
+                    flow: _,
+                    context: _,
+                } = self.run_node(RunNodeArgs {
+                    node: body,
+                    context: context.clone(),
+                    stdin,
+                    stack,
+                })?;
                 while captured.stdout.last() == Some(&b'\n') {
                     captured.stdout.pop();
                 }
@@ -590,10 +1098,10 @@ impl Executor<'_> {
                 let mut context = context;
                 context.variables.insert(name.clone(), normalized);
                 captured.stdout.clear();
-                Ok((captured, context))
+                Ok(Step::next(captured, context))
             }
             Operation::FileRead { path } => {
-                if !self.policy.allow_file_read {
+                if !self.policy.allows(Capability::FileRead) {
                     return Err(policy("file read denied by policy"));
                 }
                 let path = evaluate(path, &context)?;
@@ -602,7 +1110,7 @@ impl Executor<'_> {
                     .backend
                     .read_file(&path)
                     .map_err(|message| execution(redact(&message, &context.secret_values)))?;
-                Ok((
+                Ok(Step::next(
                     RunResult {
                         exit_code: 0,
                         stdout: contents,
@@ -619,7 +1127,7 @@ impl Executor<'_> {
                 contents,
                 append,
             } => {
-                if !self.policy.allow_file_write {
+                if !self.policy.allows(Capability::FileWrite) {
                     return Err(policy("file write denied by policy"));
                 }
                 let path = evaluate(path, &context)?;
@@ -628,7 +1136,7 @@ impl Executor<'_> {
                 self.backend
                     .write_file(&path, contents.as_bytes(), *append)
                     .map_err(|message| execution(redact(&message, &context.secret_values)))?;
-                Ok((
+                Ok(Step::next(
                     RunResult {
                         exit_code: 0,
                         stdout: vec![],
@@ -641,7 +1149,7 @@ impl Executor<'_> {
                 ))
             }
             Operation::FileRemove { path } => {
-                if !self.policy.allow_file_write {
+                if !self.policy.allows(Capability::FileWrite) {
                     return Err(policy("file remove denied by policy"));
                 }
                 let path = evaluate(path, &context)?;
@@ -649,7 +1157,7 @@ impl Executor<'_> {
                 self.backend
                     .remove_file(&path)
                     .map_err(|message| execution(redact(&message, &context.secret_values)))?;
-                Ok((
+                Ok(Step::next(
                     RunResult {
                         exit_code: 0,
                         stdout: vec![],
@@ -662,7 +1170,7 @@ impl Executor<'_> {
                 ))
             }
             Operation::NetworkRequest { method, uri } => {
-                if !self.policy.allow_network {
+                if !self.policy.allows(Capability::Network) {
                     return Err(policy("network request denied by policy"));
                 }
                 let method = evaluate(method, &context)?;
@@ -671,7 +1179,7 @@ impl Executor<'_> {
                     .backend
                     .network_request(&method, &uri)
                     .map_err(|message| execution(redact(&message, &context.secret_values)))?;
-                Ok((
+                Ok(Step::next(
                     RunResult {
                         exit_code: 0,
                         stdout: response,
@@ -706,7 +1214,7 @@ impl Executor<'_> {
                 capabilities,
                 ..
             } => {
-                if !self.policy.allow_delegation {
+                if !self.policy.allows(Capability::Delegation) {
                     return Err(policy("pinned interpreter delegation denied by policy"));
                 }
                 if !matches!(node.guarantee, Guarantee::Delegated { .. }) {
@@ -724,7 +1232,7 @@ impl Executor<'_> {
                         stdin,
                     })
                     .map_err(|message| execution(redact(&message, &context.secret_values)))?;
-                Ok((
+                Ok(Step::next(
                     RunResult {
                         exit_code: result.exit_code,
                         stdout: result.stdout,
@@ -739,27 +1247,25 @@ impl Executor<'_> {
                 ))
             }
             Operation::OpaqueCapsule {
-                interpreter,
-                source,
-                ..
-            } => {
-                let _ = (interpreter, source, stdin);
-                Err(policy(
-                    "opaque capsule is residual-only and cannot be executed",
-                ))
-            }
+                interpreter: _interpreter,
+                source: _source,
+                path: _path,
+            } => Err(policy(
+                "opaque capsule is residual-only and cannot be executed",
+            )),
         }
     }
 
-    fn run_parallel(
-        &self,
-        nodes: &[Node],
-        context: Context,
-        stdin: Vec<u8>,
-        stack: &[String],
-    ) -> Result<(RunResult, Context), RunError> {
+    fn run_parallel(&self, parts: RunParallelArgs<'_>) -> Result<Step, RunError> {
+        // Destructured without `..`: see `RunParallelArgs`.
+        let RunParallelArgs {
+            nodes,
+            context,
+            stdin,
+            stack,
+        } = parts;
         if nodes.is_empty() {
-            return Ok((RunResult::empty(), context));
+            return Ok(Step::next(RunResult::empty(), context));
         }
         let count = nodes.len();
         let workers = std::thread::available_parallelism()
@@ -768,7 +1274,9 @@ impl Executor<'_> {
             .clamp(1, 8)
             .min(count);
         let next = std::sync::atomic::AtomicUsize::new(0);
-        let results = std::sync::Mutex::new(vec![None; count]);
+        let mut slots = Vec::new();
+        slots.resize_with(count, || None);
+        let results = std::sync::Mutex::new(slots);
         std::thread::scope(|scope| {
             for _ in 0..workers {
                 let next = &next;
@@ -781,7 +1289,12 @@ impl Executor<'_> {
                         let index = next.fetch_add(1, Ordering::Relaxed);
                         let Some(node) = nodes.get(index) else { break };
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            self.run_node(node, context.clone(), stdin.clone(), stack)
+                            self.run_node(RunNodeArgs {
+                                node,
+                                context: context.clone(),
+                                stdin: stdin.clone(),
+                                stack,
+                            })
                         }))
                         .unwrap_or_else(|_| Err(execution("parallel worker panicked")));
                         let Ok(mut output) = results.lock() else {
@@ -795,13 +1308,18 @@ impl Executor<'_> {
         let mut aggregate = RunResult::empty();
         for result in results
             .into_inner()
-            .map_err(|_| execution("parallel result lock poisoned"))?
+            .map_err(|_error| execution("parallel result lock poisoned"))?
         {
-            let (result, _) =
-                result.ok_or_else(|| execution("parallel worker omitted a result"))??;
+            // Each branch runs in its own process, so an `exit` inside one
+            // ends that branch and leaves its status behind.
+            let Step {
+                result,
+                flow: _,
+                context: _,
+            } = result.ok_or_else(|| execution("parallel worker omitted a result"))??;
             aggregate = combine(aggregate, result);
         }
-        Ok((aggregate, context))
+        Ok(Step::next(aggregate, context))
     }
 }
 
@@ -826,7 +1344,7 @@ fn combine(mut left: RunResult, right: RunResult) -> RunResult {
 
 fn evaluate(expression: &TextExpression, context: &Context) -> Result<String, RunError> {
     expression
-        .evaluate(&context.variables, &context.arguments)
+        .evaluate(&context.variables, &context.arguments, context.unset)
         .map_err(invalid)
 }
 
@@ -893,7 +1411,10 @@ fn bind_powershell_arguments(
     provided: &BTreeMap<String, String>,
     positional: &[String],
 ) -> Result<BTreeMap<String, String>, RunError> {
-    let invocation = task.invocation.as_ref().expect("checked by caller");
+    let invocation = task
+        .invocation
+        .as_ref()
+        .ok_or_else(|| invalid("PowerShell argument binding requires invocation metadata"))?;
     let mut output = BTreeMap::new();
     for (name, value) in provided {
         let parameter = invocation
@@ -996,7 +1517,11 @@ fn bind_powershell_arguments(
             }
             let value = if let Some(default) = &parameter.default {
                 default
-                    .evaluate(&BTreeMap::new(), &BTreeMap::new())
+                    .evaluate(
+                        &BTreeMap::new(),
+                        &BTreeMap::new(),
+                        crate::ir::UnsetPolicy::Empty,
+                    )
                     .map_err(invalid)?
             } else if parameter.is_switch {
                 "false".into()
@@ -1062,7 +1587,7 @@ fn normalize_value(name: &str, value_type: &ValueType, value: &str) -> Result<St
             let parsed = value
                 .trim()
                 .parse::<i64>()
-                .map_err(|_| format!("{name} must be a signed 64-bit integer"))?;
+                .map_err(|_error| format!("{name} must be a signed 64-bit integer"))?;
             Ok(parsed.to_string())
         }
         ValueType::Primitive(PrimitiveType::Path) => {
@@ -1076,7 +1601,7 @@ fn normalize_value(name: &str, value_type: &ValueType, value: &str) -> Result<St
         ValueType::Primitive(PrimitiveType::Bytes) => {
             let decoded = base64::engine::general_purpose::STANDARD
                 .decode(value)
-                .map_err(|_| format!("{name} must be canonical base64 bytes"))?;
+                .map_err(|_error| format!("{name} must be canonical base64 bytes"))?;
             if base64::engine::general_purpose::STANDARD.encode(&decoded) != value {
                 return Err(format!("{name} must be canonical padded base64 bytes"));
             }
@@ -1087,7 +1612,7 @@ fn normalize_value(name: &str, value_type: &ValueType, value: &str) -> Result<St
                 .map_err(|error| format!("{name} must be strict JSON: {error}"))?;
             let normalized = normalize_typed_json(name, value_type, parsed)?;
             String::from_utf8(crate::canonical_json::canonical_bytes(&normalized)?)
-                .map_err(|_| format!("{name} canonical JSON was not UTF-8"))
+                .map_err(|_error| format!("{name} canonical JSON was not UTF-8"))
         }
         ValueType::Secret { secret } => normalize_value(name, secret, value),
     }
@@ -1113,7 +1638,7 @@ fn typed_value_as_json(value_type: &ValueType, value: &str) -> Result<serde_json
         ValueType::Primitive(PrimitiveType::Int) => value
             .parse::<i64>()
             .map(Into::into)
-            .map_err(|_| "invalid normalized integer".into()),
+            .map_err(|_error| "invalid normalized integer".into()),
         ValueType::List { .. } | ValueType::Record { .. } => {
             crate::strict_json::parse(value.as_bytes())
         }
@@ -1330,6 +1855,7 @@ mod tests {
                 secrets: vec![],
                 platform_capabilities: vec![],
                 cacheable: false,
+                nounset: false,
                 invocation: None,
                 body,
             }],
@@ -1356,14 +1882,102 @@ mod tests {
     }
 
     fn run(backend: &MockBackend, body: Node) -> Result<RunResult, RunError> {
-        run_plan(
+        run_plan(RunPlanArgs {
             backend,
-            Policy::default(),
-            &plan(body),
-            &BTreeMap::new(),
-            &BTreeMap::new(),
-            &[],
+            policy: Policy::default(),
+            plan: &plan(body),
+            host_environment: &BTreeMap::new(),
+            named_inputs: &BTreeMap::new(),
+            arguments: &[],
+        })
+    }
+
+    /// `exit` does not return to its caller, and every construct that runs a
+    /// second node has to know that.
+    ///
+    /// Before `Step` carried a `Flow`, a node's result said only what its
+    /// status was, so the statement after an `exit` ran: the result of `exit 3`
+    /// is indistinguishable from the result of a command that failed with 3.
+    #[test]
+    fn exit_ends_the_task_and_nothing_after_it_runs() {
+        let exit = |status: &str| {
+            node(Operation::Exit {
+                status: TextExpression::literal(status),
+                non_numeric: crate::ir::NonNumericStatus::Unreachable,
+            })
+        };
+        let backend = MockBackend::default();
+
+        // A sequence stops at the `exit`, whatever `on_failure` says — `exit 0`
+        // succeeds and still ends the task.
+        for (status, expected) in [("3", 3), ("0", 0)] {
+            for on_failure in [
+                crate::ir::SequenceFailure::Continue,
+                crate::ir::SequenceFailure::Stop,
+            ] {
+                let result = run(
+                    &backend,
+                    node(Operation::Sequence {
+                        nodes: vec![
+                            node(Operation::WriteStdout {
+                                contents: TextExpression::literal("before\n"),
+                            }),
+                            exit(status),
+                            node(Operation::WriteStdout {
+                                contents: TextExpression::literal("after\n"),
+                            }),
+                        ],
+                        on_failure,
+                    }),
+                )
+                .unwrap();
+                assert_eq!(result.stdout, b"before\n", "{status} {on_failure:?}");
+                assert_eq!(result.exit_code, expected, "{status} {on_failure:?}");
+            }
+        }
+
+        // A loop ends where the `exit` is, rather than running the rest of the
+        // body and testing the condition again.
+        let result = run(
+            &backend,
+            node(Operation::While {
+                condition: Box::new(node(Operation::Test {
+                    predicate: crate::ir::TestPredicate::Empty {
+                        value: TextExpression::literal(""),
+                    },
+                })),
+                body: Box::new(node(Operation::Sequence {
+                    nodes: vec![
+                        node(Operation::WriteStdout {
+                            contents: TextExpression::literal("once\n"),
+                        }),
+                        exit("4"),
+                    ],
+                    on_failure: crate::ir::SequenceFailure::Continue,
+                })),
+            }),
         )
+        .unwrap();
+        assert_eq!(result.stdout, b"once\n");
+        assert_eq!(result.exit_code, 4);
+
+        // `! exit 1` is 1, not 0: the shell has already left by the time the
+        // inversion would happen.
+        let result = run(
+            &backend,
+            node(Operation::Not {
+                body: Box::new(exit("1")),
+            }),
+        )
+        .unwrap();
+        assert_eq!(result.exit_code, 1);
+
+        // Measured in `contracts/golden/exit-builtin-semantics-v1.json`: every
+        // shell reduces the status modulo 256.
+        for (status, expected) in [("256", 0), ("300", 44), ("-1", 255)] {
+            let result = run(&backend, exit(status)).unwrap();
+            assert_eq!(result.exit_code, expected, "exit {status}");
+        }
     }
 
     #[test]
@@ -1376,11 +1990,37 @@ mod tests {
         assert_eq!(run(&backend, pipeline).unwrap().stdout, b"HELLO");
         let sequence = node(Operation::Sequence {
             nodes: vec![exec(&["fail", "9"]), exec(&["emit", "after"])],
+            on_failure: crate::ir::SequenceFailure::Continue,
         });
         let result = run(&backend, sequence).unwrap();
         assert_eq!(result.exit_code, 0);
         assert_eq!(result.stdout, b"after");
         assert_eq!(result.stderr, b"failed");
+    }
+
+    #[test]
+    fn a_stopping_sequence_does_not_run_past_a_failure() {
+        let backend = MockBackend::default();
+        let sequence = node(Operation::Sequence {
+            nodes: vec![exec(&["fail", "9"]), exec(&["emit", "after"])],
+            on_failure: crate::ir::SequenceFailure::Stop,
+        });
+        let result = run(&backend, sequence).unwrap();
+        assert_eq!(result.exit_code, 9, "the failing status is the sequence's");
+        assert!(
+            result.stdout.is_empty(),
+            "the statement after the failure must not run: {:?}",
+            String::from_utf8_lossy(&result.stdout)
+        );
+
+        // The other direction: the same tree that continues past the failure is
+        // what the shell does without `set -e`, and it still does.
+        let sequence = node(Operation::Sequence {
+            nodes: vec![exec(&["fail", "9"]), exec(&["emit", "after"])],
+            on_failure: crate::ir::SequenceFailure::Continue,
+        });
+        let result = run(&backend, sequence).unwrap();
+        assert_eq!(result.stdout, b"after");
     }
 
     #[test]
@@ -1416,7 +2056,15 @@ mod tests {
             ("SECOND".into(), "wrong".into()),
         ]);
         let inputs = BTreeMap::from([("input".into(), "-${SECOND}".into())]);
-        let result = run_plan(&backend, Policy::default(), &plan, &host, &inputs, &[]).unwrap();
+        let result = run_plan(RunPlanArgs {
+            backend: &backend,
+            policy: Policy::default(),
+            plan: &plan,
+            host_environment: &host,
+            named_inputs: &inputs,
+            arguments: &[],
+        })
+        .unwrap();
         assert_eq!(result.stdout, b"$SECOND-${SECOND}");
     }
 
@@ -1456,16 +2104,14 @@ mod tests {
         capsule.guarantee = Guarantee::Residual {
             reason: "non-UTF-8".into(),
         };
-        let error = run_plan(
-            &backend,
-            Policy {
-                ..Policy::default()
-            },
-            &plan(capsule),
-            &BTreeMap::new(),
-            &BTreeMap::new(),
-            &["one".into()],
-        )
+        let error = run_plan(RunPlanArgs {
+            backend: &backend,
+            policy: Policy::default(),
+            plan: &plan(capsule),
+            host_environment: &BTreeMap::new(),
+            named_inputs: &BTreeMap::new(),
+            arguments: &["one".into()],
+        })
         .unwrap_err();
         assert_eq!(error.kind, RunErrorKind::Policy);
         assert!(error.message.contains("residual-only"));
@@ -1490,14 +2136,14 @@ mod tests {
         plan.tasks[0].environment = vec!["TOKEN".into()];
         plan.tasks[0].secrets = vec!["TOKEN".into()];
         plan.assign_node_ids().unwrap();
-        let error = run_plan(
-            &backend,
-            Policy::default(),
-            &plan,
-            &BTreeMap::from([("TOKEN".into(), "super-secret-value".into())]),
-            &BTreeMap::new(),
-            &[],
-        )
+        let error = run_plan(RunPlanArgs {
+            backend: &backend,
+            policy: Policy::default(),
+            plan: &plan,
+            host_environment: &BTreeMap::from([("TOKEN".into(), "super-secret-value".into())]),
+            named_inputs: &BTreeMap::new(),
+            arguments: &[],
+        })
         .unwrap_err();
         assert!(!error.message.contains("super-secret-value"));
         assert!(error.message.contains("<redacted>"));
@@ -1556,11 +2202,11 @@ mod tests {
                     value: TextExpression::literal("selected"),
                     cases: vec![
                         MatchCase {
-                            pattern: TextExpression::literal("other"),
+                            pattern: crate::ir::PatternExpression::literal("other"),
                             body: exec(&["emit", "wrong"]),
                         },
                         MatchCase {
-                            pattern: TextExpression::literal("selected"),
+                            pattern: crate::ir::PatternExpression::literal("selected"),
                             body: exec(&["emit", "matched"]),
                         },
                     ],
@@ -1591,15 +2237,14 @@ mod tests {
                     uri: TextExpression::literal("https://example.invalid/value"),
                 }),
             ],
+            on_failure: crate::ir::SequenceFailure::Continue,
         });
         let result = run_plan_with_io(
             &backend,
-            Policy {
-                allow_file_read: true,
-                allow_file_write: true,
-                allow_network: true,
-                allow_delegation: false,
-            },
+            Policy::default()
+                .allow(Capability::FileRead)
+                .allow(Capability::FileWrite)
+                .allow(Capability::Network),
             &plan(body),
             RunInputs {
                 host_environment: &BTreeMap::new(),
@@ -1664,6 +2309,7 @@ mod tests {
             secrets: vec![],
             platform_capabilities: vec![],
             cacheable: false,
+            nounset: false,
             invocation: None,
             body: node(Operation::Exec {
                 argv: vec![
@@ -1684,18 +2330,19 @@ mod tests {
                 name: "message".into(),
                 value: TextExpression::literal("called"),
             }],
+            positional: vec![],
         }));
         task_plan.tasks.push(helper);
         task_plan.assign_node_ids().unwrap();
         assert_eq!(
-            run_plan(
-                &backend,
-                Policy::default(),
-                &task_plan,
-                &BTreeMap::new(),
-                &BTreeMap::new(),
-                &[],
-            )
+            run_plan(RunPlanArgs {
+                backend: &backend,
+                policy: Policy::default(),
+                plan: &task_plan,
+                host_environment: &BTreeMap::new(),
+                named_inputs: &BTreeMap::new(),
+                arguments: &[],
+            })
             .unwrap()
             .stdout,
             b"called"
@@ -1753,10 +2400,7 @@ mod tests {
         delegated.source = Some(delegated_span);
         let result = run_plan_with_io(
             &backend,
-            Policy {
-                allow_delegation: true,
-                ..Policy::default()
-            },
+            Policy::default().allow(Capability::Delegation),
             &plan(delegated),
             RunInputs {
                 host_environment: &BTreeMap::new(),
@@ -1806,18 +2450,16 @@ mod tests {
                 append: false,
             },
         ] {
-            let error = run_plan(
-                &backend,
-                Policy {
-                    allow_file_read: true,
-                    allow_file_write: true,
-                    ..Policy::default()
-                },
-                &plan(node(operation)),
-                &BTreeMap::new(),
-                &BTreeMap::new(),
-                &[],
-            )
+            let error = run_plan(RunPlanArgs {
+                backend: &backend,
+                policy: Policy::default()
+                    .allow(Capability::FileRead)
+                    .allow(Capability::FileWrite),
+                plan: &plan(node(operation)),
+                host_environment: &BTreeMap::new(),
+                named_inputs: &BTreeMap::new(),
+                arguments: &[],
+            })
             .unwrap_err();
             assert_eq!(error.kind, RunErrorKind::Invalid);
         }
@@ -1838,19 +2480,17 @@ mod tests {
                 uri: TextExpression::literal("fail"),
             },
         ] {
-            let error = run_plan(
-                &backend,
-                Policy {
-                    allow_file_read: true,
-                    allow_file_write: true,
-                    allow_network: true,
-                    allow_delegation: false,
-                },
-                &plan(node(operation)),
-                &BTreeMap::new(),
-                &BTreeMap::new(),
-                &[],
-            )
+            let error = run_plan(RunPlanArgs {
+                backend: &backend,
+                policy: Policy::default()
+                    .allow(Capability::FileRead)
+                    .allow(Capability::FileWrite)
+                    .allow(Capability::Network),
+                plan: &plan(node(operation)),
+                host_environment: &BTreeMap::new(),
+                named_inputs: &BTreeMap::new(),
+                arguments: &[],
+            })
             .unwrap_err();
             assert_eq!(error.kind, RunErrorKind::Execution);
         }
@@ -1963,6 +2603,7 @@ mod tests {
             secrets: vec![],
             platform_capabilities: vec![],
             cacheable: false,
+            nounset: false,
             invocation: Some(Invocation {
                 style: InvocationStyle::Powershell,
                 accepts_common_parameters: false,

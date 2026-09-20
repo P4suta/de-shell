@@ -33,7 +33,73 @@ All notable changes are documented here. No compatibility contract predates
   dependency-policy and coverage floors, a CycloneDX SBOM, checksums, keyless
   signatures, provenance, smoke tests, and protected crates.io publication.
 
+- `mise run test:miri`, `test:fuzz-smoke` and `test:mutation`, and a CI job
+  that runs the first two on every change. The ROADMAP has listed "fuzz smoke /
+  Miri / ASan / UBSan / mutation thresholds" as unmet since 0.1 planning.
+
+  Miri covers the canonical byte forms, the IR, the digests, the report, the
+  trace and the transactional filesystem layer — everything that does not reach
+  a tree-sitter parser, because Miri interprets the program and cannot call
+  foreign code. Isolation is disabled because `patch::` is about real files and
+  checking it against a filesystem that is not there would check nothing.
+
+- `cargo xtask fuzz-modules`. `fuzz/src/lib.rs` re-declares every module of
+  `crates/deshell/src/main.rs` with a `#[path]`, and nothing in the workspace
+  build reaches it: `cargo clippy --workspace` does not, and the nightly fuzz
+  job was the only thing that did. Adding `host` and `trace` to the binary
+  broke the fuzz build invisibly. The two lists are compared now, and a module
+  that belongs to only one of them is named in the fuzz crate with its reason.
+
+- Trace v1: `--trace off|jsonl` and `--trace-output PATH`, `deshell schema
+  trace`, `contracts/trace-v1.md` and `contracts/schema/trace-v1.schema.json`.
+  Off by default, never on stdout, and `--trace-output` without `--trace` is a
+  usage error rather than a request that quietly does not happen.
+
+  `--diagnostics` explains a failure to somebody who hit one and says nothing
+  about a run that succeeded. A trace says what the run *did*: which files it
+  staged and committed with which digests in which order, which environment
+  variables it read and whether they were set, which processes it started with
+  the exact argv and how each ended. The approval race that blocked this
+  repository's CI was a write that no record named.
+
+  No event carries a value read from outside — a variable contributes its name
+  and whether it was set, a file its path, length and digest, a process its
+  argv and exit code, the clock only that it was read. That is a property of
+  the vocabulary rather than of each call site, so it holds for a caller who
+  has not thought about it.
+
+  The events come from the layers that are already the only route to what they
+  describe, so a new call site is traced because it compiles: the filesystem
+  from the transactional layer, the clock and environment from the ambient one,
+  the launches from the launch one, the approval decisions from the single
+  function that produces a review status, and the provider selections from the
+  single function that chooses one. A stale approval and a missing one both
+  come back "not current", and which it was is the whole question a reviewer is
+  asking; a run that ends in exit 6 said only that nothing was available, and
+  now says which platform was asked and what the probe answered.
+  `cargo xtask trace-events` holds `trace::Event` and the contract equal in
+  both directions and in order.
+
+- `host::output`, `host::status` and `host::spawn`, the third enforced
+  chokepoint after `patch::` for the filesystem and `host::` for the clock and
+  the environment. `Command::output`, `Command::status` and `Command::spawn`
+  are disallowed elsewhere, so every process de-shell starts is one it can name.
+
+- `[[declared_shell]]` in `project.toml` and `deshell declared list` /
+  `deshell declared approve`: shell that is in the repository on purpose, named
+  by its exact byte span, carrying the reason it stays and an approval digest.
+  `verify --require shell-free` reports `0 live, N declared` and prints each
+  reason. A declaration that is not approved removes nothing, and one whose
+  shell has moved is reported stale rather than ignored.
+
 ### Changed
+
+- Turned de-shell's determinism claim into something a test can check one layer
+  down. It was a claim about the bytes a command writes to stdout; the same
+  work run twice now records the same trace apart from `elapsed_nanos` — the
+  same files staged in the same order with the same digests, after the same
+  readings of the environment. That is why the elapsed time is a field of its
+  own rather than folded into the event.
 
 - Made Rust the default for `deshell`, `mise run deshell`, CI, packaging, and
   distribution.
@@ -46,7 +112,278 @@ All notable changes are documented here. No compatibility contract predates
 - Moved all maintained schemas and golden contracts under `contracts/`.
 - Retained OCaml only as an unpublished, opt-in deterministic reference.
 
+### Fixed
+
+- Gave the ambient inputs a name and landed the ban that was waiting for it.
+  `clippy.toml` said the clock and environment entries were "deliberately NOT
+  banned yet, because there is no injected `HostEnvironment` for callers to
+  reach for instead", and that banning an API before its replacement exists
+  converts each call into a suppression nobody revisits. `host::` is that
+  replacement — `variable`, `text_variable`, `wall_clock` and `Stopwatch`, one
+  module, answerable by a test — so `std::env::var`, `var_os`, `vars`,
+  `vars_os`, `SystemTime::now` and `Instant::now` are disallowed everywhere
+  else, the way the filesystem APIs already were. The set of things de-shell
+  reads from outside the repository is now a list a reader can finish.
+
+  It immediately paid for itself: an audit acknowledgement's expiry is compared
+  against the clock, so no test could check that one stops suppressing its
+  finding — the existing test uses `expires = "2099-01-01"` precisely because
+  the real clock would never reach it, which is the same as not testing the
+  window. The day can be moved across the boundary now, and is.
+
+- Refused a stored approval for each way it can be wrong. `Approval::validate`
+  is what makes an approval artifact trustworthy — it is read back from a
+  directory on disk that anything can write to — and mutation testing replaced
+  the entire function with `Ok(())` without a single test failing. Two `||`
+  between its checks could also be `&&` unnoticed, and `declared_shell_name`
+  could return an empty string, which would give two declarations in one file
+  one name. All four are covered, and each new case was checked by
+  reintroducing the mutation.
+
+- Made `span_of` state and keep its own precondition. It took an unchecked byte
+  offset, and an offset can land inside a multi-byte character: the search asked
+  `get` and survived that, while the arm for "not found" indexed with `[from..]`
+  and did not, so the function answered safely or panicked depending on which
+  branch it took. Every caller passes a boundary today, so this was a
+  precondition nothing stated rather than a crash anybody had seen — the new
+  property test reaches it directly. A span now always names bytes a reader can
+  slice: both ends inside the source, in order, and on character boundaries.
+
+- Read a process launch for its program and the command it hands over, rather
+  than for whether every argument is a literal. Those are different questions,
+  and the second answered the first wrongly in both directions:
+  `subprocess.run(["/bin/sh", "-c", command])` was excluded as safe because
+  every element was a literal, and `subprocess.run(["/bin/echo", name])` was
+  reported as shell because one was not. `shell=False` with a sequence is
+  `execvp(args[0], args)`, so the program is `args[0]` and the arguments are
+  not the program. `sh -lc` and `cmd /C` hand over a command exactly as `-c`
+  does. A shell handed a script file — `["sh", "build.sh"]` — is a third
+  answer, not a candidate: the script is its own location and the call site is
+  a script reference this already resolves. The JavaScript arm carried half of
+  this rule already; it now carries all of it, and so does Python.
+
+- Closed the set of `details.items[].kind`. All fifteen report contracts
+  declared it `"type": "string"`, and the structured report is built by
+  re-reading the command's human output, so `scan` took whatever token stood in
+  a line's first tab-separated field and called it a kind. A consumer branching
+  on `kind` — the corpus audit does, and so does any agent reading a report —
+  had nothing to branch over. `ItemKind` is an enum now, a `scan` line naming a
+  kind outside it is reported as a scan error rather than carried as a kind,
+  every report contract names the same twelve kinds in the same order, and
+  `cargo xtask report-item-kinds` fails when the enum and the contracts
+  disagree.
+
+- Returned three doc comments to the items they describe. `walk_rust_sources`,
+  `run_lint_expectations` and `run_repository_guardrails` had ended up with
+  their three paragraphs stacked into one comment on the last of them, so two
+  gates were documented by prose attached to a third.
+
+- Made the independent IR verifier run sixteen of the IR's thirty-five
+  operations instead of four, and replaced its `other => Err(...)` catch-all
+  with an exhaustive `match`. `contracts/golden/ir-verifier-coverage-v1.json`
+  records what each of the other nineteen is refused for, so "nobody
+  implemented this" is a value rather than an absence. A refusal is classified
+  `permanent`, `unimplemented`, or `unexamined`, and each value carries one
+  check: a permanent refusal may never become verified, the unimplemented count
+  is a tight ratchet, and the unexamined count is a tight ratchet at zero so
+  that a new operation has somewhere honest to land.
+- Stopped the independent IR verifier from dropping `set -e`: the arm read
+  `Sequence { nodes, .. }`, and the `..` discarded `on_failure`, so the
+  statement after a failing one ran during verification.
+- Carried `set -u` into the independent IR verifier, which read
+  `UnsetPolicy::Empty` as a constant and expanded an unset name to an empty
+  string where the shell failed.
+- Bound a scenario's `argv` to the entrypoint task's inputs during
+  verification; it was passed to the walk and discarded there, so a script
+  reading `$1` was verified against an empty string. A scenario that gives one
+  argument two different values through `argv` and `arguments` is now refused
+  by name instead of surfacing as an observed difference.
+
+- `cargo xtask lint-expectations`, wired into `mise run lint`: `allow` is
+  rejected outright, a `dead_code` expectation must be
+  `cfg_attr(not(test), ...)`, and it may not sit on a `mod` declaration.
+- Narrowed the blanket `dead_code` expectation on `mod lab` to the one item that
+  was actually dead, and corrected the reason on `Severity`, which claimed a
+  platform gate that applies to none of its variants.
+- `severity_vocabulary_matches_the_diagnostic_schema`, which holds the
+  `Severity` variants and `contracts/schema/diagnostic-v1.schema.json` equal in
+  both directions.
+
+- Gave every location in a file its own byte span. The span came from searching
+  the whole file for the command text, which returns the first occurrence, so
+  repeated identical `run:` lines in one workflow all reported the first one's
+  bytes. `deshell init` refused its own inventory as duplicate location
+  overrides — correctly — which is why de-shell could not be run on its own
+  repository.
+- Stopped a value the scanner cannot locate from claiming the whole file as its
+  span; it gets the line it was found on.
+
+- Stopped a parser process from deciding which interpreter answers. It ran in
+  its own scratch directory, and a version-manager shim on `PATH` resolves its
+  version from the configuration nearest the working directory, so de-shell
+  could not use any interpreter installed through `mise`, `asdf` or `volta`: it
+  reported `runtime unavailable` and delegated a block whose runtime was
+  present. A parser now runs where de-shell runs, which is the rule already
+  applied to `PATH`.
+- Separated a parser that ran out of its time or memory budget from one that
+  answered. Both used to be `runtime unavailable`, so a block was delegated or
+  lowered natively depending on how busy the machine was; a budget failure is
+  now an error, because nobody measured.
+
+- Stopped reporting a migration as `different` when the original never ran.
+  The comparison starts the original's interpreter in a private workspace, and
+  an interpreter that fails to start leaves an empty stdout and a non-zero
+  status, which reads as a difference — so the report blamed the replacement for
+  a baseline that was never taken. A probe now runs an empty script through the
+  same argv the comparison uses, and the evidence says `unavailable` with the
+  interpreter's own error.
+- Made a set of Evidence checks report the worst status in it. The aggregation
+  asked three questions and everything that answered no to all three came out
+  `verified`, so a check whose run could not be made was reported as a verified
+  plan with exit 0.
+
+- Located a shell candidate in a parsed JSON or TOML document by the bytes the
+  document holds rather than the bytes the value decodes to. Searching for the
+  decoded text finds nothing whenever the document escaped anything, so every
+  such candidate fell to the whole-file fallback: running de-shell on its own
+  repository produced seven blockers on one golden corpus that all read `@0..1`.
+
+- Kept the PowerShell parser running instead of starting one process per parse.
+  `adapters/powershell/adapter.ps1` has always been a loop over framed requests
+  on stdin; de-shell started one, sent one request and let it die. Measured on
+  macOS: one `pwsh` start is 0.26 s and sixteen concurrent starts are 4.6 s each,
+  which under a parallel test run reached the parser's ten-second budget.
+- Refused to lower a GitHub workflow step whose `run:` holds a `${{ }}`
+  expression. The runner substitutes it before any shell sees it, so the bytes
+  the scanner read are a template; `run: /bin/echo '${{ matrix.os }}'` was
+  lowered natively and would have printed the template where the step printed
+  the value. Such a step is now a residual and the plan blocks.
+
+- Carried the byte span of every scanned location into the structured report.
+  The report is built by re-reading the human output, so it could only carry
+  what the prose carried, and the prose carried a locator like `run:118`. A
+  reader that cannot ask a follow-up question needs the bytes.
+- Bounded what a failing shell-free gate prints. It named every location in one
+  line and printed that line twice; on a repository with 101 locations a reader
+  learns from it that there are a lot. It now names the first few, says how many
+  more and in how many files, and gives the argv that lists them all.
+
+- Retired several shell blocks of one workflow together. A host rewrite
+  replaces the whole file, and each proposal carried the rewrite of its own
+  block only, so two proposals for one workflow described the same file
+  differently — `DESHELL_BLOCKER_DUPLICATE_TARGET`, 37 times on de-shell's own
+  repository. Every proposal now carries the same rewrite with every block
+  replaced, and identical patches across proposals are applied once.
+- Stopped `deshell init` from writing `declared_shell = []`, which made the
+  obvious `[[declared_shell]]` block appended underneath a duplicate key.
+
+- Lowered a GitHub workflow step under the options the runner sets. GitHub
+  executes a `run:` step as `bash -e {0}`, so `set -e` is in effect whether or
+  not the step says so; de-shell read the text alone and lowered a two-command
+  step to a sequence that carries on after a failure, then claimed it `native`.
+- Delegated a pipeline inside a workflow step. The runner's default is
+  `bash -e {0}` and an explicit `shell: bash` is
+  `bash --noprofile --norc -eo pipefail {0}`, the scanner reports both as
+  `bash`, and the two statuses are two programs.
+
+- Generated a program for a workflow step with several commands instead of
+  refusing it. The program writes each command with its own literal argv and
+  stops where the step stops, and `run_argv` is the program rather than the
+  step's first command.
+- Ran the original of a workflow step the way the runner does — `bash -e {0}`
+  over a file, not `bash -c <text>` — so the comparison has the baseline the
+  step actually has.
+
+- Placed a pipeline inside a workflow step instead of delegating it. The
+  runner's default is `bash -e {0}` and an explicit `shell: bash` is
+  `bash --noprofile --norc -eo pipefail {0}`; both are bash, so the scanner now
+  carries whether the host named the shell and the frontend reads the status
+  from it.
+
+- Lowered a PowerShell command that names a path, not only one that uses the
+  call operator. `./build.ps1 a` and `& './build.ps1' a` are the same
+  invocation, measured;
+  `contracts/golden/powershell-invocation-semantics-v1.json` records it and
+  `cargo xtask powershell-invocation` re-measures it on every runner.
+
+- Generated a workflow step that is an `&&` chain. Under the `set -e` the
+  runner applies, `a && b` is the two commands in a list that stops on failure —
+  the same program, so the generator no longer refuses a `Condition` there. It
+  still refuses one where a failure would not stop the list, because there the
+  two are different programs.
+
+- Built `scan`'s structured report from the inventory instead of re-reading the
+  command's own printed lines. The report could carry only what the prose
+  carried, which is why a location's byte span and content digest arrived one at
+  a time, each after somebody needed it. `dispatch` now lets a command hand the
+  report its own items.
+
+- Ran the original of a pwsh workflow step the way the runner does — a file
+  carrying `$ErrorActionPreference = 'stop'` and `exit $LASTEXITCODE`,
+  dot-sourced — rather than handing its text to `pwsh -Command`. Measured: a
+  step whose cmdlet fails carries on and ends successfully under the second form
+  and stops with status 1 under the first.
+  `contracts/golden/powershell-step-invocation-semantics-v1.json` records it and
+  `cargo xtask powershell-step-invocation` re-measures it.
+
+- Lowered a PowerShell script's own variable: `$name = '<literal>'` becomes an
+  assignment and `$name` passed as an argument reads it. Measured: a value
+  holding a space arrives as one argument, so nothing splits it. A name
+  PowerShell answers itself is refused —
+  `contracts/golden/powershell-variable-inventory-v1.json` records the measured
+  list and `cargo xtask powershell-variables` re-runs it.
+- Generated a host action that sets a variable and passes it on, and stopped
+  the scanner reporting `spawnSync("/bin/echo", [name])` as a shell location. A
+  program that is not a shell starts no shell whatever its arguments are; a
+  program that is one is the case the rule is for.
+
+- Skipped a PowerShell declaration: `[CmdletBinding()]`, an empty `param()`,
+  and `$ErrorActionPreference = '<literal>'` run nothing. All three carry
+  parentheses or a supplied name, and they were the first line every PowerShell
+  file in this repository was refused for. Skipping the preference rests on a
+  measurement — it reaches a cmdlet and nothing else this frontend lowers —
+  recorded in `contracts/golden/powershell-preference-semantics-v1.json` and
+  held by a test that every cmdlet is still refused.
+
+- Read `!=` as an operator rather than as the negation reserved word. The
+  statement splitter refused `[ "$a" != "b" ]`, and with it every
+  `if [ "$a" != "b" ]` in this repository's own workflows, while
+  `TestPredicate::StringNotEqual` and the `string-not-equal` corpus case sat
+  unreached.
+- Generated a workflow step that branches: `if TEST; then BODY; fi` with `echo`
+  and `exit` in it. A branch keeps its own steps, because one that is not taken
+  must not run; an `&&` chain still flattens, because a failure there ends the
+  step.
+
+- Wrote a `echo "the result was: $R"` as the pieces it is, so a step that
+  interpolates a name into its output can be generated.
+- Stopped requiring a generated step to start a process. `if [ ... ]; then echo
+  ...; exit 1; fi` is a program, and it is the shape a workflow gate has.
+
+- Synthesized a scenario for every shell location, not only for entrypoints and
+  embedded blocks. A shell file that was not a declared entrypoint got none, and
+  the plan requires one for every source it holds — so `deshell init` produced a
+  project whose own plan it could not satisfy.
+
 ### Removed
+- `scripts/repository-guardrails.ps1`, rewritten as
+  `cargo xtask repository-guardrails`. de-shell refuses that file — it reads
+  .NET types and formats with `-f` — so the answer is the one the tool exists to
+  prompt: write it in the project's own language.
+
+- `scripts/audit-corpus.ps1`, rewritten as `cargo xtask corpus-audit`. The
+  corpus audit is a 0.1.0 release gate, so every release runner had to carry a
+  PowerShell to run a gate; none does now. Ported rather than reimplemented and
+  checked against the script on the same fourteen repositories: every count,
+  file result, residual reason and all 103 inventory groups matched. The one
+  ordering that differed was the script's — `Sort-Object` and `Group-Object`
+  are case-insensitive by default, so a Dockerfile `RUN` and a workflow `run:`
+  tied, and would have been merged into one row had their interpreters matched.
+  The port also refuses a Scan Report location whose `kind` is none of
+  `shell_file`, `embedded_shell` or `candidate`, where the script read "not an
+  error and not a skip" as a location, and refuses a `--format` that is neither
+  `text` nor `json`.
+
 
 - Pre-v1 Effect IR and lock migration promises.
 - Public OCaml library/runtime/install artifacts and legacy executable-name

@@ -14,6 +14,14 @@ use clap::{Parser, Subcommand, ValueEnum};
 struct Cli {
     #[arg(long, global = true, value_enum, default_value = "human")]
     diagnostics: crate::diagnostics::Mode,
+    /// Record what this run did. Off unless asked for, and never on stdout.
+    #[arg(long, global = true, value_enum, default_value = "off")]
+    trace: crate::trace::Mode,
+    /// Where the trace goes. Standard error when a trace was asked for and no
+    /// path was given, because a trace that lands in a file nobody named is a
+    /// trace nobody reads.
+    #[arg(long = "trace-output", global = true, value_name = "PATH")]
+    trace_output: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -65,6 +73,11 @@ enum Command {
     Matrix {
         #[command(subcommand)]
         command: MatrixCommand,
+    },
+    /// Review and approve shell that stays in the repository on purpose.
+    Declared {
+        #[command(subcommand)]
+        command: DeclaredCommand,
     },
     /// Lower an entrypoint into canonical Effect IR.
     Analyze {
@@ -208,6 +221,27 @@ enum Command {
 enum OutputFormat {
     Human,
     Json,
+    /// For a reader that cannot ask a follow-up question.
+    ///
+    /// The JSON values, plus the source each anchored message points at and a
+    /// description of the shape. A consumer holding this needs no second read
+    /// of the repository to see what a blocker is about.
+    Agent,
+}
+
+impl OutputFormat {
+    /// Whether this form is a structure a program reads, as opposed to lines a
+    /// person does.
+    ///
+    /// A method rather than `== OutputFormat::Json` at each site: `==` is
+    /// outside the exhaustiveness check a `match` gets, and `Agent` was added
+    /// to this enum after those sites were written.
+    fn is_structured(self) -> bool {
+        match self {
+            Self::Json | Self::Agent => true,
+            Self::Human => false,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -279,6 +313,29 @@ enum MatrixCommand {
         root: PathBuf,
         #[arg(long)]
         cell: String,
+        #[arg(long)]
+        digest: String,
+        #[arg(long, value_enum, default_value = "human")]
+        format: OutputFormat,
+    },
+}
+
+#[derive(Clone, Debug, Subcommand)]
+enum DeclaredCommand {
+    /// List declared shell review digests and approval state.
+    List {
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        #[arg(long, value_enum, default_value = "human")]
+        format: OutputFormat,
+    },
+    /// Approve the exact declared location shown by list.
+    Approve {
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        /// The location as `path@start..end`, copied from list.
+        #[arg(long)]
+        location: String,
         #[arg(long)]
         digest: String,
         #[arg(long, value_enum, default_value = "human")]
@@ -418,6 +475,7 @@ enum ExportTarget {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum SchemaName {
     Approval,
+    Trace,
     #[value(name = "init-report")]
     InitReport,
     #[value(name = "scan-report")]
@@ -489,10 +547,75 @@ enum SchemaName {
 struct ReportSpec {
     command: &'static str,
     format: OutputFormat,
+    /// Where an anchored message's path is relative to. The agent format reads
+    /// the source it points at, and a path alone does not say from where.
+    root: PathBuf,
     next_actions: Vec<crate::report::Action>,
 }
 
 impl Command {
+    /// The root this command needs an initialized project at, if it needs one.
+    ///
+    /// Listed rather than defaulted: a command added without an answer here
+    /// does not compile. A command that reads `.deshell` and finds nothing
+    /// otherwise reports a missing directory, which is true and says nothing
+    /// about what to do — and the next step it used to print was `--help`,
+    /// which is three commands away from `deshell init`.
+    fn requires_initialized_project(&self) -> Option<&Path> {
+        match self {
+            // These make or inspect a tree that need not exist yet.
+            Self::Init { .. }
+            | Self::Scan { .. }
+            | Self::Audit { .. }
+            | Self::Schema { .. }
+            | Self::Doctor { .. } => None,
+            // Agent and adapter entry points are spoken to over a pipe by
+            // de-shell itself; they read no project tree.
+            Self::ProcessAgent | Self::ObserverAgent | Self::NushellAdapter | Self::Generator => {
+                None
+            }
+            Self::Analyze { root, .. }
+            | Self::Rewrite { root, .. }
+            | Self::Modernize { root, .. }
+            | Self::Verify { root, .. }
+            | Self::Observe { root, .. }
+            | Self::Run { root, .. }
+            | Self::Export { root, .. }
+            | Self::Check { root, .. }
+            | Self::Explain { root, .. } => Some(root),
+            Self::Scenario { command } => match command {
+                ScenarioCommand::List { root, .. }
+                | ScenarioCommand::Show { root, .. }
+                | ScenarioCommand::Synthesize { root, .. }
+                | ScenarioCommand::Approve { root, .. } => Some(root),
+            },
+            Self::Matrix { command } => match command {
+                MatrixCommand::List { root, .. } | MatrixCommand::Approve { root, .. } => {
+                    Some(root)
+                }
+            },
+            Self::Declared { command } => match command {
+                DeclaredCommand::List { root, .. } | DeclaredCommand::Approve { root, .. } => {
+                    Some(root)
+                }
+            },
+            Self::Harden { command } => match command {
+                HardenCommand::Plan { root, .. }
+                | HardenCommand::Verify { root, .. }
+                | HardenCommand::Apply { root, .. } => Some(root),
+            },
+            Self::Migrate { command } => match command {
+                MigrateCommand::Plan { root, .. }
+                | MigrateCommand::Verify { root, .. }
+                | MigrateCommand::Apply { root, .. }
+                | MigrateCommand::Status { root, .. } => Some(root),
+                MigrateCommand::Evidence { command } => match command {
+                    MigrateEvidenceCommand::Import { root, .. } => Some(root),
+                },
+            },
+        }
+    }
+
     fn report_spec(&self) -> Option<ReportSpec> {
         fn root_value(root: &Path) -> String {
             root.to_string_lossy().into_owned()
@@ -503,6 +626,7 @@ impl Command {
         let spec = match self {
             Self::Init { root, format, .. } => ReportSpec {
                 command: "init",
+                root: root.clone(),
                 format: *format,
                 next_actions: vec![
                     action(vec![
@@ -521,19 +645,22 @@ impl Command {
                     ]),
                 ],
             },
-            Self::Scan { format, .. } => ReportSpec {
+            Self::Scan { root, format, .. } => ReportSpec {
                 command: "scan",
+                root: root.clone(),
                 format: *format,
                 next_actions: Vec::new(),
             },
-            Self::Audit { format, .. } => match format {
+            Self::Audit { root, format, .. } => match format {
                 AuditOutputFormat::Human => ReportSpec {
                     command: "audit",
+                    root: root.clone(),
                     format: OutputFormat::Human,
                     next_actions: Vec::new(),
                 },
                 AuditOutputFormat::Json => ReportSpec {
                     command: "audit",
+                    root: root.clone(),
                     format: OutputFormat::Json,
                     next_actions: Vec::new(),
                 },
@@ -550,6 +677,7 @@ impl Command {
                 };
                 ReportSpec {
                     command: "scenario",
+                    root: root.clone(),
                     format,
                     next_actions: vec![action(vec![
                         "deshell".into(),
@@ -567,6 +695,7 @@ impl Command {
                 };
                 ReportSpec {
                     command: "matrix",
+                    root: root.clone(),
                     format,
                     next_actions: vec![action(vec![
                         "deshell".into(),
@@ -577,8 +706,27 @@ impl Command {
                     ])],
                 }
             }
+            Self::Declared { command } => {
+                let (root, format) = match command {
+                    DeclaredCommand::List { root, format }
+                    | DeclaredCommand::Approve { root, format, .. } => (root, *format),
+                };
+                ReportSpec {
+                    command: "declared",
+                    root: root.clone(),
+                    format,
+                    next_actions: vec![action(vec![
+                        "deshell".into(),
+                        "declared".into(),
+                        "list".into(),
+                        "--root".into(),
+                        root_value(root),
+                    ])],
+                }
+            }
             Self::Analyze { root, format, .. } => ReportSpec {
                 command: "analyze",
+                root: root.clone(),
                 format: *format,
                 next_actions: vec![action(vec![
                     "deshell".into(),
@@ -587,24 +735,27 @@ impl Command {
                     root_value(root),
                 ])],
             },
-            Self::Rewrite { format, .. } => ReportSpec {
+            Self::Rewrite { root, format, .. } => ReportSpec {
                 command: "rewrite",
+                root: root.clone(),
                 format: *format,
                 next_actions: Vec::new(),
             },
-            Self::Modernize { format, .. } => ReportSpec {
+            Self::Modernize { root, format, .. } => ReportSpec {
                 command: "modernize",
+                root: root.clone(),
                 format: *format,
                 next_actions: Vec::new(),
             },
             Self::Harden { command } => {
-                let format = match command {
-                    HardenCommand::Plan { format, .. }
-                    | HardenCommand::Verify { format, .. }
-                    | HardenCommand::Apply { format, .. } => *format,
+                let (root, format) = match command {
+                    HardenCommand::Plan { root, format, .. }
+                    | HardenCommand::Verify { root, format, .. }
+                    | HardenCommand::Apply { root, format, .. } => (root, *format),
                 };
                 ReportSpec {
                     command: "harden",
+                    root: root.clone(),
                     format,
                     next_actions: Vec::new(),
                 }
@@ -621,6 +772,7 @@ impl Command {
                 };
                 ReportSpec {
                     command: "migrate",
+                    root: root.clone(),
                     format,
                     next_actions: vec![action(vec![
                         "deshell".into(),
@@ -633,6 +785,7 @@ impl Command {
             }
             Self::Verify { root, format, .. } => ReportSpec {
                 command: "verify",
+                root: root.clone(),
                 format: *format,
                 next_actions: vec![action(vec![
                     "deshell".into(),
@@ -643,6 +796,7 @@ impl Command {
             },
             Self::Observe { root, format, .. } => ReportSpec {
                 command: "observe",
+                root: root.clone(),
                 format: *format,
                 next_actions: vec![action(vec![
                     "deshell".into(),
@@ -651,13 +805,15 @@ impl Command {
                     root_value(root),
                 ])],
             },
-            Self::Doctor { format, .. } => ReportSpec {
+            Self::Doctor { root, format, .. } => ReportSpec {
                 command: "doctor",
+                root: root.clone(),
                 format: *format,
                 next_actions: Vec::new(),
             },
             Self::Check { root, format } => ReportSpec {
                 command: "check",
+                root: root.clone(),
                 format: *format,
                 next_actions: vec![
                     action(vec![
@@ -676,8 +832,9 @@ impl Command {
                     ]),
                 ],
             },
-            Self::Explain { format, .. } => ReportSpec {
+            Self::Explain { root, format, .. } => ReportSpec {
                 command: "explain",
+                root: root.clone(),
                 format: *format,
                 next_actions: Vec::new(),
             },
@@ -716,6 +873,11 @@ impl Command {
                     *format = OutputFormat::Human
                 }
             },
+            Self::Declared { command } => match command {
+                DeclaredCommand::List { format, .. } | DeclaredCommand::Approve { format, .. } => {
+                    *format = OutputFormat::Human
+                }
+            },
             Self::Harden { command } => match command {
                 HardenCommand::Plan { format, .. }
                 | HardenCommand::Verify { format, .. }
@@ -751,6 +913,30 @@ struct Failure {
 }
 
 impl Failure {
+    /// The project has no `.deshell`, and the next step is to make one.
+    ///
+    /// Its own constructor because the remedy is known here and nowhere else:
+    /// the read that fails reports a missing directory, which is true and does
+    /// not say what to do about it.
+    fn uninitialized(root: &Path) -> Self {
+        Self {
+            exit: 3,
+            code: "DESHELL_UNINITIALIZED",
+            message: format!(
+                "{} has no .deshell directory; the project is not initialized",
+                root.display()
+            ),
+            help: Some("Run deshell init to create the canonical project files.".into()),
+            next_actions: vec![crate::report::Action::Command {
+                argv: vec![
+                    "deshell".into(),
+                    "init".into(),
+                    "--root".into(),
+                    root.to_string_lossy().into_owned(),
+                ],
+            }],
+        }
+    }
     fn io(message: impl Into<String>) -> Self {
         Self {
             exit: 1,
@@ -844,10 +1030,12 @@ impl Failure {
     }
 }
 
-pub(crate) fn run_from<I, T>(args: I, stdout: &mut dyn Write, stderr: &mut dyn Write) -> i32
+pub(crate) fn run_from<I, T, Out, Err>(args: I, stdout: &mut Out, stderr: &mut Err) -> i32
 where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
+    Out: Write,
+    Err: Write,
 {
     let args: Vec<OsString> = args.into_iter().map(Into::into).collect();
     let fallback_mode = requested_diagnostic_mode(&args);
@@ -864,26 +1052,48 @@ where
                     Err(_) => 1,
                 };
             }
-            let diagnostic = crate::diagnostics::Diagnostic::error(
+            let diagnostic = crate::diagnostics::Diagnostic::usage(
                 "DESHELL_USAGE",
                 error.to_string().trim().to_owned(),
             );
-            let _ = crate::diagnostics::emit(stderr, fallback_mode, &diagnostic);
-            return 2;
+            return if crate::diagnostics::emit(stderr, fallback_mode, &diagnostic).is_err() {
+                70
+            } else {
+                2
+            };
         }
     };
     let diagnostic_mode = cli.diagnostics;
+    // Started before anything else runs, so the first thing the trace holds is
+    // the first thing the run did. Stopped by the guard on every path out,
+    // including the early returns below.
+    let _recording = match start_recording(cli.trace, cli.trace_output.as_deref()) {
+        Ok(recording) => recording,
+        Err(message) => {
+            // A run that was asked to record and silently did not is worse than
+            // one that stops: the absence of an event would read as the absence
+            // of the work.
+            let diagnostic = crate::diagnostics::Diagnostic::error("DESHELL_IO", message);
+            return if crate::diagnostics::emit(stderr, diagnostic_mode, &diagnostic).is_err() {
+                70
+            } else {
+                1
+            };
+        }
+    };
     let mut command = cli.command;
     if let Some(spec) = command.report_spec() {
         command.force_human_report_source();
         let mut captured_stdout = Vec::new();
         let mut captured_stderr = Vec::new();
-        let outcome = dispatch(
+        let mut supplied_details = None;
+        let outcome = dispatch(DispatchArgs {
             command,
             diagnostic_mode,
-            &mut captured_stdout,
-            &mut captured_stderr,
-        );
+            stdout: &mut captured_stdout,
+            stderr: &mut captured_stderr,
+            details: &mut supplied_details,
+        });
         let (code, completed_failure) = match outcome {
             Ok(code) => (code, None),
             Err(failure) if completed_report_failure(&failure) => (failure.exit, Some(failure)),
@@ -897,31 +1107,43 @@ where
                 };
             }
         };
-        let mut report = command_report(
-            &spec,
+        let mut report = command_report(CommandReportArgs {
+            spec: &spec,
             code,
-            completed_failure.as_ref(),
-            &captured_stdout,
-            &captured_stderr,
-        );
+            failure: completed_failure.as_ref(),
+            stdout: &captured_stdout,
+            stderr: &captured_stderr,
+            supplied: supplied_details,
+        });
         if report.next_actions.is_empty() {
             report.next_actions = spec.next_actions;
         }
         let emitted = match spec.format {
             OutputFormat::Human => report.emit_human(stdout).map_err(|error| error.to_string()),
             OutputFormat::Json => report.emit_json(stdout),
+            OutputFormat::Agent => report.emit_agent(&spec.root, stdout),
         };
         if let Err(message) = emitted {
             let diagnostic = crate::diagnostics::Diagnostic::error(
                 "DESHELL_IO",
                 format!("cannot write report: {message}"),
             );
-            let _ = crate::diagnostics::emit(stderr, diagnostic_mode, &diagnostic);
-            return 1;
+            return if crate::diagnostics::emit(stderr, diagnostic_mode, &diagnostic).is_err() {
+                70
+            } else {
+                1
+            };
         }
         return code;
     }
-    match dispatch(command, diagnostic_mode, stdout, stderr) {
+    // Nothing reads a report on this path, so nothing is asked to build one.
+    match dispatch(DispatchArgs {
+        command,
+        diagnostic_mode,
+        stdout,
+        stderr,
+        details: &mut None,
+    }) {
         Ok(code) => code,
         Err(failure) => {
             let exit = failure.exit;
@@ -933,6 +1155,48 @@ where
             }
         }
     }
+}
+
+/// Recording, for as long as this is held.
+///
+/// A guard rather than a call beside each `return`: `run_from` leaves by five
+/// paths and a trace that stops on four of them is a trace whose end means
+/// nothing.
+struct Recording(crate::trace::Mode);
+
+impl Drop for Recording {
+    fn drop(&mut self) {
+        match self.0 {
+            crate::trace::Mode::Off => {}
+            crate::trace::Mode::Jsonl => crate::trace::stop(),
+        }
+    }
+}
+
+fn start_recording(mode: crate::trace::Mode, output: Option<&Path>) -> Result<Recording, String> {
+    match mode {
+        crate::trace::Mode::Off => {
+            if let Some(path) = output {
+                return Err(format!(
+                    "--trace-output {} was given without --trace; a destination with nothing to write to it is a request that did not happen",
+                    path.display()
+                ));
+            }
+        }
+        crate::trace::Mode::Jsonl => {
+            match output {
+                Some(path) => {
+                    crate::trace::start_file(std::fs::File::create(path).map_err(|error| {
+                        format!("cannot write the trace to {}: {error}", path.display())
+                    })?)
+                }
+                // Standard error, because stdout carries the command's answer
+                // and a trace must never change those bytes.
+                None => crate::trace::start_standard_error(),
+            }
+        }
+    }
+    Ok(Recording(mode))
 }
 
 fn failure_diagnostic(failure: Failure) -> crate::diagnostics::Diagnostic {
@@ -954,13 +1218,32 @@ fn completed_report_failure(failure: &Failure) -> bool {
             .contains("current scenarios have not been observed")
 }
 
-fn command_report(
-    spec: &ReportSpec,
+/// The inputs of [`command_report`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`command_report`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct CommandReportArgs<'a> {
+    spec: &'a ReportSpec,
     code: i32,
-    failure: Option<&Failure>,
-    stdout: &[u8],
-    stderr: &[u8],
-) -> crate::report::Report {
+    failure: Option<&'a Failure>,
+    stdout: &'a [u8],
+    stderr: &'a [u8],
+    /// What the command said about itself, when it says it. See [`dispatch`].
+    supplied: Option<crate::report::Details>,
+}
+
+fn command_report(parts: CommandReportArgs<'_>) -> crate::report::Report {
+    // Destructured without `..`: see `CommandReportArgs`.
+    let CommandReportArgs {
+        spec,
+        code,
+        failure,
+        stdout,
+        stderr,
+        supplied,
+    } = parts;
     let stdout = String::from_utf8_lossy(stdout);
     let stderr = String::from_utf8_lossy(stderr);
     let not_ready = code == 0
@@ -994,17 +1277,25 @@ fn command_report(
             crate::report::Status::Failed => format!("{} failed", spec.command),
         });
     let mut report = crate::report::Report::new(spec.command, status, summary);
+    // A command that built its own items keeps them; the loop below still reads
+    // the prose for counts, values, paths and next actions, which are about the
+    // run rather than about a location.
+    let supplied_items = supplied.is_some();
+    if let Some(details) = supplied {
+        report.details.items = details.items;
+    }
     if let Some(failure) = failure {
         report.details.items.push(crate::report::Item {
-            kind: Some("failure".into()),
+            kind: Some(crate::report::ItemKind::Failure),
             name: Some(failure.code.into()),
             message: Some(failure.message.clone()),
             ..crate::report::Item::default()
         });
-        report
-            .details
-            .output
-            .push(format!("{}: {}", failure.code, failure.message));
+        // The code is not pushed into `output` beside the summary. It used to
+        // be, and `emit_human` prints the summary and then every output line,
+        // so a failing gate said the same sentence twice — 101 locations' worth
+        // of it, before the message was bounded. `emit_human` reads the code off
+        // the item instead, and machines read it there too.
         report.next_actions.extend(failure.next_actions.clone());
     }
     for line in stdout.lines() {
@@ -1032,7 +1323,7 @@ fn command_report(
             report.details.paths.push(path.to_owned());
         } else if let Some(entrypoint) = line.strip_prefix("entrypoint ") {
             report.details.items.push(crate::report::Item {
-                kind: Some("entrypoint".into()),
+                kind: Some(crate::report::ItemKind::Entrypoint),
                 path: Some(entrypoint.into()),
                 ..crate::report::Item::default()
             });
@@ -1048,60 +1339,91 @@ fn command_report(
             report.details.values.insert("reason".into(), reason.into());
         } else if let Some(cell) = line.strip_prefix("required cell ") {
             report.details.items.push(crate::report::Item {
-                kind: Some("matrix_cell".into()),
+                kind: Some(crate::report::ItemKind::MatrixCell),
                 name: Some(cell.into()),
                 ..crate::report::Item::default()
             });
         } else if let Some(reason) = line.strip_prefix("not-ready: ") {
             report.details.items.push(crate::report::Item {
-                kind: Some("not_ready".into()),
+                kind: Some(crate::report::ItemKind::NotReady),
                 message: Some(reason.into()),
                 ..crate::report::Item::default()
             });
         } else if let Some(blocker) = line.strip_prefix("blocker ") {
             let (name, message) = blocker.split_once(' ').unwrap_or((blocker, ""));
             report.details.items.push(crate::report::Item {
-                kind: Some("blocker".into()),
+                kind: Some(crate::report::ItemKind::Blocker),
                 name: Some(name.into()),
                 message: (!message.is_empty()).then(|| message.into()),
                 ..crate::report::Item::default()
             });
-        } else if spec.command == "scan" && line.contains('\t') {
+        } else if spec.command == "scan" && line.contains('\t') && !supplied_items {
             let fields = line.split('\t').collect::<Vec<_>>();
             if fields.len() >= 2 {
                 let item = match fields[0] {
                     "error" => crate::report::Item {
-                        kind: Some("error".into()),
+                        kind: Some(crate::report::ItemKind::Error),
                         path: Some(fields[1].into()),
                         name: fields.get(2).map(|stage| (*stage).into()),
                         message: fields.get(3).map(|message| (*message).into()),
                         ..crate::report::Item::default()
                     },
                     "skipped" => crate::report::Item {
-                        kind: Some("skipped".into()),
+                        kind: Some(crate::report::ItemKind::Skipped),
                         path: Some(fields[1].into()),
                         message: fields.get(2).map(|reason| (*reason).into()),
                         ..crate::report::Item::default()
                     },
-                    kind => crate::report::Item {
-                        kind: Some(kind.into()),
-                        path: Some(fields[1].into()),
-                        name: fields.get(2).map(|interpreter| (*interpreter).into()),
-                        status: fields.get(3).map(|confidence| (*confidence).into()),
-                        message: fields
-                            .get(4)
-                            .filter(|locator| **locator != "-")
-                            .map(|locator| (*locator).into()),
-                        ..crate::report::Item::default()
-                    },
+                    // The line came from this process a moment ago, so an
+                    // unmodelled token here is `scan` printing a kind the
+                    // report does not carry. It is reported as a scan error
+                    // rather than passed on as a kind made of the token — a
+                    // consumer branching on `kind` cannot tell those apart.
+                    token if crate::report::ItemKind::parse(token).is_none() => {
+                        crate::report::Item {
+                            kind: Some(crate::report::ItemKind::Error),
+                            path: Some(fields[1].into()),
+                            name: Some("report".into()),
+                            message: Some(format!(
+                                "scan printed the unmodelled location kind '{token}'"
+                            )),
+                            ..crate::report::Item::default()
+                        }
+                    }
+                    token => {
+                        let span = fields
+                            .get(5)
+                            .and_then(|span| span.split_once(".."))
+                            .and_then(|(start, end)| {
+                                Some((start.parse().ok()?, end.parse().ok()?))
+                            });
+                        crate::report::Item {
+                            kind: crate::report::ItemKind::parse(token),
+                            path: Some(fields[1].into()),
+                            name: fields.get(2).map(|interpreter| (*interpreter).into()),
+                            status: fields.get(3).map(|confidence| (*confidence).into()),
+                            message: fields
+                                .get(4)
+                                .filter(|locator| **locator != "-")
+                                .map(|locator| (*locator).into()),
+                            start_byte: span.map(|(start, _)| start),
+                            end_byte: span.map(|(_, end)| end),
+                            ..crate::report::Item::default()
+                        }
+                    }
                 };
                 report.details.items.push(item);
             }
-        } else if matches!(spec.command, "scenario" | "matrix") && line.contains('\t') {
+        } else if let Some(row) = match spec.command {
+            "scenario" => Some(crate::report::ItemKind::Scenario),
+            "matrix" => Some(crate::report::ItemKind::Matrix),
+            _ => None,
+        } && line.contains('\t')
+        {
             let fields = line.split('\t').collect::<Vec<_>>();
             if fields.len() >= 3 {
                 report.details.items.push(crate::report::Item {
-                    kind: Some(spec.command.into()),
+                    kind: Some(row),
                     name: Some(fields[0].into()),
                     status: Some(fields[1].into()),
                     digest: Some(fields[2].into()),
@@ -1185,12 +1507,88 @@ fn requested_diagnostic_mode(args: &[OsString]) -> crate::diagnostics::Mode {
     crate::diagnostics::Mode::Human
 }
 
-fn dispatch(
+/// Run a command.
+///
+/// `details` is how a command hands the structured report its own items instead
+/// of having them read back out of its prose. `command_report` reconstructs a
+/// report by parsing the human output, which is why a scanned location's byte
+/// span and content digest reached the machine-readable face only after the
+/// human line was made to print them. A command that fills this says what it
+/// found; one that leaves it empty is parsed as before.
+/// What `scan` found, as the structured report says it.
+///
+/// The one place the inventory becomes report items. `command_report` fills the
+/// counts and values from the summary lines, which are statements about the
+/// whole run rather than about a location.
+fn scan_details(inventory: &crate::scanner::Inventory) -> crate::report::Details {
+    let mut details = crate::report::Details::default();
+    for finding in &inventory.findings {
+        details.items.push(crate::report::Item {
+            kind: Some(finding_kind(&finding.kind)),
+            path: Some(finding.path.clone()),
+            name: Some(
+                finding
+                    .interpreter
+                    .clone()
+                    .unwrap_or_else(|| "unknown".into()),
+            ),
+            status: Some(interpreter_confidence(&finding.interpreter_confidence).into()),
+            message: finding.locator.clone(),
+            digest: Some(finding.content_digest.clone()),
+            start_byte: Some(finding.span.start_byte),
+            end_byte: Some(finding.span.end_byte),
+            ..crate::report::Item::default()
+        });
+    }
+    for skipped in &inventory.skipped {
+        details.items.push(crate::report::Item {
+            kind: Some(crate::report::ItemKind::Skipped),
+            path: Some(skipped.path.clone()),
+            message: Some(skipped.reason.clone()),
+            ..crate::report::Item::default()
+        });
+    }
+    for error in &inventory.errors {
+        details.items.push(crate::report::Item {
+            kind: Some(crate::report::ItemKind::Error),
+            path: Some(error.path.clone().unwrap_or_else(|| "<root>".into())),
+            name: Some(error.stage.clone()),
+            message: Some(error.message.clone()),
+            ..crate::report::Item::default()
+        });
+    }
+    details
+}
+
+struct DispatchArgs<'a, Out: Write, Err: Write> {
     command: Command,
     diagnostic_mode: crate::diagnostics::Mode,
-    stdout: &mut dyn Write,
-    stderr: &mut dyn Write,
-) -> Result<i32, Failure> {
+    stdout: &'a mut Out,
+    stderr: &'a mut Err,
+    details: &'a mut Option<crate::report::Details>,
+}
+
+fn dispatch<Out: Write, Err: Write>(parts: DispatchArgs<'_, Out, Err>) -> Result<i32, Failure> {
+    // Destructured without `..`: see `DispatchArgs`.
+    let DispatchArgs {
+        command,
+        diagnostic_mode,
+        stdout,
+        stderr,
+        details,
+    } = parts;
+    // Asked before the command runs, so the answer is "the project is not
+    // initialized, run `deshell init`" rather than whatever read happened to
+    // fail first.
+    // A root that is not there at all is a different condition from one that is
+    // there and holds no project: `deshell init` is the answer to the second
+    // and not to the first.
+    if let Some(root) = command.requires_initialized_project()
+        && root.is_dir()
+        && !root.join(".deshell").is_dir()
+    {
+        return Err(Failure::uninitialized(root));
+    }
     match command {
         Command::Init {
             root,
@@ -1235,7 +1633,7 @@ fn dispatch(
                     Failure::io(message)
                 }
             })?;
-            if format == OutputFormat::Json {
+            if format.is_structured() {
                 let value = serde_json::json!({
                     "created": result.created,
                     "entrypoints": result.entrypoints,
@@ -1280,6 +1678,13 @@ fn dispatch(
         Command::Scan { root, format } => {
             let inventory = crate::project::scan(&root).map_err(Failure::io)?;
             let exit = if inventory.errors.is_empty() { 0 } else { 1 };
+            // Built from the inventory, not read back out of the lines printed
+            // below. The report used to be a parse of this command's prose, so
+            // it carried only what the prose carried: a location's byte span and
+            // content digest reached the machine-readable face only once the
+            // human line was made to print them, and a reader that cannot ask a
+            // follow-up question got a locator like `run:118` instead of bytes.
+            *details = Some(scan_details(&inventory));
             match format {
                 OutputFormat::Json => {
                     let value = serde_json::to_value(&inventory)
@@ -1289,17 +1694,22 @@ fn dispatch(
                         &crate::canonical_json::pretty_bytes(&value).map_err(Failure::internal)?,
                     )?;
                 }
-                OutputFormat::Human => {
+                // `Agent` is collected from the human output by `command_report`,
+                // which sets the format to `Human` before dispatch runs, so it cannot
+                // arrive here. Listing it says that rather than leaving a wildcard.
+                OutputFormat::Agent | OutputFormat::Human => {
                     for finding in &inventory.findings {
                         writeln_io(
                             stdout,
                             format_args!(
-                                "{}\t{}\t{}\t{}\t{}",
-                                finding_kind(&finding.kind),
+                                "{}\t{}\t{}\t{}\t{}\t{}..{}",
+                                finding_kind(&finding.kind).as_str(),
                                 finding.path,
                                 finding.interpreter.as_deref().unwrap_or("unknown"),
                                 interpreter_confidence(&finding.interpreter_confidence),
                                 finding.locator.as_deref().unwrap_or("-"),
+                                finding.span.start_byte,
+                                finding.span.end_byte,
                             ),
                         )?;
                     }
@@ -1329,6 +1739,22 @@ fn dispatch(
                             inventory.errors.len()
                         ),
                     )?;
+                    // A count alone says how much was inventoried, not how much of
+                    // it is understood. Five `bash` steps declared by a composite
+                    // action once sat inside forty low-confidence guesses, and only
+                    // a reader who went through every line would have seen them.
+                    let (mut high, mut medium, mut low) = (0_usize, 0_usize, 0_usize);
+                    for finding in &inventory.findings {
+                        match finding.interpreter_confidence {
+                            crate::scanner::InterpreterConfidence::High => high += 1,
+                            crate::scanner::InterpreterConfidence::Medium => medium += 1,
+                            crate::scanner::InterpreterConfidence::Low => low += 1,
+                        }
+                    }
+                    writeln_io(
+                        stdout,
+                        format_args!("confidence: {high} high; {medium} medium; {low} low"),
+                    )?;
                 }
             }
             Ok(exit)
@@ -1355,7 +1781,30 @@ fn dispatch(
                 name,
                 digest,
                 format,
-            } => scenario_approve_command(&root, &name, &digest, format, stdout),
+            } => scenario_approve_command(ScenarioApproveCommandArgs {
+                root: &root,
+                name: &name,
+                digest: &digest,
+                format,
+                stdout,
+            }),
+        },
+        Command::Declared { command } => match command {
+            DeclaredCommand::List { root, format } => {
+                declared_review_command(&root, format, stdout)
+            }
+            DeclaredCommand::Approve {
+                root,
+                location,
+                digest,
+                format,
+            } => declared_approve_command(DeclaredApproveCommandArgs {
+                root: &root,
+                location: &location,
+                digest: &digest,
+                format,
+                stdout,
+            }),
         },
         Command::Matrix { command } => match command {
             MatrixCommand::List { root, format } => matrix_review_command(&root, format, stdout),
@@ -1364,7 +1813,13 @@ fn dispatch(
                 cell,
                 digest,
                 format,
-            } => matrix_approve_command(&root, &cell, &digest, format, stdout),
+            } => matrix_approve_command(MatrixApproveCommandArgs {
+                root: &root,
+                cell: &cell,
+                digest: &digest,
+                format,
+                stdout,
+            }),
         },
         Command::Analyze { root, entry, .. } => {
             for entry in selected_entries(&root, entry)? {
@@ -1394,7 +1849,10 @@ fn dispatch(
                     stdout,
                     format_args!("{}: project artifacts are ready", root.display()),
                 )?,
-                OutputFormat::Human => {
+                // `Agent` is collected from the human output by `command_report`,
+                // which sets the format to `Human` before dispatch runs, so it cannot
+                // arrive here. Listing it says that rather than leaving a wildcard.
+                OutputFormat::Agent | OutputFormat::Human => {
                     writeln_io(
                         stdout,
                         format_args!("{}: project is valid but not ready", root.display()),
@@ -1484,6 +1942,12 @@ fn dispatch(
                         report.uncovered_bytes
                     ),
                 )?;
+                // Named rather than counted: a reader who has to find out which
+                // of twelve scenarios went unobserved is reading the project's
+                // files to answer a question the report already knew.
+                for scenario in &report.unobserved_scenarios {
+                    writeln_io(stdout, format_args!("{prefix}unobserved: {scenario}"))?;
+                }
                 for reason in report.residual_reasons {
                     writeln_io(stdout, format_args!("{prefix}residual: {reason}"))?;
                 }
@@ -1620,13 +2084,26 @@ fn dispatch(
             equivalent,
             apply,
             ..
-        } => rewrite_command(&root, entry, equivalent, apply, stdout),
+        } => rewrite_command(RewriteCommandArgs {
+            root: &root,
+            entry,
+            equivalent,
+            apply,
+            stdout,
+        }),
         Command::Modernize {
             root,
             profile,
             apply,
             ..
-        } => modernize_command(&root, &profile, apply, diagnostic_mode, stdout, stderr),
+        } => modernize_command(ModernizeCommandArgs {
+            root: &root,
+            profile: &profile,
+            apply,
+            diagnostic_mode,
+            stdout,
+            stderr,
+        }),
         Command::Harden { command } => harden_command(command, stdout),
         Command::Migrate { command } => match command {
             MigrateCommand::Plan { root, .. } => migrate_plan_command(&root, stdout),
@@ -1636,7 +2113,13 @@ fn dispatch(
                 cell,
                 output,
                 ..
-            } => migrate_verify_command(&root, &plan, &cell, &output, stdout),
+            } => migrate_verify_command(MigrateVerifyCommandArgs {
+                root: &root,
+                plan: &plan,
+                cell: &cell,
+                output: &output,
+                stdout,
+            }),
             MigrateCommand::Evidence { command } => match command {
                 MigrateEvidenceCommand::Import {
                     root, plan, files, ..
@@ -1730,6 +2213,7 @@ fn schema(name: SchemaName) -> &'static [u8] {
         SchemaName::Diagnostic => {
             include_bytes!("../../../contracts/schema/diagnostic-v1.schema.json")
         }
+        SchemaName::Trace => include_bytes!("../../../contracts/schema/trace-v1.schema.json"),
         SchemaName::Protocol => include_bytes!("../../../contracts/schema/protocol-v1.schema.json"),
         SchemaName::Project => include_bytes!("../../../contracts/schema/project-v1.schema.json"),
         SchemaName::Scenario => include_bytes!("../../../contracts/schema/scenario-v1.schema.json"),
@@ -1863,11 +2347,11 @@ fn is_io_message(message: &str) -> bool {
     .any(|marker| message.contains(marker))
 }
 
-fn finding_kind(kind: &crate::scanner::FindingKind) -> &'static str {
+fn finding_kind(kind: &crate::scanner::FindingKind) -> crate::report::ItemKind {
     match kind {
-        crate::scanner::FindingKind::ShellFile => "shell_file",
-        crate::scanner::FindingKind::EmbeddedShell => "embedded_shell",
-        crate::scanner::FindingKind::Candidate => "candidate",
+        crate::scanner::FindingKind::ShellFile => crate::report::ItemKind::ShellFile,
+        crate::scanner::FindingKind::EmbeddedShell => crate::report::ItemKind::EmbeddedShell,
+        crate::scanner::FindingKind::Candidate => crate::report::ItemKind::Candidate,
     }
 }
 
@@ -1879,8 +2363,8 @@ fn interpreter_confidence(confidence: &crate::scanner::InterpreterConfidence) ->
     }
 }
 
-fn shell_free_command(root: &Path, stdout: &mut dyn Write) -> Result<i32, Failure> {
-    let inventory = crate::project::scan(root).map_err(Failure::io)?;
+fn shell_free_command<W: Write>(root: &Path, stdout: &mut W) -> Result<i32, Failure> {
+    let mut inventory = crate::project::scan(root).map_err(Failure::io)?;
     if !inventory.errors.is_empty() || !inventory.skipped.is_empty() {
         let blockers = inventory
             .errors
@@ -1905,44 +2389,191 @@ fn shell_free_command(root: &Path, stdout: &mut dyn Write) -> Result<i32, Failur
             "shell-free scan is incomplete: {blockers}"
         )));
     }
+    let declared = take_declared_shell(root, &mut inventory)?;
     if !inventory.findings.is_empty() {
-        let locations = inventory
-            .findings
-            .iter()
-            .map(|finding| {
-                format!(
-                    "{}:{}@{}..{}",
-                    finding_kind(&finding.kind),
-                    finding.path,
-                    finding.span.start_byte,
-                    finding.span.end_byte
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(Failure::shell_reintroduced(format!(
-            "live tree is not shell-free ({} location(s)): {locations}",
-            inventory.findings.len()
-        )));
+        return Err(shell_reintroduced_failure(&inventory, declared.len()));
     }
     crate::migration::verify_integrity(root).map_err(Failure::policy)?;
-    writeln_io(stdout, format_args!("shell-free: verified"))?;
+    // The declared count is printed even when it is zero. A gate that says
+    // `verified` and nothing else cannot be told apart from one that has
+    // nothing declared, and the difference is the whole point of declaring.
+    writeln_io(
+        stdout,
+        format_args!("shell-free: verified (0 live, {} declared)", declared.len()),
+    )?;
+    for location in &declared {
+        writeln_io(stdout, format_args!("declared {location}"))?;
+    }
     Ok(0)
 }
 
-fn scenario_synthesize_command(
+/// Remove the locations this project has declared and approved, and name them.
+///
+/// A declared location is not skipped: it is matched by its exact span, counted,
+/// and printed. A declaration that matches nothing is stale — the shell it named
+/// moved or went — and a declaration that is not approved does not remove
+/// anything, so neither can quietly widen the gate.
+fn take_declared_shell(
+    root: &Path,
+    inventory: &mut crate::scanner::Inventory,
+) -> Result<Vec<String>, Failure> {
+    let config = crate::project::load_config(root).map_err(classify_project_errors)?;
+    if config.declared_shell.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut approved = std::collections::BTreeSet::new();
+    let mut named = Vec::new();
+    let mut unapproved = Vec::new();
+    for location in &config.declared_shell {
+        let name = crate::approval::declared_shell_name(
+            &location.path,
+            location.start_byte,
+            location.end_byte,
+        );
+        match crate::approval::declared_shell_approval(root, location)
+            .map_err(classify_project_error)?
+        {
+            Some(_) => {
+                approved.insert((
+                    location.path.clone(),
+                    location.start_byte,
+                    location.end_byte,
+                ));
+                named.push(format!("{name}: {}", location.reason));
+            }
+            None => unapproved.push(name),
+        }
+    }
+    if !unapproved.is_empty() {
+        return Err(Failure {
+            help: Some(
+                "A declaration removes nothing until it is approved, so the gate would otherwise pass on a review nobody did.".into(),
+            ),
+            next_actions: vec![crate::report::Action::Command {
+                argv: vec![
+                    "deshell".into(),
+                    "declared".into(),
+                    "list".into(),
+                    "--root".into(),
+                    root.to_string_lossy().into_owned(),
+                ],
+            }],
+            ..Failure::policy(format!(
+                "declared shell is not approved: {}",
+                unapproved.join(", ")
+            ))
+        });
+    }
+    let mut matched = std::collections::BTreeSet::new();
+    inventory.findings.retain(|finding| {
+        let key = (
+            finding.path.clone(),
+            finding.span.start_byte,
+            finding.span.end_byte,
+        );
+        if approved.contains(&key) {
+            matched.insert(key);
+            false
+        } else {
+            true
+        }
+    });
+    let stale = approved
+        .difference(&matched)
+        .map(|(path, start, end)| crate::approval::declared_shell_name(path, *start, *end))
+        .collect::<Vec<_>>();
+    if !stale.is_empty() {
+        return Err(Failure {
+            help: Some(
+                "The shell a declaration named is no longer there. Remove the declaration, or point it at where the shell went.".into(),
+            ),
+            ..Failure::policy(format!("declared shell matches nothing: {}", stale.join(", ")))
+        });
+    }
+    named.sort();
+    Ok(named)
+}
+
+/// The failure a live shell location produces, said in a length somebody can
+/// read.
+///
+/// It used to name every location in one line. On this repository that is 101
+/// of them, printed twice — once as the message and once beside the diagnostic
+/// code — and a reader learns from it that there are a lot. The list itself is
+/// what `deshell scan` is for, and `--format json` now carries each byte span,
+/// so the failure names the shape and the next argv instead of inlining the
+/// inventory.
+///
+/// The first few are still here. A gate that says only "101 locations" makes a
+/// reader run another command to find out whether the answer is surprising.
+fn shell_reintroduced_failure(inventory: &crate::scanner::Inventory, declared: usize) -> Failure {
+    const NAMED: usize = 5;
+    let mut by_kind: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    let mut by_path: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for finding in &inventory.findings {
+        *by_kind
+            .entry(finding_kind(&finding.kind).as_str())
+            .or_default() += 1;
+        *by_path.entry(finding.path.as_str()).or_default() += 1;
+    }
+    let shape = by_kind
+        .iter()
+        .map(|(kind, count)| format!("{count} {kind}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let named = inventory
+        .findings
+        .iter()
+        .take(NAMED)
+        .map(|finding| {
+            format!(
+                "{}:{}@{}..{}",
+                finding_kind(&finding.kind).as_str(),
+                finding.path,
+                finding.span.start_byte,
+                finding.span.end_byte
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let remaining = inventory.findings.len().saturating_sub(NAMED);
+    let tail = if remaining == 0 {
+        String::new()
+    } else {
+        format!(", and {remaining} more in {} file(s)", by_path.len())
+    };
+    Failure {
+        help: Some(format!(
+            "Every location is in `deshell scan --format json`, with the byte span of each. {shape}. {declared} declared."
+        )),
+        next_actions: vec![crate::report::Action::Command {
+            argv: vec![
+                "deshell".into(),
+                "scan".into(),
+                "--format".into(),
+                "json".into(),
+            ],
+        }],
+        ..Failure::shell_reintroduced(format!(
+            "live tree is not shell-free ({} location(s)): {named}{tail}",
+            inventory.findings.len()
+        ))
+    }
+}
+
+fn scenario_synthesize_command<W: Write>(
     root: &Path,
     apply: bool,
     format: OutputFormat,
-    stdout: &mut dyn Write,
+    stdout: &mut W,
 ) -> Result<i32, Failure> {
-    if format == OutputFormat::Json {
+    if format.is_structured() {
         let mut output = Vec::new();
         let code = scenario_synthesize_human(root, apply, &mut output)?;
         let value = serde_json::json!({
             "applied": apply,
             "output": String::from_utf8(output)
-                .map_err(|_| Failure::internal("scenario output was not UTF-8"))?,
+                .map_err(|_error| Failure::internal("scenario output was not UTF-8"))?,
         });
         write_io(
             stdout,
@@ -1953,10 +2584,10 @@ fn scenario_synthesize_command(
     scenario_synthesize_human(root, apply, stdout)
 }
 
-fn scenario_synthesize_human(
+fn scenario_synthesize_human<W: Write>(
     root: &Path,
     apply: bool,
-    stdout: &mut dyn Write,
+    stdout: &mut W,
 ) -> Result<i32, Failure> {
     let config = crate::project::load_config(root).map_err(classify_project_errors)?;
     if config.entrypoints.is_empty() {
@@ -1973,9 +2604,8 @@ fn scenario_synthesize_human(
             crate::project::resolve_entry(root, entry).map_err(classify_project_error)?;
         let source = std::fs::read(&path)
             .map_err(|error| Failure::io(format!("cannot read {}: {error}", path.display())))?;
-        let plan =
-            crate::frontend::lower(entry, &source, config.policy.unknown_interpreter.clone())
-                .map_err(classify_project_error)?;
+        let plan = crate::frontend::lower(entry, &source, config.policy.unknown_interpreter)
+            .map_err(classify_project_error)?;
         let task = plan
             .tasks
             .iter()
@@ -2066,11 +2696,11 @@ fn scenario_synthesize_human(
     Ok(0)
 }
 
-fn scenario_review_command(
+fn scenario_review_command<W: Write>(
     root: &Path,
     selected: Option<&str>,
     format: OutputFormat,
-    stdout: &mut dyn Write,
+    stdout: &mut W,
 ) -> Result<i32, Failure> {
     let mut reviews = crate::approval::scenario_reviews(root).map_err(classify_project_error)?;
     if let Some(name) = selected {
@@ -2093,7 +2723,10 @@ fn scenario_review_command(
                 &crate::canonical_json::pretty_bytes(&value).map_err(Failure::internal)?,
             )?;
         }
-        OutputFormat::Human => {
+        // `Agent` is collected from the human output by `command_report`,
+        // which sets the format to `Human` before dispatch runs, so it cannot
+        // arrive here. Listing it says that rather than leaving a wildcard.
+        OutputFormat::Agent | OutputFormat::Human => {
             for review in &reviews {
                 writeln_io(
                     stdout,
@@ -2105,7 +2738,7 @@ fn scenario_review_command(
                         review.path.as_deref().unwrap_or("-")
                     ),
                 )?;
-                if review.status != crate::approval::ReviewStatus::Approved {
+                if !review.status.is_current() {
                     let argv = vec![
                         "deshell".to_owned(),
                         "scenario".to_owned(),
@@ -2132,13 +2765,31 @@ fn scenario_review_command(
     Ok(0)
 }
 
-fn scenario_approve_command(
-    root: &Path,
-    name: &str,
-    digest: &str,
+/// The inputs of [`scenario_approve_command`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`scenario_approve_command`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct ScenarioApproveCommandArgs<'a, W: Write> {
+    root: &'a Path,
+    name: &'a str,
+    digest: &'a str,
     format: OutputFormat,
-    stdout: &mut dyn Write,
+    stdout: &'a mut W,
+}
+
+fn scenario_approve_command<W: Write>(
+    parts: ScenarioApproveCommandArgs<'_, W>,
 ) -> Result<i32, Failure> {
+    // Destructured without `..`: see `ScenarioApproveCommandArgs`.
+    let ScenarioApproveCommandArgs {
+        root,
+        name,
+        digest,
+        format,
+        stdout,
+    } = parts;
     let approval = crate::approval::approve_scenario(root, name, digest).map_err(|message| {
         if message.starts_with("review digest mismatch") {
             Failure::policy(message)
@@ -2155,7 +2806,10 @@ fn scenario_approve_command(
                 &crate::canonical_json::pretty_bytes(&value).map_err(Failure::internal)?,
             )?;
         }
-        OutputFormat::Human => writeln_io(
+        // `Agent` is collected from the human output by `command_report`,
+        // which sets the format to `Human` before dispatch runs, so it cannot
+        // arrive here. Listing it says that rather than leaving a wildcard.
+        OutputFormat::Agent | OutputFormat::Human => writeln_io(
             stdout,
             format_args!("approved scenario {name} as {}", approval.approval_digest),
         )?,
@@ -2163,10 +2817,10 @@ fn scenario_approve_command(
     Ok(0)
 }
 
-fn matrix_review_command(
+fn matrix_review_command<W: Write>(
     root: &Path,
     format: OutputFormat,
-    stdout: &mut dyn Write,
+    stdout: &mut W,
 ) -> Result<i32, Failure> {
     let reviews = crate::approval::matrix_reviews(root).map_err(classify_project_error)?;
     match format {
@@ -2178,7 +2832,10 @@ fn matrix_review_command(
                 &crate::canonical_json::pretty_bytes(&value).map_err(Failure::internal)?,
             )?;
         }
-        OutputFormat::Human => {
+        // `Agent` is collected from the human output by `command_report`,
+        // which sets the format to `Human` before dispatch runs, so it cannot
+        // arrive here. Listing it says that rather than leaving a wildcard.
+        OutputFormat::Agent | OutputFormat::Human => {
             for review in &reviews {
                 writeln_io(
                     stdout,
@@ -2189,7 +2846,7 @@ fn matrix_review_command(
                         review.digest
                     ),
                 )?;
-                if review.status != crate::approval::ReviewStatus::Approved {
+                if !review.status.is_current() {
                     let argv = vec![
                         "deshell".to_owned(),
                         "matrix".to_owned(),
@@ -2216,13 +2873,141 @@ fn matrix_review_command(
     Ok(0)
 }
 
-fn matrix_approve_command(
+fn declared_review_command<W: Write>(
     root: &Path,
-    cell: &str,
-    digest: &str,
     format: OutputFormat,
-    stdout: &mut dyn Write,
+    stdout: &mut W,
 ) -> Result<i32, Failure> {
+    let reviews = crate::approval::declared_shell_reviews(root).map_err(classify_project_error)?;
+    match format {
+        OutputFormat::Json => {
+            let value = serde_json::to_value(&reviews)
+                .map_err(|error| Failure::internal(error.to_string()))?;
+            write_io(
+                stdout,
+                &crate::canonical_json::pretty_bytes(&value).map_err(Failure::internal)?,
+            )?;
+        }
+        // `Agent` is collected from the human output by `command_report`,
+        // which sets the format to `Human` before dispatch runs, so it cannot
+        // arrive here. Listing it says that rather than leaving a wildcard.
+        OutputFormat::Agent | OutputFormat::Human => {
+            for review in &reviews {
+                writeln_io(
+                    stdout,
+                    format_args!(
+                        "{}\t{}\t{}",
+                        review.name,
+                        review_status(review.status),
+                        review.digest
+                    ),
+                )?;
+                if !review.status.is_current() {
+                    let argv = vec![
+                        "deshell".to_owned(),
+                        "declared".to_owned(),
+                        "approve".to_owned(),
+                        "--root".to_owned(),
+                        root.to_string_lossy().into_owned(),
+                        "--location".to_owned(),
+                        review.name.clone(),
+                        "--digest".to_owned(),
+                        review.digest.clone(),
+                    ];
+                    writeln_io(
+                        stdout,
+                        format_args!(
+                            "next argv: {}",
+                            serde_json::to_string(&argv)
+                                .map_err(|error| Failure::internal(error.to_string()))?
+                        ),
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(0)
+}
+
+/// The inputs of [`declared_approve_command`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to
+/// a many-argument function stays invisible to every call site that already
+/// compiles. [`declared_approve_command`] takes this apart without `..`, so a
+/// field added here fails to compile until somebody gives it a destination.
+struct DeclaredApproveCommandArgs<'a, W: Write> {
+    root: &'a Path,
+    location: &'a str,
+    digest: &'a str,
+    format: OutputFormat,
+    stdout: &'a mut W,
+}
+
+fn declared_approve_command<W: Write>(
+    parts: DeclaredApproveCommandArgs<'_, W>,
+) -> Result<i32, Failure> {
+    // Destructured without `..`: see `DeclaredApproveCommandArgs`.
+    let DeclaredApproveCommandArgs {
+        root,
+        location,
+        digest,
+        format,
+        stdout,
+    } = parts;
+    let approval =
+        crate::approval::approve_declared_shell(root, location, digest).map_err(|message| {
+            if message.starts_with("review digest mismatch") {
+                Failure::policy(message)
+            } else {
+                classify_project_error(message)
+            }
+        })?;
+    match format {
+        OutputFormat::Json => {
+            let value = serde_json::to_value(&approval)
+                .map_err(|error| Failure::internal(error.to_string()))?;
+            write_io(
+                stdout,
+                &crate::canonical_json::pretty_bytes(&value).map_err(Failure::internal)?,
+            )?;
+        }
+        // See `declared_review_command`.
+        OutputFormat::Agent | OutputFormat::Human => writeln_io(
+            stdout,
+            format_args!(
+                "approved declared shell {location} as {}",
+                approval.approval_digest
+            ),
+        )?,
+    }
+    Ok(0)
+}
+
+/// The inputs of [`matrix_approve_command`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`matrix_approve_command`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct MatrixApproveCommandArgs<'a, W: Write> {
+    root: &'a Path,
+    cell: &'a str,
+    digest: &'a str,
+    format: OutputFormat,
+    stdout: &'a mut W,
+}
+
+fn matrix_approve_command<W: Write>(
+    parts: MatrixApproveCommandArgs<'_, W>,
+) -> Result<i32, Failure> {
+    // Destructured without `..`: see `MatrixApproveCommandArgs`.
+    let MatrixApproveCommandArgs {
+        root,
+        cell,
+        digest,
+        format,
+        stdout,
+    } = parts;
     let approval = crate::approval::approve_matrix(root, cell, digest).map_err(|message| {
         if message.starts_with("review digest mismatch") {
             Failure::policy(message)
@@ -2239,7 +3024,10 @@ fn matrix_approve_command(
                 &crate::canonical_json::pretty_bytes(&value).map_err(Failure::internal)?,
             )?;
         }
-        OutputFormat::Human => writeln_io(
+        // `Agent` is collected from the human output by `command_report`,
+        // which sets the format to `Human` before dispatch runs, so it cannot
+        // arrive here. Listing it says that rather than leaving a wildcard.
+        OutputFormat::Agent | OutputFormat::Human => writeln_io(
             stdout,
             format_args!(
                 "approved matrix cell {cell} as {}",
@@ -2277,11 +3065,11 @@ fn scenario_stem(path: &str) -> String {
     }
 }
 
-fn audit_command(
+fn audit_command<W: Write>(
     root: &Path,
     format: AuditOutputFormat,
     _persona: AuditPersona,
-    stdout: &mut dyn Write,
+    stdout: &mut W,
 ) -> Result<i32, Failure> {
     let inventory = crate::project::scan(root).map_err(Failure::io)?;
     let config_path = root.join(".deshell/project.toml");
@@ -2428,7 +3216,7 @@ fn audit_command(
         .iter()
         .filter(|finding| !finding.acknowledged && finding.severity >= config.audit.fail_on)
         .count();
-    if format == AuditOutputFormat::Human {
+    if matches!(format, AuditOutputFormat::Human) {
         writeln_io(
             stdout,
             format_args!(
@@ -2468,7 +3256,7 @@ fn github_escape(value: &str) -> String {
         .replace(',', "%2C")
 }
 
-fn harden_command(command: HardenCommand, stdout: &mut dyn Write) -> Result<i32, Failure> {
+fn harden_command<W: Write>(command: HardenCommand, stdout: &mut W) -> Result<i32, Failure> {
     match command {
         HardenCommand::Plan { root, .. } => {
             let output = crate::harden::plan(&root).map_err(classify_harden_error)?;
@@ -2547,10 +3335,13 @@ fn bundle_export_runtime(
 ) -> Option<&str> {
     match target {
         crate::exporter::Target::Dagger => Some(&lock.targets.dagger_image),
-        _ => None,
+        crate::exporter::Target::Internal
+        | crate::exporter::Target::Nushell
+        | crate::exporter::Target::Cwl => None,
     }
 }
 
+#[derive(Clone, Copy)]
 struct RunOptions<'a> {
     root: &'a Path,
     entrypoint: Option<&'a str>,
@@ -2559,24 +3350,24 @@ struct RunOptions<'a> {
     arguments: &'a [String],
 }
 
-fn run_plan(
+fn run_plan<Out: Write, Err: Write>(
     options: RunOptions<'_>,
-    stdout: &mut dyn Write,
-    stderr: &mut dyn Write,
+    stdout: &mut Out,
+    stderr: &mut Err,
 ) -> Result<i32, Failure> {
     let project =
         crate::project::ValidatedProject::load(options.root).map_err(classify_project_errors)?;
     let entrypoint =
         selected_entry_from_config(&project.config, options.entrypoint.map(str::to_owned))?;
     if options.backend == BackendKind::Disposable {
-        return run_disposable(
-            options.root,
-            &entrypoint,
-            options.node_id,
-            options.arguments,
+        return run_disposable(RunDisposableArgs {
+            root: options.root,
+            entrypoint: &entrypoint,
+            node_id: options.node_id,
+            arguments: options.arguments,
             stdout,
             stderr,
-        );
+        });
     }
     let validated = project
         .entry(&entrypoint)
@@ -2591,18 +3382,18 @@ fn run_plan(
     let backend = crate::local_backend::LocalBackend::for_validated_project(&project);
     let mut environment = std::collections::BTreeMap::new();
     for name in plan.tasks.iter().flat_map(|task| &task.environment) {
-        if let Ok(value) = std::env::var(name) {
+        if let Some(value) = crate::host::text_variable(name) {
             environment.insert(name.clone(), value);
         }
     }
-    let result = crate::runner::run_plan(
-        &backend,
-        policy_from_config(config, false),
-        &plan,
-        &environment,
-        &std::collections::BTreeMap::new(),
-        options.arguments,
-    )
+    let result = crate::runner::run_plan(crate::runner::RunPlanArgs {
+        backend: &backend,
+        policy: policy_from_config(config, false),
+        plan: &plan,
+        host_environment: &environment,
+        named_inputs: &std::collections::BTreeMap::new(),
+        arguments: options.arguments,
+    })
     .map_err(|error| match error.kind {
         crate::runner::RunErrorKind::Execution
             if error.message.contains("provider is unavailable") =>
@@ -2617,9 +3408,11 @@ fn run_plan(
         crate::runner::RunErrorKind::Policy => Failure::policy(error.message),
     })?;
     // Once execution returns, its status is the command status. Diagnostics mode
-    // never transforms the plan's raw stdout or stderr.
-    let _ = stdout.write_all(&result.stdout);
-    let _ = stderr.write_all(&result.stderr);
+    // never transforms the plan's raw stdout or stderr. Delivery is best effort:
+    // a closed consumer must not replace the status returned by the program that
+    // already ran.
+    let _stdout_delivery = stdout.write_all(&result.stdout);
+    let _stderr_delivery = stderr.write_all(&result.stderr);
     Ok(result.exit_code)
 }
 
@@ -2627,27 +3420,38 @@ fn policy_from_config(
     config: &crate::config::ProjectConfig,
     disposable: bool,
 ) -> crate::runner::Policy {
-    crate::runner::Policy {
-        allow_file_read: matches!(
-            config.policy.file_read,
-            crate::config::FileReadPolicy::Project
-        ),
-        allow_file_write: disposable
-            && matches!(
-                config.policy.file_write,
-                crate::config::FileWritePolicy::Sandbox
+    crate::runner::Policy::default()
+        .allow_if(
+            crate::runner::Capability::FileRead,
+            matches!(
+                config.policy.file_read,
+                crate::config::FileReadPolicy::Project
             ),
-        allow_network: disposable
-            && matches!(
-                config.policy.network,
-                crate::config::NetworkPolicy::RecordReplay
-            ),
-        allow_delegation: disposable
-            && matches!(
-                config.policy.delegation,
-                crate::config::DelegationPolicy::Pinned
-            ),
-    }
+        )
+        .allow_if(
+            crate::runner::Capability::FileWrite,
+            disposable
+                && matches!(
+                    config.policy.file_write,
+                    crate::config::FileWritePolicy::Sandbox
+                ),
+        )
+        .allow_if(
+            crate::runner::Capability::Network,
+            disposable
+                && matches!(
+                    config.policy.network,
+                    crate::config::NetworkPolicy::RecordReplay
+                ),
+        )
+        .allow_if(
+            crate::runner::Capability::Delegation,
+            disposable
+                && matches!(
+                    config.policy.delegation,
+                    crate::config::DelegationPolicy::Pinned
+                ),
+        )
 }
 
 fn disposable_provider(lock: &crate::config::Lockfile) -> Result<crate::lab::Provider, Failure> {
@@ -2672,15 +3476,33 @@ fn disposable_provider(lock: &crate::config::Lockfile) -> Result<crate::lab::Pro
     Ok(provider)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_disposable(
-    root: &Path,
-    entrypoint: &str,
-    node_id: Option<&str>,
-    arguments: &[String],
-    stdout: &mut dyn Write,
-    stderr: &mut dyn Write,
+/// The inputs of [`run_disposable`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`run_disposable`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct RunDisposableArgs<'a, Out: Write, Err: Write> {
+    root: &'a Path,
+    entrypoint: &'a str,
+    node_id: Option<&'a str>,
+    arguments: &'a [String],
+    stdout: &'a mut Out,
+    stderr: &'a mut Err,
+}
+
+fn run_disposable<Out: Write, Err: Write>(
+    parts: RunDisposableArgs<'_, Out, Err>,
 ) -> Result<i32, Failure> {
+    // Destructured without `..`: see `RunDisposableArgs`.
+    let RunDisposableArgs {
+        root,
+        entrypoint,
+        node_id,
+        arguments,
+        stdout,
+        stderr,
+    } = parts;
     let workspace = crate::workspace::private_snapshot(root).map_err(Failure::io)?;
     let project = crate::project::ValidatedProject::load(workspace.path())
         .map_err(classify_project_errors)?;
@@ -2695,7 +3517,7 @@ fn run_disposable(
         .tasks
         .iter()
         .flat_map(|task| &task.environment)
-        .filter_map(|name| std::env::var(name).ok().map(|value| (name.clone(), value)))
+        .filter_map(|name| crate::host::text_variable(name).map(|value| (name.clone(), value)))
         .collect();
     let request = crate::lab::Request {
         workspace: path_string(workspace.path(), "private workspace")?,
@@ -2716,8 +3538,11 @@ fn run_disposable(
         image: project.lock.lab.image.clone(),
     };
     let result = crate::lab::execute(provider, &request).map_err(classify_lab_failure)?;
-    let _ = stdout.write_all(&result.stdout);
-    let _ = stderr.write_all(&result.stderr);
+    // Preserve the guest's completed status even when its output consumer has
+    // gone away. The named results make this deliberate best-effort boundary
+    // visible to the ignored-result lint and to reviewers.
+    let _stdout_delivery = stdout.write_all(&result.stdout);
+    let _stderr_delivery = stderr.write_all(&result.stderr);
     Ok(result.exit_code)
 }
 
@@ -2744,11 +3569,45 @@ fn path_string(path: &Path, label: &str) -> Result<String, Failure> {
         .ok_or_else(|| Failure::invalid(format!("{label} is not valid UTF-8: {}", path.display())))
 }
 
-fn doctor_command(
+/// The version string each supported interpreter reports on this host.
+///
+/// Absent entries mean the interpreter is not installed, which is not itself an
+/// error: a project that lowers no PowerShell does not need `pwsh`.
+fn observed_interpreter_builds() -> serde_json::Value {
+    let mut builds = serde_json::Map::new();
+    for (name, program, argument) in [
+        ("bash", "bash", "--version"),
+        ("zsh", "zsh", "--version"),
+        ("fish", "fish", "--version"),
+        ("powershell", "pwsh", "--version"),
+        ("nushell", "nu", "--version"),
+    ] {
+        let Ok(output) = crate::host::output(std::process::Command::new(program).arg(argument))
+        else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        let Ok(text) = String::from_utf8(output.stdout) else {
+            continue;
+        };
+        let Some(first) = text.lines().next() else {
+            continue;
+        };
+        builds.insert(
+            name.to_owned(),
+            serde_json::Value::String(first.trim().to_owned()),
+        );
+    }
+    serde_json::Value::Object(builds)
+}
+
+fn doctor_command<W: Write>(
     root: &Path,
     format: OutputFormat,
     require: Option<DoctorRequirement>,
-    stdout: &mut dyn Write,
+    stdout: &mut W,
 ) -> Result<i32, Failure> {
     let binary = std::env::current_exe()
         .map_err(|error| Failure::io(format!("cannot resolve current executable: {error}")))?;
@@ -2858,7 +3717,10 @@ fn doctor_command(
                 &crate::canonical_json::pretty_bytes(&value).map_err(Failure::internal)?,
             )?;
         }
-        OutputFormat::Human => {
+        // `Agent` is collected from the human output by `command_report`,
+        // which sets the format to `Human` before dispatch runs, so it cannot
+        // arrive here. Listing it says that rather than leaving a wildcard.
+        OutputFormat::Agent | OutputFormat::Human => {
             writeln_io(
                 stdout,
                 format_args!("binary: {}", if binary_ok { "ok" } else { "invalid" }),
@@ -2871,6 +3733,23 @@ fn doctor_command(
                 stdout,
                 format_args!("lock: {}", if lock.is_ok() { "ok" } else { "invalid" }),
             )?;
+            // The pins in the lock identify de-shell's own runtime contract, not the
+            // build of the interpreter that will run a delegated node. `nu` is
+            // version-matched exactly at parse time while `bash` is not pinned at
+            // all, and macOS ships 3.2 where Linux runners ship 5.x — the `set -e`
+            // rules differ between them, so a claim of equivalence has to name
+            // which build it means. Reporting the measurement is the first half of
+            // that; carrying it in the lock is tracked in ROADMAP.
+            if let serde_json::Value::Object(builds) = observed_interpreter_builds()
+                && !builds.is_empty()
+            {
+                let mut line = String::from("interpreter builds:");
+                for (name, value) in &builds {
+                    let version = value.as_str().unwrap_or("unknown");
+                    line.push_str(&format!(" {name}={version};"));
+                }
+                writeln_io(stdout, format_args!("{}", line.trim_end_matches(';')))?;
+            }
             writeln_io(
                 stdout,
                 format_args!(
@@ -2938,11 +3817,11 @@ fn doctor_command(
     })
 }
 
-fn observe_command(
+fn observe_command<W: Write>(
     root: &Path,
     entry: Option<String>,
     selected_scenarios: &[String],
-    stdout: &mut dyn Write,
+    stdout: &mut W,
 ) -> Result<i32, Failure> {
     let base_workspace = crate::workspace::private_snapshot(root).map_err(Failure::io)?;
     let base = base_workspace.path();
@@ -3024,26 +3903,26 @@ fn observe_command(
         };
         let original_workspace = crate::workspace::private_snapshot(base).map_err(Failure::io)?;
         let actual_workspace = crate::workspace::private_snapshot(base).map_err(Failure::io)?;
-        let original = lab_scenario_request(
-            original_workspace.path(),
-            crate::lab::Target::Original {
+        let original = lab_scenario_request(LabScenarioRequestArgs {
+            workspace: original_workspace.path(),
+            target: crate::lab::Target::Original {
                 interpreter: interpreter.clone(),
                 script: entry.clone(),
             },
-            &scenario,
+            scenario: &scenario,
             config,
-            &lock.lab.image,
-        )?;
-        let actual = lab_scenario_request(
-            actual_workspace.path(),
-            crate::lab::Target::Plan {
+            image: &lock.lab.image,
+        })?;
+        let actual = lab_scenario_request(LabScenarioRequestArgs {
+            workspace: actual_workspace.path(),
+            target: crate::lab::Target::Plan {
                 entrypoint: entry.clone(),
                 node_id: None,
             },
-            &scenario,
+            scenario: &scenario,
             config,
-            &lock.lab.image,
-        )?;
+            image: &lock.lab.image,
+        })?;
         let expected = match crate::lab::execute(provider, &original) {
             Ok(result) => result,
             Err(error) => {
@@ -3102,13 +3981,13 @@ fn observe_command(
             }
         };
         let comparison = crate::verify::compare(&expected, &actual).map_err(Failure::internal)?;
-        let status = crate::verify::record_comparison(
-            &mut evidence,
-            &scenario.name,
-            provider_name,
+        let status = crate::verify::record_comparison(crate::verify::RecordComparisonArgs {
+            evidence: &mut evidence,
+            scenario: &scenario.name,
+            provider: provider_name,
             key,
-            &comparison,
-        )
+            comparison: &comparison,
+        })
         .map_err(Failure::invalid)?;
         writeln_io(
             stdout,
@@ -3126,13 +4005,29 @@ fn observe_command(
     Ok(exit)
 }
 
-fn lab_scenario_request(
-    workspace: &Path,
+/// The inputs of [`lab_scenario_request`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`lab_scenario_request`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct LabScenarioRequestArgs<'a> {
+    workspace: &'a Path,
     target: crate::lab::Target,
-    scenario: &crate::config::Scenario,
-    config: &crate::config::ProjectConfig,
-    image: &str,
-) -> Result<crate::lab::Request, Failure> {
+    scenario: &'a crate::config::Scenario,
+    config: &'a crate::config::ProjectConfig,
+    image: &'a str,
+}
+
+fn lab_scenario_request(parts: LabScenarioRequestArgs<'_>) -> Result<crate::lab::Request, Failure> {
+    // Destructured without `..`: see `LabScenarioRequestArgs`.
+    let LabScenarioRequestArgs {
+        workspace,
+        target,
+        scenario,
+        config,
+        image,
+    } = parts;
     let output = workspace.join(".deshell/provider-result.json");
     Ok(crate::lab::Request {
         workspace: path_string(workspace, "private workspace")?,
@@ -3290,7 +4185,7 @@ fn bundle_request<'a>(
         let name = entry
             .file_name()
             .into_string()
-            .map_err(|_| Failure::invalid("scenario filename is not valid UTF-8"))?;
+            .map_err(|_error| Failure::invalid("scenario filename is not valid UTF-8"))?;
         if Path::new(&name)
             .extension()
             .is_some_and(|extension| extension == "toml")
@@ -3452,7 +4347,7 @@ fn safe_output_path(root: &Path, output: &Path) -> Result<PathBuf, Failure> {
         .ok_or_else(|| Failure::policy("export output has no project-relative parent"))?;
     let relative_parent = parent
         .strip_prefix(&root)
-        .map_err(|_| Failure::policy("export output escapes the project"))?;
+        .map_err(|_error| Failure::policy("export output escapes the project"))?;
     let mut current = root.clone();
     for component in relative_parent.components() {
         current.push(component);
@@ -3466,9 +4361,24 @@ fn safe_output_path(root: &Path, output: &Path) -> Result<PathBuf, Failure> {
                 )));
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                std::fs::create_dir(&current).map_err(|error| {
-                    Failure::io(format!("cannot create {}: {error}", current.display()))
-                })?;
+                match crate::patch::ensure_directory(&current) {
+                    Ok(
+                        crate::patch::DirectoryState::Created
+                        | crate::patch::DirectoryState::Existing,
+                    ) => {}
+                    Err(crate::patch::DirectoryError::Occupied) => {
+                        return Err(Failure::policy(format!(
+                            "export output parent is not a regular directory: {}",
+                            current.display()
+                        )));
+                    }
+                    Err(crate::patch::DirectoryError::Io(error)) => {
+                        return Err(Failure::io(format!(
+                            "cannot create {}: {error}",
+                            current.display()
+                        )));
+                    }
+                }
             }
             Err(error) => {
                 return Err(Failure::io(format!(
@@ -3514,7 +4424,7 @@ fn select_node(
         }
     }
     let (owner, node) = selected.ok_or_else(|| format!("node not found: {node_id}"))?;
-    plan.entrypoint = plan.tasks[owner].name.clone();
+    plan.entrypoint.clone_from(&plan.tasks[owner].name);
     plan.tasks[owner].body = node;
     plan.assign_node_ids()?;
     plan.validate().map_err(|errors| errors.join("; "))?;
@@ -3527,7 +4437,7 @@ fn find_node<'a>(node: &'a crate::ir::Node, id: &str) -> Option<&'a crate::ir::N
     }
     match &node.operation {
         crate::ir::Operation::Pipeline { nodes, .. }
-        | crate::ir::Operation::Sequence { nodes }
+        | crate::ir::Operation::Sequence { nodes, .. }
         | crate::ir::Operation::Parallel { nodes } => {
             nodes.iter().find_map(|node| find_node(node, id))
         }
@@ -3547,11 +4457,37 @@ fn find_node<'a>(node: &'a crate::ir::Node, id: &str) -> Option<&'a crate::ir::N
         crate::ir::Operation::TryFinally { body, finalizer } => {
             find_node(body, id).or_else(|| find_node(finalizer, id))
         }
-        _ => None,
+        crate::ir::Operation::Exec { .. }
+        | crate::ir::Operation::ExpandWords { .. }
+        | crate::ir::Operation::Redirect { .. }
+        | crate::ir::Operation::WriteStdout { .. }
+        | crate::ir::Operation::Exit { .. }
+        | crate::ir::Operation::NoOp
+        | crate::ir::Operation::Test { .. }
+        | crate::ir::Operation::While { .. }
+        | crate::ir::Operation::Not { .. }
+        | crate::ir::Operation::Scope { .. }
+        | crate::ir::Operation::TaskCall { .. }
+        | crate::ir::Operation::SetVariable { .. }
+        | crate::ir::Operation::SetEnvironment { .. }
+        | crate::ir::Operation::SetWorkingDirectory { .. }
+        | crate::ir::Operation::Spawn { .. }
+        | crate::ir::Operation::Wait { .. }
+        | crate::ir::Operation::SendSignal { .. }
+        | crate::ir::Operation::FileRead { .. }
+        | crate::ir::Operation::FileWrite { .. }
+        | crate::ir::Operation::FileRemove { .. }
+        | crate::ir::Operation::FileMetadata { .. }
+        | crate::ir::Operation::FileSetMetadata { .. }
+        | crate::ir::Operation::NetworkRequest { .. }
+        | crate::ir::Operation::ClockRead { .. }
+        | crate::ir::Operation::RandomBytes { .. }
+        | crate::ir::Operation::InterpreterCall { .. }
+        | crate::ir::Operation::OpaqueCapsule { .. } => None,
     }
 }
 
-fn explain(root: &Path, node_id: Option<&str>, stdout: &mut dyn Write) -> Result<i32, Failure> {
+fn explain<W: Write>(root: &Path, node_id: Option<&str>, stdout: &mut W) -> Result<i32, Failure> {
     let (plan, _) = crate::project::load_artifacts(root).map_err(classify_project_errors)?;
     let nodes: Vec<_> = plan
         .tasks
@@ -3589,7 +4525,7 @@ fn collect_nodes<'a>(node: &'a crate::ir::Node, values: &mut Vec<&'a crate::ir::
     values.push(node);
     match &node.operation {
         crate::ir::Operation::Pipeline { nodes, .. }
-        | crate::ir::Operation::Sequence { nodes }
+        | crate::ir::Operation::Sequence { nodes, .. }
         | crate::ir::Operation::Parallel { nodes } => {
             for node in nodes {
                 collect_nodes(node, values);
@@ -3620,17 +4556,59 @@ fn collect_nodes<'a>(node: &'a crate::ir::Node, values: &mut Vec<&'a crate::ir::
             collect_nodes(body, values);
             collect_nodes(finalizer, values);
         }
-        _ => {}
+        crate::ir::Operation::Exec { .. }
+        | crate::ir::Operation::ExpandWords { .. }
+        | crate::ir::Operation::Redirect { .. }
+        | crate::ir::Operation::WriteStdout { .. }
+        | crate::ir::Operation::Exit { .. }
+        | crate::ir::Operation::NoOp
+        | crate::ir::Operation::Test { .. }
+        | crate::ir::Operation::While { .. }
+        | crate::ir::Operation::Not { .. }
+        | crate::ir::Operation::Scope { .. }
+        | crate::ir::Operation::TaskCall { .. }
+        | crate::ir::Operation::SetVariable { .. }
+        | crate::ir::Operation::SetEnvironment { .. }
+        | crate::ir::Operation::SetWorkingDirectory { .. }
+        | crate::ir::Operation::Spawn { .. }
+        | crate::ir::Operation::Wait { .. }
+        | crate::ir::Operation::SendSignal { .. }
+        | crate::ir::Operation::FileRead { .. }
+        | crate::ir::Operation::FileWrite { .. }
+        | crate::ir::Operation::FileRemove { .. }
+        | crate::ir::Operation::FileMetadata { .. }
+        | crate::ir::Operation::FileSetMetadata { .. }
+        | crate::ir::Operation::NetworkRequest { .. }
+        | crate::ir::Operation::ClockRead { .. }
+        | crate::ir::Operation::RandomBytes { .. }
+        | crate::ir::Operation::InterpreterCall { .. }
+        | crate::ir::Operation::OpaqueCapsule { .. } => {}
     }
 }
 
-fn rewrite_command(
-    root: &Path,
+/// The inputs of [`rewrite_command`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`rewrite_command`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct RewriteCommandArgs<'a, W: Write> {
+    root: &'a Path,
     entry: Option<String>,
     equivalent: bool,
     apply: bool,
-    stdout: &mut dyn Write,
-) -> Result<i32, Failure> {
+    stdout: &'a mut W,
+}
+
+fn rewrite_command<W: Write>(parts: RewriteCommandArgs<'_, W>) -> Result<i32, Failure> {
+    // Destructured without `..`: see `RewriteCommandArgs`.
+    let RewriteCommandArgs {
+        root,
+        entry,
+        equivalent,
+        apply,
+        stdout,
+    } = parts;
     if !equivalent {
         return Err(Failure::usage("rewrite requires --equivalent"));
     }
@@ -3638,8 +4616,9 @@ fn rewrite_command(
     let (_, path) = crate::project::resolve_entry(root, &entry).map_err(classify_project_error)?;
     let source = std::fs::read(&path)
         .map_err(|error| Failure::io(format!("cannot read {}: {error}", path.display())))?;
-    let source = String::from_utf8(source)
-        .map_err(|_| Failure::invalid(format!("rewrite source is not valid UTF-8: {entry}")))?;
+    let source = String::from_utf8(source).map_err(|_error| {
+        Failure::invalid(format!("rewrite source is not valid UTF-8: {entry}"))
+    })?;
     let result = crate::rewrite::equivalent(&entry, &source);
     if result.edits.is_empty() {
         writeln_io(
@@ -3690,14 +4669,33 @@ fn rewrite_command(
     Ok(0)
 }
 
-fn modernize_command(
-    root: &Path,
-    profile: &str,
+/// The inputs of [`modernize_command`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`modernize_command`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct ModernizeCommandArgs<'a, Out: Write, Err: Write> {
+    root: &'a Path,
+    profile: &'a str,
     apply: bool,
     diagnostic_mode: crate::diagnostics::Mode,
-    stdout: &mut dyn Write,
-    stderr: &mut dyn Write,
+    stdout: &'a mut Out,
+    stderr: &'a mut Err,
+}
+
+fn modernize_command<Out: Write, Err: Write>(
+    parts: ModernizeCommandArgs<'_, Out, Err>,
 ) -> Result<i32, Failure> {
+    // Destructured without `..`: see `ModernizeCommandArgs`.
+    let ModernizeCommandArgs {
+        root,
+        profile,
+        apply,
+        diagnostic_mode,
+        stdout,
+        stderr,
+    } = parts;
     let profiles = parse_profiles(profile)?;
     let inventory = crate::project::scan(root).map_err(Failure::io)?;
     if !inventory.errors.is_empty() || !inventory.skipped.is_empty() {
@@ -3727,7 +4725,7 @@ fn modernize_command(
     let mut paths = inventory
         .findings
         .into_iter()
-        .filter(|finding| finding.kind == crate::scanner::FindingKind::ShellFile)
+        .filter(|finding| finding.kind.is_a_shell_file())
         .map(|finding| finding.path)
         .collect::<Vec<_>>();
     paths.sort();
@@ -3780,7 +4778,7 @@ fn modernize_command(
                 let mut preflight = crate::frontend::lower(
                     entry,
                     output.as_bytes(),
-                    config.policy.unknown_interpreter.clone(),
+                    config.policy.unknown_interpreter,
                 )
                 .map_err(classify_project_error)?;
                 crate::frontend::bind_interpreter_pins(&mut preflight, &lock.interpreters)
@@ -3823,7 +4821,7 @@ fn modernize_command(
                                 crate::patch::prepare_expected(
                                     &manifest_path,
                                     &crate::digest::sha256(&manifest_current),
-                                    manifest_before.clone(),
+                                    manifest_before,
                                 )
                                 .map_err(Failure::io)?,
                             );
@@ -3881,7 +4879,7 @@ fn parse_profiles(value: &str) -> Result<Vec<crate::rewrite::Profile>, Failure> 
     }
 }
 
-fn migrate_plan_command(root: &Path, stdout: &mut dyn Write) -> Result<i32, Failure> {
+fn migrate_plan_command<W: Write>(root: &Path, stdout: &mut W) -> Result<i32, Failure> {
     let output = crate::migration::create_plan(root).map_err(classify_project_error)?;
     writeln_io(stdout, format_args!("plan {}", output.digest))?;
     writeln_io(stdout, format_args!("artifact {}", output.artifact_path))?;
@@ -3938,13 +4936,31 @@ fn migrate_plan_command(root: &Path, stdout: &mut dyn Write) -> Result<i32, Fail
     }
 }
 
-fn migrate_verify_command(
-    root: &Path,
-    plan: &str,
-    cell: &str,
-    output: &Path,
-    stdout: &mut dyn Write,
+/// The inputs of [`migrate_verify_command`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`migrate_verify_command`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct MigrateVerifyCommandArgs<'a, W: Write> {
+    root: &'a Path,
+    plan: &'a str,
+    cell: &'a str,
+    output: &'a Path,
+    stdout: &'a mut W,
+}
+
+fn migrate_verify_command<W: Write>(
+    parts: MigrateVerifyCommandArgs<'_, W>,
 ) -> Result<i32, Failure> {
+    // Destructured without `..`: see `MigrateVerifyCommandArgs`.
+    let MigrateVerifyCommandArgs {
+        root,
+        plan,
+        cell,
+        output,
+        stdout,
+    } = parts;
     let evidence = crate::migration::verify(root, plan, cell).map_err(Failure::policy)?;
     let status = evidence.status;
     atomic_write(output, evidence.encode_pretty().map_err(Failure::invalid)?)?;
@@ -4002,11 +5018,11 @@ fn migrate_verify_command(
     }
 }
 
-fn migrate_evidence_import_command(
+fn migrate_evidence_import_command<W: Write>(
     root: &Path,
     plan: &str,
     files: &[PathBuf],
-    stdout: &mut dyn Write,
+    stdout: &mut W,
 ) -> Result<i32, Failure> {
     let digests =
         crate::migration::import_evidence(root, plan, files).map_err(classify_project_error)?;
@@ -4040,7 +5056,11 @@ fn migrate_evidence_import_command(
     Ok(0)
 }
 
-fn migrate_apply_command(root: &Path, plan: &str, stdout: &mut dyn Write) -> Result<i32, Failure> {
+fn migrate_apply_command<W: Write>(
+    root: &Path,
+    plan: &str,
+    stdout: &mut W,
+) -> Result<i32, Failure> {
     crate::migration::apply(root, plan).map_err(Failure::policy)?;
     writeln_io(stdout, format_args!("retired migration plan {plan}"))?;
     writeln_io(
@@ -4069,10 +5089,10 @@ fn migrate_apply_command(root: &Path, plan: &str, stdout: &mut dyn Write) -> Res
     Ok(0)
 }
 
-fn migrate_status_command(
+fn migrate_status_command<W: Write>(
     root: &Path,
     format: OutputFormat,
-    stdout: &mut dyn Write,
+    stdout: &mut W,
 ) -> Result<i32, Failure> {
     let status = crate::migration::status(root).map_err(Failure::io)?;
     match format {
@@ -4084,7 +5104,10 @@ fn migrate_status_command(
             )
             .map_err(Failure::internal)?,
         )?,
-        OutputFormat::Human => {
+        // `Agent` is collected from the human output by `command_report`,
+        // which sets the format to `Human` before dispatch runs, so it cannot
+        // arrive here. Listing it says that rather than leaving a wildcard.
+        OutputFormat::Agent | OutputFormat::Human => {
             writeln_io(
                 stdout,
                 format_args!(
@@ -4293,13 +5316,13 @@ fn atomic_write(path: &Path, contents: Vec<u8>) -> Result<(), Failure> {
     crate::patch::apply_all(&[proposal]).map_err(Failure::io)
 }
 
-fn write_io(writer: &mut dyn Write, bytes: &[u8]) -> Result<(), Failure> {
+fn write_io<W: Write>(writer: &mut W, bytes: &[u8]) -> Result<(), Failure> {
     writer
         .write_all(bytes)
         .map_err(|error| Failure::io(error.to_string()))
 }
 
-fn writeln_io(writer: &mut dyn Write, arguments: std::fmt::Arguments<'_>) -> Result<(), Failure> {
+fn writeln_io<W: Write>(writer: &mut W, arguments: std::fmt::Arguments<'_>) -> Result<(), Failure> {
     writer
         .write_fmt(arguments)
         .and_then(|()| writer.write_all(b"\n"))
@@ -4307,10 +5330,600 @@ fn writeln_io(writer: &mut dyn Write, arguments: std::fmt::Arguments<'_>) -> Res
 }
 
 #[cfg(test)]
+// Tests reach for the raw APIs on purpose: they stage corrupt trees, race two
+// writers against one path, and assert on what the transactional layer does with
+// the result. Constructing those situations is precisely what the production ban
+// exists to prevent, so the ban is lifted here and nowhere else.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "tests construct the races and corrupt trees the production ban prevents"
+)]
 mod tests {
     use super::*;
     use crate::config::ProjectConfig;
     use std::path::Path;
+
+    #[test]
+    fn disposable_boundary_preserves_every_scenario_input_and_failure_class() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut config = ProjectConfig::decode(&ProjectConfig::default_text()).unwrap();
+        config.policy.network = crate::config::NetworkPolicy::RecordReplay;
+        let mut scenario = crate::config::Scenario::decode(
+            &crate::config::Scenario::default_text()
+                .replace("name = \"default\"", "name = \"full\""),
+        )
+        .unwrap();
+        scenario.argv = vec!["one".into(), "two".into()];
+        scenario.arguments = vec![crate::config::NamedValue {
+            name: "1".into(),
+            value: "named".into(),
+        }];
+        scenario.environment = vec![crate::config::NamedValue {
+            name: "VALUE".into(),
+            value: "environment".into(),
+        }];
+        scenario.stdin = Some(crate::config::BinaryData::from_utf8("stdin"));
+        scenario.cwd = Some("work".into());
+        scenario.fixtures = vec![crate::config::Fixture {
+            path: "fixture.txt".into(),
+            contents: crate::config::BinaryData::from_utf8("fixture"),
+            executable: false,
+        }];
+        scenario.expect.files = vec![crate::config::ExpectedFile {
+            path: "result.txt".into(),
+            sha256: format!("sha256:{}", "a".repeat(64)),
+        }];
+
+        let request = lab_scenario_request(LabScenarioRequestArgs {
+            workspace: workspace.path(),
+            target: crate::lab::Target::Original {
+                interpreter: "bash".into(),
+                script: "build.sh".into(),
+            },
+            scenario: &scenario,
+            config: &config,
+            image: "image@sha256:fixture",
+        })
+        .unwrap();
+        assert_eq!(request.arguments, ["one", "two"]);
+        assert_eq!(request.named_inputs, [("1".into(), "named".into())]);
+        assert_eq!(
+            request.environment,
+            [("VALUE".into(), "environment".into())]
+        );
+        assert_eq!(request.stdin, b"stdin");
+        assert_eq!(request.working_directory.as_deref(), Some("work"));
+        assert_eq!(request.fixtures, scenario.fixtures);
+        assert_eq!(request.expected_files, scenario.expect.files);
+        assert_eq!(request.limits, scenario.limits);
+        assert_eq!(
+            request.network,
+            crate::lab::Network::Replay {
+                proxy: "http://deshell-replay:8080".into(),
+                tape: "/workspace/.deshell/replay.json".into(),
+            }
+        );
+        assert!(
+            request
+                .result_path
+                .ends_with(".deshell/provider-result.json")
+        );
+
+        config.policy.network = crate::config::NetworkPolicy::Deny;
+        assert_eq!(lab_network(&config), crate::lab::Network::Deny);
+        for (kind, exit, code) in [
+            (
+                crate::lab::ExecutionFailureKind::Unavailable,
+                6,
+                "DESHELL_PROVIDER_UNAVAILABLE",
+            ),
+            (crate::lab::ExecutionFailureKind::Failed, 1, "DESHELL_IO"),
+        ] {
+            let failure = classify_lab_failure(crate::lab::ExecutionFailure {
+                kind,
+                message: "classified".into(),
+            });
+            assert_eq!(
+                (failure.exit, failure.code, failure.message.as_str()),
+                (exit, code, "classified")
+            );
+        }
+
+        let scenarios = vec![
+            crate::project::ValidatedScenario {
+                scenario: scenario.clone(),
+                digest: "first".into(),
+            },
+            crate::project::ValidatedScenario {
+                scenario: crate::config::Scenario {
+                    name: "second".into(),
+                    ..scenario
+                },
+                digest: "second".into(),
+            },
+        ];
+        assert_eq!(select_scenarios(&scenarios, &[]).unwrap(), scenarios);
+        assert_eq!(
+            select_scenarios(&scenarios, &["second".into()])
+                .unwrap()
+                .iter()
+                .map(|value| value.scenario.name.as_str())
+                .collect::<Vec<_>>(),
+            ["second"]
+        );
+        assert!(select_scenarios(&scenarios, &["missing".into()]).is_err());
+        assert!(select_scenarios(&[], &[]).is_err());
+
+        assert_eq!(
+            [
+                crate::evidence::ObservationStatus::Verified,
+                crate::evidence::ObservationStatus::Different,
+                crate::evidence::ObservationStatus::Unavailable,
+                crate::evidence::ObservationStatus::Failed,
+                crate::evidence::ObservationStatus::Nondeterministic,
+            ]
+            .map(observation_status),
+            [
+                "verified",
+                "different",
+                "unavailable",
+                "failed",
+                "nondeterministic",
+            ]
+        );
+
+        let mut lock =
+            crate::config::Lockfile::decode(&crate::config::Lockfile::default_text()).unwrap();
+        let unavailable = disposable_provider(&lock).unwrap_err();
+        assert_eq!(unavailable.exit, 6);
+        lock.lab.image = "not-pinned".into();
+        let invalid = disposable_provider(&lock).unwrap_err();
+        assert_eq!(invalid.exit, 3);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt as _;
+            let path = PathBuf::from(std::ffi::OsString::from_vec(vec![0xff]));
+            let failure = path_string(&path, "fixture").unwrap_err();
+            assert_eq!(failure.exit, 3);
+            assert!(failure.message.contains("not valid UTF-8"));
+        }
+    }
+
+    #[test]
+    fn connected_disposable_run_preserves_raw_output_and_exit_status() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        configure(directory.path(), "build.sh", b"/usr/bin/printf hello\n");
+        let lock_path = directory.path().join("deshell.lock");
+        let lock = std::fs::read_to_string(&lock_path).unwrap().replace(
+            "image = \"unconfigured\"",
+            &format!("image = \"example.invalid/lab@sha256:{}\"", "a".repeat(64)),
+        );
+        std::fs::write(lock_path, lock).unwrap();
+        crate::project::analyze(directory.path(), "build.sh").unwrap();
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let status = crate::lab::with_test_execution(
+            crate::lab::Provider::DockerRootless,
+            vec![Ok(crate::runner::RunResult {
+                exit_code: 23,
+                stdout: vec![0, b'o', b'k', 0xff],
+                stderr: vec![0xfe, b'e', b'r', b'r'],
+                trace: Vec::new(),
+            })],
+            || {
+                run_disposable(RunDisposableArgs {
+                    root: directory.path(),
+                    entrypoint: "build.sh",
+                    node_id: None,
+                    arguments: &["argument".into()],
+                    stdout: &mut stdout,
+                    stderr: &mut stderr,
+                })
+                .unwrap()
+            },
+        );
+        assert_eq!(status, 23);
+        assert_eq!(stdout, [0, b'o', b'k', 0xff]);
+        assert_eq!(stderr, [0xfe, b'e', b'r', b'r']);
+
+        let failure = crate::lab::with_test_execution(
+            crate::lab::Provider::Podman,
+            vec![Err(crate::lab::ExecutionFailure {
+                kind: crate::lab::ExecutionFailureKind::Failed,
+                message: "guest transport failed".into(),
+            })],
+            || {
+                run_disposable(RunDisposableArgs {
+                    root: directory.path(),
+                    entrypoint: "build.sh",
+                    node_id: None,
+                    arguments: &[],
+                    stdout: &mut Vec::new(),
+                    stderr: &mut Vec::new(),
+                })
+                .unwrap_err()
+            },
+        );
+        assert_eq!(
+            (failure.exit, failure.code, failure.message.as_str()),
+            (1, "DESHELL_IO", "guest transport failed")
+        );
+    }
+
+    #[test]
+    fn node_selection_and_explanation_walk_every_recursive_shape() {
+        fn node(id: &str, operation: crate::ir::Operation) -> crate::ir::Node {
+            crate::ir::Node {
+                id: id.into(),
+                operation,
+                guarantee: crate::ir::Guarantee::Native {
+                    semantic_model: "test model".into(),
+                },
+                source: None,
+            }
+        }
+
+        fn leaf(id: &str) -> crate::ir::Node {
+            node(id, crate::ir::Operation::NoOp)
+        }
+
+        let tree = node(
+            "root",
+            crate::ir::Operation::Sequence {
+                nodes: vec![
+                    node(
+                        "parallel",
+                        crate::ir::Operation::Parallel {
+                            nodes: vec![node(
+                                "pipeline",
+                                crate::ir::Operation::Pipeline {
+                                    nodes: vec![leaf("pipeline-leaf")],
+                                    status: crate::ir::PipelineStatus::Last,
+                                },
+                            )],
+                        },
+                    ),
+                    node(
+                        "condition",
+                        crate::ir::Operation::Condition {
+                            predicate: Box::new(leaf("predicate")),
+                            if_true: Box::new(leaf("if-true")),
+                            if_false: Some(Box::new(leaf("if-false"))),
+                        },
+                    ),
+                    node(
+                        "match",
+                        crate::ir::Operation::Match {
+                            value: crate::ir::TextExpression::literal("value"),
+                            cases: vec![crate::ir::MatchCase {
+                                pattern: crate::ir::PatternExpression::literal("case"),
+                                body: leaf("match-case"),
+                            }],
+                            default: Some(Box::new(leaf("match-default"))),
+                        },
+                    ),
+                    node(
+                        "foreach",
+                        crate::ir::Operation::Foreach {
+                            variable: "item".into(),
+                            items: vec![crate::ir::TextExpression::literal("one")],
+                            body: Box::new(leaf("foreach-body")),
+                        },
+                    ),
+                    node(
+                        "capture",
+                        crate::ir::Operation::CaptureStdout {
+                            name: "captured".into(),
+                            value_type: crate::ir::PrimitiveType::Text,
+                            body: Box::new(leaf("capture-body")),
+                        },
+                    ),
+                    node(
+                        "try-finally",
+                        crate::ir::Operation::TryFinally {
+                            body: Box::new(leaf("try-body")),
+                            finalizer: Box::new(leaf("finally-body")),
+                        },
+                    ),
+                ],
+                on_failure: crate::ir::SequenceFailure::Continue,
+            },
+        );
+        let expected = [
+            "root",
+            "parallel",
+            "pipeline",
+            "pipeline-leaf",
+            "condition",
+            "predicate",
+            "if-true",
+            "if-false",
+            "match",
+            "match-case",
+            "match-default",
+            "foreach",
+            "foreach-body",
+            "capture",
+            "capture-body",
+            "try-finally",
+            "try-body",
+            "finally-body",
+        ];
+        let mut collected = Vec::new();
+        collect_nodes(&tree, &mut collected);
+        assert_eq!(
+            collected
+                .iter()
+                .map(|node| node.id.as_str())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        for id in expected {
+            assert_eq!(find_node(&tree, id).map(|node| node.id.as_str()), Some(id));
+        }
+        assert!(find_node(&tree, "missing").is_none());
+
+        let plan = crate::frontend::lower(
+            "build.sh",
+            b"#!/bin/sh\n/usr/bin/printf one\n/usr/bin/printf two\n",
+            crate::config::UnknownInterpreter::Reject,
+        )
+        .unwrap();
+        assert_eq!(select_node(plan.clone(), None).unwrap(), plan);
+        let mut nodes = Vec::new();
+        collect_nodes(&plan.tasks[0].body, &mut nodes);
+        let child = nodes.last().unwrap().id.clone();
+        let selected = select_node(plan.clone(), Some(&child)).unwrap();
+        assert_eq!(selected.entrypoint, plan.tasks[0].name);
+        assert!(matches!(
+            selected.tasks[0].body.operation,
+            crate::ir::Operation::Exec { .. }
+        ));
+        assert_eq!(
+            select_node(plan, Some("missing")).unwrap_err(),
+            "node not found: missing"
+        );
+    }
+
+    #[test]
+    fn doctor_reports_verified_assets_and_each_required_capability() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+
+        let mut config = crate::project::load_config(directory.path()).unwrap();
+        config.sandbox.allow_local = true;
+        std::fs::write(
+            directory.path().join(".deshell/project.toml"),
+            config.encode_pretty().unwrap(),
+        )
+        .unwrap();
+
+        let runtime_path = directory.path().join("runtime.bin");
+        std::fs::write(&runtime_path, b"runtime").unwrap();
+        let (_, runtime_digest) = crate::digest::file_sha256(&runtime_path).unwrap();
+        let mut lock = crate::project::load_lock(directory.path()).unwrap();
+        lock.lab.image = format!("example.invalid/runtime@sha256:{}", "a".repeat(64));
+        lock.targets.dagger_image = format!("example.invalid/dagger@sha256:{}", "b".repeat(64));
+        lock.lab.assets = vec![
+            crate::config::LabAsset {
+                name: "runtime".into(),
+                role: crate::config::LabAssetRole::Runtime,
+                operating_system: std::env::consts::OS.into(),
+                architecture: std::env::consts::ARCH.into(),
+                path: "runtime.bin".into(),
+                sha256: format!("sha256:{runtime_digest}"),
+                executable: false,
+            },
+            crate::config::LabAsset {
+                name: "missing-helper".into(),
+                role: crate::config::LabAssetRole::Helper,
+                operating_system: std::env::consts::OS.into(),
+                architecture: std::env::consts::ARCH.into(),
+                path: "missing.bin".into(),
+                sha256: format!("sha256:{}", "c".repeat(64)),
+                executable: false,
+            },
+            crate::config::LabAsset {
+                name: "foreign".into(),
+                role: crate::config::LabAssetRole::Helper,
+                operating_system: if cfg!(target_os = "linux") {
+                    "macos".into()
+                } else {
+                    "linux".into()
+                },
+                architecture: std::env::consts::ARCH.into(),
+                path: "foreign.bin".into(),
+                sha256: format!("sha256:{}", "d".repeat(64)),
+                executable: false,
+            },
+        ];
+        let lock_text = toml::to_string_pretty(&lock).unwrap();
+        crate::config::Lockfile::decode(&lock_text).unwrap();
+        std::fs::write(directory.path().join("deshell.lock"), lock_text).unwrap();
+
+        crate::lab::with_test_execution(
+            crate::lab::Provider::VirtualizationFramework,
+            Vec::new(),
+            || {
+                let mut json = Vec::new();
+                let code =
+                    doctor_command(directory.path(), OutputFormat::Json, None, &mut json).unwrap();
+                assert_eq!(code, 0);
+                let report: serde_json::Value = serde_json::from_slice(&json).unwrap();
+                assert_eq!(report["bundle"]["ready"], true);
+                assert_eq!(report["bundle"]["assets"].as_array().unwrap().len(), 2);
+                assert_eq!(report["capabilities"]["planning"], true);
+                assert_eq!(report["capabilities"]["local"], true);
+                assert_eq!(report["capabilities"]["disposable"], false);
+                assert_eq!(report["capabilities"]["bundle"], true);
+                assert_eq!(report["capabilities"]["dagger"], true);
+
+                let mut human = Vec::new();
+                assert_eq!(
+                    doctor_command(directory.path(), OutputFormat::Human, None, &mut human)
+                        .unwrap(),
+                    0
+                );
+                let human = String::from_utf8(human).unwrap();
+                for expected in [
+                    "binary: ok",
+                    "config: ok",
+                    "lock: ok",
+                    "lab image: pinned",
+                    "Dagger target: pinned",
+                    "bundle assets: ready",
+                    "disposable execution:",
+                    "planning=true local=true",
+                ] {
+                    assert!(human.contains(expected), "missing {expected:?} in {human}");
+                }
+
+                for (requirement, expected) in [
+                    (DoctorRequirement::Planning, 0),
+                    (DoctorRequirement::Local, 0),
+                    (DoctorRequirement::Disposable, 6),
+                    (DoctorRequirement::Bundle, 0),
+                    (DoctorRequirement::Dagger, 0),
+                ] {
+                    assert_eq!(
+                        doctor_command(
+                            directory.path(),
+                            OutputFormat::Agent,
+                            Some(requirement),
+                            &mut Vec::new(),
+                        )
+                        .unwrap(),
+                        expected,
+                        "{requirement:?}"
+                    );
+                }
+            },
+        );
+    }
+
+    /// A `scan` line naming a kind the report does not model becomes a scan
+    /// error, not a kind.
+    ///
+    /// The structured report is built by re-reading the command's human
+    /// output, and the first tab-separated field used to be taken as the kind
+    /// verbatim. A reader branching on `kind` — the corpus audit does — would
+    /// have counted whatever that said as a location to migrate.
+    #[test]
+    fn a_scan_line_naming_an_unmodelled_kind_is_reported_rather_than_carried() {
+        let spec = ReportSpec {
+            command: "scan",
+            format: OutputFormat::Json,
+            root: std::env::current_dir().unwrap(),
+            next_actions: Vec::new(),
+        };
+        let stdout = concat!(
+            "shell_file\tscripts/build.sh\tsh\thigh\t-\t0..12\n",
+            "future_kind\tsrc/odd.bin\tsh\thigh\t-\t0..4\n",
+            "skipped\tvendor/blob\tbinary\n",
+        );
+        let report = command_report(CommandReportArgs {
+            spec: &spec,
+            code: 0,
+            failure: None,
+            stdout: stdout.as_bytes(),
+            stderr: b"",
+            supplied: None,
+        });
+        let kinds = report
+            .details
+            .items
+            .iter()
+            .map(|item| item.kind)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            vec![
+                Some(crate::report::ItemKind::ShellFile),
+                Some(crate::report::ItemKind::Error),
+                Some(crate::report::ItemKind::Skipped),
+            ],
+            "{:#?}",
+            report.details.items
+        );
+        let reported = &report.details.items[1];
+        assert_eq!(reported.path.as_deref(), Some("src/odd.bin"));
+        assert_eq!(
+            reported.message.as_deref(),
+            Some("scan printed the unmodelled location kind 'future_kind'")
+        );
+    }
+
+    /// The same input twice produces the same trace, apart from how long it
+    /// took.
+    ///
+    /// de-shell's contract is deterministic output and canonical digest bytes,
+    /// and until now that was a claim about stdout only. A trace says what the
+    /// run *did*, so comparing two of them checks the same property one layer
+    /// down: the same files staged, in the same order, with the same digests,
+    /// after the same readings of the environment.
+    ///
+    /// `elapsed_nanos` is the one field that cannot match, which is why it is a
+    /// field of its own and not folded into the event.
+    #[test]
+    fn the_same_work_twice_records_the_same_trace_apart_from_its_timing() {
+        let run = || {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().to_path_buf();
+            std::fs::write(root.join("build.sh"), b"#!/bin/sh\nprintf hi\n").unwrap();
+            let text = crate::trace::testing::recorded(|| {
+                let mut stdout = Vec::new();
+                let mut stderr = Vec::new();
+                let code = run_from(
+                    [
+                        "deshell",
+                        "init",
+                        "--root",
+                        &root.to_string_lossy(),
+                        "--target",
+                        "rust",
+                    ],
+                    &mut stdout,
+                    &mut stderr,
+                );
+                assert_eq!(code, 0, "{}", String::from_utf8_lossy(&stderr));
+            });
+            // The temporary directory is part of the path, so it is removed the
+            // same way from both: what is being compared is the work, not where
+            // it happened.
+            let root = root.canonicalize().unwrap().to_string_lossy().into_owned();
+            crate::trace::testing::events(&text)
+                .into_iter()
+                .map(|mut event| {
+                    let object = event.as_object_mut().unwrap();
+                    object.remove("elapsed_nanos");
+                    // Normalize values before JSON escaping. Replacing text in
+                    // the serialized form happened to work for `/` paths, but
+                    // could not find a Windows root once each `\` had become
+                    // `\\` in JSON.
+                    for value in object.values_mut() {
+                        if let serde_json::Value::String(text) = value {
+                            *text = text.replace(&root, "<root>");
+                        }
+                    }
+                    serde_json::to_string(&object).unwrap()
+                })
+                .collect::<Vec<_>>()
+        };
+        let first = run();
+        let second = run();
+        assert!(!first.is_empty());
+        assert_eq!(first, second);
+        // And it is a trace of the work, not an empty one that trivially
+        // matches: `init` writes these four and reads no environment.
+        let committed = first
+            .iter()
+            .filter(|line| line.contains(r#""event":"file_commit""#))
+            .count();
+        assert_eq!(committed, 4, "{first:#?}");
+    }
 
     fn invoke(args: &[&str]) -> (i32, Vec<u8>, Vec<u8>) {
         let mut stdout = Vec::new();
@@ -4394,6 +6007,13 @@ mod tests {
         let human = String::from_utf8(human.1).unwrap();
         assert!(human.starts_with(report["summary"].as_str().unwrap()));
         assert!(human.contains("1 shell location(s) found; 0 skipped; 0 error(s)"));
+        // The count says how much was inventoried; this line says how much of it is
+        // understood. Without it a reader has to go through every row to notice
+        // that a declared interpreter was recorded as a guess.
+        assert!(
+            human.contains("confidence: 1 high; 0 medium; 0 low"),
+            "{human}"
+        );
     }
 
     #[test]
@@ -4855,7 +6475,7 @@ mod tests {
             "scenario".into(),
             "synthesize".into(),
             "--root".into(),
-            root,
+            root.clone(),
             "--apply".into(),
         ]);
         assert_eq!(applied.0, 0, "{}", String::from_utf8_lossy(&applied.2));
@@ -4866,6 +6486,42 @@ mod tests {
         )
         .unwrap();
         assert!(persisted.contains("approval = \"draft\""));
+
+        let idempotent = invoke_owned(vec![
+            "deshell".into(),
+            "scenario".into(),
+            "synthesize".into(),
+            "--root".into(),
+            root.clone(),
+            "--apply".into(),
+        ]);
+        assert_eq!(
+            idempotent.0,
+            0,
+            "{}",
+            String::from_utf8_lossy(&idempotent.2)
+        );
+
+        std::fs::write(
+            directory
+                .path()
+                .join(".deshell/scenarios/synthesized-build.toml"),
+            b"occupied by a different review\n",
+        )
+        .unwrap();
+        let occupied = invoke_owned(vec![
+            "deshell".into(),
+            "scenario".into(),
+            "synthesize".into(),
+            "--root".into(),
+            root,
+            "--apply".into(),
+        ]);
+        assert_eq!(occupied.0, 4);
+        assert!(
+            String::from_utf8_lossy(&occupied.1)
+                .contains("refusing to overwrite an existing scenario draft")
+        );
     }
 
     #[test]
@@ -4916,8 +6572,8 @@ mod tests {
             assert_eq!(finding["schema_version"], 1);
             assert_eq!(finding["confidence"], "high");
             assert!(finding["url"].as_str().unwrap().starts_with("https://"));
-            let start = finding["span"]["start_byte"].as_u64().unwrap() as usize;
-            let end = finding["span"]["end_byte"].as_u64().unwrap() as usize;
+            let start = usize::try_from(finding["span"]["start_byte"].as_u64().unwrap()).unwrap();
+            let end = usize::try_from(finding["span"]["end_byte"].as_u64().unwrap()).unwrap();
             assert!(start < end);
             let selected = &source.as_bytes()[start..end];
             assert!(
@@ -5020,8 +6676,8 @@ mod tests {
             .collect::<Vec<serde_json::Value>>();
         assert_eq!(findings.len(), 1, "{findings:#?}");
         assert_eq!(findings[0]["rule_id"], "shell.dynamic-eval");
-        let start = findings[0]["span"]["start_byte"].as_u64().unwrap() as usize;
-        let end = findings[0]["span"]["end_byte"].as_u64().unwrap() as usize;
+        let start = usize::try_from(findings[0]["span"]["start_byte"].as_u64().unwrap()).unwrap();
+        let end = usize::try_from(findings[0]["span"]["end_byte"].as_u64().unwrap()).unwrap();
         assert_eq!(&workflow[start..end], "eval");
     }
 
@@ -5062,8 +6718,8 @@ mod tests {
                 .iter()
                 .find(|finding| finding["rule_id"] == rule)
                 .unwrap_or_else(|| panic!("missing {rule}: {findings:#?}"));
-            let start = finding["span"]["start_byte"].as_u64().unwrap() as usize;
-            let end = finding["span"]["end_byte"].as_u64().unwrap() as usize;
+            let start = usize::try_from(finding["span"]["start_byte"].as_u64().unwrap()).unwrap();
+            let end = usize::try_from(finding["span"]["end_byte"].as_u64().unwrap()).unwrap();
             assert_eq!(&source[start..end], selected, "{rule}");
         }
     }
@@ -5175,6 +6831,49 @@ mod tests {
         }
     }
 
+    /// A project with no `.deshell` says so, and says what to run.
+    ///
+    /// It used to report whichever read failed first — `cannot inspect
+    /// .../.deshell: No such file` — and offer `deshell --help` as the next
+    /// step. Following that costs three commands to arrive at `deshell init`.
+    /// A wrong next step is more expensive than a missing one, because it stops
+    /// the search somewhere else.
+    #[test]
+    fn a_project_that_is_not_initialized_says_so_and_says_what_to_run() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_string_lossy().into_owned();
+        let (code, stdout, stderr) = invoke(&[
+            "deshell",
+            "analyze",
+            "--root",
+            &root,
+            "--entry",
+            "build.sh",
+            "--diagnostics=jsonl",
+        ]);
+        assert_eq!(code, 3);
+        assert!(stdout.is_empty());
+        let diagnostic: serde_json::Value =
+            serde_json::from_slice(stderr.split(|byte| *byte == b'\n').next().unwrap()).unwrap();
+        assert_eq!(diagnostic["code"], "DESHELL_UNINITIALIZED");
+        assert_eq!(
+            diagnostic["next_actions"][0]["argv"],
+            serde_json::json!(["deshell", "init", "--root", root])
+        );
+
+        // Not every error has a next step, and inventing one is the defect this
+        // replaced: a usage error is where `--help` is the answer.
+        let (code, _, stderr) = invoke(&["deshell", "schema", "unknown", "--diagnostics=jsonl"]);
+        assert_eq!(code, 2);
+        let diagnostic: serde_json::Value =
+            serde_json::from_slice(stderr.split(|byte| *byte == b'\n').next().unwrap()).unwrap();
+        assert_eq!(diagnostic["code"], "DESHELL_USAGE");
+        assert_eq!(
+            diagnostic["next_actions"][0]["argv"],
+            serde_json::json!(["deshell", "--help"])
+        );
+    }
+
     #[test]
     fn usage_errors_are_exit_two_and_jsonl_stays_on_stderr() {
         let (code, stdout, stderr) =
@@ -5268,6 +6967,32 @@ mod tests {
 
     #[test]
     fn failures_use_the_fixed_io_invalid_and_policy_categories() {
+        let fixed = [
+            (Failure::io("io"), 1, "DESHELL_IO"),
+            (Failure::limit("limit"), 1, "DESHELL_LIMIT_EXCEEDED"),
+            (Failure::usage("usage"), 2, "DESHELL_USAGE"),
+            (Failure::invalid("invalid"), 3, "DESHELL_INVALID_CONTRACT"),
+            (Failure::policy("policy"), 4, "DESHELL_POLICY"),
+            (
+                Failure::shell_reintroduced("shell"),
+                4,
+                "DESHELL_SHELL_REINTRODUCED",
+            ),
+            (Failure::difference("different"), 5, "DESHELL_DIFFERENCE"),
+            (
+                Failure::unavailable("unavailable"),
+                6,
+                "DESHELL_PROVIDER_UNAVAILABLE",
+            ),
+            (Failure::internal("internal"), 70, "DESHELL_INTERNAL"),
+        ];
+        for (failure, exit, code) in fixed {
+            assert_eq!((failure.exit, failure.code), (exit, code));
+            assert!(!failure.message.is_empty());
+            assert!(failure.help.is_none());
+            assert!(failure.next_actions.is_empty());
+        }
+
         let missing = tempfile::tempdir().unwrap().path().join("gone");
         let checked = invoke_owned(vec![
             "deshell".into(),
@@ -5459,6 +7184,241 @@ mod tests {
         );
     }
 
+    /// The structured scan is built from the inventory, not read back out of
+    /// the printed lines.
+    ///
+    /// A Scan Report used to be a parse of this command's own prose, so it
+    /// could carry only what the prose carried — which is why a location's byte
+    /// span and content digest reached the machine-readable face only after the
+    /// human line was made to print them, one at a time, each after somebody
+    /// needed it.
+    ///
+    /// This checks the two faces are no longer the same sentence: the report
+    /// carries a digest that the human line does not print.
+    #[test]
+    fn the_structured_scan_carries_what_the_printed_line_does_not() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        configure(directory.path(), "build.sh", b"/usr/bin/printf hello\n");
+        let root = path(directory.path());
+        let human = invoke_owned(vec![
+            "deshell".into(),
+            "scan".into(),
+            "--root".into(),
+            root.clone(),
+        ]);
+        assert_eq!(human.0, 0, "{}", String::from_utf8_lossy(&human.2));
+        let printed = String::from_utf8(human.1).unwrap();
+
+        let structured = invoke_owned(vec![
+            "deshell".into(),
+            "scan".into(),
+            "--root".into(),
+            root,
+            "--format".into(),
+            "json".into(),
+        ]);
+        assert_eq!(structured.0, 0);
+        let report: serde_json::Value = crate::strict_json::parse(&structured.1).unwrap();
+        let items = report["details"]["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1, "{report}");
+        let digest = items[0]["digest"].as_str().expect("a content digest");
+        assert_eq!(digest.len(), 64, "{digest}");
+        assert!(
+            !printed.contains(digest),
+            "the report is still only what the prose says: {printed}"
+        );
+    }
+
+    /// A structured scan carries the bytes, not a sentence about them.
+    ///
+    /// The structured report is built by re-reading the human output, so it
+    /// could only carry what the prose carried — and the prose carried a
+    /// locator like `run:118`. A line number is not a span. Meanwhile
+    /// `verify --require shell-free` was printing spans for every location in
+    /// one line, so the information existed and reached only the face that
+    /// could not use it.
+    #[test]
+    fn a_structured_scan_carries_the_byte_span_of_every_location() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        let source = b"/usr/bin/printf hello\n";
+        configure(directory.path(), "build.sh", source);
+        let scan = invoke_owned(vec![
+            "deshell".into(),
+            "scan".into(),
+            "--root".into(),
+            path(directory.path()),
+            "--format".into(),
+            "json".into(),
+        ]);
+        assert_eq!(scan.0, 0, "{}", String::from_utf8_lossy(&scan.2));
+        let report: serde_json::Value = crate::strict_json::parse(&scan.1).unwrap();
+        let items = report["details"]["items"].as_array().unwrap();
+        assert!(!items.is_empty(), "{report}");
+        for item in items {
+            let start = item["start_byte"].as_u64().expect("a start byte");
+            let end = item["end_byte"].as_u64().expect("an end byte");
+            assert!(start < end, "{item}");
+            assert!(end <= source.len() as u64, "{item}");
+        }
+    }
+
+    /// Shell that is in the repository on purpose is declared, approved, and
+    /// still counted.
+    ///
+    /// The case that made this necessary is de-shell's own: `contracts/golden`
+    /// records shell behaviour measured from real shells, and `cargo xtask`
+    /// re-measures it by running exactly those bytes. Without a way to say so, a
+    /// repository whose subject matter is shell can never pass its own gate, and
+    /// the alternatives are deleting the evidence or leaving the gate
+    /// permanently red — neither of which is a true statement about it.
+    ///
+    /// Four states are checked here, because the value of the mechanism is in
+    /// the three that are not "pass": a declaration nobody approved removes
+    /// nothing, a declaration whose shell moved is stale rather than ignored,
+    /// and a location that is not declared still fails.
+    #[test]
+    fn declared_shell_is_approved_matched_and_counted_rather_than_ignored() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        let kept = b"/usr/bin/printf measured\n";
+        configure(directory.path(), "corpus.sh", kept);
+        let root = path(directory.path());
+
+        let undeclared = invoke_owned(vec![
+            "deshell".into(),
+            "verify".into(),
+            "--root".into(),
+            root.clone(),
+            "--require".into(),
+            "shell-free".into(),
+        ]);
+        assert_eq!(undeclared.0, 4, "an undeclared location must still fail");
+
+        let config = directory.path().join(".deshell/project.toml");
+        let declare = |start: u64, end: u64| {
+            let mut text = std::fs::read_to_string(&config).unwrap();
+            text.push_str(&format!(
+                "\n[[declared_shell]]\npath = \"corpus.sh\"\nstart_byte = {start}\nend_byte = {end}\nreason = \"measured shell behaviour\"\napproval = \"draft\"\n"
+            ));
+            std::fs::write(&config, text).unwrap();
+        };
+        let gate = || {
+            invoke_owned(vec![
+                "deshell".into(),
+                "verify".into(),
+                "--root".into(),
+                root.clone(),
+                "--require".into(),
+                "shell-free".into(),
+            ])
+        };
+        let approve_every = || {
+            let listed = invoke_owned(vec![
+                "deshell".into(),
+                "declared".into(),
+                "list".into(),
+                "--root".into(),
+                root.clone(),
+            ]);
+            let text = String::from_utf8(listed.1).unwrap();
+            for line in text.lines() {
+                let fields = line.split('\t').collect::<Vec<_>>();
+                if fields.len() == 3 && fields[1] != "approved" {
+                    let approved = invoke_owned(vec![
+                        "deshell".into(),
+                        "declared".into(),
+                        "approve".into(),
+                        "--root".into(),
+                        root.clone(),
+                        "--location".into(),
+                        fields[0].into(),
+                        "--digest".into(),
+                        fields[2].into(),
+                    ]);
+                    assert_eq!(approved.0, 0, "{}", String::from_utf8_lossy(&approved.2));
+                }
+            }
+        };
+
+        // Declared and not approved: the gate refuses, because otherwise it
+        // would pass on a review nobody did.
+        declare(0, kept.len() as u64);
+        let unapproved = gate();
+        assert_eq!(unapproved.0, 4);
+        let text = String::from_utf8(unapproved.1).unwrap();
+        assert!(text.contains("declared shell is not approved"), "{text}");
+
+        // Approved and matching: the gate passes and says how many stayed.
+        approve_every();
+        let passing = gate();
+        assert_eq!(passing.0, 0, "{}", String::from_utf8_lossy(&passing.2));
+        let text = String::from_utf8(passing.1).unwrap();
+        assert!(
+            text.contains("shell-free: verified (0 live, 1 declared)"),
+            "{text}"
+        );
+        assert!(text.contains("measured shell behaviour"), "{text}");
+
+        // Approved and matching nothing: stale, not silently dropped.
+        let mut config_text = std::fs::read_to_string(&config).unwrap();
+        config_text = config_text.replace(
+            &format!("end_byte = {}", kept.len()),
+            &format!("end_byte = {}", kept.len() - 1),
+        );
+        std::fs::write(&config, config_text).unwrap();
+        approve_every();
+        let stale = gate();
+        assert_eq!(stale.0, 4);
+        let text = String::from_utf8(stale.1).unwrap();
+        assert!(text.contains("declared shell matches nothing"), "{text}");
+    }
+
+    /// A gate that fails names its code once and does not inline the inventory.
+    ///
+    /// It used to print every location in one line, and print that line twice —
+    /// once as the summary and once as an output line prefixed with the code.
+    /// On de-shell's own repository that is 101 locations, twice, and what a
+    /// reader learns is that there are a lot of them.
+    #[test]
+    fn a_failing_gate_says_its_code_once_and_points_at_the_full_list() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::project::init(directory.path()).unwrap();
+        for index in 0..8 {
+            configure(
+                directory.path(),
+                &format!("build{index}.sh"),
+                b"/usr/bin/printf hello\n",
+            );
+        }
+        let verified = invoke_owned(vec![
+            "deshell".into(),
+            "verify".into(),
+            "--root".into(),
+            path(directory.path()),
+            "--require".into(),
+            "shell-free".into(),
+        ]);
+        assert_eq!(verified.0, 4);
+        let text = String::from_utf8(verified.1).unwrap();
+        assert_eq!(
+            text.matches("DESHELL_SHELL_REINTRODUCED").count(),
+            1,
+            "the code is said more than once: {text}"
+        );
+        assert_eq!(
+            text.matches("live tree is not shell-free").count(),
+            1,
+            "the message is said more than once: {text}"
+        );
+        assert!(text.contains("and 3 more in"), "{text}");
+        assert!(
+            text.contains(r#"next argv: ["deshell","scan","--format","json"]"#),
+            "the failure does not say where the full list is: {text}"
+        );
+    }
+
     #[test]
     fn scan_json_and_export_are_stdout_artifacts_only() {
         let directory = tempfile::tempdir().unwrap();
@@ -5577,6 +7537,140 @@ mod tests {
             String::from_utf8(verified.1)
                 .unwrap()
                 .contains("unavailable=1")
+        );
+    }
+
+    #[test]
+    fn observation_records_every_connected_execution_outcome() {
+        fn result(stdout: &[u8]) -> crate::runner::RunResult {
+            crate::runner::RunResult {
+                exit_code: 0,
+                stdout: stdout.to_vec(),
+                stderr: Vec::new(),
+                trace: Vec::new(),
+            }
+        }
+
+        fn failure(
+            kind: crate::lab::ExecutionFailureKind,
+            message: &str,
+        ) -> Result<crate::runner::RunResult, crate::lab::ExecutionFailure> {
+            Err(crate::lab::ExecutionFailure {
+                kind,
+                message: message.into(),
+            })
+        }
+
+        fn observe(
+            expected_stdout: Option<&str>,
+            results: Vec<Result<crate::runner::RunResult, crate::lab::ExecutionFailure>>,
+        ) -> (i32, String, crate::evidence::ObservationEvidence) {
+            let directory = tempfile::tempdir().unwrap();
+            crate::project::init(directory.path()).unwrap();
+            configure(directory.path(), "build.sh", b"/usr/bin/printf hello\n");
+            let lock_path = directory.path().join("deshell.lock");
+            let lock = std::fs::read_to_string(&lock_path).unwrap().replace(
+                "image = \"unconfigured\"",
+                &format!("image = \"example.invalid/lab@sha256:{}\"", "a".repeat(64)),
+            );
+            std::fs::write(lock_path, lock).unwrap();
+            if let Some(expected_stdout) = expected_stdout {
+                let scenario_path = directory.path().join(".deshell/scenarios/default.toml");
+                let scenario = std::fs::read_to_string(&scenario_path).unwrap().replace(
+                    "[expect]\n",
+                    &format!("[expect]\nstdout = {{ utf8 = {expected_stdout:?} }}\n"),
+                );
+                std::fs::write(scenario_path, scenario).unwrap();
+            }
+            crate::project::analyze(directory.path(), "build.sh").unwrap();
+            let mut output = Vec::new();
+            let code =
+                crate::lab::with_test_execution(crate::lab::Provider::Podman, results, || {
+                    observe_command(directory.path(), None, &[], &mut output).unwrap()
+                });
+            let (_, evidence) =
+                crate::project::load_entry_artifacts(directory.path(), "build.sh").unwrap();
+            assert_eq!(evidence.observations.len(), 1);
+            (
+                code,
+                String::from_utf8(output).unwrap(),
+                evidence.observations[0].clone(),
+            )
+        }
+
+        let verified = observe(None, vec![Ok(result(b"same")), Ok(result(b"same"))]);
+        assert_eq!(verified.0, 0);
+        assert_eq!(verified.1, "default: verified\n");
+        assert_eq!(
+            verified.2.status,
+            crate::evidence::ObservationStatus::Verified
+        );
+        assert_eq!(verified.2.provider, "podman");
+        assert!(verified.2.reason.is_none());
+        assert!(verified.2.digest.is_some());
+
+        let different = observe(None, vec![Ok(result(b"original")), Ok(result(b"plan"))]);
+        assert_eq!(different.0, 5);
+        assert_eq!(different.1, "default: different\n");
+        assert_eq!(
+            different.2.status,
+            crate::evidence::ObservationStatus::Different
+        );
+        assert!(different.2.reason.as_deref().unwrap().contains("stdout"));
+
+        let unavailable = observe(
+            None,
+            vec![failure(
+                crate::lab::ExecutionFailureKind::Unavailable,
+                "provider disappeared",
+            )],
+        );
+        assert_eq!(unavailable.0, 6);
+        assert!(unavailable.1.is_empty());
+        assert_eq!(
+            unavailable.2.status,
+            crate::evidence::ObservationStatus::Unavailable
+        );
+        assert_eq!(
+            unavailable.2.reason.as_deref(),
+            Some("provider disappeared")
+        );
+
+        let original_failed = observe(
+            None,
+            vec![failure(
+                crate::lab::ExecutionFailureKind::Failed,
+                "original crashed",
+            )],
+        );
+        assert_eq!(original_failed.0, 1);
+        assert_eq!(
+            original_failed.2.status,
+            crate::evidence::ObservationStatus::Failed
+        );
+        assert_eq!(
+            original_failed.2.reason.as_deref(),
+            Some("original crashed")
+        );
+
+        let expectation_failed = observe(Some("wanted"), vec![Ok(result(b"observed"))]);
+        assert_eq!(expectation_failed.0, 1);
+        assert_eq!(
+            expectation_failed.2.reason.as_deref(),
+            Some("scenario expected stdout did not match the original observation")
+        );
+
+        let plan_failed = observe(
+            None,
+            vec![
+                Ok(result(b"original")),
+                failure(crate::lab::ExecutionFailureKind::Failed, "plan crashed"),
+            ],
+        );
+        assert_eq!(plan_failed.0, 1);
+        assert_eq!(
+            plan_failed.2.reason.as_deref(),
+            Some("plan execution failed: plan crashed")
         );
     }
 
@@ -6001,7 +8095,7 @@ mod tests {
         std::fs::write(&evidence_path, evidence.encode_pretty().unwrap()).unwrap();
         let replay_path = directory.path().join(".deshell/replay.json");
         let canonical_replay = replay.encode_pretty().unwrap();
-        let mut changed_replay = replay.clone();
+        let mut changed_replay = replay;
         changed_replay.entries[0].body = crate::ir::SourceBytes::from_bytes(b"changed\n");
         std::fs::write(&replay_path, changed_replay.encode_pretty().unwrap()).unwrap();
         let stale = crate::migration::import_evidence(
@@ -7823,9 +9917,9 @@ for line in sys.stdin:
             "evidence".into(),
             "import".into(),
             "--root".into(),
-            root.clone(),
+            root,
             "--plan".into(),
-            digest.clone(),
+            digest,
             path(&conflicting_path),
         ]);
         assert_eq!(imported.0, 4, "{}", String::from_utf8_lossy(&imported.2));
@@ -8608,8 +10702,47 @@ for line in sys.stdin:
             ]);
             assert_eq!(exported.0, 4, "{}", String::from_utf8_lossy(&exported.2));
         }
+
+        let nested =
+            safe_output_path(directory.path(), Path::new("nested/deeper/internal.json")).unwrap();
+        assert_eq!(
+            nested
+                .strip_prefix(directory.path().canonicalize().unwrap())
+                .unwrap(),
+            Path::new("nested/deeper/internal.json")
+        );
+        assert!(directory.path().join("nested/deeper").is_dir());
+        std::fs::write(&nested, b"existing").unwrap();
+        assert_eq!(
+            safe_output_path(directory.path(), Path::new("nested/deeper/internal.json")).unwrap(),
+            nested
+        );
+
+        std::fs::create_dir(directory.path().join("directory-output")).unwrap();
+        assert_eq!(
+            safe_output_path(directory.path(), Path::new("directory-output"))
+                .unwrap_err()
+                .message,
+            "export output must be a regular file"
+        );
+        std::fs::write(directory.path().join("file-parent"), b"occupied").unwrap();
+        assert!(
+            safe_output_path(directory.path(), Path::new("file-parent/output.json"))
+                .unwrap_err()
+                .message
+                .contains("parent is not a regular directory")
+        );
         #[cfg(unix)]
         {
+            use std::os::unix::ffi::OsStringExt as _;
+
+            let non_utf8 = PathBuf::from(std::ffi::OsString::from_vec(vec![0xff]));
+            assert_eq!(
+                safe_output_path(directory.path(), &non_utf8)
+                    .unwrap_err()
+                    .message,
+                "export --output must be valid UTF-8"
+            );
             let outside = tempfile::NamedTempFile::new().unwrap();
             std::os::unix::fs::symlink(outside.path(), directory.path().join("output.json"))
                 .unwrap();
@@ -8839,6 +10972,26 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn large_previews_use_the_bounded_linear_diff_without_losing_context() {
+        let prefix = (0..1_000)
+            .map(|index| format!("prefix-{index}\n"))
+            .collect::<String>();
+        let suffix = (0..1_000)
+            .map(|index| format!("suffix-{index}\n"))
+            .collect::<String>();
+        let before = format!("{prefix}before\n{suffix}");
+        let after = format!("{prefix}after\n{suffix}");
+        let diff = preview("large.sh", &before, &after);
+        assert!(diff.starts_with("--- a/large.sh\n+++ b/large.sh\n"));
+        assert!(diff.contains(" prefix-999\n-before\n+after\n suffix-0\n"));
+        assert!(
+            diff.len() < 1_000,
+            "bounded preview grew to {} bytes",
+            diff.len()
+        );
+    }
+
+    #[test]
     fn modernize_rolls_back_sources_when_reanalysis_cannot_commit() {
         let directory = tempfile::tempdir().unwrap();
         crate::project::init(directory.path()).unwrap();
@@ -8993,10 +11146,35 @@ for line in sys.stdin:
             "deshell".into(),
             "explain".into(),
             "--root".into(),
-            root,
+            root.clone(),
         ]);
         assert_eq!(explained.0, 0);
         assert!(String::from_utf8(explained.1).unwrap().contains("nodes: 1"));
+
+        let (plan, _) = crate::project::load_artifacts(directory.path()).unwrap();
+        let node_id = plan.tasks[0].body.id.clone();
+        let node = invoke_owned(vec![
+            "deshell".into(),
+            "explain".into(),
+            "--root".into(),
+            root.clone(),
+            node_id.clone(),
+        ]);
+        assert_eq!(node.0, 0, "{}", String::from_utf8_lossy(&node.2));
+        let node = String::from_utf8(node.1).unwrap();
+        assert!(node.contains(&format!("{node_id}\n")));
+        assert!(node.contains("\"level\": \"native\""));
+        assert!(node.contains("\"semantic_model\""));
+
+        let missing = invoke_owned(vec![
+            "deshell".into(),
+            "explain".into(),
+            "--root".into(),
+            root,
+            "missing-node".into(),
+        ]);
+        assert_eq!(missing.0, 3);
+        assert!(String::from_utf8_lossy(&missing.2).contains("node not found: missing-node"));
     }
 
     #[test]

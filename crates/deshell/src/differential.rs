@@ -1,4 +1,10 @@
-#![cfg_attr(not(test), allow(dead_code))]
+#![cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "reachable only from the test-only differential harness; kept compiled in release so the two paths cannot drift"
+    )
+)]
 
 use crate::config::Scenario;
 use crate::evidence::Evidence;
@@ -6,7 +12,6 @@ use crate::ir::Plan;
 use crate::runner::{Backend, Policy, RunResult};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(dead_code)]
 pub(crate) enum ProviderFailureKind {
     Unavailable,
     Failed,
@@ -34,16 +39,42 @@ pub(crate) enum Outcome {
     Failed,
     Nondeterministic,
 }
+/// The inputs of a differential evaluation.
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to
+/// a seven-argument function stays invisible to every call site that already
+/// compiles. [`evaluate`] takes this apart without `..`, so a field added here
+/// fails to compile until it is given a destination.
+pub(crate) struct Evaluation<'a, O: Observer, B: Backend> {
+    pub(crate) observer: &'a O,
+    pub(crate) backend: &'a B,
+    pub(crate) policy: Policy,
+    pub(crate) plan: &'a Plan,
+    pub(crate) scenario: &'a Scenario,
+    pub(crate) runtime_lock_digest: &'a str,
+    pub(crate) evidence: &'a mut Evidence,
+}
 
-pub(crate) fn evaluate(
-    observer: &dyn Observer,
-    backend: &dyn Backend,
-    policy: Policy,
-    plan: &Plan,
-    scenario: &Scenario,
-    runtime_lock_digest: &str,
-    evidence: &mut Evidence,
+pub(crate) fn evaluate<O: Observer, B: Backend>(
+    parts: Evaluation<'_, O, B>,
 ) -> Result<Outcome, String> {
+    // Destructured without `..`: see `Evaluation`.
+
+    let Evaluation {
+        observer,
+
+        backend,
+
+        policy,
+
+        plan,
+
+        scenario,
+
+        runtime_lock_digest,
+
+        evidence,
+    } = parts;
     if observer.name().trim().is_empty() {
         return Err("observer provider name must not be empty".into());
     }
@@ -134,17 +165,20 @@ pub(crate) fn evaluate(
         }
     };
     let comparison = crate::verify::compare(&expected, &actual)?;
-    let status = crate::verify::record_comparison(
+    let status = crate::verify::record_comparison(crate::verify::RecordComparisonArgs {
         evidence,
-        &scenario.name,
-        observer.name(),
+        scenario: &scenario.name,
+        provider: observer.name(),
         key,
-        &comparison,
-    )?;
+        comparison: &comparison,
+    })?;
     Ok(match status {
         crate::evidence::ObservationStatus::Nondeterministic => Outcome::Nondeterministic,
         _ if comparison.equivalent => Outcome::Verified,
-        _ => Outcome::Different,
+        crate::evidence::ObservationStatus::Verified
+        | crate::evidence::ObservationStatus::Different
+        | crate::evidence::ObservationStatus::Unavailable
+        | crate::evidence::ObservationStatus::Failed => Outcome::Different,
     })
 }
 
@@ -200,19 +234,19 @@ mod tests {
             &self,
             _request: InterpreterRequest,
         ) -> Result<ProcessResult, String> {
-            unreachable!()
+            panic!("mock interpreter execution was not expected")
         }
         fn read_file(&self, _path: &str) -> Result<Vec<u8>, String> {
-            unreachable!()
+            panic!("mock file read was not expected")
         }
         fn write_file(&self, _path: &str, _contents: &[u8], _append: bool) -> Result<(), String> {
-            unreachable!()
+            panic!("mock file write was not expected")
         }
         fn remove_file(&self, _path: &str) -> Result<(), String> {
-            unreachable!()
+            panic!("mock file removal was not expected")
         }
         fn network_request(&self, _method: &str, _uri: &str) -> Result<Vec<u8>, String> {
-            unreachable!()
+            panic!("mock network request was not expected")
         }
     }
 
@@ -241,6 +275,7 @@ mod tests {
                 secrets: vec![],
                 platform_capabilities: vec![],
                 cacheable: false,
+                nounset: false,
                 invocation: None,
                 body: Node {
                     id: String::new(),
@@ -277,15 +312,15 @@ mod tests {
         let before = plan.encode_pretty().unwrap();
         let expected = result(0, b"");
         let mut evidence = Evidence::from_plan(&plan, "build.sh", b"emit").unwrap();
-        let outcome = evaluate(
-            &MockObserver(Ok(expected.clone())),
-            &MockBackend(expected),
-            Policy::default(),
-            &plan,
-            &scenario(),
-            &runtime_digest(),
-            &mut evidence,
-        )
+        let outcome = evaluate(Evaluation {
+            observer: &MockObserver(Ok(expected.clone())),
+            backend: &MockBackend(expected),
+            policy: Policy::default(),
+            plan: &plan,
+            scenario: &scenario(),
+            runtime_lock_digest: &runtime_digest(),
+            evidence: &mut evidence,
+        })
         .unwrap();
         assert_eq!(outcome, Outcome::Verified);
         assert_eq!(evidence.observations[0].status, ObservationStatus::Verified);
@@ -296,15 +331,15 @@ mod tests {
     fn raw_output_or_status_differences_are_observations_not_plan_guarantees() {
         let plan = plan();
         let mut evidence = Evidence::from_plan(&plan, "build.sh", b"emit").unwrap();
-        let outcome = evaluate(
-            &MockObserver(Ok(result(0, &[0xff]))),
-            &MockBackend(result(7, &[0xfe])),
-            Policy::default(),
-            &plan,
-            &scenario(),
-            &runtime_digest(),
-            &mut evidence,
-        )
+        let outcome = evaluate(Evaluation {
+            observer: &MockObserver(Ok(result(0, &[0xff]))),
+            backend: &MockBackend(result(7, &[0xfe])),
+            policy: Policy::default(),
+            plan: &plan,
+            scenario: &scenario(),
+            runtime_lock_digest: &runtime_digest(),
+            evidence: &mut evidence,
+        })
         .unwrap();
         assert_eq!(outcome, Outcome::Different);
         assert_eq!(
@@ -341,15 +376,15 @@ mod tests {
                 message: "provider stopped".into(),
             }));
             assert_eq!(
-                evaluate(
-                    &observer,
-                    &MockBackend(result(0, b"")),
-                    Policy::default(),
-                    &plan,
-                    &scenario(),
-                    &runtime_digest(),
-                    &mut evidence
-                )
+                evaluate(Evaluation {
+                    observer: &observer,
+                    backend: &MockBackend(result(0, b"")),
+                    policy: Policy::default(),
+                    plan: &plan,
+                    scenario: &scenario(),
+                    runtime_lock_digest: &runtime_digest(),
+                    evidence: &mut evidence,
+                })
                 .unwrap(),
                 outcome
             );
@@ -365,15 +400,15 @@ mod tests {
         let mut scenario = scenario();
         scenario.expect.stdout = Some(crate::config::BinaryData::from("expected"));
         let mut evidence = Evidence::from_plan(&plan, "build.sh", b"emit").unwrap();
-        let outcome = evaluate(
-            &MockObserver(Ok(result(0, b"actual"))),
-            &MockBackend(result(0, b"actual")),
-            Policy::default(),
-            &plan,
-            &scenario,
-            &runtime_digest(),
-            &mut evidence,
-        )
+        let outcome = evaluate(Evaluation {
+            observer: &MockObserver(Ok(result(0, b"actual"))),
+            backend: &MockBackend(result(0, b"actual")),
+            policy: Policy::default(),
+            plan: &plan,
+            scenario: &scenario,
+            runtime_lock_digest: &runtime_digest(),
+            evidence: &mut evidence,
+        })
         .unwrap();
         assert_eq!(outcome, Outcome::Failed);
         assert_eq!(evidence.observations[0].status, ObservationStatus::Failed);

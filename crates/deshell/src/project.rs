@@ -93,7 +93,7 @@ impl ProjectReader {
 
     fn read_utf8(&self, relative: &str) -> Result<String, String> {
         String::from_utf8(self.read_file(relative)?)
-            .map_err(|_| format!("project file is not valid UTF-8: {relative}"))
+            .map_err(|_error| format!("project file is not valid UTF-8: {relative}"))
     }
 
     fn file_path(&self, relative: &str) -> Result<PathBuf, String> {
@@ -129,7 +129,7 @@ impl ProjectReader {
             .read_file("deshell.lock")
             .map_err(|error| vec![error])?;
         let input = std::str::from_utf8(&bytes)
-            .map_err(|_| vec!["project file is not valid UTF-8: deshell.lock".into()])?;
+            .map_err(|_error| vec!["project file is not valid UTF-8: deshell.lock".into()])?;
         let lock = Lockfile::decode(input)?;
         Ok((lock, crate::digest::sha256(&bytes)))
     }
@@ -273,15 +273,26 @@ impl ValidatedProject {
         if !errors.is_empty() {
             return Err(errors);
         }
-        let (lock, runtime_lock_digest) = lock_snapshot.expect("valid project has a lock");
+        let reader =
+            reader.ok_or_else(|| vec!["validated project has no canonical root".into()])?;
+        let config = config.ok_or_else(|| vec!["validated project has no configuration".into()])?;
+        let (lock, runtime_lock_digest) =
+            lock_snapshot.ok_or_else(|| vec!["validated project has no lock snapshot".into()])?;
+        let manifest = manifest.ok_or_else(|| vec!["validated project has no manifest".into()])?;
+        let entries = validated_entries
+            .ok_or_else(|| vec!["validated project has no analyzed entries".into()])?;
+        let scenarios =
+            scenarios.ok_or_else(|| vec!["validated project has no validated scenarios".into()])?;
+        let replay =
+            replay.ok_or_else(|| vec!["validated project has no replay snapshot".into()])?;
         Ok(Self {
-            canonical_root: reader.expect("valid project has a canonical root").root,
-            config: config.expect("valid project has a config"),
+            canonical_root: reader.root,
+            config,
             lock,
-            manifest: manifest.expect("valid project has a manifest"),
-            entries: validated_entries.expect("valid project has validated entries"),
-            scenarios: scenarios.expect("valid project has validated scenarios"),
-            replay: replay.expect("valid project has a replay snapshot"),
+            manifest,
+            entries,
+            scenarios,
+            replay,
             runtime_lock_digest,
         })
     }
@@ -626,7 +637,9 @@ pub(crate) fn init_cli(
         InitTarget::Rust => "src/bin",
         InitTarget::Go => "cmd",
         InitTarget::Host => ".deshell/host",
-        InitTarget::Auto => unreachable!(),
+        InitTarget::Auto => {
+            return Err("automatic target selection did not resolve a target".into());
+        }
     }
     .to_owned();
 
@@ -658,15 +671,17 @@ pub(crate) fn init_cli(
 
     let mut config = ProjectConfig::decode(&ProjectConfig::default_text())
         .map_err(|errors| errors.join("; "))?;
-    config.entrypoints = entrypoints.clone();
+    config.entrypoints.clone_from(&entrypoints);
     config.migration.target = match target {
         InitTarget::Rust => crate::config::MigrationTarget::Rust,
         InitTarget::Go => crate::config::MigrationTarget::Go,
         InitTarget::Host => crate::config::MigrationTarget::Host,
-        InitTarget::Auto => unreachable!(),
+        InitTarget::Auto => {
+            return Err("automatic target selection did not resolve a target".into());
+        }
     };
     config.migration.generator = target.as_str().into();
-    config.migration.module_root = module_root.clone();
+    config.migration.module_root.clone_from(&module_root);
     config.location_overrides = inventory
         .findings
         .iter()
@@ -805,18 +820,32 @@ fn synthesized_initial_scenarios(
             finding: None,
         })
         .collect::<Vec<_>>();
+    // Every shell location, not only the embedded ones.
+    //
+    // A shell file that is not a declared entrypoint got no scenario at all,
+    // and the plan requires one for every source it holds — so `deshell init`
+    // produced a project whose own plan it could not satisfy:
+    // `approved scenarios do not cover environment GITHUB_PATH required by
+    // scripts/install-nushell.ps1`, for a script no scenario had been written
+    // for. A shell file keys on its path so it dedups against an entrypoint of
+    // the same path rather than becoming a second scenario for one file.
     sources.extend(
         inventory
             .findings
             .iter()
-            .filter(|finding| finding.kind == crate::scanner::FindingKind::EmbeddedShell)
+            .filter(|finding| !finding.kind.is_a_candidate())
             .map(|finding| {
-                let location = finding.locator.clone().unwrap_or_else(|| {
-                    format!("{}-{}", finding.span.start_byte, finding.span.end_byte)
-                });
+                let key = if finding.kind.is_a_shell_file() {
+                    finding.path.clone()
+                } else {
+                    let location = finding.locator.clone().unwrap_or_else(|| {
+                        format!("{}-{}", finding.span.start_byte, finding.span.end_byte)
+                    });
+                    format!("{}#{location}", finding.path)
+                };
                 Source {
                     path: finding.path.clone(),
-                    key: format!("{}#{location}", finding.path),
+                    key,
                     finding: Some(finding),
                 }
             }),
@@ -842,20 +871,29 @@ fn synthesized_initial_scenarios(
     for (source, stem) in sources.into_iter().zip(stems) {
         let mut arguments = std::collections::BTreeSet::new();
         let mut environment = std::collections::BTreeSet::new();
-        if let Some(finding) = source.finding {
+        if let Some(finding) = source.finding.filter(|finding| finding.kind.is_embedded()) {
             if let Some(interpreter) = finding.interpreter.as_deref()
                 && let Ok(plan) = crate::frontend::lower_with_interpreter(
-                    &source.path,
-                    &finding.source,
-                    crate::config::UnknownInterpreter::Reject,
-                    interpreter,
+                    crate::frontend::LowerWithInterpreterArgs {
+                        path: &source.path,
+                        source: &finding.source,
+                        unknown_policy: crate::config::UnknownInterpreter::Reject,
+                        configured: interpreter,
+                        host: crate::frontend::HostShell {
+                            named: finding.host_named_the_shell,
+                        },
+                    },
                 )
                 && let Some(task) = plan.tasks.iter().find(|task| task.name == plan.entrypoint)
             {
                 arguments.extend(task.inputs.iter().map(|input| input.name.clone()));
                 environment.extend(task.environment.iter().cloned());
             }
-        } else if entrypoints.contains(&source.path) {
+        } else if entrypoints.contains(&source.path)
+            || source
+                .finding
+                .is_some_and(|finding| finding.kind.is_a_shell_file())
+        {
             let (_, path) = resolve_entry(root, &source.path)?;
             let bytes = std::fs::read(&path)
                 .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
@@ -1067,12 +1105,16 @@ pub(crate) fn analyze(root: &Path, entry: &str) -> Result<AnalysisResult, String
         .iter()
         .find(|override_| override_.path == entry)
     {
-        Some(override_) => crate::frontend::lower_with_interpreter(
-            entry,
-            &source,
-            config.policy.unknown_interpreter,
-            override_.interpreter.name(),
-        )?,
+        // An entrypoint is a shell file, which has no host to name a shell.
+        Some(override_) => {
+            crate::frontend::lower_with_interpreter(crate::frontend::LowerWithInterpreterArgs {
+                path: entry,
+                source: &source,
+                unknown_policy: config.policy.unknown_interpreter,
+                configured: override_.interpreter.name(),
+                host: crate::frontend::HostShell::default(),
+            })?
+        }
         None => crate::frontend::lower(entry, &source, config.policy.unknown_interpreter)?,
     };
     crate::frontend::bind_interpreter_pins(&mut plan, &lock.interpreters)?;
@@ -1092,11 +1134,7 @@ pub(crate) fn analyze(root: &Path, entry: &str) -> Result<AnalysisResult, String
     let mut proposals = Vec::new();
     match plan_path.symlink_metadata() {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            proposals.push(crate::patch::prepare_create(
-                &plan_path,
-                plan_bytes.clone(),
-                0o644,
-            )?);
+            proposals.push(crate::patch::prepare_create(&plan_path, plan_bytes, 0o644)?);
         }
         Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {
             if std::fs::read(&plan_path).map_err(|error| error.to_string())? != plan_bytes {
@@ -1342,8 +1380,21 @@ fn ensure_directory(path: &Path) -> Result<(), String> {
             "path is not a regular directory: {}",
             path.display()
         )),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir(path)
-            .map_err(|error| format!("cannot create directory {}: {error}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match crate::patch::ensure_directory(path) {
+                Ok(
+                    crate::patch::DirectoryState::Created | crate::patch::DirectoryState::Existing,
+                ) => Ok(()),
+                Err(crate::patch::DirectoryError::Occupied) => Err(format!(
+                    "path is not a regular directory: {}",
+                    path.display()
+                )),
+                Err(crate::patch::DirectoryError::Io(error)) => Err(format!(
+                    "cannot create directory {}: {error}",
+                    path.display()
+                )),
+            }
+        }
         Err(error) => Err(format!(
             "cannot inspect directory {}: {error}",
             path.display()
@@ -1377,7 +1428,7 @@ fn read_utf8(path: &Path) -> Result<String, String> {
     }
     let bytes =
         std::fs::read(path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-    String::from_utf8(bytes).map_err(|_| format!("{} is not valid UTF-8", path.display()))
+    String::from_utf8(bytes).map_err(|_error| format!("{} is not valid UTF-8", path.display()))
 }
 
 pub(crate) fn load_lock(root: &Path) -> Result<Lockfile, Vec<String>> {
@@ -1388,7 +1439,7 @@ pub(crate) fn load_lock(root: &Path) -> Result<Lockfile, Vec<String>> {
 fn load_lock_snapshot(root: &Path) -> Result<(Lockfile, String), Vec<String>> {
     let bytes = read_project_file(root, "deshell.lock").map_err(|error| vec![error])?;
     let input = std::str::from_utf8(&bytes)
-        .map_err(|_| vec!["project file is not valid UTF-8: deshell.lock".into()])?;
+        .map_err(|_error| vec!["project file is not valid UTF-8: deshell.lock".into()])?;
     let lock = Lockfile::decode(input)?;
     let digest = crate::digest::sha256(&bytes);
     Ok((lock, digest))
@@ -1396,7 +1447,8 @@ fn load_lock_snapshot(root: &Path) -> Result<(Lockfile, String), Vec<String>> {
 
 fn read_project_utf8(root: &Path, relative: &str) -> Result<String, String> {
     let bytes = read_project_file(root, relative)?;
-    String::from_utf8(bytes).map_err(|_| format!("project file is not valid UTF-8: {relative}"))
+    String::from_utf8(bytes)
+        .map_err(|_error| format!("project file is not valid UTF-8: {relative}"))
 }
 
 fn read_project_file(root: &Path, relative: &str) -> Result<Vec<u8>, String> {
@@ -1611,6 +1663,14 @@ fn prepare_write(path: &Path, contents: Vec<u8>) -> Result<crate::patch::Proposa
 }
 
 #[cfg(test)]
+// Tests reach for the raw APIs on purpose: they stage corrupt trees, race two
+// writers against one path, and assert on what the transactional layer does with
+// the result. Constructing those situations is precisely what the production ban
+// exists to prevent, so the ban is lifted here and nowhere else.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "tests construct the races and corrupt trees the production ban prevents"
+)]
 mod tests {
     use super::*;
 
@@ -1620,6 +1680,78 @@ mod tests {
             std::fs::create_dir_all(parent).unwrap();
         }
         std::fs::write(path, bytes).unwrap();
+    }
+
+    /// Every shell location gets a scenario, and it names the environment the
+    /// source reads.
+    ///
+    /// A shell file that was not a declared entrypoint got none, and the plan
+    /// requires one for every source it holds. So `deshell init` produced a
+    /// project whose own plan it could not satisfy:
+    /// `approved scenarios do not cover environment GITHUB_PATH required by
+    /// scripts/install-nushell.ps1`, for a script no scenario had been written
+    /// for.
+    #[test]
+    fn every_shell_location_gets_a_scenario_that_names_what_it_reads() {
+        let directory = tempfile::tempdir().unwrap();
+        init(directory.path()).unwrap();
+        write(
+            directory.path(),
+            "entry.sh",
+            b"/bin/echo \"${ENTRY_NAME}\"\n",
+        );
+        write(
+            directory.path(),
+            "other.sh",
+            b"/bin/echo \"${OTHER_NAME}\"\n",
+        );
+        let config_path = directory.path().join(".deshell/project.toml");
+        let config = std::fs::read_to_string(&config_path)
+            .unwrap()
+            .replace("entrypoints = []", "entrypoints = [\"entry.sh\"]");
+        std::fs::write(&config_path, config).unwrap();
+
+        let inventory = scan(directory.path()).unwrap();
+        let scenarios = synthesized_initial_scenarios(
+            directory.path(),
+            &["entry.sh".to_owned()],
+            &inventory,
+            crate::config::ResourceLimits {
+                timeout_ms: 30_000,
+                memory_bytes: 1 << 30,
+                processes: 512,
+                stdout_bytes: 16 << 20,
+                stderr_bytes: 16 << 20,
+            },
+        )
+        .unwrap();
+        let named = |name: &str| {
+            scenarios
+                .iter()
+                .find(|(key, _)| key == name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "no scenario for {name}: {:?}",
+                        scenarios.iter().map(|(key, _)| key).collect::<Vec<_>>()
+                    )
+                })
+                .1
+                .environment
+                .iter()
+                .map(|value| value.name.clone())
+                .collect::<Vec<_>>()
+        };
+        // The entrypoint, and the shell file that is not one.
+        assert_eq!(named("synthesized-entry"), vec!["ENTRY_NAME".to_owned()]);
+        assert_eq!(named("synthesized-other"), vec!["OTHER_NAME".to_owned()]);
+        // One scenario per file, not two for the entrypoint.
+        assert_eq!(
+            scenarios
+                .iter()
+                .filter(|(key, _)| key.starts_with("synthesized-entry"))
+                .count(),
+            1
+        );
     }
 
     fn configured_project(source: &[u8]) -> tempfile::TempDir {

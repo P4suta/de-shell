@@ -17,6 +17,12 @@ pub(crate) struct AuditReport {
     pub nondeterministic: usize,
     pub stale: usize,
     pub unobserved: usize,
+    /// Which scenarios were not observed, in the order they are declared.
+    ///
+    /// The count says how much is missing and not what: a reader who has to
+    /// find out which four of twelve went unobserved is reading the project's
+    /// files to answer a question the report already knew.
+    pub unobserved_scenarios: Vec<String>,
     pub source_bytes: usize,
     pub native_bytes: usize,
     pub delegated_bytes: usize,
@@ -24,6 +30,7 @@ pub(crate) struct AuditReport {
     pub uncovered_bytes: usize,
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct AuditContext<'a> {
     pub source_path: &'a str,
     pub source_bytes: usize,
@@ -33,7 +40,13 @@ pub(crate) struct AuditContext<'a> {
     pub provider_fingerprint: &'a str,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "reachable only from the test-only differential harness; kept compiled in release so the two paths cannot drift"
+    )
+)]
 pub(crate) fn audit(plan: &Plan, evidence: Option<&Evidence>) -> Result<AuditReport, Vec<String>> {
     audit_inner(plan, evidence, None)
 }
@@ -57,6 +70,7 @@ fn audit_inner(
         delegated: 0,
         residual: 0,
         residual_reasons: vec![],
+        unobserved_scenarios: vec![],
         observations: evidence.map_or(0, |value| value.observations.len()),
         verified: 0,
         different: 0,
@@ -109,14 +123,17 @@ fn audit_inner(
             return Err(vec!["evidence node inventory does not match plan".into()]);
         }
         if let Some(context) = &context {
-            report.unobserved = context
+            report.unobserved_scenarios = context
                 .scenario_digests
                 .keys()
                 .filter(|scenario| !observed_scenarios.contains(scenario.as_str()))
-                .count();
+                .cloned()
+                .collect();
+            report.unobserved = report.unobserved_scenarios.len();
         }
     } else if let Some(context) = &context {
-        report.unobserved = context.scenario_digests.len();
+        report.unobserved_scenarios = context.scenario_digests.keys().cloned().collect();
+        report.unobserved = report.unobserved_scenarios.len();
     }
     Ok(report)
 }
@@ -157,7 +174,7 @@ fn audit_coverage(
             1 => report.native_bytes += 1,
             2 => report.delegated_bytes += 1,
             3 => report.residual_bytes += 1,
-            _ => unreachable!(),
+            _ => report.residual_bytes += 1,
         }
     }
     Ok(())
@@ -222,8 +239,13 @@ fn collect_identity<'a>(node: &'a Node, output: &mut Vec<(&'a str, &'a str, &'a 
 
 fn visit_children<'a>(node: &'a Node, mut visit: impl FnMut(&'a Node)) {
     match &node.operation {
+        Operation::NoOp | Operation::WriteStdout { .. } | Operation::Exit { .. } => {}
+        Operation::While { condition, body } => {
+            visit(condition);
+            visit(body);
+        }
         Operation::Pipeline { nodes, .. }
-        | Operation::Sequence { nodes }
+        | Operation::Sequence { nodes, .. }
         | Operation::Parallel { nodes } => {
             for child in nodes {
                 visit(child);
@@ -250,6 +272,7 @@ fn visit_children<'a>(node: &'a Node, mut visit: impl FnMut(&'a Node)) {
         }
         Operation::Foreach { body, .. }
         | Operation::Scope { body, .. }
+        | Operation::Not { body }
         | Operation::Redirect { body, .. }
         | Operation::CaptureStdout { body, .. }
         | Operation::Spawn { body, .. } => visit(body),
@@ -265,6 +288,7 @@ fn visit_children<'a>(node: &'a Node, mut visit: impl FnMut(&'a Node)) {
         | Operation::SetWorkingDirectory { .. }
         | Operation::Wait { .. }
         | Operation::SendSignal { .. }
+        | Operation::Test { .. }
         | Operation::FileRead { .. }
         | Operation::FileWrite { .. }
         | Operation::FileRemove { .. }
@@ -325,13 +349,31 @@ pub(crate) fn compare(expected: &RunResult, actual: &RunResult) -> Result<Compar
     })
 }
 
+/// The inputs of [`record_comparison`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`record_comparison`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+pub(crate) struct RecordComparisonArgs<'a> {
+    pub(crate) evidence: &'a mut Evidence,
+    pub(crate) scenario: &'a str,
+    pub(crate) provider: &'a str,
+    pub(crate) key: crate::evidence::ObservationKey,
+    pub(crate) comparison: &'a Comparison,
+}
+
 pub(crate) fn record_comparison(
-    evidence: &mut Evidence,
-    scenario: &str,
-    provider: &str,
-    key: crate::evidence::ObservationKey,
-    comparison: &Comparison,
+    parts: RecordComparisonArgs<'_>,
 ) -> Result<ObservationStatus, String> {
+    // Destructured without `..`: see `RecordComparisonArgs`.
+    let RecordComparisonArgs {
+        evidence,
+        scenario,
+        provider,
+        key,
+        comparison,
+    } = parts;
     let dimensions = comparison
         .differences
         .iter()
@@ -441,11 +483,13 @@ mod tests {
                 secrets: vec![],
                 platform_capabilities: vec![],
                 cacheable: false,
+                nounset: false,
                 invocation: None,
                 body: Node {
                     id: String::new(),
                     operation: Operation::Sequence {
                         nodes: vec![child, residual],
+                        on_failure: crate::ir::SequenceFailure::Continue,
                     },
                     guarantee: Guarantee::Native {
                         semantic_model: "test-sequence-v1".into(),
@@ -545,6 +589,15 @@ mod tests {
         assert_eq!(report.stale, 1);
         assert_eq!(report.unavailable, 0);
         assert_eq!(report.unobserved, 1);
+        // Named, not just counted: the count says how much is missing and the
+        // names say what, which is the difference between a reader knowing
+        // there is work and knowing where it is.
+        assert_eq!(report.unobserved_scenarios.len(), report.unobserved);
+        assert!(
+            !report.unobserved_scenarios[0].is_empty(),
+            "{:?}",
+            report.unobserved_scenarios
+        );
     }
 
     #[test]
@@ -575,13 +628,13 @@ mod tests {
         let before = plan.encode_pretty().unwrap();
         let mut evidence = Evidence::from_plan(&plan, "build.sh", b"dynamic").unwrap();
         let comparison = compare(&result(0, b"same"), &result(0, b"same")).unwrap();
-        record_comparison(
-            &mut evidence,
-            "default",
-            "test-provider",
-            observation_key(),
-            &comparison,
-        )
+        record_comparison(RecordComparisonArgs {
+            evidence: &mut evidence,
+            scenario: "default",
+            provider: "test-provider",
+            key: observation_key(),
+            comparison: &comparison,
+        })
         .unwrap();
         assert_eq!(evidence.observations[0].status, ObservationStatus::Verified);
         assert_eq!(plan.encode_pretty().unwrap(), before);
@@ -592,13 +645,13 @@ mod tests {
         let plan = plan();
         let mut evidence = Evidence::from_plan(&plan, "build.sh", b"dynamic").unwrap();
         let comparison = compare(&result(0, b"a"), &result(1, b"b")).unwrap();
-        record_comparison(
-            &mut evidence,
-            "default",
-            "test-provider",
-            observation_key(),
-            &comparison,
-        )
+        record_comparison(RecordComparisonArgs {
+            evidence: &mut evidence,
+            scenario: "default",
+            provider: "test-provider",
+            key: observation_key(),
+            comparison: &comparison,
+        })
         .unwrap();
         assert_eq!(
             evidence.observations[0].status,

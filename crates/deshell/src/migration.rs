@@ -190,6 +190,52 @@ pub(crate) enum EvidenceStatus {
 }
 
 impl EvidenceStatus {
+    /// Whether the evidence says the two behaved alike.
+    ///
+    /// A method rather than `== EvidenceStatus::Verified`: a status added later
+    /// is not verification, and `==` would let it pass as "not verified"
+    /// without anybody deciding that it should.
+    pub(crate) fn is_verified(self) -> bool {
+        match self {
+            Self::Verified => true,
+            Self::Different | Self::Unavailable | Self::Failed | Self::Nondeterministic => false,
+        }
+    }
+
+    // `is_a_difference` and `is_nondeterministic` were here, and each answered
+    // one question the aggregation below used to ask in an `if`/`else` chain.
+    // `evidence_severity` ranks every status instead, so the chain and its
+    // two predicates are gone. They are deleted rather than suppressed: a
+    // predicate nobody asks is a place for a status added later to be
+    // classified without anybody noticing, which is what the `else` was.
+}
+
+/// How bad a status is, so that a set of checks reports the worst one.
+///
+/// This was an `if`/`else` chain over three questions — is anything
+/// nondeterministic, is anything different, did a validation command fail — and
+/// everything that answered no to all three came out `Verified`. `Unavailable`
+/// answers no to all three. A plan holding a check whose run could not be made
+/// was reported as a plan that had been verified.
+///
+/// Nothing produced an `Unavailable` check until the interpreter probe did,
+/// which is the shape of hole that waits for its first caller rather than
+/// announcing itself. The `match` is exhaustive and takes the status by value,
+/// so a status added later has to be given a place instead of inheriting
+/// "verified" from an `else`.
+fn evidence_severity(status: EvidenceStatus) -> u8 {
+    match status {
+        EvidenceStatus::Verified => 0,
+        // Nobody looked. Not a verdict about the two programs, and not a claim
+        // that they agree.
+        EvidenceStatus::Unavailable => 1,
+        EvidenceStatus::Failed => 2,
+        EvidenceStatus::Different => 3,
+        EvidenceStatus::Nondeterministic => 4,
+    }
+}
+
+impl EvidenceStatus {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Verified => "verified",
@@ -443,7 +489,7 @@ pub(crate) fn create_plan(root: &Path) -> Result<PlanOutput, String> {
         } else {
             for review in scenario_reviews
                 .iter()
-                .filter(|review| review.status != crate::approval::ReviewStatus::Approved)
+                .filter(|review| !review.status.is_current())
             {
                 blockers.push(Blocker {
                     code: "DESHELL_BLOCKER_UNAPPROVED_SCENARIO".into(),
@@ -469,7 +515,7 @@ pub(crate) fn create_plan(root: &Path) -> Result<PlanOutput, String> {
         } else {
             for review in matrix_reviews
                 .iter()
-                .filter(|review| review.status != crate::approval::ReviewStatus::Approved)
+                .filter(|review| !review.status.is_current())
             {
                 blockers.push(Blocker {
                     code: "DESHELL_BLOCKER_UNAPPROVED_MATRIX_CELL".into(),
@@ -555,7 +601,20 @@ pub(crate) fn create_plan(root: &Path) -> Result<PlanOutput, String> {
         proposals: Vec::new(),
     };
     let mut coverage = Coverage::default();
-    let mut targets = BTreeSet::new();
+    let mut targets: BTreeMap<String, String> = BTreeMap::new();
+    // Only the approved ones. An unapproved declaration removes nothing, here
+    // or at the shell-free gate, so a plan cannot be cleared by writing a line
+    // nobody reviewed.
+    let mut declared_locations = BTreeSet::new();
+    for location in &config.declared_shell {
+        if crate::approval::declared_shell_approval(root, location)?.is_some() {
+            declared_locations.insert(Location {
+                path: location.path.clone(),
+                start_byte: location.start_byte,
+                end_byte: location.end_byte,
+            });
+        }
+    }
     let mut network_replay_digest = None;
 
     for finding in &inventory.findings {
@@ -564,7 +623,14 @@ pub(crate) fn create_plan(root: &Path) -> Result<PlanOutput, String> {
             start_byte: finding.span.start_byte,
             end_byte: finding.span.end_byte,
         };
-        if finding.kind == crate::scanner::FindingKind::Candidate {
+        // A location this project has declared and approved is not a migration
+        // source. It is shell that stays, with a reason and a review; reporting
+        // it as a blocker would ask somebody to migrate what they have already
+        // decided to keep.
+        if declared_locations.contains(&location) {
+            continue;
+        }
+        if finding.kind.is_a_candidate() {
             blockers.push(Blocker {
                 code: "DESHELL_BLOCKER_DYNAMIC_CANDIDATE".into(),
                 message: format!(
@@ -578,7 +644,7 @@ pub(crate) fn create_plan(root: &Path) -> Result<PlanOutput, String> {
         let kind = match finding.kind {
             crate::scanner::FindingKind::ShellFile => SourceKind::ShellFile,
             crate::scanner::FindingKind::EmbeddedShell => SourceKind::EmbeddedShell,
-            crate::scanner::FindingKind::Candidate => unreachable!(),
+            crate::scanner::FindingKind::Candidate => continue,
         };
         let wrapper_target = wrapper_targets.get(&location);
         if finding.interpreter.as_deref() == Some("package-shell") && wrapper_target.is_none() {
@@ -593,7 +659,7 @@ pub(crate) fn create_plan(root: &Path) -> Result<PlanOutput, String> {
             continue;
         }
         let source_interpreter = resolved_finding_interpreter(finding)?;
-        let plan = lower_finding(finding, config.policy.unknown_interpreter.clone())?;
+        let plan = lower_finding(finding, config.policy.unknown_interpreter)?;
         add_scenario_input_coverage_blockers(
             &plan,
             &approved_scenario_values,
@@ -664,8 +730,7 @@ pub(crate) fn create_plan(root: &Path) -> Result<PlanOutput, String> {
                     end_byte: reference.span.end_byte,
                 })
                 .collect::<Vec<_>>();
-            if kind == SourceKind::EmbeddedShell
-                && selection.target != crate::config::MigrationTarget::Host
+            if kind == SourceKind::EmbeddedShell && !selection.target.rewrites_the_source_in_place()
             {
                 blockers.push(Blocker {
                     code: "DESHELL_BLOCKER_UNSUPPORTED_HOST_REWRITE".into(),
@@ -686,6 +751,7 @@ pub(crate) fn create_plan(root: &Path) -> Result<PlanOutput, String> {
                     call_sites,
                     selection,
                     &mut targets,
+                    host_siblings_of(&inventory, finding).as_slice(),
                 ) {
                     Ok((request, proposal)) => {
                         proposal_digest = Some(proposal.proposal_digest.clone());
@@ -841,6 +907,44 @@ pub(crate) fn create_plan(root: &Path) -> Result<PlanOutput, String> {
     })
 }
 
+/// One patch per path across a set of proposals.
+///
+/// A host rewrite replaces the whole file, and every proposal for a file with
+/// several shell blocks carries the same rewrite — the one with all of them
+/// replaced. Applying it once per block would leave the second attempt reading
+/// an expected digest the first had already changed, which is a conflict
+/// between a proposal and itself.
+///
+/// Identical bytes are one edit. Different bytes for one path are a real
+/// conflict; the plan refuses them when the proposals are built, and this says
+/// so again rather than assuming it.
+fn unique_patches(proposals: &[&Proposal]) -> Result<Vec<GeneratorPatch>, String> {
+    let mut written: BTreeMap<String, String> = BTreeMap::new();
+    let mut output = Vec::new();
+    for proposal in proposals {
+        for patch in &proposal.patches {
+            match written.entry(patch.path.clone()) {
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(patch.content_digest.clone());
+                }
+                std::collections::btree_map::Entry::Occupied(slot)
+                    if *slot.get() == patch.content_digest =>
+                {
+                    continue;
+                }
+                std::collections::btree_map::Entry::Occupied(_) => {
+                    return Err(format!(
+                        "two proposals write {} with different content",
+                        patch.path
+                    ));
+                }
+            }
+            output.push(patch.clone());
+        }
+    }
+    Ok(output)
+}
+
 fn remaining_static_references_after_proposals(
     root: &Path,
     retiring_paths: &BTreeSet<String>,
@@ -850,9 +954,8 @@ fn remaining_static_references_after_proposals(
         return crate::scanner::static_script_references(root, retiring_paths);
     }
     let workspace = crate::workspace::private_snapshot(root)?;
-    for proposal in proposals {
-        apply_generator_patches(workspace.path(), proposal)?;
-    }
+    let patches = unique_patches(&proposals.iter().collect::<Vec<_>>())?;
+    apply_patch_set(workspace.path(), &patches)?;
     crate::scanner::static_script_references(workspace.path(), retiring_paths)
 }
 
@@ -860,7 +963,7 @@ fn thin_project_interface_target(
     finding: &crate::scanner::Finding,
     references: &[crate::scanner::ScriptReference],
 ) -> Option<String> {
-    if finding.kind != crate::scanner::FindingKind::EmbeddedShell
+    if !finding.kind.is_embedded()
         || !(is_make_or_package_path(&finding.path) || is_github_workflow_path(&finding.path))
     {
         return None;
@@ -879,7 +982,7 @@ fn thin_shell_file_target(
     finding: &crate::scanner::Finding,
     retiring_paths: &BTreeSet<String>,
 ) -> Option<String> {
-    if finding.kind != crate::scanner::FindingKind::ShellFile {
+    if !finding.kind.is_a_shell_file() {
         return None;
     }
     let source = std::str::from_utf8(&finding.source).ok()?;
@@ -934,7 +1037,14 @@ fn is_make_or_package_path(path: &str) -> bool {
         || filename == "package.json"
 }
 
-fn is_github_workflow_path(path: &str) -> bool {
+/// Whether this path is a GitHub workflow.
+///
+/// `pub(crate)` because the frontend asks the same question: a workflow step's
+/// `run:` text is a template the runner substitutes before any shell sees it,
+/// and the frontend has to know that before it claims to have lowered a
+/// program. One definition, because two would be two places for the answer to
+/// drift.
+pub(crate) fn is_github_workflow_path(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     lower.starts_with(".github/workflows/") && (lower.ends_with(".yml") || lower.ends_with(".yaml"))
 }
@@ -980,7 +1090,56 @@ fn generator_selection<'a>(
         )
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Record that this plan writes `bytes` to `target`, or say who else already
+/// claimed it with something different.
+fn claim_generated_target(
+    targets: &mut BTreeMap<String, String>,
+    target: &str,
+    bytes: &[u8],
+) -> Result<(), String> {
+    claim_generated_digest(targets, target, &crate::digest::sha256(bytes))
+}
+
+fn claim_generated_digest(
+    targets: &mut BTreeMap<String, String>,
+    target: &str,
+    digest: &str,
+) -> Result<(), String> {
+    match targets.entry(target.to_owned()) {
+        std::collections::btree_map::Entry::Vacant(slot) => {
+            slot.insert(digest.to_owned());
+            Ok(())
+        }
+        std::collections::btree_map::Entry::Occupied(slot) if slot.get() == digest => Ok(()),
+        std::collections::btree_map::Entry::Occupied(_) => Err(format!(
+            "DESHELL_BLOCKER_DUPLICATE_TARGET: two sources write {target} with different content"
+        )),
+    }
+}
+
+/// The other shell locations in the same file as `finding`.
+///
+/// A host rewrite replaces the whole file, so a proposal for one location has to
+/// describe what happens to the rest of them. Ordered and deduplicated by the
+/// inventory, which is already sorted by path and span.
+fn host_siblings_of(
+    inventory: &crate::scanner::Inventory,
+    finding: &crate::scanner::Finding,
+) -> Vec<crate::scanner::Finding> {
+    inventory
+        .findings
+        .iter()
+        .filter(|other| {
+            other.path == finding.path && other.span != finding.span && other.kind.is_embedded()
+        })
+        .cloned()
+        .collect()
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the arguments are a contract record; grouping them into a struct would hide which fields the caller must supply"
+)]
 fn build_request_and_proposal(
     root: &Path,
     config: &crate::config::ProjectConfig,
@@ -990,7 +1149,8 @@ fn build_request_and_proposal(
     ir_digest: &str,
     call_sites: Vec<Location>,
     selection: GeneratorSelection<'_>,
-    targets: &mut BTreeSet<String>,
+    targets: &mut BTreeMap<String, String>,
+    host_siblings: &[crate::scanner::Finding],
 ) -> Result<(MigrationRequest, Proposal), String> {
     let task = plan
         .tasks
@@ -1044,25 +1204,19 @@ fn build_request_and_proposal(
             &finding.path,
         );
         let expected_digest = current_target_digest(root, &target)?;
-        let proposal = invoke_external_generator(
+        let proposal = invoke_external_generator(InvokeExternalGeneratorArgs {
             root,
             config,
             registration,
-            &request,
-            &target,
+            request: &request,
+            target_path: &target,
             expected_digest,
             task,
-        )
+        })
         .map_err(external_generator_blocker)?;
         for patch in &proposal.patches {
-            if targets.contains(&patch.path) {
-                return Err(format!(
-                    "DESHELL_BLOCKER_DUPLICATE_TARGET: multiple sources generate {}",
-                    patch.path
-                ));
-            }
+            claim_generated_digest(targets, &patch.path, &patch.content_digest)?;
         }
-        targets.extend(proposal.patches.iter().map(|patch| patch.path.clone()));
         return Ok((request, proposal));
     }
     let mut host_build_argv = None;
@@ -1081,24 +1235,32 @@ fn build_request_and_proposal(
             return Err("DESHELL_BLOCKER_GENERATOR_POLICY: agent target requires a digest-pinned external generator".into());
         }
     };
-    if !targets.insert(target.clone()) {
-        return Err(format!(
-            "DESHELL_BLOCKER_DUPLICATE_TARGET: multiple sources generate {target}"
-        ));
-    }
     let generated = match selection.target {
         crate::config::MigrationTarget::Rust => generate_rust(plan)?,
         crate::config::MigrationTarget::Go => generate_go(plan)?,
         crate::config::MigrationTarget::Host => {
-            let host = generate_structured_host(root, finding, plan)?;
+            let host = generate_structured_host(root, finding, plan, host_siblings)?;
             host_build_argv = Some(host.build_argv);
             host_run_argv = Some(host.run_argv);
             generated_span = Some(host.generated_span);
             host_additional_files = host.additional_files;
             host.bytes
         }
-        crate::config::MigrationTarget::Agent => unreachable!(),
+        crate::config::MigrationTarget::Agent => {
+            return Err("DESHELL_BLOCKER_GENERATOR_POLICY: agent target requires a digest-pinned external generator".into());
+        }
     };
+    // Checked after generating, not before, because two proposals writing one
+    // path are only a conflict when they write different bytes.
+    //
+    // Two generated programs cannot be one file, and that is what this is for.
+    // A host rewrite is different: several shell blocks in one workflow are
+    // several spans of the same file, and the rewrite for each one replaces
+    // every span — so the proposals describe the same file identically, which is
+    // a file rewritten once and named by each of the blocks it retires. The
+    // whole plan is applied in one transaction, so there is no state where some
+    // of the blocks are replaced and the rest are not.
+    claim_generated_target(targets, &target, &generated)?;
     let canonical_root = canonical_root(root)?;
     let verification_output = verification_binary_path(&stem, std::env::consts::OS);
     let (build_argv, run_argv) = match selection.target {
@@ -1121,7 +1283,9 @@ fn build_request_and_proposal(
             host_build_argv.ok_or("host generator omitted exact build argv")?,
             host_run_argv.ok_or("host generator omitted exact run argv")?,
         ),
-        crate::config::MigrationTarget::Agent => unreachable!(),
+        crate::config::MigrationTarget::Agent => {
+            return Err("DESHELL_BLOCKER_GENERATOR_POLICY: agent target requires a digest-pinned external generator".into());
+        }
     };
     let generator_digest = official_generator_digest();
     let mut node_ids = Vec::new();
@@ -1132,32 +1296,25 @@ fn build_request_and_proposal(
         generated.clone(),
         0o644,
     )?];
-    let call_site_patches = official_call_site_patches(
+    let call_site_patches = official_call_site_patches(OfficialCallSitePatchesArgs {
         root,
         config,
-        &request.call_sites,
-        &finding.path,
+        call_sites: &request.call_sites,
+        retiring_source: &finding.path,
         selection,
-        &stem,
-        &target,
-    )
+        stem: &stem,
+        generated_target: &target,
+    })
     .unwrap_or_default();
     for patch in call_site_patches {
-        if !targets.insert(patch.path.clone()) {
-            return Err(format!(
-                "DESHELL_BLOCKER_DUPLICATE_TARGET: multiple sources generate {}",
-                patch.path
-            ));
-        }
+        // A call-site rewrite of a file several sources also point at is the
+        // same case as the host rewrite: identical bytes are one edit named
+        // twice, different bytes are a conflict.
+        claim_generated_digest(targets, &patch.path, &patch.content_digest)?;
         patches.push(patch);
     }
     for file in host_additional_files {
-        if !targets.insert(file.path.clone()) {
-            return Err(format!(
-                "DESHELL_BLOCKER_DUPLICATE_TARGET: multiple sources generate {}",
-                file.path
-            ));
-        }
+        claim_generated_target(targets, &file.path, &file.bytes)?;
         patches.push(generator_patch(
             &canonical_root,
             &file.path,
@@ -1196,16 +1353,36 @@ fn build_request_and_proposal(
     Ok((request, proposal))
 }
 
-#[allow(clippy::too_many_arguments)]
+/// The inputs of [`official_call_site_patches`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`official_call_site_patches`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+#[derive(Clone, Copy)]
+struct OfficialCallSitePatchesArgs<'a> {
+    root: &'a Path,
+    config: &'a crate::config::ProjectConfig,
+    call_sites: &'a [Location],
+    retiring_source: &'a str,
+    selection: GeneratorSelection<'a>,
+    stem: &'a str,
+    generated_target: &'a str,
+}
+
 fn official_call_site_patches(
-    root: &Path,
-    config: &crate::config::ProjectConfig,
-    call_sites: &[Location],
-    retiring_source: &str,
-    selection: GeneratorSelection<'_>,
-    stem: &str,
-    generated_target: &str,
+    parts: OfficialCallSitePatchesArgs<'_>,
 ) -> Result<Vec<GeneratorPatch>, String> {
+    // Destructured without `..`: see `OfficialCallSitePatchesArgs`.
+    let OfficialCallSitePatchesArgs {
+        root,
+        config,
+        call_sites,
+        retiring_source,
+        selection,
+        stem,
+        generated_target,
+    } = parts;
     if call_sites.is_empty() {
         return Ok(Vec::new());
     }
@@ -1277,21 +1454,21 @@ fn official_call_site_patches(
         let mut additional_files = Vec::new();
         for location in locations {
             if is_github_workflow_path(&path) {
-                let rewritten = rewrite_github_run_call_site(
-                    &path,
-                    &contents,
+                let rewritten = rewrite_github_run_call_site(RewriteGithubRunCallSiteArgs {
+                    path: &path,
+                    contents: &contents,
                     location,
                     retiring_source,
-                    &replacement_argv,
-                )?;
+                    replacement_argv: &replacement_argv,
+                })?;
                 contents = rewritten.0;
                 additional_files.extend(rewritten.1);
                 continue;
             }
             let start = usize::try_from(location.start_byte)
-                .map_err(|_| "DESHELL_BLOCKER_UNSUPPORTED_CALL_SITE: span is too large")?;
+                .map_err(|_error| "DESHELL_BLOCKER_UNSUPPORTED_CALL_SITE: span is too large")?;
             let end = usize::try_from(location.end_byte)
-                .map_err(|_| "DESHELL_BLOCKER_UNSUPPORTED_CALL_SITE: span is too large")?;
+                .map_err(|_error| "DESHELL_BLOCKER_UNSUPPORTED_CALL_SITE: span is too large")?;
             let fragment = contents.get(start..end).ok_or_else(|| {
                 format!(
                     "DESHELL_BLOCKER_UNSUPPORTED_CALL_SITE: {} span is outside its host file",
@@ -1316,11 +1493,12 @@ fn official_call_site_patches(
 }
 
 fn require_regular_project_file(root: &Path, path: &str, context: &str) -> Result<(), String> {
-    let absolute = crate::project::project_file_path(root, path)
-        .map_err(|_| format!("DESHELL_BLOCKER_UNSUPPORTED_CALL_SITE: {context} requires {path}"))?;
-    let metadata = absolute
-        .symlink_metadata()
-        .map_err(|_| format!("DESHELL_BLOCKER_UNSUPPORTED_CALL_SITE: {context} requires {path}"))?;
+    let absolute = crate::project::project_file_path(root, path).map_err(|_error| {
+        format!("DESHELL_BLOCKER_UNSUPPORTED_CALL_SITE: {context} requires {path}")
+    })?;
+    let metadata = absolute.symlink_metadata().map_err(|_error| {
+        format!("DESHELL_BLOCKER_UNSUPPORTED_CALL_SITE: {context} requires {path}")
+    })?;
     if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
         return Err(format!(
             "DESHELL_BLOCKER_UNSUPPORTED_CALL_SITE: {context} requires a regular {path}"
@@ -1336,7 +1514,7 @@ fn rewrite_static_process_call(
     replacement_argv: &[String],
 ) -> Result<Vec<u8>, String> {
     let text = std::str::from_utf8(fragment)
-        .map_err(|_| format!("DESHELL_BLOCKER_UNSUPPORTED_CALL_SITE: {path} is not UTF-8"))?;
+        .map_err(|_error| format!("DESHELL_BLOCKER_UNSUPPORTED_CALL_SITE: {path} is not UTF-8"))?;
     let lower = path.to_ascii_lowercase();
     if lower.ends_with(".py") {
         rewrite_static_python_call(path, text, retiring_source, replacement_argv)
@@ -1357,17 +1535,36 @@ fn rewrite_static_process_call(
     }
 }
 
+/// The inputs of [`rewrite_github_run_call_site`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`rewrite_github_run_call_site`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+#[derive(Clone, Copy)]
+struct RewriteGithubRunCallSiteArgs<'a> {
+    path: &'a str,
+    contents: &'a [u8],
+    location: &'a Location,
+    retiring_source: &'a str,
+    replacement_argv: &'a [String],
+}
+
 fn rewrite_github_run_call_site(
-    path: &str,
-    contents: &[u8],
-    location: &Location,
-    retiring_source: &str,
-    replacement_argv: &[String],
+    parts: RewriteGithubRunCallSiteArgs<'_>,
 ) -> Result<(Vec<u8>, Vec<HostFile>), String> {
+    // Destructured without `..`: see `RewriteGithubRunCallSiteArgs`.
+    let RewriteGithubRunCallSiteArgs {
+        path,
+        contents,
+        location,
+        retiring_source,
+        replacement_argv,
+    } = parts;
     let start = usize::try_from(location.start_byte)
-        .map_err(|_| "DESHELL_BLOCKER_UNSUPPORTED_CALL_SITE: span is too large")?;
+        .map_err(|_error| "DESHELL_BLOCKER_UNSUPPORTED_CALL_SITE: span is too large")?;
     let end = usize::try_from(location.end_byte)
-        .map_err(|_| "DESHELL_BLOCKER_UNSUPPORTED_CALL_SITE: span is too large")?;
+        .map_err(|_error| "DESHELL_BLOCKER_UNSUPPORTED_CALL_SITE: span is too large")?;
     let fragment = contents.get(start..end).ok_or_else(|| {
         format!("DESHELL_BLOCKER_UNSUPPORTED_CALL_SITE: {path} span is outside its host file")
     })?;
@@ -1380,9 +1577,10 @@ fn rewrite_github_run_call_site(
         .iter()
         .position(|byte| *byte == b'\n')
         .map_or(contents.len(), |index| line_start + index);
-    let first_line = std::str::from_utf8(&contents[line_start..first_line_end]).map_err(|_| {
-        format!("DESHELL_BLOCKER_UNSUPPORTED_CALL_SITE: {path} run line is not UTF-8")
-    })?;
+    let first_line =
+        std::str::from_utf8(&contents[line_start..first_line_end]).map_err(|_error| {
+            format!("DESHELL_BLOCKER_UNSUPPORTED_CALL_SITE: {path} run line is not UTF-8")
+        })?;
     let search_end = if start == line_start {
         first_line.len()
     } else {
@@ -1401,7 +1599,7 @@ fn rewrite_github_run_call_site(
             ));
         }
         let indentation = first_line.len() - first_line.trim_start().len();
-        let body = std::str::from_utf8(&contents[first_line_end + 1..end]).map_err(|_| {
+        let body = std::str::from_utf8(&contents[first_line_end + 1..end]).map_err(|_error| {
             format!("DESHELL_BLOCKER_UNSUPPORTED_CALL_SITE: {path} block scalar is not UTF-8")
         })?;
         if body.lines().any(|line| {
@@ -1419,8 +1617,9 @@ fn rewrite_github_run_call_site(
             lines.join("\n")
         }
     } else {
-        let command = std::str::from_utf8(fragment)
-            .map_err(|_| format!("DESHELL_BLOCKER_UNSUPPORTED_CALL_SITE: {path} is not UTF-8"))?;
+        let command = std::str::from_utf8(fragment).map_err(|_error| {
+            format!("DESHELL_BLOCKER_UNSUPPORTED_CALL_SITE: {path} is not UTF-8")
+        })?;
         let value_start = start - line_start;
         if first_line_end < end
             || !first_line.as_bytes()[key_end..value_start]
@@ -1617,7 +1816,7 @@ fn static_shell_words(command: &str) -> Result<Vec<String>, &'static str> {
             },
         }
     }
-    if escaped || quote != Quote::None {
+    if escaped || !matches!(quote, Quote::None) {
         return Err("contains an unterminated quote or escape");
     }
     if started {
@@ -1830,15 +2029,33 @@ fn current_target_digest(root: &Path, target: &str) -> Result<Option<String>, St
     }
 }
 
-fn invoke_external_generator(
-    root: &Path,
-    config: &crate::config::ProjectConfig,
-    registration: &crate::config::ExternalGenerator,
-    request: &MigrationRequest,
-    target_path: &str,
+/// The inputs of [`invoke_external_generator`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`invoke_external_generator`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct InvokeExternalGeneratorArgs<'a> {
+    root: &'a Path,
+    config: &'a crate::config::ProjectConfig,
+    registration: &'a crate::config::ExternalGenerator,
+    request: &'a MigrationRequest,
+    target_path: &'a str,
     expected_digest: Option<String>,
-    task: &crate::ir::Task,
-) -> Result<Proposal, String> {
+    task: &'a crate::ir::Task,
+}
+
+fn invoke_external_generator(parts: InvokeExternalGeneratorArgs<'_>) -> Result<Proposal, String> {
+    // Destructured without `..`: see `InvokeExternalGeneratorArgs`.
+    let InvokeExternalGeneratorArgs {
+        root,
+        config,
+        registration,
+        request,
+        target_path,
+        expected_digest,
+        task,
+    } = parts;
     if !config.migration.allow_agent_network {
         return Err(
             "DESHELL_BLOCKER_GENERATOR_NETWORK_POLICY: external generator execution requires explicit allow_agent_network because this host has no enforced network sandbox"
@@ -1872,12 +2089,12 @@ fn invoke_external_generator(
     let copied = isolated.path().join("generator.exe");
     #[cfg(not(windows))]
     let copied = isolated.path().join("generator");
-    std::fs::copy(&executable, &copied)
+    crate::patch::scratch::copy(&executable, &copied)
         .map_err(|error| format!("cannot copy external generator into isolation: {error}"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&copied, std::fs::Permissions::from_mode(0o500))
+        crate::patch::scratch::set_permissions(&copied, std::fs::Permissions::from_mode(0o500))
             .map_err(|error| format!("cannot make isolated generator executable: {error}"))?;
     }
     let baseline = isolated_tree_digest(isolated.path())?;
@@ -1888,14 +2105,14 @@ fn invoke_external_generator(
         "method": "deshell.handshake",
         "params": {"protocol_version": 1}
     });
-    let handshake_result = execute_external_rpc(
-        isolated.path(),
-        &copied,
-        &handshake_request,
-        &serde_json::json!("handshake"),
-        config.limits,
-        crate::protocol::MAX_MESSAGE_BYTES,
-    );
+    let handshake_result = execute_external_rpc(ExecuteExternalRpcArgs {
+        root: isolated.path(),
+        executable: &copied,
+        request: &handshake_request,
+        id: &serde_json::json!("handshake"),
+        project_limits: config.limits,
+        frame_limit: crate::protocol::MAX_MESSAGE_BYTES,
+    });
     ensure_isolated_tree_unchanged(isolated.path(), &baseline)?;
     ensure_guarded_project_tree_unchanged(root, &project_baseline)?;
     let handshake_value = handshake_result?;
@@ -1919,20 +2136,30 @@ fn invoke_external_generator(
             "validation": validation
         }
     });
-    let proposal_result = execute_external_rpc(
-        isolated.path(),
-        &copied,
-        &propose_request,
-        &serde_json::json!("proposal"),
-        config.limits,
-        handshake.max_frame_bytes as usize,
-    );
+    let frame_limit = usize::try_from(handshake.max_frame_bytes).map_err(|_error| {
+        "external generator frame limit exceeds this platform's address space".to_owned()
+    })?;
+    let proposal_result = execute_external_rpc(ExecuteExternalRpcArgs {
+        root: isolated.path(),
+        executable: &copied,
+        request: &propose_request,
+        id: &serde_json::json!("proposal"),
+        project_limits: config.limits,
+        frame_limit,
+    });
     ensure_isolated_tree_unchanged(isolated.path(), &baseline)?;
     ensure_guarded_project_tree_unchanged(root, &project_baseline)?;
     let result = proposal_result?;
     let proposal: Proposal = serde_json::from_value(result)
         .map_err(|error| format!("external generator returned an invalid Proposal v1: {error}"))?;
-    validate_external_proposal(root, registration, request, task, &validation, &proposal)?;
+    validate_external_proposal(ValidateExternalProposalArgs {
+        root,
+        registration,
+        request,
+        task,
+        validation: &validation,
+        proposal: &proposal,
+    })?;
     Ok(proposal)
 }
 
@@ -1972,14 +2199,32 @@ fn validate_external_handshake(
     Ok(())
 }
 
-fn execute_external_rpc(
-    root: &Path,
-    executable: &Path,
-    request: &serde_json::Value,
-    id: &serde_json::Value,
+/// The inputs of [`execute_external_rpc`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`execute_external_rpc`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+#[derive(Clone, Copy)]
+struct ExecuteExternalRpcArgs<'a> {
+    root: &'a Path,
+    executable: &'a Path,
+    request: &'a serde_json::Value,
+    id: &'a serde_json::Value,
     project_limits: crate::config::ResourceLimits,
     frame_limit: usize,
-) -> Result<serde_json::Value, String> {
+}
+
+fn execute_external_rpc(parts: ExecuteExternalRpcArgs<'_>) -> Result<serde_json::Value, String> {
+    // Destructured without `..`: see `ExecuteExternalRpcArgs`.
+    let ExecuteExternalRpcArgs {
+        root,
+        executable,
+        request,
+        id,
+        project_limits,
+        frame_limit,
+    } = parts;
     let mut input = crate::canonical_json::canonical_bytes(request)?;
     if input.len() > frame_limit || input.len() > crate::protocol::MAX_MESSAGE_BYTES {
         return Err("external generator request exceeds its negotiated frame limit".into());
@@ -2029,14 +2274,32 @@ fn execute_external_rpc(
     crate::protocol::decode_response(frames[0], id)
 }
 
-fn validate_external_proposal(
-    root: &Path,
-    registration: &crate::config::ExternalGenerator,
-    request: &MigrationRequest,
-    task: &crate::ir::Task,
-    validation: &[Vec<String>],
-    proposal: &Proposal,
-) -> Result<(), String> {
+/// The inputs of [`validate_external_proposal`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`validate_external_proposal`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+#[derive(Clone, Copy)]
+struct ValidateExternalProposalArgs<'a> {
+    root: &'a Path,
+    registration: &'a crate::config::ExternalGenerator,
+    request: &'a MigrationRequest,
+    task: &'a crate::ir::Task,
+    validation: &'a [Vec<String>],
+    proposal: &'a Proposal,
+}
+
+fn validate_external_proposal(parts: ValidateExternalProposalArgs<'_>) -> Result<(), String> {
+    // Destructured without `..`: see `ValidateExternalProposalArgs`.
+    let ValidateExternalProposalArgs {
+        root,
+        registration,
+        request,
+        task,
+        validation,
+        proposal,
+    } = parts;
     validate_proposal(proposal)?;
     if proposal.request_digest != request.request_id
         || proposal.generator_digest != registration.digest
@@ -2101,7 +2364,7 @@ fn isolated_tree_digest(root: &Path) -> Result<String, String> {
         let relative = entry
             .path()
             .strip_prefix(root)
-            .map_err(|_| "generator isolation path escaped its root")?
+            .map_err(|_error| "generator isolation path escaped its root")?
             .to_str()
             .ok_or("generator isolation path is not UTF-8")?
             .replace('\\', "/");
@@ -2175,7 +2438,7 @@ fn guarded_project_tree_digest(root: &Path) -> Result<String, String> {
         let relative = entry
             .path()
             .strip_prefix(&root)
-            .map_err(|_| "guarded project path escaped its root")?
+            .map_err(|_error| "guarded project path escaped its root")?
             .to_str()
             .ok_or("guarded project path is not UTF-8")?
             .replace('\\', "/");
@@ -2292,7 +2555,7 @@ pub(crate) fn generator_propose(
         crate::config::MigrationTarget::Rust => generate_rust(&plan)?,
         crate::config::MigrationTarget::Go => generate_go(&plan)?,
         crate::config::MigrationTarget::Host | crate::config::MigrationTarget::Agent => {
-            unreachable!()
+            return Err("official generator RPC currently accepts Rust or Go requests".into());
         }
     };
     let verification_output = verification_binary_path(&stem, std::env::consts::OS);
@@ -2313,7 +2576,7 @@ pub(crate) fn generator_propose(
             vec![verification_output],
         ),
         crate::config::MigrationTarget::Host | crate::config::MigrationTarget::Agent => {
-            unreachable!()
+            return Err("official generator RPC currently accepts Rust or Go requests".into());
         }
     };
     let mut node_ids = Vec::new();
@@ -2407,10 +2670,20 @@ struct HostFile {
     permissions: u32,
 }
 
+/// Rewrite the host file that holds `finding`.
+///
+/// `siblings` are the other shell locations in the same file that this plan is
+/// also retiring. A host rewrite replaces the whole file, so every proposal for
+/// that file has to describe the same file — the one with all of them replaced —
+/// or two proposals describe it differently and only one can be applied. Only
+/// the GitHub workflow host uses them today; the others hold one location per
+/// file in every corpus measured so far, and a second one there still reports
+/// `DESHELL_BLOCKER_DUPLICATE_TARGET`.
 fn generate_structured_host(
     root: &Path,
     finding: &crate::scanner::Finding,
     plan: &crate::ir::Plan,
+    siblings: &[crate::scanner::Finding],
 ) -> Result<HostGeneration, String> {
     let name = finding.path.rsplit('/').next().unwrap_or(&finding.path);
     let lower = name.to_ascii_lowercase();
@@ -2436,7 +2709,30 @@ fn generate_structured_host(
     if finding.path.starts_with(".github/workflows/")
         && (lower.ends_with(".yml") || lower.ends_with(".yaml"))
     {
-        return generate_github_action_host(root, finding, plan);
+        return generate_github_action_host(root, finding, plan, siblings);
+    }
+    // A composite action is a `run:` step like a workflow's, and the rewrite
+    // that replaces one is not the same. A workflow step becomes
+    // `uses: ./.github/actions/...`, which puts the generated program in the
+    // repository the workflow lives in — the same repository, so the path is
+    // there when the step runs.
+    //
+    // An action is consumed by other repositories. Generating a file beside it
+    // and pointing at that file with a local path crosses the boundary the
+    // action is distributed across, and it does so whatever GitHub resolves
+    // such a path against: the program has to reach the consumer, and a path
+    // is not a distribution. The right target is whatever the action already
+    // uses to ship its own executable — a release archive, a container, a
+    // pinned remote action — and this generator has no shape for one.
+    //
+    // Stated this way rather than as "not measured", which the OComment
+    // session pointed out would invite somebody to measure it and turn the
+    // rewrite on.
+    if lower == "action.yml" || lower == "action.yaml" {
+        return Err(format!(
+            "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: {} is an action other repositories consume, and a generated file beside it does not travel with it; the replacement belongs in whatever the action already ships its executable through",
+            finding.path
+        ));
     }
     Err(format!(
         "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: structured host generator does not support {}",
@@ -2444,16 +2740,21 @@ fn generate_structured_host(
     ))
 }
 
-fn generate_github_action_host(
-    root: &Path,
+/// Where one workflow step's `run:` sits, and what replaces it.
+///
+/// Split out of `generate_github_action_host` because a workflow holds many
+/// steps and a host rewrite replaces the whole file. Two proposals for one file
+/// each carrying their own single-step rewrite describe the same file twice —
+/// which is what `DESHELL_BLOCKER_DUPLICATE_TARGET` said, correctly. The way to
+/// stop saying it is for every proposal to carry the same rewrite, with every
+/// step replaced, and for that the replacement of a step has to be computable
+/// without lowering it: the local action's name comes from the step's content
+/// digest and nothing else.
+fn github_run_replacement(
+    host: &[u8],
     finding: &crate::scanner::Finding,
-    plan: &crate::ir::Plan,
-) -> Result<HostGeneration, String> {
-    let argv = literal_exec_argv(plan, "GitHub local action argv")?;
-    let (_, path) = crate::project::resolve_entry(root, &finding.path)?;
-    let host = std::fs::read(&path)
-        .map_err(|error| format!("cannot read structured host {}: {error}", finding.path))?;
-    let (start, end, original) = structured_host_span(&host, finding)?;
+) -> Result<(usize, usize, String), String> {
+    let (start, end, original) = structured_host_span(host, finding)?;
     let line_start = host[..start]
         .iter()
         .rposition(|byte| *byte == b'\n')
@@ -2468,7 +2769,7 @@ fn generate_github_action_host(
         .position(|byte| *byte == b'\n')
         .map_or(host.len(), |index| line_start + index);
     let first_line = std::str::from_utf8(&host[line_start..first_line_end])
-        .map_err(|_| "GitHub workflow run line is not UTF-8")?;
+        .map_err(|_error| "GitHub workflow run line is not UTF-8")?;
     let key = first_line
         .rfind("run:")
         .ok_or("DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: GitHub shell span is not a run step")?;
@@ -2502,24 +2803,210 @@ fn generate_github_action_host(
             );
         }
     }
-    let action_id = &finding.content_digest[..12];
-    let action_directory = format!(".github/actions/deshell-{action_id}");
-    let uses = format!("uses: ./{action_directory}");
-    let (bytes, _workflow_span) =
-        replace_structured_host_span(&host, finding, key_start, end, uses.as_bytes());
-    let program = serde_json::to_string(&argv[0]).map_err(|error| error.to_string())?;
-    let arguments = serde_json::to_string(&argv[1..]).map_err(|error| error.to_string())?;
+    Ok((
+        key_start,
+        end,
+        format!("uses: ./{}", github_action_directory(finding)),
+    ))
+}
+
+/// The generated body for a list of steps.
+///
+/// Recursive because a branch keeps its own steps: one that is not taken must
+/// not run. `indent` is only how it reads.
+fn javascript_steps(
+    steps: &[HostStep],
+    on_failure: crate::ir::SequenceFailure,
+    assigned: &mut BTreeSet<String>,
+    indent: &str,
+) -> Result<String, String> {
+    let mut body = String::new();
+    // `stop` is `set -e`: the step ends at the first command that fails.
+    // `continue` runs them all and reports the last one, which is what a shell
+    // without the option does. The last command has nothing after it either way,
+    // so the check is written only where something follows.
+    let runs = steps
+        .iter()
+        .filter(|step| matches!(step, HostStep::Run(_)))
+        .count();
+    let mut written = 0_usize;
+    for step in steps {
+        match step {
+            HostStep::Assign { name, value } => {
+                let value = serde_json::to_string(value).map_err(|error| error.to_string())?;
+                body.push_str(&format!(
+                    "{indent}const {} = {value};\n",
+                    javascript_variable(name)
+                ));
+                assigned.insert(name.clone());
+            }
+            HostStep::Write(contents) => {
+                let contents = contents
+                    .iter()
+                    .map(|word| javascript_word(word, assigned))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .join(" + ");
+                body.push_str(&format!(
+                    "{indent}process.stdout.write({contents});\n{indent}deshellStatus = 0;\n"
+                ));
+            }
+            HostStep::Exit(status) => {
+                body.push_str(&format!(
+                    "{indent}deshellStatus = {status};\n{indent}break deshell;\n"
+                ));
+            }
+            HostStep::When { test, body: arm } => {
+                let arm = javascript_steps(arm, on_failure, assigned, &format!("{indent}  "))?;
+                body.push_str(&format!(
+                    "{indent}if ({}) {{\n{arm}{indent}}}\n",
+                    javascript_test(test, assigned)?
+                ));
+            }
+            HostStep::Run(argv) => {
+                let program = javascript_word(&argv[0], assigned)?;
+                let arguments = argv[1..]
+                    .iter()
+                    .map(|word| javascript_word(word, assigned))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .join(", ");
+                body.push_str(&format!(
+                    concat!(
+                        "{indent}{{\n",
+                        "{indent}  const result = spawnSync({program}, [{arguments}], {{ stdio: \"inherit\", shell: false }});\n",
+                        "{indent}  if (result.error) throw result.error;\n",
+                        "{indent}  if (result.signal) process.kill(process.pid, result.signal);\n",
+                        "{indent}  deshellStatus = result.status === null ? 1 : result.status;\n",
+                        "{indent}}}\n",
+                    ),
+                    indent = indent,
+                    program = program,
+                    arguments = arguments,
+                ));
+                written += 1;
+                if on_failure == crate::ir::SequenceFailure::Stop && written < runs {
+                    body.push_str(&format!(
+                        "{indent}if (deshellStatus !== 0) break deshell;\n"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(body)
+}
+
+/// A modelled `test`, as JavaScript.
+///
+/// `===` and `!==` rather than `==`: the words are strings on both sides, and
+/// the loose comparison would answer a different question for a value that looks
+/// like a number.
+fn javascript_test(test: &HostTest, assigned: &BTreeSet<String>) -> Result<String, String> {
+    Ok(match test {
+        HostTest::Equal(left, right) => format!(
+            "{} === {}",
+            javascript_word(left, assigned)?,
+            javascript_word(right, assigned)?
+        ),
+        HostTest::NotEqual(left, right) => format!(
+            "{} !== {}",
+            javascript_word(left, assigned)?,
+            javascript_word(right, assigned)?
+        ),
+        HostTest::Empty(value) => format!("{} === \"\"", javascript_word(value, assigned)?),
+        HostTest::NonEmpty(value) => format!("{} !== \"\"", javascript_word(value, assigned)?),
+    })
+}
+
+/// A JavaScript name for a shell variable.
+///
+/// Prefixed so a script's `$status` cannot collide with the generated program's
+/// own bookkeeping, and because a shell name is not always a JavaScript one.
+fn javascript_variable(name: &str) -> String {
+    let mut output = String::from("deshellVar_");
+    for character in name.chars() {
+        if character.is_ascii_alphanumeric() || character == '_' {
+            output.push(character);
+        } else {
+            output.push('_');
+        }
+    }
+    output
+}
+
+/// One word of a command, as JavaScript.
+///
+/// A name the program assigned reads the constant it set. Any other name is the
+/// environment's, and an unset one is the empty string — measured with pwsh
+/// 7.6.5, where `$env:UNSET` passed as an argument arrives as one empty
+/// argument rather than as no argument at all.
+fn javascript_word(word: &HostWord, assigned: &BTreeSet<String>) -> Result<String, String> {
+    match word {
+        HostWord::Literal(value) => serde_json::to_string(value).map_err(|error| error.to_string()),
+        HostWord::Variable(name) if assigned.contains(name) => Ok(javascript_variable(name)),
+        HostWord::Variable(name) => {
+            let name = serde_json::to_string(name).map_err(|error| error.to_string())?;
+            Ok(format!("(process.env[{name}] ?? \"\")"))
+        }
+    }
+}
+
+/// The local action a step's replacement lives in.
+///
+/// Keyed by the step's content digest, so two steps running the same command
+/// share one action and a step is named the same whoever computes it.
+fn github_action_directory(finding: &crate::scanner::Finding) -> String {
+    format!(".github/actions/deshell-{}", &finding.content_digest[..12])
+}
+
+fn generate_github_action_host(
+    root: &Path,
+    finding: &crate::scanner::Finding,
+    plan: &crate::ir::Plan,
+    siblings: &[crate::scanner::Finding],
+) -> Result<HostGeneration, String> {
+    let (commands, on_failure) = literal_exec_sequence(plan, "GitHub local action argv")?;
+    let (_, path) = crate::project::resolve_entry(root, &finding.path)?;
+    let host = std::fs::read(&path)
+        .map_err(|error| format!("cannot read structured host {}: {error}", finding.path))?;
+    // Every step in this file, not only this one. Applied from the end so that
+    // an earlier replacement does not move a later span.
+    let mut replacements = Vec::new();
+    for step in std::iter::once(finding).chain(siblings.iter()) {
+        replacements.push(github_run_replacement(&host, step)?);
+    }
+    replacements.sort_by_key(|(start, _, _)| std::cmp::Reverse(*start));
+    if replacements.windows(2).any(|pair| pair[0].0 < pair[1].1) {
+        return Err(
+            "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: two GitHub run steps in one file overlap"
+                .into(),
+        );
+    }
+    let mut bytes = host;
+    for (start, end, uses) in &replacements {
+        let mut rewritten = Vec::with_capacity(bytes.len() - (end - start) + uses.len());
+        rewritten.extend_from_slice(&bytes[..*start]);
+        rewritten.extend_from_slice(uses.as_bytes());
+        rewritten.extend_from_slice(&bytes[*end..]);
+        bytes = rewritten;
+    }
+    let action_directory = github_action_directory(finding);
+    // Each command is written out with its own literal argv rather than looped
+    // over a list. A loop puts a variable where the program name goes, and
+    // de-shell's own scanner reads `spawnSync(program, ...)` as a dynamic
+    // candidate — correctly. The generated program would have failed the
+    // shell-free gate it exists to satisfy, which is how this was found.
+    let mut assigned: BTreeSet<String> = BTreeSet::new();
+    let body = javascript_steps(&commands, on_failure, &mut assigned, "  ")?;
     let javascript = format!(
         concat!(
             "// Generated by de-shell; project-native code with no de-shell runtime.\n",
             "const {{ spawnSync }} = require(\"node:child_process\");\n",
-            "const result = spawnSync({program}, {arguments}, {{ stdio: \"inherit\", shell: false }});\n",
-            "if (result.error) throw result.error;\n",
-            "if (result.signal) process.kill(process.pid, result.signal);\n",
-            "process.exitCode = result.status === null ? 1 : result.status;\n",
+            "let deshellStatus = 0;\n",
+            "deshell: {{\n",
+            "{body}",
+            "}}\n",
+            "process.exitCode = deshellStatus;\n",
         ),
-        program = program,
-        arguments = arguments,
+        body = body,
     );
     let action = concat!(
         "name: de-shell generated action\n",
@@ -2537,7 +3024,10 @@ fn generate_github_action_host(
     Ok(HostGeneration {
         bytes,
         build_argv: vec!["node".into(), "--check".into(), index_path.clone()],
-        run_argv: argv,
+        // The generated program, not the step's first command. A step with
+        // several commands has no single argv, and running one of them would
+        // compare a part against the whole.
+        run_argv: vec!["node".into(), index_path.clone()],
         generated_span,
         additional_files: vec![
             HostFile {
@@ -2589,8 +3079,13 @@ fn generate_javascript_host(
     let program = serde_json::to_string(&argv[0]).map_err(|error| error.to_string())?;
     let arguments = serde_json::to_string(&argv[1..]).map_err(|error| error.to_string())?;
     let replacement = format!("child_process.execFileSync({program},{arguments}, {options})");
-    let (bytes, generated_span) =
-        replace_structured_host_span(&host, finding, start, end, replacement.as_bytes());
+    let (bytes, generated_span) = replace_structured_host_span(ReplaceStructuredHostSpanArgs {
+        host: &host,
+        finding,
+        start,
+        end,
+        replacement: replacement.as_bytes(),
+    });
     Ok(HostGeneration {
         bytes,
         build_argv: vec!["node".into(), "--check".into(), finding.path.clone()],
@@ -2659,8 +3154,13 @@ fn generate_python_host(
             "False"
         }
     );
-    let (bytes, generated_span) =
-        replace_structured_host_span(&host, finding, start, end, replacement.as_bytes());
+    let (bytes, generated_span) = replace_structured_host_span(ReplaceStructuredHostSpanArgs {
+        host: &host,
+        finding,
+        start,
+        end,
+        replacement: replacement.as_bytes(),
+    });
     Ok(HostGeneration {
         bytes,
         build_argv: vec![
@@ -2673,6 +3173,384 @@ fn generate_python_host(
         generated_span,
         additional_files: Vec::new(),
     })
+}
+
+/// One step of a generated host program.
+///
+/// A workflow step is not only a list of commands: it can set a variable and
+/// pass it on. Keeping the two in one ordered list is what lets the generated
+/// program run them in the order the step does.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum HostStep {
+    Assign {
+        name: String,
+        value: String,
+    },
+    Run(Vec<HostWord>),
+    /// Bytes on standard output, which is what a modelled `echo` is.
+    ///
+    /// A list rather than one string, because a step writes
+    /// `"the result was: $RESULT"` far more often than it writes a constant.
+    Write(Vec<HostWord>),
+    /// The step ends with this status.
+    Exit(i32),
+    /// `if TEST; then BODY; fi`, with no else branch.
+    ///
+    /// The branch is kept as its own steps rather than flattened, because a
+    /// branch that is not taken must not run and a flat list has no way to skip
+    /// one. That is the difference from an `&&` chain, which flattens because a
+    /// failure there ends the step.
+    When {
+        test: HostTest,
+        body: Vec<HostStep>,
+    },
+}
+
+/// A modelled `test`, as the generated program asks it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum HostTest {
+    Equal(HostWord, HostWord),
+    NotEqual(HostWord, HostWord),
+    Empty(HostWord),
+    NonEmpty(HostWord),
+}
+
+/// One word of a generated command.
+///
+/// A variable reference stays a reference rather than being resolved here: its
+/// value is whatever the assignment before it set, or the environment when
+/// nothing did. Measured with pwsh 7.6.5: `$env:UNSET` passed as an argument
+/// arrives as one empty argument, and a value holding a space arrives as one
+/// argument rather than two.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum HostWord {
+    Literal(String),
+    Variable(String),
+}
+
+/// The steps a host generator runs, in order, and what a failure does.
+///
+/// `literal_exec_argv` takes one command, which is what a host generator writing
+/// a single call needs. A workflow step is usually several lines, and refusing
+/// those was ten of this repository's own blockers —
+/// `GitHub local action argv requires one Exec node`.
+///
+/// The sequence's `on_failure` is carried rather than assumed. It is `Stop` for
+/// a workflow step because the runner executes `bash -e {0}`; see
+/// `crate::frontend::host_shell_options`, which is what makes that true in the
+/// IR rather than something this generator has to know.
+fn literal_exec_sequence(
+    plan: &crate::ir::Plan,
+    context: &str,
+) -> Result<(Vec<HostStep>, crate::ir::SequenceFailure), String> {
+    let task = plan
+        .tasks
+        .iter()
+        .find(|task| task.name == plan.entrypoint)
+        .ok_or("host generator entrypoint task is missing")?;
+    let (nodes, on_failure): (Vec<&crate::ir::Node>, crate::ir::SequenceFailure) = match &task
+        .body
+        .operation
+    {
+        crate::ir::Operation::Exec {
+            argv: _,
+            environment: _,
+            working_directory: _,
+        }
+        | crate::ir::Operation::Condition {
+            predicate: _,
+            if_true: _,
+            if_false: _,
+        }
+        | crate::ir::Operation::SetVariable {
+            name: _,
+            value_type: _,
+            value: _,
+        } => (vec![&task.body], crate::ir::SequenceFailure::Stop),
+        crate::ir::Operation::Sequence { nodes, on_failure } => {
+            (nodes.iter().collect(), *on_failure)
+        }
+        other @ crate::ir::Operation::ExpandWords { .. }
+        | other @ crate::ir::Operation::Redirect { .. }
+        | other @ crate::ir::Operation::Pipeline { .. }
+        | other @ crate::ir::Operation::Parallel { .. }
+        | other @ crate::ir::Operation::WriteStdout { .. }
+        | other @ crate::ir::Operation::Exit { .. }
+        | other @ crate::ir::Operation::NoOp
+        | other @ crate::ir::Operation::Test { .. }
+        | other @ crate::ir::Operation::While { .. }
+        | other @ crate::ir::Operation::Not { .. }
+        | other @ crate::ir::Operation::Match { .. }
+        | other @ crate::ir::Operation::Foreach { .. }
+        | other @ crate::ir::Operation::Scope { .. }
+        | other @ crate::ir::Operation::TryFinally { .. }
+        | other @ crate::ir::Operation::TaskCall { .. }
+        | other @ crate::ir::Operation::SetEnvironment { .. }
+        | other @ crate::ir::Operation::SetWorkingDirectory { .. }
+        | other @ crate::ir::Operation::CaptureStdout { .. }
+        | other @ crate::ir::Operation::Spawn { .. }
+        | other @ crate::ir::Operation::Wait { .. }
+        | other @ crate::ir::Operation::SendSignal { .. }
+        | other @ crate::ir::Operation::FileRead { .. }
+        | other @ crate::ir::Operation::FileWrite { .. }
+        | other @ crate::ir::Operation::FileRemove { .. }
+        | other @ crate::ir::Operation::FileMetadata { .. }
+        | other @ crate::ir::Operation::FileSetMetadata { .. }
+        | other @ crate::ir::Operation::NetworkRequest { .. }
+        | other @ crate::ir::Operation::ClockRead { .. }
+        | other @ crate::ir::Operation::RandomBytes { .. }
+        | other @ crate::ir::Operation::InterpreterCall { .. }
+        | other @ crate::ir::Operation::OpaqueCapsule { .. } => {
+            return Err(format!(
+                "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: {context} runs commands in order, and this is {}",
+                other.name()
+            ));
+        }
+    };
+    let mut steps = Vec::new();
+    for node in nodes {
+        flatten_literal_commands(node, on_failure, context, &mut steps)?;
+    }
+    if steps.is_empty() {
+        return Err(format!(
+            "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: {context} is empty"
+        ));
+    }
+    // No requirement that a step start a process. A step that only writes and
+    // ends is a program, and the generated action is started as `node index.js`
+    // either way — the guard that was here refused
+    // `if [ ... ]; then echo ...; exit 1; fi`, which is the commonest shape a
+    // workflow has.
+    Ok((steps, on_failure))
+}
+
+/// Append the steps `node` runs, in order.
+///
+/// An `&&` chain lowers to a `Condition`, and a step of
+/// `sudo apt-get update && sudo apt-get install ...` was refused for being one.
+/// Under `Stop` it is the same program as the two commands in a list: if the
+/// left one fails the step ends with its status, and if it succeeds the right
+/// one runs and its status is the step's.
+///
+/// That equivalence is what `Stop` buys, and it is why this refuses under
+/// `Continue` — there, `a && b` followed by `c` still runs `c` when `a` fails,
+/// and a flat list with no stop would run `b` as well.
+fn flatten_literal_commands(
+    node: &crate::ir::Node,
+    on_failure: crate::ir::SequenceFailure,
+    context: &str,
+    steps: &mut Vec<HostStep>,
+) -> Result<(), String> {
+    match &node.operation {
+        crate::ir::Operation::Exec {
+            argv,
+            environment,
+            working_directory,
+        } => {
+            if !environment.is_empty() || working_directory.is_some() {
+                return Err(format!(
+                    "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: {context} cannot preserve per-command environment or cwd"
+                ));
+            }
+            let argv = argv
+                .iter()
+                .map(|word| host_word(word, context))
+                .collect::<Result<Vec<_>, _>>()?;
+            if argv.is_empty() {
+                return Err(format!(
+                    "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: {context} is empty"
+                ));
+            }
+            steps.push(HostStep::Run(argv));
+            Ok(())
+        }
+        crate::ir::Operation::SetVariable {
+            name,
+            value_type,
+            value,
+        } => {
+            if !value_type.is_plain_text() {
+                return Err(format!(
+                    "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: {context} carries text, and this assignment is typed"
+                ));
+            }
+            steps.push(HostStep::Assign {
+                name: name.clone(),
+                value: literal_text_expression(value)?,
+            });
+            Ok(())
+        }
+        crate::ir::Operation::WriteStdout { contents } => {
+            steps.push(HostStep::Write(host_words(contents, context)?));
+            Ok(())
+        }
+        crate::ir::Operation::Exit {
+            status,
+            non_numeric: _,
+        } => {
+            let status = literal_text_expression(status)?;
+            let status = status.trim().parse::<i64>().map_err(|_error| {
+                format!("DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: {context} ends with a status that is not an integer")
+            })?;
+            // Measured and recorded in
+            // `contracts/golden/exit-builtin-semantics-v1.json`: every shell
+            // reduces the status modulo 256, negatives and values above 255
+            // alike.
+            let status = i32::try_from(status.rem_euclid(256)).map_err(|error| {
+                format!("DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: {context} status is out of range: {error}")
+            })?;
+            steps.push(HostStep::Exit(status));
+            Ok(())
+        }
+        crate::ir::Operation::Sequence {
+            nodes,
+            on_failure: nested,
+        } if *nested == on_failure => {
+            for node in nodes {
+                flatten_literal_commands(node, on_failure, context, steps)?;
+            }
+            Ok(())
+        }
+        // `if TEST; then BODY; fi`. The branch keeps its own steps: one that is
+        // not taken must not run, and a flat list has no way to skip it. An `&&`
+        // chain is the other case and does flatten, because a failure there ends
+        // the step.
+        crate::ir::Operation::Condition {
+            predicate,
+            if_true,
+            if_false,
+        } if if_false.is_none()
+            && matches!(predicate.operation, crate::ir::Operation::Test { .. }) =>
+        {
+            let crate::ir::Operation::Test { predicate } = &predicate.operation else {
+                return Err(format!(
+                    "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: {context} condition changed shape while generating"
+                ));
+            };
+            let mut body = Vec::new();
+            flatten_literal_commands(if_true, on_failure, context, &mut body)?;
+            steps.push(HostStep::When {
+                test: host_test(predicate, context)?,
+                body,
+            });
+            Ok(())
+        }
+        crate::ir::Operation::Condition {
+            predicate,
+            if_true,
+            if_false,
+        } if if_false.is_none() && on_failure == crate::ir::SequenceFailure::Stop => {
+            flatten_literal_commands(predicate, on_failure, context, steps)?;
+            flatten_literal_commands(if_true, on_failure, context, steps)
+        }
+        other @ crate::ir::Operation::ExpandWords { .. }
+        | other @ crate::ir::Operation::Redirect { .. }
+        | other @ crate::ir::Operation::Pipeline { .. }
+        | other @ crate::ir::Operation::Sequence { .. }
+        | other @ crate::ir::Operation::Parallel { .. }
+        | other @ crate::ir::Operation::NoOp
+        | other @ crate::ir::Operation::Condition { .. }
+        | other @ crate::ir::Operation::Test { .. }
+        | other @ crate::ir::Operation::While { .. }
+        | other @ crate::ir::Operation::Not { .. }
+        | other @ crate::ir::Operation::Match { .. }
+        | other @ crate::ir::Operation::Foreach { .. }
+        | other @ crate::ir::Operation::Scope { .. }
+        | other @ crate::ir::Operation::TryFinally { .. }
+        | other @ crate::ir::Operation::TaskCall { .. }
+        | other @ crate::ir::Operation::SetEnvironment { .. }
+        | other @ crate::ir::Operation::SetWorkingDirectory { .. }
+        | other @ crate::ir::Operation::CaptureStdout { .. }
+        | other @ crate::ir::Operation::Spawn { .. }
+        | other @ crate::ir::Operation::Wait { .. }
+        | other @ crate::ir::Operation::SendSignal { .. }
+        | other @ crate::ir::Operation::FileRead { .. }
+        | other @ crate::ir::Operation::FileWrite { .. }
+        | other @ crate::ir::Operation::FileRemove { .. }
+        | other @ crate::ir::Operation::FileMetadata { .. }
+        | other @ crate::ir::Operation::FileSetMetadata { .. }
+        | other @ crate::ir::Operation::NetworkRequest { .. }
+        | other @ crate::ir::Operation::ClockRead { .. }
+        | other @ crate::ir::Operation::RandomBytes { .. }
+        | other @ crate::ir::Operation::InterpreterCall { .. }
+        | other @ crate::ir::Operation::OpaqueCapsule { .. } => Err(format!(
+            "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: {context} runs commands, and this step holds {}",
+            other.name()
+        )),
+    }
+}
+
+/// A modelled `test`, as the generated program asks it.
+///
+/// Only the four shapes the IR carries for a string. A predicate this does not
+/// name is refused rather than approximated, because a neighbouring rule answers
+/// a different question.
+fn host_test(predicate: &crate::ir::TestPredicate, context: &str) -> Result<HostTest, String> {
+    match predicate {
+        crate::ir::TestPredicate::StringEqual { left, right } => Ok(HostTest::Equal(
+            host_word(left, context)?,
+            host_word(right, context)?,
+        )),
+        crate::ir::TestPredicate::StringNotEqual { left, right } => Ok(HostTest::NotEqual(
+            host_word(left, context)?,
+            host_word(right, context)?,
+        )),
+        crate::ir::TestPredicate::Empty { value } => {
+            Ok(HostTest::Empty(host_word(value, context)?))
+        }
+        crate::ir::TestPredicate::NonEmpty { value } => {
+            Ok(HostTest::NonEmpty(host_word(value, context)?))
+        }
+        crate::ir::TestPredicate::StartsWith {
+            value: _,
+            prefix: _,
+        }
+        | crate::ir::TestPredicate::EndsWith {
+            value: _,
+            suffix: _,
+        }
+        | crate::ir::TestPredicate::Contains { value: _, infix: _ } => Err(format!(
+            "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: {context} asks string tests and this one is a pattern"
+        )),
+    }
+}
+
+/// The pieces of a text expression, each a literal or a name to read.
+///
+/// A whole argument that is one variable is the `host_word` case; this is the
+/// one where literal text and a name are joined, which is what `echo "a: $b"`
+/// is. A positional argument is refused: a generated action is started with
+/// none.
+fn host_words(
+    expression: &crate::ir::TextExpression,
+    context: &str,
+) -> Result<Vec<HostWord>, String> {
+    expression
+        .parts
+        .iter()
+        .map(|part| match part {
+            crate::ir::TextPart::Literal { value } => Ok(HostWord::Literal(value.clone())),
+            crate::ir::TextPart::Variable { name } => Ok(HostWord::Variable(name.clone())),
+            crate::ir::TextPart::Argument { name: _ }
+            | crate::ir::TextPart::DefaultValue { .. } => Err(format!(
+                "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: {context} joins literal text and names, and this holds neither"
+            )),
+        })
+        .collect()
+}
+
+/// One word of a command, as a literal or a name to read.
+fn host_word(word: &crate::ir::TextExpression, context: &str) -> Result<HostWord, String> {
+    match word.parts.as_slice() {
+        [crate::ir::TextPart::Variable { name }] => Ok(HostWord::Variable(name.clone())),
+        _ => Ok(HostWord::Literal(literal_text_expression(word).map_err(
+            |_error| {
+                format!(
+                    "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: {context} carries literal words and whole variables"
+                )
+            },
+        )?)),
+    }
 }
 
 fn literal_exec_argv(plan: &crate::ir::Plan, context: &str) -> Result<Vec<String>, String> {
@@ -2713,24 +3591,41 @@ fn structured_host_span<'a>(
     finding: &crate::scanner::Finding,
 ) -> Result<(usize, usize, &'a str), String> {
     let start = usize::try_from(finding.span.start_byte)
-        .map_err(|_| "structured host start offset is too large")?;
+        .map_err(|_error| "structured host start offset is too large")?;
     let end = usize::try_from(finding.span.end_byte)
-        .map_err(|_| "structured host end offset is too large")?;
+        .map_err(|_error| "structured host end offset is too large")?;
     if start > end || end > host.len() {
         return Err("structured host source span is outside the document".into());
     }
     let original = std::str::from_utf8(&host[start..end])
-        .map_err(|_| "structured host source span is not UTF-8")?;
+        .map_err(|_error| "structured host source span is not UTF-8")?;
     Ok((start, end, original))
 }
 
-fn replace_structured_host_span(
-    host: &[u8],
-    finding: &crate::scanner::Finding,
+/// The inputs of [`replace_structured_host_span`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`replace_structured_host_span`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+#[derive(Clone, Copy)]
+struct ReplaceStructuredHostSpanArgs<'a> {
+    host: &'a [u8],
+    finding: &'a crate::scanner::Finding,
     start: usize,
     end: usize,
-    replacement: &[u8],
-) -> (Vec<u8>, Location) {
+    replacement: &'a [u8],
+}
+
+fn replace_structured_host_span(parts: ReplaceStructuredHostSpanArgs<'_>) -> (Vec<u8>, Location) {
+    // Destructured without `..`: see `ReplaceStructuredHostSpanArgs`.
+    let ReplaceStructuredHostSpanArgs {
+        host,
+        finding,
+        start,
+        end,
+        replacement,
+    } = parts;
     let mut generated = Vec::with_capacity(host.len() - (end - start) + replacement.len());
     generated.extend_from_slice(&host[..start]);
     generated.extend_from_slice(replacement);
@@ -2779,14 +3674,14 @@ fn generate_docker_host(
     let host = std::fs::read(&path)
         .map_err(|error| format!("cannot read structured host {}: {error}", finding.path))?;
     let start = usize::try_from(finding.span.start_byte)
-        .map_err(|_| "structured host start offset is too large")?;
+        .map_err(|_error| "structured host start offset is too large")?;
     let end = usize::try_from(finding.span.end_byte)
-        .map_err(|_| "structured host end offset is too large")?;
+        .map_err(|_error| "structured host end offset is too large")?;
     if start > end || end > host.len() {
         return Err("structured host source span is outside the document".into());
     }
     let original = std::str::from_utf8(&host[start..end])
-        .map_err(|_| "structured host source span is not UTF-8")?;
+        .map_err(|_error| "structured host source span is not UTF-8")?;
     let indentation = &original[..original.len() - original.trim_start().len()];
     let json = serde_json::to_string(&argv).map_err(|error| error.to_string())?;
     let replacement = format!("{indentation}RUN {json}");
@@ -2810,7 +3705,9 @@ fn literal_text_expression(expression: &crate::ir::TextExpression) -> Result<Str
     for part in &expression.parts {
         match part {
             crate::ir::TextPart::Literal { value } => output.push_str(value),
-            crate::ir::TextPart::Variable { .. } | crate::ir::TextPart::Argument { .. } => {
+            crate::ir::TextPart::Variable { .. }
+            | crate::ir::TextPart::Argument { .. }
+            | crate::ir::TextPart::DefaultValue { .. } => {
                 return Err("DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: structured host argv cannot preserve shell expansion".into());
             }
         }
@@ -2823,7 +3720,15 @@ fn lower_finding(
     policy: crate::config::UnknownInterpreter,
 ) -> Result<crate::ir::Plan, String> {
     let interpreter = resolved_finding_interpreter(finding)?;
-    crate::frontend::lower_with_interpreter(&finding.path, &finding.source, policy, &interpreter)
+    crate::frontend::lower_with_interpreter(crate::frontend::LowerWithInterpreterArgs {
+        path: &finding.path,
+        source: &finding.source,
+        unknown_policy: policy,
+        configured: &interpreter,
+        host: crate::frontend::HostShell {
+            named: finding.host_named_the_shell,
+        },
+    })
 }
 
 fn resolved_finding_interpreter(finding: &crate::scanner::Finding) -> Result<String, String> {
@@ -2835,7 +3740,7 @@ fn resolved_finding_interpreter(finding: &crate::scanner::Finding) -> Result<Str
     })?;
     if configured == "package-shell" {
         let command = std::str::from_utf8(&finding.source).map_err(
-            |_| "DESHELL_BLOCKER_UNIMPLEMENTED_HOST_INTERFACE: package script is not UTF-8",
+            |_error| "DESHELL_BLOCKER_UNIMPLEMENTED_HOST_INTERFACE: package script is not UTF-8",
         )?;
         let argv = static_shell_words(command).map_err(|message| {
             format!("DESHELL_BLOCKER_UNIMPLEMENTED_HOST_INTERFACE: package script {message}")
@@ -2963,7 +3868,7 @@ fn classify_coverage(plan: &crate::ir::Plan, source_bytes: usize) -> Coverage {
             1 => coverage.native_bytes += 1,
             2 => coverage.delegated_bytes += 1,
             3 => coverage.residual_bytes += 1,
-            _ => unreachable!(),
+            _ => coverage.residual_bytes += 1,
         }
     }
     coverage
@@ -3049,7 +3954,7 @@ fn delegated_blocker_location(reasons: &[String], source: &Location, kind: Sourc
 fn visit_node(node: &crate::ir::Node, mut visit: impl FnMut(&crate::ir::Node)) {
     match &node.operation {
         crate::ir::Operation::Pipeline { nodes, .. }
-        | crate::ir::Operation::Sequence { nodes }
+        | crate::ir::Operation::Sequence { nodes, .. }
         | crate::ir::Operation::Parallel { nodes } => {
             for child in nodes {
                 visit(child);
@@ -3075,15 +3980,46 @@ fn visit_node(node: &crate::ir::Node, mut visit: impl FnMut(&crate::ir::Node)) {
             }
         }
         crate::ir::Operation::Foreach { body, .. }
+        | crate::ir::Operation::Not { body }
         | crate::ir::Operation::Redirect { body, .. }
         | crate::ir::Operation::Scope { body, .. }
         | crate::ir::Operation::CaptureStdout { body, .. }
         | crate::ir::Operation::Spawn { body, .. } => visit(body),
+        crate::ir::Operation::While { condition, body } => {
+            visit(condition);
+            visit(body);
+        }
         crate::ir::Operation::TryFinally { body, finalizer } => {
             visit(body);
             visit(finalizer);
         }
-        _ => {}
+        // Listed rather than matched with `_`: a new operation that carries a
+        // node has to be added here, and a wildcard would instead walk past its
+        // children in silence. `While` reached this walk only after the
+        // wildcard was removed, and until then every node inside a loop was
+        // invisible to every caller.
+        crate::ir::Operation::Exec { .. }
+        | crate::ir::Operation::ExpandWords { .. }
+        | crate::ir::Operation::NoOp
+        | crate::ir::Operation::WriteStdout { .. }
+        | crate::ir::Operation::Test { .. }
+        | crate::ir::Operation::SetVariable { .. }
+        | crate::ir::Operation::SetEnvironment { .. }
+        | crate::ir::Operation::SetWorkingDirectory { .. }
+        | crate::ir::Operation::Wait { .. }
+        | crate::ir::Operation::SendSignal { .. }
+        | crate::ir::Operation::FileRead { .. }
+        | crate::ir::Operation::FileWrite { .. }
+        | crate::ir::Operation::FileRemove { .. }
+        | crate::ir::Operation::FileMetadata { .. }
+        | crate::ir::Operation::FileSetMetadata { .. }
+        | crate::ir::Operation::NetworkRequest { .. }
+        | crate::ir::Operation::ClockRead { .. }
+        | crate::ir::Operation::RandomBytes { .. }
+        | crate::ir::Operation::TaskCall { .. }
+        | crate::ir::Operation::InterpreterCall { .. }
+        | crate::ir::Operation::Exit { .. }
+        | crate::ir::Operation::OpaqueCapsule { .. } => {}
     }
 }
 
@@ -3101,7 +4037,7 @@ struct ReplayRequest {
 
 fn load_network_replay(root: &Path) -> Result<(crate::replay::ReplayStore, String), String> {
     let path = crate::project::project_file_path(root, ".deshell/replay.json")
-        .map_err(|_| ".deshell/replay.json is missing or unsafe".to_owned())?;
+        .map_err(|_error| ".deshell/replay.json is missing or unsafe".to_owned())?;
     let metadata = path
         .symlink_metadata()
         .map_err(|error| format!("cannot inspect network replay: {error}"))?;
@@ -3174,7 +4110,39 @@ fn network_replay_requests(plan: &crate::ir::Plan) -> Result<Vec<ReplayRequest>,
                     return Err(format!("network replay does not support {name}"));
                 }
             }
-            _ => {}
+            crate::ir::Operation::ExpandWords { .. }
+            | crate::ir::Operation::Redirect { .. }
+            | crate::ir::Operation::Pipeline { .. }
+            | crate::ir::Operation::Sequence { .. }
+            | crate::ir::Operation::Parallel { .. }
+            | crate::ir::Operation::WriteStdout { .. }
+            | crate::ir::Operation::Exit { .. }
+            | crate::ir::Operation::NoOp
+            | crate::ir::Operation::Condition { .. }
+            | crate::ir::Operation::Test { .. }
+            | crate::ir::Operation::While { .. }
+            | crate::ir::Operation::Not { .. }
+            | crate::ir::Operation::Match { .. }
+            | crate::ir::Operation::Foreach { .. }
+            | crate::ir::Operation::Scope { .. }
+            | crate::ir::Operation::TryFinally { .. }
+            | crate::ir::Operation::TaskCall { .. }
+            | crate::ir::Operation::SetVariable { .. }
+            | crate::ir::Operation::SetEnvironment { .. }
+            | crate::ir::Operation::SetWorkingDirectory { .. }
+            | crate::ir::Operation::CaptureStdout { .. }
+            | crate::ir::Operation::Spawn { .. }
+            | crate::ir::Operation::Wait { .. }
+            | crate::ir::Operation::SendSignal { .. }
+            | crate::ir::Operation::FileRead { .. }
+            | crate::ir::Operation::FileWrite { .. }
+            | crate::ir::Operation::FileRemove { .. }
+            | crate::ir::Operation::FileMetadata { .. }
+            | crate::ir::Operation::FileSetMetadata { .. }
+            | crate::ir::Operation::ClockRead { .. }
+            | crate::ir::Operation::RandomBytes { .. }
+            | crate::ir::Operation::InterpreterCall { .. }
+            | crate::ir::Operation::OpaqueCapsule { .. } => {}
         }
         let mut error = None;
         visit_node(node, |child| {
@@ -3268,7 +4236,39 @@ fn network_effects(plan: &crate::ir::Plan) -> Vec<(String, Option<Location>)> {
                     .contains(&name.as_str())
                     .then_some(name)
                 }),
-            _ => None,
+            crate::ir::Operation::ExpandWords { .. }
+            | crate::ir::Operation::Redirect { .. }
+            | crate::ir::Operation::Pipeline { .. }
+            | crate::ir::Operation::Sequence { .. }
+            | crate::ir::Operation::Parallel { .. }
+            | crate::ir::Operation::WriteStdout { .. }
+            | crate::ir::Operation::Exit { .. }
+            | crate::ir::Operation::NoOp
+            | crate::ir::Operation::Condition { .. }
+            | crate::ir::Operation::Test { .. }
+            | crate::ir::Operation::While { .. }
+            | crate::ir::Operation::Not { .. }
+            | crate::ir::Operation::Match { .. }
+            | crate::ir::Operation::Foreach { .. }
+            | crate::ir::Operation::Scope { .. }
+            | crate::ir::Operation::TryFinally { .. }
+            | crate::ir::Operation::TaskCall { .. }
+            | crate::ir::Operation::SetVariable { .. }
+            | crate::ir::Operation::SetEnvironment { .. }
+            | crate::ir::Operation::SetWorkingDirectory { .. }
+            | crate::ir::Operation::CaptureStdout { .. }
+            | crate::ir::Operation::Spawn { .. }
+            | crate::ir::Operation::Wait { .. }
+            | crate::ir::Operation::SendSignal { .. }
+            | crate::ir::Operation::FileRead { .. }
+            | crate::ir::Operation::FileWrite { .. }
+            | crate::ir::Operation::FileRemove { .. }
+            | crate::ir::Operation::FileMetadata { .. }
+            | crate::ir::Operation::FileSetMetadata { .. }
+            | crate::ir::Operation::ClockRead { .. }
+            | crate::ir::Operation::RandomBytes { .. }
+            | crate::ir::Operation::InterpreterCall { .. }
+            | crate::ir::Operation::OpaqueCapsule { .. } => None,
         };
         if let Some(effect) = effect {
             output.insert((
@@ -3336,17 +4336,69 @@ fn generate_rust(plan: &crate::ir::Plan) -> Result<Vec<u8>, String> {
         .iter()
         .find(|task| task.name == plan.entrypoint)
         .ok_or_else(|| "generator entrypoint task is missing".to_owned())?;
-    if task.invocation.is_some() || !task.outputs.is_empty() {
-        return Err("generator does not support invocation metadata or task outputs".into());
+    for task in &plan.tasks {
+        if task.invocation.is_some() || !task.outputs.is_empty() {
+            return Err("generator does not support invocation metadata or task outputs".into());
+        }
     }
-    let pipeline = rust_node_uses_pipeline(&task.body);
+    // A shell function becomes a function, so the helpers a plan needs are
+    // decided over every task rather than over the entry alone: a pipeline
+    // inside a function would otherwise call a helper the generator had chosen
+    // not to define.
+    let locals = Locals::of(plan);
+    let bodies: Vec<&crate::ir::Node> = plan.tasks.iter().map(|task| &task.body).collect();
+    let mut functions = String::new();
+    for other in plan.tasks.iter().filter(|other| other.name != task.name) {
+        if !rust_function_name(&other.name) {
+            return Err(format!(
+                "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: task name is not a Rust identifier: {}",
+                other.name
+            ));
+        }
+        let mut other_body = String::new();
+        emit_rust_node(&other.body, &mut other_body, 2, locals)?;
+        // The parameter is named the same as the entry's binding, so `$1` in a
+        // function body reads the call's arguments with no special case and the
+        // body is emitted by the same code either way.
+        functions.push_str(&format!(
+            concat!(
+                "/// `{name}` from the retired shell, taking the arguments the\n",
+                "/// call site passed it.\n",
+                "fn {name}(deshell_args: &[String]) -> i32 {{\n",
+                "{locals}",
+                "{body}\n",
+                "}}\n\n"
+            ),
+            name = other.name,
+            locals = rust_variable_binding(&other.body, locals),
+            body = other_body,
+        ));
+    }
+    let pipeline = plan
+        .tasks
+        .iter()
+        .any(|task| rust_node_uses_pipeline(&task.body));
     let arguments = rust_node_uses_arguments(&task.body);
     let mut body = String::new();
-    emit_rust_node(&task.body, &mut body, 2)?;
-    let import = if pipeline {
+    emit_rust_node(&task.body, &mut body, 2, locals)?;
+    // `Stdio` is named by a pipeline and by a redirection, which are the two
+    // places a command's descriptors are set to something other than the
+    // parent's.
+    let import = if pipeline
+        || plan
+            .tasks
+            .iter()
+            .any(|task| rust_node_redirects(&task.body))
+    {
         "use std::process::{Command, Stdio};\n\n"
-    } else {
+    } else if plan
+        .tasks
+        .iter()
+        .any(|task| rust_node_starts_a_process(&task.body))
+    {
         "use std::process::Command;\n\n"
+    } else {
+        ""
     };
     let pipeline_helper = if pipeline {
         concat!(
@@ -3377,40 +4429,310 @@ fn generate_rust(plan: &crate::ir::Plan) -> Result<Vec<u8>, String> {
     } else {
         ""
     };
-    let argument_binding = if arguments {
-        "    let deshell_args: Vec<String> = std::env::args().skip(1).collect();\n"
+    // `echo` and `printf` both write to standard output, and both report 1 if
+    // the write fails, which is what the shell's builtins do. One helper rather
+    // than ten lines at each site, for the same reason a shell function stays a
+    // function.
+    let write_helper = if body.contains("deshell_write(") || functions.contains("deshell_write(") {
+        concat!(
+            "/// Write to standard output, reporting 1 if the write fails.\n",
+            "///\n",
+            "/// The shell's `echo` and `printf` both do, which is why a script\n",
+            "/// whose reader has closed ends the way it does.\n",
+            "fn deshell_write(text: &str) -> i32 {\n",
+            "    use std::io::Write as _;\n",
+            "    i32::from(std::io::stdout().write_all(text.as_bytes()).is_err())\n",
+            "}\n\n"
+        )
     } else {
         ""
     };
+    let argument_binding = if arguments {
+        "    let deshell_args: &[String] = &std::env::args().skip(1).collect::<Vec<_>>();\n"
+    } else {
+        ""
+    };
+    // `$1` and `${NAME}` are the same question about a different store, so
+    // `set -u` is answered for both in one place.
+    let argument_helper = if arguments {
+        if task.nounset {
+            concat!(
+                "/// Read a positional argument the script requires to be there.\n",
+                "///\n",
+                "/// The retired script ran under `set -u`, where reading one that\n",
+                "/// was not passed ends the script rather than producing an empty\n",
+                "/// string.\n",
+                "fn deshell_argument(arguments: &[String], index: usize) -> String {\n",
+                "    match arguments.get(index) {\n",
+                "        Some(value) => value.clone(),\n",
+                "        None => {\n",
+                "            eprintln!(\"${}: unbound variable\", index + 1);\n",
+                "            std::process::exit(1)\n",
+                "        }\n",
+                "    }\n",
+                "}\n\n"
+            )
+        } else {
+            concat!(
+                "fn deshell_argument(arguments: &[String], index: usize) -> String {\n",
+                "    arguments.get(index).cloned().unwrap_or_default()\n",
+                "}\n\n"
+            )
+        }
+    } else {
+        ""
+    };
+    // A shell-local name is not an environment variable: the rest of the script
+    // sees it and the processes it starts do not. The generated program keeps
+    // them in their own map, and an expansion consults it before falling back to
+    // the environment, which is the order the shell looks in.
+    // The helper and the map travel together: an expansion needs somewhere to
+    // look, and an assignment needs somewhere to write. Emitting one without the
+    // other produces code that does not compile, which is a defect this
+    // repository has now produced three times.
+    // Each helper is emitted only if something calls it: an unused function is an
+    // error under the generated code's `-D warnings` gate, so "might be needed"
+    // is not good enough. `deshell_lookup` is written in terms of
+    // `deshell_lookup_opt`, so a plain expansion needs both and a default
+    // expansion needs only the second.
+    let uses_plain_expansion = bodies.iter().any(|body| {
+        node_has_expression_part(body, &|part| {
+            matches!(part, crate::ir::TextPart::Variable { .. })
+        })
+    });
+    let uses_default_expansion = bodies.iter().any(|body| {
+        node_has_expression_part(body, &|part| {
+            matches!(part, crate::ir::TextPart::DefaultValue { .. })
+        })
+    });
+    // `set -u` says an unset name and an empty one are different. A lookup that
+    // answers an empty string for both is a program with the option silently
+    // off, which is what `unwrap_or_default` did — the `Option` was already
+    // there and the answer was being thrown away.
+    // Built from three answers rather than four spellings: whether an
+    // expansion reads a name at all, whether `set -u` is on, and whether there
+    // is a locals map to look in. Four `concat!` blocks said the same thing
+    // four times, and the third answer had to be added to each of them.
+    let lookup_opt = format!(
+        concat!(
+            "fn deshell_lookup_opt(\n",
+            "    name: &str{parameter},\n",
+            ") -> Option<String> {{\n",
+            "{read}",
+            "}}\n\n"
+        ),
+        parameter = locals.parameter(),
+        read = locals.read(),
+    );
+    let lookup = if task.nounset {
+        format!(
+            concat!(
+                "/// Read a name the script requires to be set.\n",
+                "///\n",
+                "/// The retired script ran under `set -u`, where reading an unset\n",
+                "/// name ends the script rather than producing an empty string.\n",
+                "fn deshell_lookup(name: &str{parameter}) -> String {{\n",
+                "    match deshell_lookup_opt(name{inner}) {{\n",
+                "        Some(value) => value,\n",
+                "        None => {{\n",
+                "            eprintln!(\"{{name}}: unbound variable\");\n",
+                "            std::process::exit(1)\n",
+                "        }}\n",
+                "    }}\n",
+                "}}\n\n"
+            ),
+            parameter = locals
+                .parameter()
+                .trim_end_matches('\n')
+                .replace(",\n    ", ", "),
+            // Inside the helper the map is its own parameter, not the caller's
+            // binding: `&deshell_vars` here would name something out of scope.
+            inner = match locals {
+                Locals::Kept => ", locals",
+                Locals::None => "",
+            },
+        )
+    } else {
+        format!(
+            concat!(
+                "fn deshell_lookup(name: &str{parameter}) -> String {{\n",
+                "    deshell_lookup_opt(name{inner}).unwrap_or_default()\n",
+                "}}\n\n"
+            ),
+            parameter = locals
+                .parameter()
+                .trim_end_matches('\n')
+                .replace(",\n    ", ", "),
+            // Inside the helper the map is its own parameter, not the caller's
+            // binding: `&deshell_vars` here would name something out of scope.
+            inner = match locals {
+                Locals::Kept => ", locals",
+                Locals::None => "",
+            },
+        )
+    };
+    // Each helper is emitted only if something calls it: an unused function is
+    // an error under the generated code's `-D warnings` gate, so "might be
+    // needed" is not good enough. `deshell_lookup` is written in terms of
+    // `deshell_lookup_opt`, so a plain expansion needs both and a default
+    // expansion needs only the second.
+    let lookup_helper = match (uses_plain_expansion, uses_default_expansion) {
+        (true, _) => format!("{lookup_opt}{lookup}"),
+        (false, true) => lookup_opt,
+        (false, false) => String::new(),
+    };
+    let variable_binding = rust_variable_binding(&task.body, locals);
     let source = format!(
         concat!(
-            "// Generated by de-shell. This file has no de-shell runtime dependency.\n",
+            "//! Generated by de-shell from a retired shell script.\n",
+            "//!\n",
+            "//! This file has no de-shell runtime dependency, and nothing here\n",
+            "//! refers back to the tool that wrote it.\n",
+            "//!\n",
+            "//! Built for the 2024 edition, which is where `TryFrom` is in the\n",
+            "//! prelude. `rustc` defaults to 2015 when it is handed a file\n",
+            "//! directly, so a build outside a manifest needs `--edition 2024`.\n\n",
             "{import}",
             "{pipeline_helper}",
-            "fn main() {{\n",
+            "{write_helper}",
+            "{argument_helper}",
+            "{lookup_helper}",
+            "{functions}",
+            "/// The retired script's own statements.\n",
+            "///\n",
+            "/// A function rather than `main` because `set -e` stops the script\n",
+            "/// at a failing statement, which is a return rather than a jump.\n",
+            "fn deshell_main() -> i32 {{\n",
             "{argument_binding}",
-            "    let deshell_status =\n",
+            "{variable_binding}",
+            "{binding}",
             "{body}",
-            ";\n",
-            "    std::process::exit(deshell_status);\n",
+            "\n}}\n\n",
+            "fn main() {{\n",
+            "    std::process::exit(deshell_main());\n",
             "}}\n"
         ),
         import = import,
         pipeline_helper = pipeline_helper,
+        write_helper = write_helper,
+        argument_helper = argument_helper,
+        lookup_helper = lookup_helper,
+        functions = functions,
         argument_binding = argument_binding,
+        variable_binding = variable_binding,
+        binding = "",
         body = body,
     );
     rustfmt_generated(source.as_bytes())
 }
 
+/// Whether a task name can be a Rust function name.
+///
+/// A shell function name may hold characters Rust will not, and renaming one
+/// would put a name in the reader's program that is not in the script it
+/// replaced.
+fn rust_function_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with(|character: char| character.is_ascii_digit())
+        && name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_')
+}
+
+/// The shell-local map a body needs, if it needs one.
+///
+/// A function has its own: the shell's locals are the caller's, but a body that
+/// only reads them still needs somewhere to look, and `mut` on a map nothing
+/// writes is a warning the generated code is checked against.
+/// Whether the generated program keeps a map of shell-local names.
+///
+/// Only a plan that assigns to one has locals to keep; without an assignment
+/// the map is always empty, and emitting it makes a reader follow a type and a
+/// parameter to find out they do nothing.
+///
+/// A type rather than a `bool` so a call site cannot pass the wrong one of two
+/// flags, and so the answer reads as what it is where it is used.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Locals {
+    /// Something assigns to a shell-local name, so the program keeps a map.
+    Kept,
+    /// Nothing does, so an expansion reads the environment and no map exists.
+    None,
+}
+
+impl Locals {
+    /// The plan's answer.
+    fn of(plan: &crate::ir::Plan) -> Self {
+        if plan
+            .tasks
+            .iter()
+            .any(|task| rust_node_sets_variables(&task.body))
+        {
+            Self::Kept
+        } else {
+            Self::None
+        }
+    }
+
+    /// The argument a lookup helper takes, which is nothing when there is no
+    /// map to pass.
+    fn argument(self) -> &'static str {
+        match self {
+            Self::Kept => ", &deshell_vars",
+            Self::None => "",
+        }
+    }
+
+    /// The parameter a lookup helper declares.
+    fn parameter(self) -> &'static str {
+        match self {
+            Self::Kept => ",\n    locals: &std::collections::BTreeMap<String, String>",
+            Self::None => "",
+        }
+    }
+
+    /// Where a lookup helper reads from.
+    fn read(self) -> &'static str {
+        match self {
+            Self::Kept => "    locals.get(name).cloned().or_else(|| std::env::var(name).ok())\n",
+            Self::None => "    std::env::var(name).ok()\n",
+        }
+    }
+}
+
+fn rust_variable_binding(body: &crate::ir::Node, locals: Locals) -> String {
+    // No map when nothing assigns to a local: the lookups read the environment
+    // directly, and a binding nothing refers to is an error under the generated
+    // code's own gate.
+    if locals == Locals::None {
+        return String::new();
+    }
+    let reads = node_has_expression_part(body, &|part| {
+        matches!(
+            part,
+            crate::ir::TextPart::Variable { .. } | crate::ir::TextPart::DefaultValue { .. }
+        )
+    });
+    if rust_node_sets_variables(body) {
+        "    let mut deshell_vars: std::collections::BTreeMap<String, String> =\n        std::collections::BTreeMap::new();\n".to_owned()
+    } else if reads {
+        // Read-only: `mut` would be an unused-mut warning under the gate the
+        // generated Rust is checked with.
+        "    let deshell_vars: std::collections::BTreeMap<String, String> =\n        std::collections::BTreeMap::new();\n".to_owned()
+    } else {
+        String::new()
+    }
+}
+
 fn rustfmt_generated(source: &[u8]) -> Result<Vec<u8>, String> {
-    let mut child = std::process::Command::new("rustfmt")
-        .args(["--edition", "2024", "--emit", "stdout"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("official Rust generator requires rustfmt: {error}"))?;
+    let mut child = crate::host::spawn(
+        std::process::Command::new("rustfmt")
+            .args(["--edition", "2024", "--emit", "stdout"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped()),
+    )
+    .map_err(|error| format!("official Rust generator requires rustfmt: {error}"))?;
     child
         .stdin
         .take()
@@ -3430,7 +4752,12 @@ fn rustfmt_generated(source: &[u8]) -> Result<Vec<u8>, String> {
     }
 }
 
-fn emit_rust_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> Result<(), String> {
+fn emit_rust_node(
+    node: &crate::ir::Node,
+    output: &mut String,
+    depth: usize,
+    locals: Locals,
+) -> Result<(), String> {
     let indent = "    ".repeat(depth);
     match &node.operation {
         crate::ir::Operation::Exec {
@@ -3439,15 +4766,16 @@ fn emit_rust_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> 
             working_directory,
         } => {
             output.push_str(&format!("{indent}{{\n"));
-            emit_rust_command(
+            emit_rust_command(EmitRustCommandArgs {
+                locals,
                 argv,
                 environment,
-                working_directory.as_ref(),
-                "deshell_command",
-                true,
+                working_directory: working_directory.as_ref(),
+                variable: "deshell_command",
+                force_mutable: true,
                 output,
-                depth + 1,
-            )?;
+                depth: depth + 1,
+            })?;
             output.push_str(&format!(
                 concat!(
                     "{indent}    match deshell_command.status() {{\n",
@@ -3459,17 +4787,269 @@ fn emit_rust_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> 
                 indent = indent
             ));
         }
-        crate::ir::Operation::Sequence { nodes } => {
-            let Some((last, preceding)) = nodes.split_last() else {
+        crate::ir::Operation::While { condition, body } => {
+            output.push_str(&format!("{indent}{{\n"));
+            output.push_str(&format!("{indent}    let mut deshell_last = 0;\n"));
+            output.push_str(&format!("{indent}    loop {{\n"));
+            output.push_str(&format!("{indent}        if (\n"));
+            emit_rust_node(condition, output, depth + 3, locals)?;
+            output.push_str(&format!("\n{indent}        ) != 0 {{ break; }}\n"));
+            output.push_str(&format!("{indent}        deshell_last =\n"));
+            emit_rust_node(body, output, depth + 3, locals)?;
+            output.push_str(&format!(";\n{indent}    }}\n"));
+            output.push_str(&format!("{indent}    deshell_last\n{indent}}}"));
+        }
+        crate::ir::Operation::Not { body } => {
+            // `!` inverts to a boolean, so a body exiting 2 yields 0 just as one
+            // exiting 1 does.
+            output.push_str(&format!("{indent}i32::from(\n"));
+            emit_rust_node(body, output, depth + 1, locals)?;
+            output.push_str(&format!("\n{indent}    == 0)"));
+        }
+        // `test` succeeds with 0 and fails with 1, so a node that is one becomes
+        // its exit status. A `Condition` whose predicate is one uses the bool
+        // directly — see `emit_rust_node`'s `Condition` arm.
+        crate::ir::Operation::Test { predicate } => {
+            output.push_str(&format!(
+                "{indent}i32::from(!({}))",
+                rust_test_condition(predicate, locals)?
+            ));
+        }
+        // Running nothing succeeds, which is what the shell reports for an arm
+        // whose body is empty.
+        crate::ir::Operation::NoOp => output.push_str(&format!("{indent}0")),
+        // `Operation::Match` compares for equality — the frontend refuses a
+        // glob pattern precisely so that it does — so the arms become a chain
+        // of comparisons rather than a `match`, whose patterns must be literals
+        // Rust can see at compile time. A `case` with no matching arm and no
+        // `*` runs nothing and succeeds, which is the trailing `0`.
+        crate::ir::Operation::Match {
+            value,
+            cases,
+            default,
+        } => {
+            // A pattern that matches anything compiles to `true`, which reads
+            // nothing — so a `case` whose every arm is one leaves the subject
+            // unused, and the generated program's own `-D warnings` build
+            // rejects an unused binding. The word is still expanded, because the
+            // shell expands it.
+            let reads_subject = cases
+                .iter()
+                .any(|case| !matches!(pattern_shape(&case.pattern), PatternShape::Anything));
+            output.push_str(&format!(
+                "{indent}{{\n{indent}    let {}deshell_subject = {};\n",
+                if reads_subject { "" } else { "_" },
+                rust_expression(value, locals)?
+            ));
+            for case in cases {
+                output.push_str(&format!(
+                    "{indent}    if {} {{\n",
+                    rust_pattern_test(&case.pattern, "deshell_subject")?
+                ));
+                emit_rust_node(&case.body, output, depth + 2, locals)?;
+                output.push_str(&format!("\n{indent}    }} else "));
+            }
+            output.push_str(&format!("{indent}    {{\n"));
+            match default {
+                Some(default) => emit_rust_node(default, output, depth + 2, locals)?,
+                None => output.push_str(&format!("{indent}        0")),
+            }
+            output.push_str(&format!("\n{indent}    }}\n{indent}}}"));
+        }
+        // Only a redirect around a single command is emitted. The shell can
+        // redirect a whole compound statement, and reproducing that means
+        // holding the descriptors open across everything inside — so the
+        // general case is refused rather than narrowed silently.
+        crate::ir::Operation::Redirect { redirections, body } => {
+            let crate::ir::Operation::Exec {
+                argv,
+                environment,
+                working_directory,
+            } = &body.operation
+            else {
+                return Err(
+                    "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: redirect supports only a simple command"
+                        .into(),
+                );
+            };
+            output.push_str(&format!("{indent}{{\n"));
+            emit_rust_command(EmitRustCommandArgs {
+                locals,
+                argv,
+                environment,
+                working_directory: working_directory.as_ref(),
+                variable: "deshell_command",
+                output,
+                depth: depth + 1,
+                force_mutable: true,
+            })?;
+            let mut closers = 0_usize;
+            for redirection in redirections {
+                let (fd, path, append) = match redirection {
+                    crate::ir::Redirection::Write { fd, path, append } => (fd, path, *append),
+                    crate::ir::Redirection::Read { .. }
+                    | crate::ir::Redirection::Duplicate { .. }
+                    | crate::ir::Redirection::Close { .. } => {
+                        return Err(
+                            "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: only an output redirection is emitted"
+                                .into(),
+                        );
+                    }
+                };
+                let sink = match fd {
+                    1 => "stdout",
+                    2 => "stderr",
+                    _ => {
+                        return Err(
+                            "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: only fd 1 and 2 are redirected"
+                                .into(),
+                        );
+                    }
+                };
+                // A file that will not open is the shell's exit 1, and the
+                // block is an expression, so the status is carried rather than
+                // returned: `return` here would leave `main`.
+                output.push_str(&format!(
+                    concat!(
+                        "{indent}    let deshell_opened = std::fs::OpenOptions::new()\n",
+                        "{indent}        .write(true)\n",
+                        "{indent}        .create(true)\n",
+                        "{indent}        .append({append})\n",
+                        "{indent}        .truncate({truncate})\n",
+                        "{indent}        .open({path});\n",
+                        "{indent}    match deshell_opened {{\n",
+                        "{indent}        Err(error) => {{\n",
+                        "{indent}            eprintln!(\"{{error}}\");\n",
+                        "{indent}            1\n",
+                        "{indent}        }}\n",
+                        "{indent}        Ok(deshell_file) => {{\n",
+                        "{indent}            deshell_command.{sink}(Stdio::from(deshell_file));\n"
+                    ),
+                    indent = indent,
+                    append = append,
+                    truncate = !append,
+                    path = rust_expression_borrowed(path, locals)?,
+                    sink = sink,
+                ));
+                closers += 1;
+            }
+            output.push_str(&format!(
+                concat!(
+                    "{indent}            match deshell_command.status() {{\n",
+                    "{indent}                Ok(status) => status.code().unwrap_or(128),\n",
+                    "{indent}                Err(error) => {{\n",
+                    "{indent}                    eprintln!(\"{{error}}\");\n",
+                    "{indent}                    127\n",
+                    "{indent}                }}\n",
+                    "{indent}            }}\n"
+                ),
+                indent = indent
+            ));
+            for _ in 0..closers {
+                output.push_str(&format!("{indent}        }}\n{indent}    }}\n"));
+            }
+            output.push_str(&format!("{indent}}}"));
+        }
+        // A shell function is a function: the definition and its call sites
+        // stay a definition and calls, because that is where "these are the
+        // same check" is written down.
+        crate::ir::Operation::TaskCall {
+            task,
+            arguments,
+            positional,
+        } => {
+            if !arguments.is_empty() {
+                return Err(
+                    "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: a task call with named arguments"
+                        .into(),
+                );
+            }
+            let mut values = Vec::new();
+            for value in positional {
+                values.push(rust_expression(value, locals)?);
+            }
+            output.push_str(&format!("{indent}{task}(&[{}])", values.join(", ")));
+        }
+        // `process::exit` returns `!`, which is why it stands where the
+        // surrounding expression wants an `i32`.
+        crate::ir::Operation::Exit {
+            status,
+            non_numeric,
+        } => match non_numeric {
+            crate::ir::NonNumericStatus::Unreachable => output.push_str(&format!(
+                "{indent}std::process::exit({})",
+                rust_exit_status(status)?
+            )),
+            // The status arrives at run time. Every shell reduces a decimal one
+            // modulo 256 and agrees; outside that the plan carries what the
+            // interpreter it names does, so a caller reading `$?` sees what it
+            // would have seen. What cannot be reproduced is the message — bash
+            // writes one naming its own path and a line number — so the program
+            // names the value instead.
+            crate::ir::NonNumericStatus::Ends { status: ends } => output.push_str(&format!(
+                concat!(
+                    "{indent}{{\n",
+                    "{indent}    let deshell_status = {status};\n",
+                    "{indent}    match deshell_status.trim().parse::<i64>() {{\n",
+                    "{indent}        Ok(status) => std::process::exit(\n",
+                    "{indent}            i32::try_from(status.rem_euclid(256)).unwrap_or(255),\n",
+                    "{indent}        ),\n",
+                    "{indent}        Err(_) => {{\n",
+                    "{indent}            eprintln!(\n",
+                    "{indent}                \"exit status {{deshell_status:?}} is not a number\"\n",
+                    "{indent}            );\n",
+                    "{indent}            std::process::exit({ends})\n",
+                    "{indent}        }}\n",
+                    "{indent}    }}\n",
+                    "{indent}}}"
+                ),
+                indent = indent,
+                ends = ends,
+                status = rust_expression(status, locals)?
+            )),
+        },
+        // One helper rather than eight lines at each site, for the same reason
+        // a shell function stays a function: three copies of a write are three
+        // things for the reader of the migration to read where one would do.
+        crate::ir::Operation::WriteStdout { contents } => {
+            output.push_str(&format!(
+                "{indent}deshell_write({})",
+                rust_expression_as_str(contents, locals)?
+            ));
+        }
+        // Destructured without `..`: `on_failure` is `set -e`, and discarding
+        // it emitted `let _ =` for every statement but the last — a program
+        // that runs on after a failure the script would have stopped at.
+        crate::ir::Operation::Sequence { nodes, on_failure } => {
+            let Some((last, preceding)) = reachable_nodes(nodes).split_last() else {
                 return Err("generator received an empty sequence".into());
             };
             output.push_str(&format!("{indent}{{\n"));
             for child in preceding {
-                output.push_str(&format!("{indent}    let _ =\n"));
-                emit_rust_node(child, output, depth + 2)?;
-                output.push_str(";\n");
+                // A statement that always ends the task needs no check after
+                // it: there is nothing to skip to, and the branch would be one
+                // a reader has to work out is dead.
+                match on_failure {
+                    crate::ir::SequenceFailure::Continue => {
+                        output.push_str(&format!("{indent}    let _ =\n"));
+                        emit_rust_node(child, output, depth + 2, locals)?;
+                        output.push_str(";\n");
+                    }
+                    crate::ir::SequenceFailure::Stop if node_always_exits(child) => {
+                        output.push_str(&format!("{indent}    let _ =\n"));
+                        emit_rust_node(child, output, depth + 2, locals)?;
+                        output.push_str(";\n");
+                    }
+                    crate::ir::SequenceFailure::Stop => {
+                        output.push_str(&format!("{indent}    let deshell_step =\n"));
+                        emit_rust_node(child, output, depth + 2, locals)?;
+                        output.push_str(&format!(
+                            ";\n{indent}    if deshell_step != 0 {{\n{indent}        return deshell_step;\n{indent}    }}\n"
+                        ));
+                    }
+                }
             }
-            emit_rust_node(last, output, depth + 1)?;
+            emit_rust_node(last, output, depth + 1, locals)?;
             output.push_str(&format!("\n{indent}}}"));
         }
         crate::ir::Operation::Pipeline { nodes, status } => {
@@ -3486,15 +5066,16 @@ fn emit_rust_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> 
                 else {
                     return Err("generator pipeline supports only Exec stages".into());
                 };
-                emit_rust_command(
+                emit_rust_command(EmitRustCommandArgs {
+                    locals,
                     argv,
                     environment,
-                    working_directory.as_ref(),
-                    "deshell_stage",
-                    false,
+                    working_directory: working_directory.as_ref(),
+                    variable: "deshell_stage",
+                    force_mutable: false,
                     output,
-                    depth + 1,
-                )?;
+                    depth: depth + 1,
+                })?;
                 output.push_str(&format!(
                     "{indent}    deshell_commands.push(deshell_stage);\n"
                 ));
@@ -3509,16 +5090,32 @@ fn emit_rust_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> 
             if_true,
             if_false,
         } => {
+            // A `test` predicate is already a bool. Running it through an exit
+            // status and comparing that to zero is the same answer written
+            // twice — `if !(a == b) == 0` where the script said `if a = b`.
+            if let crate::ir::Operation::Test { predicate } = &predicate.operation
+                && let Some(if_false) = if_false
+            {
+                output.push_str(&format!(
+                    "{indent}if {} {{\n",
+                    rust_test_condition(predicate, locals)?
+                ));
+                emit_rust_node(if_true, output, depth + 1, locals)?;
+                output.push_str(&format!("\n{indent}}} else {{\n"));
+                emit_rust_node(if_false, output, depth + 1, locals)?;
+                output.push_str(&format!("\n{indent}}}"));
+                return Ok(());
+            }
             output.push_str(&format!(
                 "{indent}{{\n{indent}    let deshell_predicate =\n"
             ));
-            emit_rust_node(predicate, output, depth + 2)?;
+            emit_rust_node(predicate, output, depth + 2, locals)?;
             output.push_str(&format!(";\n{indent}    if deshell_predicate == 0 {{\n"));
-            emit_rust_node(if_true, output, depth + 2)?;
+            emit_rust_node(if_true, output, depth + 2, locals)?;
             output.push('\n');
             if let Some(if_false) = if_false {
                 output.push_str(&format!("{indent}    }} else {{\n"));
-                emit_rust_node(if_false, output, depth + 2)?;
+                emit_rust_node(if_false, output, depth + 2, locals)?;
                 output.push('\n');
             } else {
                 output.push_str(&format!(
@@ -3527,7 +5124,59 @@ fn emit_rust_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> 
             }
             output.push_str(&format!("{indent}    }}\n{indent}}}"));
         }
-        other => {
+        crate::ir::Operation::SetVariable { name, value, .. } => {
+            output.push_str(&format!(
+                "{indent}{{\n{indent}    deshell_vars.insert({name:?}.to_owned(), {});\n{indent}    0\n{indent}}}",
+                rust_expression(value, locals)?
+            ));
+        }
+        crate::ir::Operation::CaptureStdout { name, body, .. } => {
+            let crate::ir::Operation::Exec {
+                argv,
+                environment,
+                working_directory,
+            } = &body.operation
+            else {
+                return Err(
+                    "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: capture supports only a simple command"
+                        .into(),
+                );
+            };
+            output.push_str(&format!("{indent}{{\n"));
+            emit_rust_command(EmitRustCommandArgs {
+                locals,
+                argv,
+                environment,
+                working_directory: working_directory.as_ref(),
+                variable: "deshell_command",
+                output,
+                depth: depth + 1,
+                force_mutable: true,
+            })?;
+            // The shell strips trailing newlines from a substitution and nothing
+            // else, so `trim_end_matches` is right where `trim` would be wrong.
+            output.push_str(&format!(
+                concat!(
+                    "{indent}    let deshell_output = deshell_command.output();\n",
+                    "{indent}    let deshell_code = match &deshell_output {{\n",
+                    "{indent}        Ok(done) => done.status.code().unwrap_or(128),\n",
+                    "{indent}        Err(error) => {{ eprintln!(\"{{error}}\"); 127 }},\n",
+                    "{indent}    }};\n",
+                    "{indent}    let deshell_captured = deshell_output\n",
+                    "{indent}        .map(|done| String::from_utf8_lossy(&done.stdout).into_owned())\n",
+                    "{indent}        .unwrap_or_default();\n",
+                    "{indent}    deshell_vars.insert(\n",
+                    "{indent}        {name:?}.to_owned(),\n",
+                    "{indent}        deshell_captured.trim_end_matches('\\n').to_owned(),\n",
+                    "{indent}    );\n",
+                    "{indent}    deshell_code\n",
+                    "{indent}}}"
+                ),
+                indent = indent,
+                name = name
+            ));
+        }
+        other @ crate::ir::Operation::ExpandWords { .. } | other @ crate::ir::Operation::Parallel { .. } | other @ crate::ir::Operation::Foreach { .. } | other @ crate::ir::Operation::Scope { .. } | other @ crate::ir::Operation::TryFinally { .. } | other @ crate::ir::Operation::SetEnvironment { .. } | other @ crate::ir::Operation::SetWorkingDirectory { .. } | other @ crate::ir::Operation::Spawn { .. } | other @ crate::ir::Operation::Wait { .. } | other @ crate::ir::Operation::SendSignal { .. } | other @ crate::ir::Operation::FileRead { .. } | other @ crate::ir::Operation::FileWrite { .. } | other @ crate::ir::Operation::FileRemove { .. } | other @ crate::ir::Operation::FileMetadata { .. } | other @ crate::ir::Operation::FileSetMetadata { .. } | other @ crate::ir::Operation::NetworkRequest { .. } | other @ crate::ir::Operation::ClockRead { .. } | other @ crate::ir::Operation::RandomBytes { .. } | other @ crate::ir::Operation::InterpreterCall { .. } | other @ crate::ir::Operation::OpaqueCapsule { .. } => {
             return Err(format!(
                 "generator cannot preserve {} semantics yet",
                 other.name()
@@ -3537,31 +5186,641 @@ fn emit_rust_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> 
     Ok(())
 }
 
-fn rust_node_uses_pipeline(node: &crate::ir::Node) -> bool {
+/// Whether the generated Go will need the `strings` package.
+///
+/// A capture trims the output; a pattern predicate calls `HasPrefix` and friends.
+/// Go rejects an unused import outright, so this has to be exact rather than
+/// generous.
+fn node_captures_stdout(node: &crate::ir::Node) -> bool {
+    if matches!(node.operation, crate::ir::Operation::CaptureStdout { .. })
+        || matches!(
+            &node.operation,
+            crate::ir::Operation::Test { predicate }
+                if matches!(
+                    predicate,
+                    crate::ir::TestPredicate::StartsWith { .. }
+                        | crate::ir::TestPredicate::EndsWith { .. }
+                        | crate::ir::TestPredicate::Contains { .. }
+                )
+        )
+    {
+        return true;
+    }
     match &node.operation {
-        crate::ir::Operation::Pipeline { .. } => true,
-        crate::ir::Operation::Sequence { nodes } => nodes.iter().any(rust_node_uses_pipeline),
+        crate::ir::Operation::NoOp
+        | crate::ir::Operation::WriteStdout { .. }
+        | crate::ir::Operation::Exit { .. } => false,
+        crate::ir::Operation::Sequence { nodes, .. }
+        | crate::ir::Operation::Pipeline { nodes, .. }
+        | crate::ir::Operation::Parallel { nodes } => nodes.iter().any(node_captures_stdout),
         crate::ir::Operation::Condition {
             predicate,
             if_true,
             if_false,
         } => {
-            rust_node_uses_pipeline(predicate)
-                || rust_node_uses_pipeline(if_true)
-                || if_false.as_deref().is_some_and(rust_node_uses_pipeline)
+            node_captures_stdout(predicate)
+                || node_captures_stdout(if_true)
+                || if_false.as_deref().is_some_and(node_captures_stdout)
         }
-        _ => false,
+        crate::ir::Operation::While { condition, body } => {
+            node_captures_stdout(condition) || node_captures_stdout(body)
+        }
+        crate::ir::Operation::TryFinally { body, finalizer } => {
+            node_captures_stdout(body) || node_captures_stdout(finalizer)
+        }
+        crate::ir::Operation::Match { cases, default, .. } => {
+            cases.iter().any(|case| node_captures_stdout(&case.body))
+                || default.as_deref().is_some_and(node_captures_stdout)
+        }
+        crate::ir::Operation::Not { body }
+        | crate::ir::Operation::Redirect { body, .. }
+        | crate::ir::Operation::Foreach { body, .. }
+        | crate::ir::Operation::Scope { body, .. }
+        | crate::ir::Operation::CaptureStdout { body, .. }
+        | crate::ir::Operation::Spawn { body, .. } => node_captures_stdout(body),
+        crate::ir::Operation::Exec { .. }
+        | crate::ir::Operation::Test { .. }
+        | crate::ir::Operation::ExpandWords { .. }
+        | crate::ir::Operation::SetVariable { .. }
+        | crate::ir::Operation::SetEnvironment { .. }
+        | crate::ir::Operation::SetWorkingDirectory { .. }
+        | crate::ir::Operation::FileRead { .. }
+        | crate::ir::Operation::FileWrite { .. }
+        | crate::ir::Operation::FileRemove { .. }
+        | crate::ir::Operation::FileMetadata { .. }
+        | crate::ir::Operation::FileSetMetadata { .. }
+        | crate::ir::Operation::NetworkRequest { .. }
+        | crate::ir::Operation::ClockRead { .. }
+        | crate::ir::Operation::RandomBytes { .. }
+        | crate::ir::Operation::Wait { .. }
+        | crate::ir::Operation::SendSignal { .. }
+        | crate::ir::Operation::TaskCall { .. }
+        | crate::ir::Operation::InterpreterCall { .. }
+        | crate::ir::Operation::OpaqueCapsule { .. } => false,
     }
 }
 
-fn rust_node_uses_arguments(node: &crate::ir::Node) -> bool {
-    fn expression(value: &crate::ir::TextExpression) -> bool {
-        value
-            .parts
-            .iter()
-            .any(|part| matches!(part, crate::ir::TextPart::Argument { .. }))
+/// Whether the tree assigns to a shell-local name.
+fn rust_node_sets_variables(node: &crate::ir::Node) -> bool {
+    if matches!(
+        node.operation,
+        crate::ir::Operation::SetVariable { .. } | crate::ir::Operation::CaptureStdout { .. }
+    ) {
+        return true;
     }
     match &node.operation {
+        crate::ir::Operation::NoOp
+        | crate::ir::Operation::WriteStdout { .. }
+        | crate::ir::Operation::Exit { .. } => false,
+        crate::ir::Operation::Sequence { nodes, .. }
+        | crate::ir::Operation::Pipeline { nodes, .. }
+        | crate::ir::Operation::Parallel { nodes } => nodes.iter().any(rust_node_sets_variables),
+        crate::ir::Operation::Condition {
+            predicate,
+            if_true,
+            if_false,
+        } => {
+            rust_node_sets_variables(predicate)
+                || rust_node_sets_variables(if_true)
+                || if_false.as_deref().is_some_and(rust_node_sets_variables)
+        }
+        crate::ir::Operation::While { condition, body } => {
+            rust_node_sets_variables(condition) || rust_node_sets_variables(body)
+        }
+        crate::ir::Operation::TryFinally { body, finalizer } => {
+            rust_node_sets_variables(body) || rust_node_sets_variables(finalizer)
+        }
+        crate::ir::Operation::Match { cases, default, .. } => {
+            cases
+                .iter()
+                .any(|case| rust_node_sets_variables(&case.body))
+                || default.as_deref().is_some_and(rust_node_sets_variables)
+        }
+        crate::ir::Operation::Not { body }
+        | crate::ir::Operation::Redirect { body, .. }
+        | crate::ir::Operation::Foreach { body, .. }
+        | crate::ir::Operation::Scope { body, .. }
+        | crate::ir::Operation::CaptureStdout { body, .. }
+        | crate::ir::Operation::Spawn { body, .. } => rust_node_sets_variables(body),
+        crate::ir::Operation::Exec { .. }
+        | crate::ir::Operation::Test { .. }
+        | crate::ir::Operation::ExpandWords { .. }
+        | crate::ir::Operation::SetVariable { .. }
+        | crate::ir::Operation::SetEnvironment { .. }
+        | crate::ir::Operation::SetWorkingDirectory { .. }
+        | crate::ir::Operation::FileRead { .. }
+        | crate::ir::Operation::FileWrite { .. }
+        | crate::ir::Operation::FileRemove { .. }
+        | crate::ir::Operation::FileMetadata { .. }
+        | crate::ir::Operation::FileSetMetadata { .. }
+        | crate::ir::Operation::NetworkRequest { .. }
+        | crate::ir::Operation::ClockRead { .. }
+        | crate::ir::Operation::RandomBytes { .. }
+        | crate::ir::Operation::Wait { .. }
+        | crate::ir::Operation::SendSignal { .. }
+        | crate::ir::Operation::TaskCall { .. }
+        | crate::ir::Operation::InterpreterCall { .. }
+        | crate::ir::Operation::OpaqueCapsule { .. } => false,
+    }
+}
+
+/// The shape a `case` pattern reduces to.
+///
+/// Every pattern in the modelled subset is one of these, and each becomes a
+/// single expression in the generated program. A generic matcher walking a list
+/// of pieces would be code the reader of the migration has to maintain and the
+/// script never needed — and a plan that used `*` and not `?` would carry a
+/// branch of it that nothing reaches.
+enum PatternShape<'a> {
+    /// `abc` — one exact string.
+    Exact(String),
+    /// `*` — anything, including nothing.
+    Anything,
+    /// `*abc*` — the text appears somewhere.
+    Contains(String),
+    /// `abc*` — the text is at the front.
+    Prefix(String),
+    /// `*abc` — the text is at the back.
+    Suffix(String),
+    /// `abc*def` — a front and a back that do not overlap.
+    PrefixAndSuffix { prefix: String, suffix: String },
+    /// `a?c` — a front, a back, and exactly `gap` characters between them.
+    FixedGap {
+        prefix: String,
+        suffix: String,
+        gap: usize,
+    },
+    /// Anything else, which is refused rather than compiled.
+    Unsupported(&'a str),
+}
+
+/// Reduce a pattern to the shape that describes it.
+///
+/// The `?` in `a?c` is a character rather than a byte, so a shape carrying one
+/// counts characters; the shapes that do not carry a `?` compare bytes, which
+/// is the same answer and a shorter expression.
+///
+/// A pattern with a literal between two runs — `a*b*c` — has no single
+/// expression, because finding the middle needs a search that can back up. It
+/// is refused, which says so out loud rather than emitting a machine to do it.
+fn pattern_shape(pattern: &crate::ir::PatternExpression) -> PatternShape<'_> {
+    let mut literals: Vec<String> = Vec::new();
+    let mut runs = 0_usize;
+    let mut gap = 0_usize;
+    let mut leading_run = false;
+    let mut trailing_run = false;
+    let mut previous_was_literal = false;
+    for (index, piece) in pattern.pieces.iter().enumerate() {
+        let last = index + 1 == pattern.pieces.len();
+        match piece {
+            crate::ir::PatternPiece::Literal { value } => {
+                let [crate::ir::TextPart::Literal { value }] = value.parts.as_slice() else {
+                    return PatternShape::Unsupported("a pattern piece is not literal text");
+                };
+                if previous_was_literal {
+                    // Two literals in a row cannot happen in a canonical
+                    // pattern, and joining them here would hide it if it did.
+                    return PatternShape::Unsupported("a pattern has adjacent literals");
+                }
+                previous_was_literal = true;
+                literals.push(value.clone());
+            }
+            crate::ir::PatternPiece::AnyRun => {
+                previous_was_literal = false;
+                runs += 1;
+                if index == 0 {
+                    leading_run = true;
+                }
+                if last {
+                    trailing_run = true;
+                }
+            }
+            crate::ir::PatternPiece::AnyCharacter => {
+                previous_was_literal = false;
+                gap += 1;
+            }
+        }
+    }
+    if runs > 0 && gap > 0 {
+        return PatternShape::Unsupported("a pattern mixes `*` and `?`");
+    }
+    if runs > 1 && !(leading_run && trailing_run && runs == 2) {
+        return PatternShape::Unsupported("a pattern has a literal between two runs");
+    }
+    match (runs, gap, literals.as_slice()) {
+        (0, 0, []) => PatternShape::Exact(String::new()),
+        (0, 0, [exact]) => PatternShape::Exact(exact.clone()),
+        (1, 0, []) => PatternShape::Anything,
+        (2, 0, [infix]) => PatternShape::Contains(infix.clone()),
+        (1, 0, [text]) if leading_run => PatternShape::Suffix(text.clone()),
+        (1, 0, [text]) if trailing_run => PatternShape::Prefix(text.clone()),
+        (1, 0, [prefix, suffix]) => PatternShape::PrefixAndSuffix {
+            prefix: prefix.clone(),
+            suffix: suffix.clone(),
+        },
+        (0, gap, []) if gap > 0 => PatternShape::FixedGap {
+            prefix: String::new(),
+            suffix: String::new(),
+            gap,
+        },
+        (0, gap, [prefix]) if gap > 0 => PatternShape::FixedGap {
+            prefix: prefix.clone(),
+            suffix: String::new(),
+            gap,
+        },
+        (0, gap, [prefix, suffix]) if gap > 0 => PatternShape::FixedGap {
+            prefix: prefix.clone(),
+            suffix: suffix.clone(),
+            gap,
+        },
+        _ => PatternShape::Unsupported("a pattern this does not reduce to one expression"),
+    }
+}
+
+/// The bool a `test` predicate is.
+fn rust_test_condition(
+    predicate: &crate::ir::TestPredicate,
+    locals: Locals,
+) -> Result<String, String> {
+    Ok(match predicate {
+        crate::ir::TestPredicate::NonEmpty { value } => {
+            format!("!{}.is_empty()", rust_expression(value, locals)?)
+        }
+        crate::ir::TestPredicate::Empty { value } => {
+            format!("{}.is_empty()", rust_expression(value, locals)?)
+        }
+        crate::ir::TestPredicate::StringEqual { left, right } => {
+            format!(
+                "{} == {}",
+                rust_expression(left, locals)?,
+                rust_expression(right, locals)?
+            )
+        }
+        crate::ir::TestPredicate::StringNotEqual { left, right } => {
+            format!(
+                "{} != {}",
+                rust_expression(left, locals)?,
+                rust_expression(right, locals)?
+            )
+        }
+        crate::ir::TestPredicate::StartsWith { value, prefix } => {
+            format!(
+                "{}.starts_with({})",
+                rust_expression(value, locals)?,
+                rust_needle(prefix)
+            )
+        }
+        crate::ir::TestPredicate::EndsWith { value, suffix } => {
+            format!(
+                "{}.ends_with({})",
+                rust_expression(value, locals)?,
+                rust_needle(suffix)
+            )
+        }
+        crate::ir::TestPredicate::Contains { value, infix } => {
+            format!(
+                "{}.contains({})",
+                rust_expression(value, locals)?,
+                rust_needle(infix)
+            )
+        }
+    })
+}
+
+/// A needle for `contains`, `starts_with` and `ends_with`.
+///
+/// A one-character needle is written as a `char`. The string form compiles, but
+/// `clippy::pedantic` rejects it — and the project receiving this code decides
+/// which lints it runs, not the generator.
+fn rust_needle(text: &str) -> String {
+    let mut characters = text.chars();
+    match (characters.next(), characters.next()) {
+        (Some(single), None) => format!("{single:?}"),
+        _ => format!("{text:?}"),
+    }
+}
+
+/// The Rust expression that tests `subject` against a `case` pattern.
+fn rust_pattern_test(
+    pattern: &crate::ir::PatternExpression,
+    subject: &str,
+) -> Result<String, String> {
+    Ok(match pattern_shape(pattern) {
+        PatternShape::Exact(exact) => format!("{subject} == {exact:?}"),
+        PatternShape::Anything => "true".to_owned(),
+        PatternShape::Contains(infix) => {
+            format!("{subject}.contains({})", rust_needle(&infix))
+        }
+        PatternShape::Prefix(prefix) => {
+            format!("{subject}.starts_with({})", rust_needle(&prefix))
+        }
+        PatternShape::Suffix(suffix) => {
+            format!("{subject}.ends_with({})", rust_needle(&suffix))
+        }
+        // The length test is what stops `ab` from matching `a*b` by using its
+        // one `b` as both ends.
+        PatternShape::PrefixAndSuffix { prefix, suffix } => format!(
+            "{subject}.len() >= {} && {subject}.starts_with({}) && {subject}.ends_with({})",
+            prefix.len() + suffix.len(),
+            rust_needle(&prefix),
+            rust_needle(&suffix)
+        ),
+        PatternShape::FixedGap {
+            prefix,
+            suffix,
+            gap,
+        } => format!(
+            "{subject}.chars().count() == {} && {subject}.starts_with({}) && {subject}.ends_with({})",
+            prefix.chars().count() + suffix.chars().count() + gap,
+            rust_needle(&prefix),
+            rust_needle(&suffix)
+        ),
+        PatternShape::Unsupported(reason) => {
+            return Err(format!("DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: {reason}"));
+        }
+    })
+}
+
+/// The Go expression that tests `subject` against a `case` pattern.
+fn go_pattern_test(
+    pattern: &crate::ir::PatternExpression,
+    subject: &str,
+) -> Result<String, String> {
+    Ok(match pattern_shape(pattern) {
+        PatternShape::Exact(exact) => format!("{subject} == {}", go_string(&exact)?),
+        PatternShape::Anything => "true".to_owned(),
+        PatternShape::Contains(infix) => {
+            format!("strings.Contains({subject}, {})", go_string(&infix)?)
+        }
+        PatternShape::Prefix(prefix) => {
+            format!("strings.HasPrefix({subject}, {})", go_string(&prefix)?)
+        }
+        PatternShape::Suffix(suffix) => {
+            format!("strings.HasSuffix({subject}, {})", go_string(&suffix)?)
+        }
+        PatternShape::PrefixAndSuffix { prefix, suffix } => format!(
+            "len({subject}) >= {} && strings.HasPrefix({subject}, {}) && strings.HasSuffix({subject}, {})",
+            prefix.len() + suffix.len(),
+            go_string(&prefix)?,
+            go_string(&suffix)?
+        ),
+        PatternShape::FixedGap {
+            prefix,
+            suffix,
+            gap,
+        } => format!(
+            "utf8.RuneCountInString({subject}) == {} && strings.HasPrefix({subject}, {}) && strings.HasSuffix({subject}, {})",
+            prefix.chars().count() + suffix.chars().count() + gap,
+            go_string(&prefix)?,
+            go_string(&suffix)?
+        ),
+        PatternShape::Unsupported(reason) => {
+            return Err(format!("DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: {reason}"));
+        }
+    })
+}
+
+/// Which packages the compiled `case` patterns under this node need.
+///
+/// A pattern becomes an expression rather than a call into a matcher, so what
+/// the generated Go imports follows from the shapes those expressions take:
+/// every shape but an exact comparison calls `strings`, and only a `?` counts
+/// characters.
+fn go_pattern_packages(node: &crate::ir::Node) -> (bool, bool) {
+    let mut strings = false;
+    let mut utf8 = false;
+    if let crate::ir::Operation::Match { cases, .. } = &node.operation {
+        for case in cases {
+            match pattern_shape(&case.pattern) {
+                PatternShape::Exact(_) | PatternShape::Anything | PatternShape::Unsupported(_) => {}
+                PatternShape::FixedGap { .. } => {
+                    strings = true;
+                    utf8 = true;
+                }
+                PatternShape::Contains(_)
+                | PatternShape::Prefix(_)
+                | PatternShape::Suffix(_)
+                | PatternShape::PrefixAndSuffix { .. } => strings = true,
+            }
+        }
+    }
+    visit_node(node, |child| {
+        let (child_strings, child_utf8) = go_pattern_packages(child);
+        strings |= child_strings;
+        utf8 |= child_utf8;
+    });
+    (strings, utf8)
+}
+
+/// Whether any command under this node has a descriptor redirected.
+fn rust_node_redirects(node: &crate::ir::Node) -> bool {
+    if matches!(node.operation, crate::ir::Operation::Redirect { .. }) {
+        return true;
+    }
+    let mut found = false;
+    visit_node(node, |child| found |= rust_node_redirects(child));
+    found
+}
+
+/// Whether every path through this node ends the task.
+///
+/// A statement after one cannot run, and emitting it anyway produces code the
+/// generator's own `-D warnings` gate rejects as unreachable. Suppressing the
+/// warning would keep the dead statement in the output; dropping it is what the
+/// shell does at run time, so the two programs still agree.
+///
+/// Conservative in the safe direction: `false` for anything this cannot prove,
+/// which at worst emits a statement that does run.
+fn node_always_exits(node: &crate::ir::Node) -> bool {
+    match &node.operation {
+        crate::ir::Operation::Exit { .. } => true,
+        // A sequence ends the task if any of its statements does, whatever
+        // `on_failure` says: the ones after it are the unreachable part.
+        crate::ir::Operation::Sequence { nodes, .. } => nodes.iter().any(node_always_exits),
+        // Every arm has to end it, and an absent default is an arm that runs
+        // nothing and returns.
+        crate::ir::Operation::Match { cases, default, .. } => {
+            default.as_deref().is_some_and(node_always_exits)
+                && cases.iter().all(|case| node_always_exits(&case.body))
+        }
+        // Without an `else` the false branch returns.
+        crate::ir::Operation::Condition {
+            if_true, if_false, ..
+        } => node_always_exits(if_true) && if_false.as_deref().is_some_and(node_always_exits),
+        crate::ir::Operation::Not { body }
+        | crate::ir::Operation::Redirect { body, .. }
+        | crate::ir::Operation::Scope { body, .. } => node_always_exits(body),
+        // A loop may run its body no times, a substitution and a pipeline stage
+        // run in their own process, and the rest start no task to end.
+        crate::ir::Operation::While { .. }
+        | crate::ir::Operation::Foreach { .. }
+        | crate::ir::Operation::Pipeline { .. }
+        | crate::ir::Operation::Parallel { .. }
+        | crate::ir::Operation::CaptureStdout { .. }
+        | crate::ir::Operation::Spawn { .. }
+        | crate::ir::Operation::TryFinally { .. }
+        | crate::ir::Operation::Exec { .. }
+        | crate::ir::Operation::ExpandWords { .. }
+        | crate::ir::Operation::NoOp
+        | crate::ir::Operation::WriteStdout { .. }
+        | crate::ir::Operation::Test { .. }
+        | crate::ir::Operation::SetVariable { .. }
+        | crate::ir::Operation::SetEnvironment { .. }
+        | crate::ir::Operation::SetWorkingDirectory { .. }
+        | crate::ir::Operation::Wait { .. }
+        | crate::ir::Operation::SendSignal { .. }
+        | crate::ir::Operation::FileRead { .. }
+        | crate::ir::Operation::FileWrite { .. }
+        | crate::ir::Operation::FileRemove { .. }
+        | crate::ir::Operation::FileMetadata { .. }
+        | crate::ir::Operation::FileSetMetadata { .. }
+        | crate::ir::Operation::NetworkRequest { .. }
+        | crate::ir::Operation::ClockRead { .. }
+        | crate::ir::Operation::RandomBytes { .. }
+        | crate::ir::Operation::TaskCall { .. }
+        | crate::ir::Operation::InterpreterCall { .. }
+        | crate::ir::Operation::OpaqueCapsule { .. } => false,
+    }
+}
+
+/// The statements of a sequence that can run.
+///
+/// Everything after the first one that always ends the task is unreachable.
+fn reachable_nodes(nodes: &[crate::ir::Node]) -> &[crate::ir::Node] {
+    match nodes.iter().position(node_always_exits) {
+        Some(index) => &nodes[..=index],
+        None => nodes,
+    }
+}
+
+/// The literal status an `Operation::Exit` ends with.
+///
+/// The frontend refuses a status it cannot read, so a plan that reaches a
+/// generator carries a decimal integer. Reducing it here rather than in the
+/// generated program keeps the arithmetic in one place, and every measured
+/// shell reduces modulo 256.
+fn rust_exit_status(status: &crate::ir::TextExpression) -> Result<i32, String> {
+    let [crate::ir::TextPart::Literal { value }] = status.parts.as_slice() else {
+        return Err(
+            "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: exit status must be a literal integer".into(),
+        );
+    };
+    let parsed: i64 = value
+        .trim()
+        .parse()
+        .map_err(|error| format!("DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: exit status: {error}"))?;
+    i32::try_from(parsed.rem_euclid(256))
+        .map_err(|error| format!("DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: exit status: {error}"))
+}
+
+/// Whether the generated program will name `Command` at all.
+///
+/// A plan made only of `Test` nodes starts no process, and an unused import is a
+/// hard error under the `-D warnings` gate the generated Rust is checked with —
+/// so emitting the import unconditionally made such a plan ungeneratable.
+fn rust_node_starts_a_process(node: &crate::ir::Node) -> bool {
+    match &node.operation {
+        crate::ir::Operation::NoOp
+        | crate::ir::Operation::WriteStdout { .. }
+        | crate::ir::Operation::Exit { .. } => false,
+        crate::ir::Operation::Exec { .. }
+        | crate::ir::Operation::Pipeline { .. }
+        | crate::ir::Operation::InterpreterCall { .. } => true,
+        crate::ir::Operation::Sequence { nodes, .. } | crate::ir::Operation::Parallel { nodes } => {
+            nodes.iter().any(rust_node_starts_a_process)
+        }
+        crate::ir::Operation::Condition {
+            predicate,
+            if_true,
+            if_false,
+        } => {
+            rust_node_starts_a_process(predicate)
+                || rust_node_starts_a_process(if_true)
+                || if_false
+                    .as_ref()
+                    .is_some_and(|node| rust_node_starts_a_process(node))
+        }
+        crate::ir::Operation::Match { cases, default, .. } => {
+            cases
+                .iter()
+                .any(|case| rust_node_starts_a_process(&case.body))
+                || default
+                    .as_ref()
+                    .is_some_and(|node| rust_node_starts_a_process(node))
+        }
+        crate::ir::Operation::Redirect { body, .. }
+        | crate::ir::Operation::Foreach { body, .. }
+        | crate::ir::Operation::Scope { body, .. }
+        | crate::ir::Operation::Not { body }
+        | crate::ir::Operation::CaptureStdout { body, .. }
+        | crate::ir::Operation::Spawn { body, .. } => rust_node_starts_a_process(body),
+        crate::ir::Operation::While {
+            condition: first,
+            body: second,
+        }
+        | crate::ir::Operation::TryFinally {
+            body: first,
+            finalizer: second,
+        } => rust_node_starts_a_process(first) || rust_node_starts_a_process(second),
+        // Listed rather than left to a wildcard: a `_` arm here answered "no" for
+        // `While`, and the generated program then named `Command` without
+        // importing it. A new operation must be classified, not defaulted.
+        crate::ir::Operation::Test { .. }
+        | crate::ir::Operation::ExpandWords { .. }
+        | crate::ir::Operation::SetVariable { .. }
+        | crate::ir::Operation::SetEnvironment { .. }
+        | crate::ir::Operation::SetWorkingDirectory { .. }
+        | crate::ir::Operation::FileRead { .. }
+        | crate::ir::Operation::FileWrite { .. }
+        | crate::ir::Operation::FileRemove { .. }
+        | crate::ir::Operation::FileMetadata { .. }
+        | crate::ir::Operation::FileSetMetadata { .. }
+        | crate::ir::Operation::NetworkRequest { .. }
+        | crate::ir::Operation::ClockRead { .. }
+        | crate::ir::Operation::RandomBytes { .. }
+        | crate::ir::Operation::Wait { .. }
+        | crate::ir::Operation::OpaqueCapsule { .. }
+        | crate::ir::Operation::SendSignal { .. } => false,
+        // A call runs whatever the callee runs, and the callee is a task of the
+        // same plan — so the decision is made over every task rather than
+        // followed from here. Assuming `true` was right while a plan had one
+        // task; with functions it puts an import in a program that starts no
+        // process, which its own `-D warnings` build rejects.
+        crate::ir::Operation::TaskCall { .. } => false,
+    }
+}
+
+/// Whether the generated program will call the pipeline helper.
+///
+/// Written over the shared walk rather than over a hand-listed few operations:
+/// the hand-listed version knew about `Sequence` and `Condition` only, so a
+/// pipeline inside a loop or a `case` arm emitted a call to a helper the
+/// generator had decided not to define.
+fn rust_node_uses_pipeline(node: &crate::ir::Node) -> bool {
+    if matches!(node.operation, crate::ir::Operation::Pipeline { .. }) {
+        return true;
+    }
+    let mut found = false;
+    visit_node(node, |child| found |= rust_node_uses_pipeline(child));
+    found
+}
+
+fn rust_node_uses_arguments(node: &crate::ir::Node) -> bool {
+    node_has_expression_part(node, &|part| {
+        matches!(part, crate::ir::TextPart::Argument { .. })
+    })
+}
+
+/// Whether any expression under `node` has a part the predicate accepts.
+fn node_has_expression_part<F: Fn(&crate::ir::TextPart) -> bool>(
+    node: &crate::ir::Node,
+    wanted: &F,
+) -> bool {
+    let expression = |value: &crate::ir::TextExpression| value.parts.iter().any(wanted);
+    match &node.operation {
+        crate::ir::Operation::NoOp => false,
+        crate::ir::Operation::WriteStdout { contents } => expression(contents),
+        crate::ir::Operation::Exit { status, .. } => expression(status),
         crate::ir::Operation::Exec {
             argv,
             environment,
@@ -3571,31 +5830,166 @@ fn rust_node_uses_arguments(node: &crate::ir::Node) -> bool {
                 || environment.iter().any(|value| expression(&value.value))
                 || working_directory.as_ref().is_some_and(expression)
         }
-        crate::ir::Operation::Sequence { nodes } | crate::ir::Operation::Pipeline { nodes, .. } => {
-            nodes.iter().any(rust_node_uses_arguments)
-        }
+        crate::ir::Operation::Sequence { nodes, .. }
+        | crate::ir::Operation::Pipeline { nodes, .. } => nodes
+            .iter()
+            .any(|child| node_has_expression_part(child, wanted)),
         crate::ir::Operation::Condition {
             predicate,
             if_true,
             if_false,
         } => {
-            rust_node_uses_arguments(predicate)
-                || rust_node_uses_arguments(if_true)
-                || if_false.as_deref().is_some_and(rust_node_uses_arguments)
+            node_has_expression_part(predicate, wanted)
+                || node_has_expression_part(if_true, wanted)
+                || if_false
+                    .as_ref()
+                    .is_some_and(|child| node_has_expression_part(child, wanted))
         }
-        _ => false,
+        crate::ir::Operation::While { condition, body } => {
+            node_has_expression_part(condition, wanted) || node_has_expression_part(body, wanted)
+        }
+        crate::ir::Operation::Test { predicate } => match predicate {
+            crate::ir::TestPredicate::NonEmpty { value }
+            | crate::ir::TestPredicate::Empty { value } => value.parts.iter().any(wanted),
+            crate::ir::TestPredicate::StringEqual { left, right }
+            | crate::ir::TestPredicate::StringNotEqual { left, right } => {
+                left.parts.iter().any(wanted) || right.parts.iter().any(wanted)
+            }
+            crate::ir::TestPredicate::StartsWith { value, .. }
+            | crate::ir::TestPredicate::EndsWith { value, .. }
+            | crate::ir::TestPredicate::Contains { value, .. } => value.parts.iter().any(wanted),
+        },
+        crate::ir::Operation::Not { body }
+        | crate::ir::Operation::Foreach { body, .. }
+        | crate::ir::Operation::Scope { body, .. }
+        | crate::ir::Operation::CaptureStdout { body, .. }
+        | crate::ir::Operation::Spawn { body, .. } => node_has_expression_part(body, wanted),
+        // Destructured without `..`: the subject is an expression, and reading
+        // it with a wildcard is how `case "$1" in` produced a program that
+        // named `deshell_args` without binding it. A pattern piece carries one
+        // too.
+        crate::ir::Operation::Match {
+            value,
+            cases,
+            default,
+        } => {
+            expression(value)
+                || cases.iter().any(|case| {
+                    case.pattern.pieces.iter().any(|piece| match piece {
+                        crate::ir::PatternPiece::Literal { value } => expression(value),
+                        crate::ir::PatternPiece::AnyRun | crate::ir::PatternPiece::AnyCharacter => {
+                            false
+                        }
+                    }) || node_has_expression_part(&case.body, wanted)
+                })
+                || default
+                    .as_ref()
+                    .is_some_and(|child| node_has_expression_part(child, wanted))
+        }
+        crate::ir::Operation::TryFinally { body, finalizer } => {
+            node_has_expression_part(body, wanted) || node_has_expression_part(finalizer, wanted)
+        }
+        crate::ir::Operation::Parallel { nodes } => nodes
+            .iter()
+            .any(|child| node_has_expression_part(child, wanted)),
+        // Each of these carries an expression, and answering `false` for the
+        // lot of them is how `x="$1"` produced a program that named
+        // `deshell_args` without binding it. A `_` arm had already done the
+        // same thing for `While`; listing the operations did not help while the
+        // list said "no" for operations that hold expressions.
+        crate::ir::Operation::ExpandWords {
+            value,
+            field_splitting,
+            ..
+        } => {
+            expression(value)
+                || match field_splitting {
+                    crate::ir::FieldSplitting::PosixIfs { ifs } => expression(ifs),
+                    crate::ir::FieldSplitting::None => false,
+                }
+        }
+        crate::ir::Operation::SetVariable { value, .. } => expression(value),
+        // The value is optional: `unset` removes the variable and holds no
+        // expression to walk.
+        crate::ir::Operation::SetEnvironment { value, .. } => match value {
+            Some(value) => expression(value),
+            None => false,
+        },
+        crate::ir::Operation::SetWorkingDirectory { path } => expression(path),
+        crate::ir::Operation::FileRead { path }
+        | crate::ir::Operation::FileRemove { path }
+        | crate::ir::Operation::FileMetadata { path, .. }
+        | crate::ir::Operation::FileSetMetadata { path, .. } => expression(path),
+        crate::ir::Operation::FileWrite { path, contents, .. } => {
+            expression(path) || expression(contents)
+        }
+        crate::ir::Operation::NetworkRequest { method, uri } => {
+            expression(method) || expression(uri)
+        }
+        // A call's arguments are expressions evaluated by the caller, so `f
+        // "$1"` reads the caller's arguments even though the callee's body does
+        // not. Answering `false` here left the generated `main` naming a
+        // binding it had decided not to emit.
+        // Destructured without `..`: a redirection's target is an expression,
+        // and `>>"${OUT}"` produced a program that named `deshell_vars` without
+        // declaring it.
+        crate::ir::Operation::Redirect { redirections, body } => {
+            redirections.iter().any(|redirection| match redirection {
+                crate::ir::Redirection::Read { path, .. }
+                | crate::ir::Redirection::Write { path, .. } => expression(path),
+                crate::ir::Redirection::Duplicate { .. } | crate::ir::Redirection::Close { .. } => {
+                    false
+                }
+            }) || node_has_expression_part(body, wanted)
+        }
+        crate::ir::Operation::TaskCall {
+            task: _,
+            arguments,
+            positional,
+        } => {
+            arguments.iter().any(|argument| expression(&argument.value))
+                || positional.iter().any(expression)
+        }
+        // These hold no expression at all, which is why they can say no.
+        crate::ir::Operation::ClockRead { .. }
+        | crate::ir::Operation::RandomBytes { .. }
+        | crate::ir::Operation::Wait { .. }
+        | crate::ir::Operation::SendSignal { .. }
+        | crate::ir::Operation::InterpreterCall { .. }
+        | crate::ir::Operation::OpaqueCapsule { .. } => false,
     }
 }
 
-fn emit_rust_command(
-    argv: &[crate::ir::TextExpression],
-    environment: &[crate::ir::NamedExpression],
-    working_directory: Option<&crate::ir::TextExpression>,
-    variable: &str,
+/// The inputs of [`emit_rust_command`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`emit_rust_command`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct EmitRustCommandArgs<'a> {
+    /// Whether the program keeps a map of shell-local names. See [`Locals`].
+    locals: Locals,
+    argv: &'a [crate::ir::TextExpression],
+    environment: &'a [crate::ir::NamedExpression],
+    working_directory: Option<&'a crate::ir::TextExpression>,
+    variable: &'a str,
     force_mutable: bool,
-    output: &mut String,
+    output: &'a mut String,
     depth: usize,
-) -> Result<(), String> {
+}
+
+fn emit_rust_command(parts: EmitRustCommandArgs<'_>) -> Result<(), String> {
+    // Destructured without `..`: see `EmitRustCommandArgs`.
+    let EmitRustCommandArgs {
+        locals,
+        argv,
+        environment,
+        working_directory,
+        variable,
+        force_mutable,
+        output,
+        depth,
+    } = parts;
     let indent = "    ".repeat(depth);
     let program = argv
         .first()
@@ -3604,62 +5998,153 @@ fn emit_rust_command(
         force_mutable || argv.len() > 1 || !environment.is_empty() || working_directory.is_some();
     output.push_str(&format!(
         "{indent}let {mutable}{variable} = Command::new({});\n",
-        rust_expression(program)?,
+        rust_expression_borrowed(program, locals)?,
         mutable = if mutable { "mut " } else { "" },
     ));
     for argument in &argv[1..] {
         output.push_str(&format!(
             "{indent}{variable}.arg({});\n",
-            rust_expression(argument)?
+            rust_expression_borrowed(argument, locals)?
         ));
     }
     for value in environment {
         output.push_str(&format!(
             "{indent}{variable}.env({:?}, {});\n",
             value.name,
-            rust_expression(&value.value)?
+            rust_expression(&value.value, locals)?
         ));
     }
     if let Some(directory) = working_directory {
         output.push_str(&format!(
             "{indent}{variable}.current_dir({});\n",
-            rust_expression(directory)?
+            rust_expression(directory, locals)?
         ));
     }
     Ok(())
 }
 
-fn rust_expression(expression: &crate::ir::TextExpression) -> Result<String, String> {
-    let mut output = "{ let mut deshell_value = String::new();".to_owned();
+/// The expression, as something that borrows rather than owns where it can.
+///
+/// `Command::new` and its friends take `impl AsRef<_>`, so a literal needs no
+/// `to_owned` — and `clippy` says so. Everywhere a `String` is required,
+/// [`rust_expression`] is the one to call.
+/// The expression as something of type `&str`.
+///
+/// Decided by how the expression was built rather than by reading the text it
+/// produced: a single literal is already a `&str`, and anything else is a
+/// `String` that needs borrowing.
+fn rust_expression_as_str(
+    expression: &crate::ir::TextExpression,
+    locals: Locals,
+) -> Result<String, String> {
+    if let [crate::ir::TextPart::Literal { value }] = expression.parts.as_slice() {
+        return Ok(format!("{value:?}"));
+    }
+    Ok(format!("&{}", rust_expression(expression, locals)?))
+}
+
+fn rust_expression_borrowed(
+    expression: &crate::ir::TextExpression,
+    locals: Locals,
+) -> Result<String, String> {
+    // An owning expression of one part ends in `.to_owned()`, which a caller
+    // taking `impl AsRef<_>` does not need and `clippy::pedantic` names.
+    // Trimming the suffix rather than rebuilding the expression keeps the two
+    // forms from drifting: the suffix is written in one place, just below.
+    let owned = rust_expression(expression, locals)?;
+    if expression.parts.len() == 1
+        && let Some(borrowed) = owned.strip_suffix(".to_owned()")
+    {
+        return Ok(borrowed.to_owned());
+    }
+    Ok(owned)
+}
+
+fn rust_expression(
+    expression: &crate::ir::TextExpression,
+    locals: Locals,
+) -> Result<String, String> {
+    // An expression of one part is that part. Building it with a `String::new()`
+    // and a `push_str` produces the same bytes and gives the reader of the
+    // migration four lines to read where one would do — and `$1` alone is the
+    // most common expression a script writes.
+    match expression.parts.as_slice() {
+        [crate::ir::TextPart::Literal { value }] => return Ok(format!("{value:?}.to_owned()")),
+        [crate::ir::TextPart::Variable { name }] => {
+            return Ok(format!("deshell_lookup({name:?}{})", locals.argument()));
+        }
+        [crate::ir::TextPart::Argument { name }] => {
+            return Ok(format!(
+                "deshell_argument(deshell_args, {})",
+                positional_index(name)?
+            ));
+        }
+        _ => {}
+    }
+    // Several parts become one `format!`, which reads like the word the script
+    // wrote: `"::error::input {} does not match tag {}"` beside the two values,
+    // rather than six statements appending to a buffer.
+    let mut template = String::new();
+    let mut values = Vec::new();
     for part in &expression.parts {
         match part {
             crate::ir::TextPart::Literal { value } => {
-                output.push_str(&format!(" deshell_value.push_str({value:?});"));
+                // Braces are the template's own syntax, so a literal one is
+                // written twice.
+                template.push_str(&value.replace('{', "{{").replace('}', "}}"));
             }
             crate::ir::TextPart::Variable { name } => {
-                output.push_str(&format!(
-                    " deshell_value.push_str(&std::env::var({name:?}).unwrap_or_default());"
-                ));
+                template.push_str("{}");
+                values.push(format!("deshell_lookup({name:?}{})", locals.argument()));
             }
             crate::ir::TextPart::Argument { name } => {
-                let index = name
-                    .parse::<usize>()
-                    .ok()
-                    .and_then(|index| index.checked_sub(1))
-                    .ok_or_else(|| format!("generator cannot bind named argument {name}"))?;
-                let lookup = if index == 0 {
-                    "deshell_args.first()".to_owned()
-                } else {
-                    format!("deshell_args.get({index})")
-                };
-                output.push_str(&format!(
-                    " deshell_value.push_str({lookup}.map(String::as_str).unwrap_or(\"\"));"
+                template.push_str("{}");
+                values.push(format!(
+                    "deshell_argument(deshell_args, {})",
+                    positional_index(name)?
                 ));
+            }
+            crate::ir::TextPart::DefaultValue {
+                name,
+                fallback,
+                empty_is_unset,
+            } => {
+                template.push_str("{}");
+                values.push(rust_default_value(name, fallback, *empty_is_unset, locals));
             }
         }
     }
-    output.push_str(" deshell_value }");
-    Ok(output)
+    Ok(format!(
+        "format!({template:?}{}{})",
+        if values.is_empty() { "" } else { ", " },
+        values.join(", ")
+    ))
+}
+
+/// The Rust expression a `${name-fallback}` is.
+///
+/// `:-` substitutes an empty value as well as an unset one, so the two forms
+/// cannot share a lookup: `unwrap_or_default` would turn `${x-d}` with `x=""`
+/// into `d`, which the shell does not. Locals shadow the environment here too —
+/// `${x:-d}` after `x=v` is `v`, and reading only the environment would give
+/// `d`.
+fn rust_default_value(name: &str, fallback: &str, empty_is_unset: bool, locals: Locals) -> String {
+    let argument = locals.argument();
+    if empty_is_unset {
+        format!(
+            "deshell_lookup_opt({name:?}{argument}).filter(|deshell_set| !deshell_set.is_empty()).unwrap_or_else(|| {fallback:?}.to_owned())"
+        )
+    } else {
+        format!("deshell_lookup_opt({name:?}{argument}).unwrap_or_else(|| {fallback:?}.to_owned())")
+    }
+}
+
+/// The zero-based index a `$N` reads.
+fn positional_index(name: &str) -> Result<usize, String> {
+    name.parse::<usize>()
+        .ok()
+        .and_then(|position| position.checked_sub(1))
+        .ok_or_else(|| format!("generator cannot bind named argument {name}"))
 }
 
 fn generate_go(plan: &crate::ir::Plan) -> Result<Vec<u8>, String> {
@@ -3668,12 +6153,46 @@ fn generate_go(plan: &crate::ir::Plan) -> Result<Vec<u8>, String> {
         .iter()
         .find(|task| task.name == plan.entrypoint)
         .ok_or_else(|| "generator entrypoint task is missing".to_owned())?;
-    if task.invocation.is_some() || !task.outputs.is_empty() {
-        return Err("generator does not support invocation metadata or task outputs".into());
+    for task in &plan.tasks {
+        if task.invocation.is_some() || !task.outputs.is_empty() {
+            return Err("generator does not support invocation metadata or task outputs".into());
+        }
     }
     let mut body = String::new();
     emit_go_node(&task.body, &mut body, 1)?;
-    let pipeline_helper = if rust_node_uses_pipeline(&task.body) {
+    // A shell function becomes a function, so the helpers a plan needs are
+    // decided over every task rather than over the entry alone.
+    let mut functions = String::new();
+    for other in plan.tasks.iter().filter(|other| other.name != task.name) {
+        if !rust_function_name(&other.name) {
+            return Err(format!(
+                "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: task name is not a Go identifier: {}",
+                other.name
+            ));
+        }
+        let mut other_body = String::new();
+        emit_go_node(&other.body, &mut other_body, 1)?;
+        functions.push_str(&format!(
+            concat!(
+                "// {name} is `{name}` from the retired shell, taking the\n",
+                "// arguments the call site passed it.\n",
+                "func {name}(deshellArgs []string) int {{\n",
+                "{locals}",
+                "\tdeshellLast := 0\n",
+                "{body}",
+                "\treturn deshellLast\n",
+                "}}\n\n"
+            ),
+            name = other.name,
+            locals = go_variable_binding(&other.body),
+            body = other_body,
+        ));
+    }
+    let pipeline_helper = if plan
+        .tasks
+        .iter()
+        .any(|task| rust_node_uses_pipeline(&task.body))
+    {
         concat!(
             "func deshellRunPipeline(commands []*exec.Cmd, pipefail bool) int {\n",
             "\tif len(commands) == 0 {\n\t\treturn 0\n\t}\n",
@@ -3710,7 +6229,38 @@ fn generate_go(plan: &crate::ir::Plan) -> Result<Vec<u8>, String> {
         ""
     };
     let uses_arguments = rust_node_uses_arguments(&task.body);
-    let argument_helper = if uses_arguments {
+    // `set -u` says an unset name and an empty one are different, so a helper
+    // that answers an empty string for both is a program with the option
+    // silently off.
+    // `echo` and `printf` both write to standard output, and both report 1 if
+    // the write fails, which is what the shell's builtins do.
+    let write_helper = if body.contains("deshellWrite(") || functions.contains("deshellWrite(") {
+        concat!(
+            "// deshellWrite writes to standard output, reporting 1 if the write\n",
+            "// fails. The shell's `echo` and `printf` both do, which is why a\n",
+            "// script whose reader has closed ends the way it does.\n",
+            "func deshellWrite(text string) int {\n",
+            "\tif _, err := os.Stdout.WriteString(text); err != nil {\n\t\treturn 1\n\t}\n",
+            "\treturn 0\n",
+            "}\n\n"
+        )
+    } else {
+        ""
+    };
+    let argument_helper = if uses_arguments && task.nounset {
+        concat!(
+            "// deshellArgument reads a positional argument the script requires\n",
+            "// to be there. The retired script ran under `set -u`, where reading\n",
+            "// one that was not passed ends the script rather than producing an\n",
+            "// empty string.\n",
+            "func deshellArgument(arguments []string, index int) string {\n",
+            "\tif len(arguments) > index {\n\t\treturn arguments[index]\n\t}\n",
+            "\tfmt.Fprintf(os.Stderr, \"$%d: unbound variable\\n\", index+1)\n",
+            "\tos.Exit(1)\n",
+            "\treturn \"\"\n",
+            "}\n\n"
+        )
+    } else if uses_arguments {
         concat!(
             "func deshellArgument(arguments []string, index int) string {\n",
             "\tif len(arguments) > index {\n\t\treturn arguments[index]\n\t}\n",
@@ -3725,11 +6275,124 @@ fn generate_go(plan: &crate::ir::Plan) -> Result<Vec<u8>, String> {
     } else {
         ""
     };
+    // A shell-local name is not an environment variable, so the generated program
+    // keeps its own map and consults it first — the order the shell resolves in.
+    // `os.Getenv` cannot tell unset from empty, which is the distinction `${x-d}`
+    // turns on, so the two default forms stay separate.
+    let go_uses_plain = plan.tasks.iter().any(|task| {
+        node_has_expression_part(&task.body, &|part| {
+            matches!(part, crate::ir::TextPart::Variable { .. })
+        })
+    });
+    let go_uses_defaults = plan
+        .tasks
+        .iter()
+        .any(|task| go_node_uses_defaults(&task.body));
+    let go_sets_variables = plan
+        .tasks
+        .iter()
+        .any(|task| rust_node_sets_variables(&task.body));
+    let lookup_helper = if (go_uses_plain || go_uses_defaults) && task.nounset {
+        concat!(
+            "func deshellLookup(locals map[string]string, name string) (string, bool) {\n",
+            "\tif value, ok := locals[name]; ok {\n\t\treturn value, true\n\t}\n",
+            "\treturn os.LookupEnv(name)\n",
+            "}\n\n",
+            "// deshellValue reads a name the script requires to be set. The\n",
+            "// retired script ran under `set -u`, where reading an unset name\n",
+            "// ends the script rather than producing an empty string.\n",
+            "func deshellValue(locals map[string]string, name string) string {\n",
+            "\tvalue, ok := deshellLookup(locals, name)\n",
+            "\tif !ok {\n",
+            "\t\tfmt.Fprintf(os.Stderr, \"%s: unbound variable\\n\", name)\n",
+            "\t\tos.Exit(1)\n",
+            "\t}\n",
+            "\treturn value\n",
+            "}\n\n"
+        )
+    } else if go_uses_plain || go_uses_defaults {
+        concat!(
+            "func deshellLookup(locals map[string]string, name string) (string, bool) {\n",
+            "\tif value, ok := locals[name]; ok {\n\t\treturn value, true\n\t}\n",
+            "\treturn os.LookupEnv(name)\n",
+            "}\n\n",
+            "func deshellValue(locals map[string]string, name string) string {\n",
+            "\tvalue, _ := deshellLookup(locals, name)\n",
+            "\treturn value\n",
+            "}\n\n"
+        )
+    } else {
+        ""
+    };
+    let default_helper = if go_uses_defaults {
+        concat!(
+            "func deshellDefaultEmpty(locals map[string]string, name string, fallback string) string {\n",
+            "\tif value, _ := deshellLookup(locals, name); value != \"\" {\n\t\treturn value\n\t}\n",
+            "\treturn fallback\n",
+            "}\n\n",
+            "func deshellDefaultUnset(locals map[string]string, name string, fallback string) string {\n",
+            "\tif value, ok := deshellLookup(locals, name); ok {\n\t\treturn value\n\t}\n",
+            "\treturn fallback\n",
+            "}\n\n"
+        )
+    } else {
+        ""
+    };
+    let variable_binding = if go_uses_plain || go_uses_defaults || go_sets_variables {
+        "\tdeshellVars := map[string]string{}\n"
+    } else {
+        ""
+    };
+    // Go rejects an unused import outright, and it rejects a missing one, so
+    // the list is decided from what the body needs rather than from a default.
+    // `strings` is used by a capture, which trims, and by the pattern matcher's
+    // prefix test; `unicode/utf8` only by the matcher, which steps over one
+    // character at a time.
+    let go_captures = plan
+        .tasks
+        .iter()
+        .any(|task| node_captures_stdout(&task.body));
+    // A run-time exit status is parsed and trimmed, which is the only place the
+    // generated Go needs `strconv`.
+    let go_parses_status = plan
+        .tasks
+        .iter()
+        .any(|task| go_node_checks_exit_status(&task.body));
+    let (pattern_strings, pattern_utf8) =
+        plan.tasks
+            .iter()
+            .fold((false, false), |(strings, utf8), task| {
+                let (task_strings, task_utf8) = go_pattern_packages(&task.body);
+                (strings || task_strings, utf8 || task_utf8)
+            });
+    // Go rejects an unused import and a missing one alike, so the list is built
+    // from what the body needs rather than chosen from a few shapes.
+    let imports = {
+        let mut names = vec!["fmt", "os", "os/exec"];
+        if go_parses_status {
+            names.push("strconv");
+        }
+        if go_captures || pattern_strings || go_parses_status {
+            names.push("strings");
+        }
+        if pattern_utf8 {
+            names.push("unicode/utf8");
+        }
+        names.sort_unstable();
+        format!(
+            "import (\n{}\n)\n\n",
+            names
+                .into_iter()
+                .map(|name| format!("\t\"{name}\""))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    };
     let source = format!(
         concat!(
             "// Code generated by de-shell. This file has no de-shell runtime dependency.\n",
             "package main\n\n",
-            "import (\n\t\"fmt\"\n\t\"os\"\n\t\"os/exec\"\n)\n\n",
+            "{imports}",
             "func deshellExitCode(err error) int {{\n",
             "\tif err == nil {{\n\t\treturn 0\n\t}}\n",
             "\tif exit, ok := err.(*exec.ExitError); ok {{\n\t\treturn exit.ExitCode()\n\t}}\n",
@@ -3737,20 +6400,63 @@ fn generate_go(plan: &crate::ir::Plan) -> Result<Vec<u8>, String> {
             "\treturn 127\n",
             "}}\n\n",
             "{pipeline_helper}",
-            "{argument_helper}",
-            "func main() {{\n",
+            "{write_helper}",
+            "{argument_helper}{lookup_helper}{default_helper}",
+            "{functions}",
+            "// deshellMain holds the retired script's own statements.\n",
+            "//\n",
+            "// A function rather than main because `set -e` stops the script at\n",
+            "// a failing statement, which is a return rather than a jump.\n",
+            "func deshellMain() int {{\n",
             "{argument_binding}",
+            "{variable_binding}",
             "\tdeshellLast := 0\n",
             "{body}",
-            "\tos.Exit(deshellLast)\n",
+            "\treturn deshellLast\n",
+            "}}\n\n",
+            "func main() {{\n",
+            "\tos.Exit(deshellMain())\n",
             "}}\n"
         ),
+        imports = imports,
         pipeline_helper = pipeline_helper,
+        write_helper = write_helper,
         argument_helper = argument_helper,
+        lookup_helper = lookup_helper,
+        default_helper = default_helper,
+        functions = functions,
         argument_binding = argument_binding,
+        variable_binding = variable_binding,
         body = body,
     );
     Ok(source.into_bytes())
+}
+
+/// Whether any `exit` under this node reads its status at run time.
+fn go_node_checks_exit_status(node: &crate::ir::Node) -> bool {
+    if let crate::ir::Operation::Exit { non_numeric, .. } = &node.operation
+        && matches!(non_numeric, crate::ir::NonNumericStatus::Ends { .. })
+    {
+        return true;
+    }
+    let mut found = false;
+    visit_node(node, |child| found |= go_node_checks_exit_status(child));
+    found
+}
+
+/// The shell-local map a Go function body needs, if it needs one.
+fn go_variable_binding(body: &crate::ir::Node) -> String {
+    let reads = node_has_expression_part(body, &|part| {
+        matches!(
+            part,
+            crate::ir::TextPart::Variable { .. } | crate::ir::TextPart::DefaultValue { .. }
+        )
+    });
+    if reads || rust_node_sets_variables(body) {
+        "\tdeshellVars := map[string]string{}\n".to_owned()
+    } else {
+        String::new()
+    }
 }
 
 fn emit_go_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> Result<(), String> {
@@ -3762,14 +6468,14 @@ fn emit_go_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> Re
             working_directory,
         } => {
             output.push_str(&format!("{indent}{{\n"));
-            emit_go_command(
+            emit_go_command(EmitGoCommandArgs {
                 argv,
                 environment,
-                working_directory.as_ref(),
-                "deshellCommand",
+                working_directory: working_directory.as_ref(),
+                variable: "deshellCommand",
                 output,
-                depth + 1,
-            )?;
+                depth: depth + 1,
+            })?;
             output.push_str(&format!(
                 "{indent}\tdeshellCommand.Stdin, deshellCommand.Stdout, deshellCommand.Stderr = os.Stdin, os.Stdout, os.Stderr\n"
             ));
@@ -3781,9 +6487,256 @@ fn emit_go_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> Re
                 indent = indent
             ));
         }
-        crate::ir::Operation::Sequence { nodes } => {
-            for child in nodes {
+        crate::ir::Operation::While { condition, body } => {
+            output.push_str(&format!("{indent}for {{\n"));
+            emit_go_node(condition, output, depth + 1)?;
+            output.push_str(&format!(
+                "{indent}\tif deshellLast != 0 {{\n{indent}\t\tdeshellLast = 0\n{indent}\t\tbreak\n{indent}\t}}\n"
+            ));
+            emit_go_node(body, output, depth + 1)?;
+            output.push_str(&format!("{indent}}}\n"));
+        }
+        crate::ir::Operation::Not { body } => {
+            emit_go_node(body, output, depth)?;
+            output.push_str(&format!(
+                concat!(
+                    "{indent}if deshellLast == 0 {{\n",
+                    "{indent}\tdeshellLast = 1\n",
+                    "{indent}}} else {{\n",
+                    "{indent}\tdeshellLast = 0\n",
+                    "{indent}}}\n"
+                ),
+                indent = indent
+            ));
+        }
+        crate::ir::Operation::Test { predicate } => {
+            // `test` succeeds with 0 and fails with 1, so the predicate becomes a
+            // bool and the node sets the running status from it.
+            let condition = match predicate {
+                crate::ir::TestPredicate::NonEmpty { value } => {
+                    format!("{} != \"\"", go_expression(value)?)
+                }
+                crate::ir::TestPredicate::Empty { value } => {
+                    format!("{} == \"\"", go_expression(value)?)
+                }
+                crate::ir::TestPredicate::StringEqual { left, right } => {
+                    format!("{} == {}", go_expression(left)?, go_expression(right)?)
+                }
+                crate::ir::TestPredicate::StringNotEqual { left, right } => {
+                    format!("{} != {}", go_expression(left)?, go_expression(right)?)
+                }
+                crate::ir::TestPredicate::StartsWith { value, prefix } => format!(
+                    "strings.HasPrefix({}, {})",
+                    go_expression(value)?,
+                    go_string(prefix)?
+                ),
+                crate::ir::TestPredicate::EndsWith { value, suffix } => format!(
+                    "strings.HasSuffix({}, {})",
+                    go_expression(value)?,
+                    go_string(suffix)?
+                ),
+                crate::ir::TestPredicate::Contains { value, infix } => format!(
+                    "strings.Contains({}, {})",
+                    go_expression(value)?,
+                    go_string(infix)?
+                ),
+            };
+            output.push_str(&format!(
+                concat!(
+                    "{indent}if {condition} {{\n",
+                    "{indent}\tdeshellLast = 0\n",
+                    "{indent}}} else {{\n",
+                    "{indent}\tdeshellLast = 1\n",
+                    "{indent}}}\n"
+                ),
+                indent = indent,
+                condition = condition
+            ));
+        }
+        // Running nothing succeeds, which is what the shell reports for an arm
+        // whose body is empty.
+        crate::ir::Operation::NoOp => {
+            output.push_str(&format!("{indent}deshellLast = 0\n"));
+        }
+        // A chain rather than a `switch` on the subject: an arm can be a
+        // pattern, and `switch` compares for equality. `switch { case cond: }`
+        // keeps the arms in one construct and reads the same way.
+        // A `case` with no matching arm and no `*` runs nothing and succeeds,
+        // which is the `default` clause.
+        crate::ir::Operation::Match {
+            value,
+            cases,
+            default,
+        } => {
+            // Go rejects an unused binding outright, and a `case` whose every
+            // arm matches anything leaves the subject unread. The word is still
+            // expanded, because the shell expands it.
+            let reads_subject = cases
+                .iter()
+                .any(|case| !matches!(pattern_shape(&case.pattern), PatternShape::Anything));
+            output.push_str(&format!(
+                "{indent}{}deshellSubject {}= {}\n{indent}switch {{\n",
+                if reads_subject { "" } else { "_ = " },
+                if reads_subject { ":" } else { "" },
+                go_expression(value)?
+            ));
+            for case in cases {
+                output.push_str(&format!(
+                    "{indent}case {}:\n",
+                    go_pattern_test(&case.pattern, "deshellSubject")?
+                ));
+                emit_go_node(&case.body, output, depth + 1)?;
+            }
+            output.push_str(&format!("{indent}default:\n"));
+            match default {
+                Some(default) => emit_go_node(default, output, depth + 1)?,
+                None => output.push_str(&format!("{indent}\tdeshellLast = 0\n")),
+            }
+            output.push_str(&format!("{indent}}}\n"));
+        }
+        crate::ir::Operation::Exit {
+            status,
+            non_numeric,
+        } => match non_numeric {
+            crate::ir::NonNumericStatus::Unreachable => {
+                output.push_str(&format!("{indent}os.Exit({})\n", rust_exit_status(status)?))
+            }
+            crate::ir::NonNumericStatus::Ends { status: ends } => output.push_str(&format!(
+                concat!(
+                    "{indent}{{\n",
+                    "{indent}\tdeshellStatus := {status}\n",
+                    "{indent}\tdeshellCode, deshellErr := strconv.ParseInt(",
+                    "strings.TrimSpace(deshellStatus), 10, 64)\n",
+                    "{indent}\tif deshellErr != nil {{\n",
+                    "{indent}\t\tfmt.Fprintf(os.Stderr,\n",
+                    "{indent}\t\t\t\"exit status %q is not a number\\n\",\n",
+                    "{indent}\t\t\tdeshellStatus)\n",
+                    "{indent}\t\tos.Exit({ends})\n",
+                    "{indent}\t}}\n",
+                    "{indent}\tdeshellCode = ((deshellCode % 256) + 256) % 256\n",
+                    "{indent}\tos.Exit(int(deshellCode))\n",
+                    "{indent}}}\n"
+                ),
+                indent = indent,
+                ends = ends,
+                status = go_expression(status)?
+            )),
+        },
+        crate::ir::Operation::TaskCall {
+            task,
+            arguments,
+            positional,
+        } => {
+            if !arguments.is_empty() {
+                return Err(
+                    "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: a task call with named arguments"
+                        .into(),
+                );
+            }
+            let mut values = Vec::new();
+            for value in positional {
+                values.push(go_expression(value)?);
+            }
+            output.push_str(&format!(
+                "{indent}deshellLast = {task}([]string{{{}}})\n",
+                values.join(", ")
+            ));
+        }
+        // Only a redirect around a single command: redirecting a compound
+        // statement means holding the descriptors open across everything
+        // inside, which is refused rather than narrowed silently.
+        crate::ir::Operation::Redirect { redirections, body } => {
+            let crate::ir::Operation::Exec {
+                argv,
+                environment,
+                working_directory,
+            } = &body.operation
+            else {
+                return Err(
+                    "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: redirect supports only a simple command"
+                        .into(),
+                );
+            };
+            output.push_str(&format!("{indent}{{\n"));
+            emit_go_command(EmitGoCommandArgs {
+                argv,
+                environment,
+                working_directory: working_directory.as_ref(),
+                variable: "deshellCommand",
+                output,
+                depth: depth + 1,
+            })?;
+            for redirection in redirections {
+                let (fd, path, append) = match redirection {
+                    crate::ir::Redirection::Write { fd, path, append } => (fd, path, *append),
+                    crate::ir::Redirection::Read { .. }
+                    | crate::ir::Redirection::Duplicate { .. }
+                    | crate::ir::Redirection::Close { .. } => {
+                        return Err(
+                            "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: only an output redirection is emitted"
+                                .into(),
+                        );
+                    }
+                };
+                let sink = match fd {
+                    1 => "Stdout",
+                    2 => "Stderr",
+                    _ => {
+                        return Err(
+                            "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: only fd 1 and 2 are redirected"
+                                .into(),
+                        );
+                    }
+                };
+                output.push_str(&format!(
+                    concat!(
+                        "{indent}\tdeshellFile, deshellErr := os.OpenFile(\n",
+                        "{indent}\t\t{path},\n",
+                        "{indent}\t\tos.O_WRONLY|os.O_CREATE|{mode},\n",
+                        "{indent}\t\t0o644,\n",
+                        "{indent}\t)\n",
+                        "{indent}\tif deshellErr != nil {{\n",
+                        "{indent}\t\tfmt.Fprintln(os.Stderr, deshellErr)\n",
+                        "{indent}\t\tdeshellLast = 1\n",
+                        "{indent}\t}} else {{\n",
+                        "{indent}\t\tdefer deshellFile.Close()\n",
+                        "{indent}\t\tdeshellCommand.{sink} = deshellFile\n",
+                        "{indent}\t}}\n"
+                    ),
+                    indent = indent,
+                    path = go_expression(path)?,
+                    mode = if append { "os.O_APPEND" } else { "os.O_TRUNC" },
+                    sink = sink,
+                ));
+            }
+            output.push_str(&format!(
+                "{indent}\tdeshellLast = deshellExitCode(deshellCommand.Run())\n{indent}}}\n"
+            ));
+        }
+        // One helper rather than five lines at each site, for the same reason a
+        // shell function stays a function.
+        crate::ir::Operation::WriteStdout { contents } => {
+            output.push_str(&format!(
+                "{indent}deshellLast = deshellWrite({})\n",
+                go_expression(contents)?
+            ));
+        }
+        crate::ir::Operation::Sequence { nodes, on_failure } => {
+            let reachable = reachable_nodes(nodes);
+            for (index, child) in reachable.iter().enumerate() {
                 emit_go_node(child, output, depth)?;
+                // The check belongs between statements. After the last one there
+                // is nothing to skip, and after one that always ends the task
+                // there is nothing to reach — either would be a branch a reader
+                // has to work out is dead.
+                if *on_failure == crate::ir::SequenceFailure::Stop
+                    && index + 1 < reachable.len()
+                    && !node_always_exits(child)
+                {
+                    output.push_str(&format!(
+                        "{indent}if deshellLast != 0 {{\n{indent}\treturn deshellLast\n{indent}}}\n"
+                    ));
+                }
             }
         }
         crate::ir::Operation::Pipeline { nodes, status } => {
@@ -3802,14 +6755,14 @@ fn emit_go_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> Re
                     return Err("generator pipeline supports only Exec stages".into());
                 };
                 let variable = format!("deshellStage{index}");
-                emit_go_command(
+                emit_go_command(EmitGoCommandArgs {
                     argv,
                     environment,
-                    working_directory.as_ref(),
-                    &variable,
+                    working_directory: working_directory.as_ref(),
+                    variable: &variable,
                     output,
-                    depth + 1,
-                )?;
+                    depth: depth + 1,
+                })?;
                 output.push_str(&format!(
                     "{indent}\tdeshellCommands = append(deshellCommands, {variable})\n"
                 ));
@@ -3833,7 +6786,68 @@ fn emit_go_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> Re
             }
             output.push_str(&format!("{indent}}}\n"));
         }
-        other => {
+        crate::ir::Operation::SetVariable { name, value, .. } => {
+            output.push_str(&format!(
+                "{indent}deshellVars[{}] = {}\n{indent}deshellLast = 0\n",
+                go_string(name)?,
+                go_expression(value)?
+            ));
+        }
+        crate::ir::Operation::CaptureStdout { name, body, .. } => {
+            let crate::ir::Operation::Exec {
+                argv,
+                environment,
+                working_directory,
+            } = &body.operation
+            else {
+                return Err(
+                    "DESHELL_BLOCKER_GENERATOR_UNSUPPORTED: capture supports only a simple command"
+                        .into(),
+                );
+            };
+            output.push_str(&format!("{indent}{{\n"));
+            emit_go_command(EmitGoCommandArgs {
+                argv,
+                environment,
+                working_directory: working_directory.as_ref(),
+                variable: "deshellCommand",
+                output,
+                depth: depth + 1,
+            })?;
+            // The shell strips trailing newlines from a substitution and nothing
+            // else, so `TrimRight(.., "\n")` is right where `TrimSpace` is not.
+            output.push_str(&format!(
+                concat!(
+                    "{indent}\tdeshellCommand.Stderr = os.Stderr\n",
+                    "{indent}\tdeshellOut, deshellErr := deshellCommand.Output()\n",
+                    "{indent}\tdeshellLast = deshellExitCode(deshellErr)\n",
+                    "{indent}\tdeshellVars[{name}] = strings.TrimRight(string(deshellOut), \"\\n\")\n",
+                    "{indent}}}\n"
+                ),
+                indent = indent,
+                name = go_string(name)?
+            ));
+        }
+        other @ crate::ir::Operation::ExpandWords { .. }
+        | other @ crate::ir::Operation::Parallel { .. }
+        | other @ crate::ir::Operation::Foreach { .. }
+        | other @ crate::ir::Operation::Scope { .. }
+        | other @ crate::ir::Operation::TryFinally { .. }
+        | other @ crate::ir::Operation::SetEnvironment { .. }
+        | other @ crate::ir::Operation::SetWorkingDirectory { .. }
+        | other @ crate::ir::Operation::Spawn { .. }
+        | other @ crate::ir::Operation::Wait { .. }
+        | other @ crate::ir::Operation::SendSignal { .. }
+        | other @ crate::ir::Operation::FileRead { .. }
+        | other @ crate::ir::Operation::FileWrite { .. }
+        | other @ crate::ir::Operation::FileRemove { .. }
+        | other @ crate::ir::Operation::FileMetadata { .. }
+        | other @ crate::ir::Operation::FileSetMetadata { .. }
+        | other @ crate::ir::Operation::NetworkRequest { .. }
+        | other @ crate::ir::Operation::ClockRead { .. }
+        | other @ crate::ir::Operation::RandomBytes { .. }
+        | other @ crate::ir::Operation::InterpreterCall { .. }
+        | other @ crate::ir::Operation::OpaqueCapsule { .. } => {
             return Err(format!(
                 "generator cannot preserve {} semantics yet",
                 other.name()
@@ -3843,14 +6857,31 @@ fn emit_go_node(node: &crate::ir::Node, output: &mut String, depth: usize) -> Re
     Ok(())
 }
 
-fn emit_go_command(
-    argv: &[crate::ir::TextExpression],
-    environment: &[crate::ir::NamedExpression],
-    working_directory: Option<&crate::ir::TextExpression>,
-    variable: &str,
-    output: &mut String,
+/// The inputs of [`emit_go_command`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`emit_go_command`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct EmitGoCommandArgs<'a> {
+    argv: &'a [crate::ir::TextExpression],
+    environment: &'a [crate::ir::NamedExpression],
+    working_directory: Option<&'a crate::ir::TextExpression>,
+    variable: &'a str,
+    output: &'a mut String,
     depth: usize,
-) -> Result<(), String> {
+}
+
+fn emit_go_command(parts: EmitGoCommandArgs<'_>) -> Result<(), String> {
+    // Destructured without `..`: see `EmitGoCommandArgs`.
+    let EmitGoCommandArgs {
+        argv,
+        environment,
+        working_directory,
+        variable,
+        output,
+        depth,
+    } = parts;
     let indent = "\t".repeat(depth);
     let program = argv
         .first()
@@ -3887,13 +6918,44 @@ fn emit_go_command(
     Ok(())
 }
 
+/// Whether any expression in the tree carries a `${name:-fallback}`.
+///
+/// Reuses the walk `rust_node_uses_arguments` performs, since the question has
+/// the same shape: does any expression anywhere under this node contain a part
+/// of a given kind.
+fn go_node_uses_defaults(node: &crate::ir::Node) -> bool {
+    node_has_expression_part(node, &|part| {
+        matches!(part, crate::ir::TextPart::DefaultValue { .. })
+    })
+}
+
 fn go_expression(expression: &crate::ir::TextExpression) -> Result<String, String> {
     let mut parts = Vec::new();
     for part in &expression.parts {
         parts.push(match part {
             crate::ir::TextPart::Literal { value } => go_string(value)?,
             crate::ir::TextPart::Variable { name } => {
-                format!("os.Getenv({})", go_string(name)?)
+                format!("deshellValue(deshellVars, {})", go_string(name)?)
+            }
+            crate::ir::TextPart::DefaultValue {
+                name,
+                fallback,
+                empty_is_unset,
+            } => {
+                // `os.Getenv` cannot tell unset from empty, so `-` needs LookupEnv.
+                if *empty_is_unset {
+                    format!(
+                        "deshellDefaultEmpty(deshellVars, {}, {})",
+                        go_string(name)?,
+                        go_string(fallback)?
+                    )
+                } else {
+                    format!(
+                        "deshellDefaultUnset(deshellVars, {}, {})",
+                        go_string(name)?,
+                        go_string(fallback)?
+                    )
+                }
             }
             crate::ir::TextPart::Argument { name } => {
                 let index = name
@@ -3922,7 +6984,7 @@ fn proposal_diff(proposals: &[Proposal]) -> Result<String, String> {
         for patch in &proposal.patches {
             let contents = patch.contents()?;
             let text = std::str::from_utf8(&contents)
-                .map_err(|_| format!("generated patch is not UTF-8: {}", patch.path))?;
+                .map_err(|_error| format!("generated patch is not UTF-8: {}", patch.path))?;
             match patch.operation {
                 PatchOperation::Create => {
                     output.push_str(&format!("--- /dev/null\n+++ b/{}\n", patch.path));
@@ -3966,8 +7028,7 @@ fn persist_plan(
     let request_directory = ensure_child_directory(&directory, "requests")?;
     let ir_directory = ensure_child_directory(&directory, "ir")?;
     let proposal_directory = ensure_child_directory(&directory, "proposals")?;
-    let evidence_directory = ensure_child_directory(&directory, "evidence")?;
-    let _ = evidence_directory;
+    ensure_child_directory(&directory, "evidence")?;
     for request in &artifacts.requests {
         persist_immutable(
             &request_directory.join(format!("{}.json", request.request_id)),
@@ -4516,23 +7577,17 @@ fn ensure_child_directory(parent: &Path, name: &str) -> Result<PathBuf, String> 
             ));
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            match std::fs::create_dir(&target) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let metadata = target.symlink_metadata().map_err(|inspect| {
-                        format!(
-                            "cannot inspect {} after concurrent create: {inspect}",
-                            target.display()
-                        )
-                    })?;
-                    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
-                        return Err(format!(
-                            "migration directory is not a regular directory: {}",
-                            target.display()
-                        ));
-                    }
+            match crate::patch::ensure_directory(&target) {
+                Ok(
+                    crate::patch::DirectoryState::Created | crate::patch::DirectoryState::Existing,
+                ) => {}
+                Err(crate::patch::DirectoryError::Occupied) => {
+                    return Err(format!(
+                        "migration directory is not a regular directory: {}",
+                        target.display()
+                    ));
                 }
-                Err(error) => {
+                Err(crate::patch::DirectoryError::Io(error)) => {
                     return Err(format!("cannot create {}: {error}", target.display()));
                 }
             }
@@ -4673,6 +7728,34 @@ pub(crate) fn verify(
                         requirement.name, requirement.digest
                     )
                 })?;
+            // `different` means both ran and disagreed. If the original's
+            // interpreter does not start, nothing was compared, and the
+            // evidence says so with the status that already exists for it.
+            if let Err(reason) = original_interpreter_starts(root, source, scenario) {
+                checks.push(EvidenceCheck {
+                    source: source.location.clone(),
+                    scenario: scenario.name.clone(),
+                    key: EvidenceKey {
+                        source_digest: source.content_digest.clone(),
+                        ir_digest: source.ir_digest.clone(),
+                        proposal_digest: proposal.proposal_digest.clone(),
+                        generator_digest: proposal
+                            .generator_digest
+                            .strip_prefix("sha256:")
+                            .unwrap_or(&proposal.generator_digest)
+                            .into(),
+                        toolchain_digest: toolchain_digest.clone(),
+                        scenario_digest: requirement.digest.clone(),
+                        platform_fingerprint: cell.platform_fingerprint.clone(),
+                        runtime_fingerprint: cell.runtime_fingerprint.clone(),
+                    },
+                    status: EvidenceStatus::Unavailable,
+                    error: Some(reason),
+                    covered_nodes: Vec::new(),
+                    comparisons: Vec::new(),
+                });
+                continue;
+            }
             let mut comparisons = Vec::new();
             let mut covered_nodes = BTreeSet::new();
             for _ in 0..2 {
@@ -4726,21 +7809,17 @@ pub(crate) fn verify(
         }
     }
     let validation = verify_validation_commands(root, &directory, &plan)?;
-    let status = if checks
+    let status = checks
         .iter()
-        .any(|check| check.status == EvidenceStatus::Nondeterministic)
-    {
-        EvidenceStatus::Nondeterministic
-    } else if checks
-        .iter()
-        .any(|check| check.status == EvidenceStatus::Different)
-    {
-        EvidenceStatus::Different
-    } else if validation.iter().any(|command| command.exit_code != 0) {
-        EvidenceStatus::Failed
-    } else {
-        EvidenceStatus::Verified
-    };
+        .map(|check| check.status)
+        .chain(
+            validation
+                .iter()
+                .any(|command| command.exit_code != 0)
+                .then_some(EvidenceStatus::Failed),
+        )
+        .max_by_key(|status| evidence_severity(*status))
+        .unwrap_or(EvidenceStatus::Verified);
     let evidence = MigrationEvidence {
         schema_version: 1,
         plan_digest: plan.plan_digest,
@@ -4882,7 +7961,7 @@ fn validate_current_source(root: &Path, source: &PlanSource) -> Result<(), Strin
 fn current_shell_source(root: &Path, source: &PlanSource) -> Result<Vec<u8>, String> {
     let inventory = crate::project::scan(root)?;
     let finding = inventory.findings.iter().find(|finding| {
-        finding.kind == crate::scanner::FindingKind::ShellFile
+        finding.kind.is_a_shell_file()
             && finding.path == source.location.path
             && finding.span.start_byte == source.location.start_byte
             && finding.span.end_byte == source.location.end_byte
@@ -4900,7 +7979,7 @@ fn current_shell_source(root: &Path, source: &PlanSource) -> Result<Vec<u8>, Str
 fn current_embedded_source(root: &Path, source: &PlanSource) -> Result<(Vec<u8>, String), String> {
     let inventory = crate::project::scan(root)?;
     let finding = inventory.findings.iter().find(|finding| {
-        finding.kind == crate::scanner::FindingKind::EmbeddedShell
+        finding.kind.is_embedded()
             && finding.path == source.location.path
             && finding.span.start_byte == source.location.start_byte
             && finding.span.end_byte == source.location.end_byte
@@ -4917,6 +7996,78 @@ fn current_embedded_source(root: &Path, source: &PlanSource) -> Result<(Vec<u8>,
     Ok((finding.source.clone(), source.interpreter.clone()))
 }
 
+/// Whether the original's interpreter starts at all, where the comparison will
+/// run it.
+///
+/// A comparison says two programs behaved differently. It can only say that if
+/// both of them ran. An interpreter that never started leaves an empty stdout
+/// and a non-zero status, which reads as a difference — and the report then
+/// blames the replacement for a baseline that was never taken.
+///
+/// Measured, not imagined: `pwsh` on this machine is a `mise` shim, and a shim
+/// resolves its version from the configuration nearest the working directory.
+/// The comparison runs in a private workspace under the system temporary root,
+/// so for a project that does not carry that configuration the original exited 1
+/// with the shim's error on stderr, the replacement printed `one` and exited 0,
+/// and de-shell reported `different`. Every byte of that was accurate and the
+/// conclusion a reader draws from it is wrong.
+///
+/// The probe is an empty script run through `original_script_argv`, so it is the
+/// same argv shape the comparison uses rather than a second idea of how to start
+/// an interpreter. Measured on this machine: `sh`, `bash`, `zsh`, `nu` and
+/// `pwsh` each exit 0 with empty stderr on an empty script of their own
+/// extension. `cmd` is not measured here and waits for a Windows runner.
+///
+/// It runs in the prepared workspace and not a bare temporary directory, because
+/// a project that declares its runtime carries that declaration into the
+/// snapshot — which is the case where the interpreter does resolve, and a probe
+/// somewhere else would deny it.
+fn original_interpreter_starts(
+    root: &Path,
+    source: &PlanSource,
+    scenario: &crate::config::Scenario,
+) -> Result<(), String> {
+    let workspace = prepared_workspace(root, scenario)?;
+    let interpreter = if source.kind == SourceKind::EmbeddedShell {
+        current_embedded_source(workspace.path(), source)?.1
+    } else {
+        source.interpreter.clone()
+    };
+    let extension = match interpreter.as_str() {
+        "sh" | "bash" | "zsh" => "sh",
+        "fish" => "fish",
+        "powershell" => "ps1",
+        "nu" => "nu",
+        "cmd" => "cmd",
+        other => return Err(format!("unknown original interpreter: {other}")),
+    };
+    let probe = workspace.path().join(format!("deshell-probe.{extension}"));
+    crate::patch::scratch::write(&probe, b"").map_err(|error| error.to_string())?;
+    let outcome = crate::agent_process::execute(
+        workspace.path(),
+        crate::agent_process::Request {
+            argv: original_script_argv(&interpreter, &probe.to_string_lossy())?,
+            environment: Vec::new(),
+            working_directory: None,
+            stdin: Vec::new(),
+            limits: scenario.limits.into(),
+        },
+    )?;
+    if outcome.exit_code == 0
+        && outcome.stderr.is_empty()
+        && !outcome.timed_out
+        && outcome.signal.is_none()
+        && outcome.limit_exceeded.is_none()
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "{interpreter} did not start in the verification workspace, so the original was never run: exit={} stderr={}",
+        outcome.exit_code,
+        String::from_utf8_lossy(&outcome.stderr).trim()
+    ))
+}
+
 fn observe_original(
     root: &Path,
     source: &PlanSource,
@@ -4929,7 +8080,8 @@ fn observe_original(
     let environment = replay_environment(scenario_environment(scenario), proxy.as_ref());
     if source.kind == SourceKind::EmbeddedShell {
         let (snippet, interpreter) = current_embedded_source(workspace.path(), source)?;
-        let mut invocation = embedded_original_invocation(&interpreter, snippet)?;
+        let mut invocation =
+            embedded_original_invocation(&source.location.path, &interpreter, snippet)?;
         invocation.argv.extend(scenario.argv.clone());
         let outcome = crate::agent_process::execute(
             workspace.path(),
@@ -4973,12 +8125,91 @@ struct EmbeddedOriginalInvocation {
     _script_directory: Option<tempfile::TempDir>,
 }
 
+/// How the host runs this block, so the comparison has the right baseline.
+///
+/// `host` is the file the block came from, because how a block runs is a
+/// property of the host and not of the interpreter. A GitHub workflow step is
+/// not `bash -c <text>`: the runner writes the text to a file and executes
+/// `bash -e {0}`.
+///
+/// Running it with `-c` gave a baseline that carries on after a failing command,
+/// so a step of `/usr/bin/false` then `/bin/echo after` was observed printing
+/// `after` and exiting 0 — and the replacement, which stops because the lowering
+/// now knows about `-e`, was reported `different`. The oracle was comparing the
+/// right two programs against the wrong original, which is the same shape as
+/// reading `${{ }}` as shell.
 fn embedded_original_invocation(
+    host: &str,
     interpreter: &str,
     snippet: Vec<u8>,
 ) -> Result<EmbeddedOriginalInvocation, String> {
     let snippet = String::from_utf8(snippet)
-        .map_err(|_| "embedded shell verification requires UTF-8 source")?;
+        .map_err(|_error| "embedded shell verification requires UTF-8 source")?;
+    if is_github_workflow_path(host) && interpreter == "powershell" {
+        // The runner does not hand a pwsh step to `-Command` as text. It writes
+        // the step to a file with `$ErrorActionPreference = 'stop'` before it and
+        // `if ((Test-Path -LiteralPath variable:/LASTEXITCODE)) { exit $LASTEXITCODE }`
+        // after it, then dot-sources that file.
+        //
+        // Both lines change what is observed, measured here. Without the first,
+        // a step whose `Get-Item` fails prints the error, carries on to the next
+        // line and ends successfully; with it, the step stops and ends with 1.
+        // Without the second, `pwsh -Command` reports 0 or 1 and never the
+        // status the step left — `exit 7` comes back as 1.
+        //
+        // The template itself is GitHub's documented one and is not measured
+        // here; what is measured is that it produces a different program from
+        // the one de-shell was comparing against. That is the same footing the
+        // `bash -e {0}` baseline stands on.
+        let directory = tempfile::Builder::new()
+            .prefix("deshell-original-workflow-")
+            .tempdir()
+            .map_err(|error| format!("cannot create embedded step directory: {error}"))?;
+        let script = directory.path().join("step.ps1");
+        crate::patch::scratch::write(
+            &script,
+            format!(
+                "$ErrorActionPreference = 'stop'\n{snippet}\nif ((Test-Path -LiteralPath variable:/LASTEXITCODE)) {{ exit $LASTEXITCODE }}\n"
+            )
+            .as_bytes(),
+        )
+        .map_err(|error| format!("cannot write embedded step script: {error}"))?;
+        let script = script
+            .to_str()
+            .ok_or("embedded step script path is not UTF-8")?;
+        if script.contains('\'') {
+            return Err("embedded step script path holds a quote".into());
+        }
+        return Ok(EmbeddedOriginalInvocation {
+            argv: vec![
+                "pwsh".into(),
+                "-NoLogo".into(),
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-Command".into(),
+                format!(". '{script}'"),
+            ],
+            _script_directory: Some(directory),
+        });
+    }
+    if is_github_workflow_path(host) && matches!(interpreter, "sh" | "bash") {
+        let directory = tempfile::Builder::new()
+            .prefix("deshell-original-workflow-")
+            .tempdir()
+            .map_err(|error| format!("cannot create embedded step directory: {error}"))?;
+        let script = directory.path().join("step.sh");
+        crate::patch::scratch::write(&script, snippet.as_bytes())
+            .map_err(|error| format!("cannot write embedded step script: {error}"))?;
+        let script = script
+            .to_str()
+            .ok_or("embedded step script path is not UTF-8")?;
+        return Ok(EmbeddedOriginalInvocation {
+            // `bash -e {0}`, which is what the runner executes for a step with
+            // no `shell:` key on Linux and macOS.
+            argv: vec![interpreter.to_owned(), "-e".to_owned(), script.to_owned()],
+            _script_directory: Some(directory),
+        });
+    }
     if interpreter == "cmd" {
         // cmd.exe does not reliably treat embedded newlines in its /C command
         // argument as batch separators. Host runners execute multiline `run:`
@@ -4989,7 +8220,7 @@ fn embedded_original_invocation(
             .tempdir()
             .map_err(|error| format!("cannot create embedded cmd script directory: {error}"))?;
         let script = directory.path().join("snippet.cmd");
-        std::fs::write(&script, snippet.as_bytes())
+        crate::patch::scratch::write(&script, snippet.as_bytes())
             .map_err(|error| format!("cannot write embedded cmd script: {error}"))?;
         let script = script
             .to_str()
@@ -5040,18 +8271,17 @@ fn observe_replacement(
     ensure_safe_directory(workspace.path(), ".deshell/verification")?;
     let build_environment = verification_build_environment(workspace.path(), &proposal.build_argv);
     let build_limits = verification_build_limits(&proposal.build_argv, scenario.limits);
-    let build = execute_exact(
-        workspace.path(),
-        &proposal.build_argv,
-        &build_environment,
-        None,
-        &[],
-        build_limits,
-    )?;
-    if build.exit_code != 0 || build.timed_out || build.limit_exceeded.is_some() {
+    let build = execute_exact(ExecuteExactArgs {
+        root: workspace.path(),
+        argv: &proposal.build_argv,
+        environment: &build_environment,
+        cwd: None,
+        stdin: &[],
+        limits: build_limits,
+    })?;
+    if let Some(reason) = classify_build(&build, build_limits.timeout_ms) {
         return Err(format!(
-            "replacement build failed with exit {}: {}",
-            build.exit_code,
+            "{reason}: {}",
             String::from_utf8_lossy(&build.stderr)
         ));
     }
@@ -5060,14 +8290,14 @@ fn observe_replacement(
     let environment = replay_environment(scenario_environment(scenario), proxy.as_ref());
     let mut argv = proposal.run_argv.clone();
     argv.extend(scenario.argv.clone());
-    let outcome = execute_exact(
-        workspace.path(),
-        &argv,
-        &environment,
-        scenario.cwd.clone(),
-        &scenario_stdin(scenario)?,
-        scenario.limits,
-    )?;
+    let outcome = execute_exact(ExecuteExactArgs {
+        root: workspace.path(),
+        argv: &argv,
+        environment: &environment,
+        cwd: scenario.cwd.clone(),
+        stdin: &scenario_stdin(scenario)?,
+        limits: scenario.limits,
+    })?;
     let network = finish_replay_proxy(proxy)?;
     observation_from_outcome(workspace.path(), &before, outcome, network)
 }
@@ -5099,6 +8329,41 @@ fn verification_validation_environment(root: &Path) -> Vec<(String, String)> {
     verification_build_environment(root, &["go".into()])
 }
 
+/// Why the replacement build produced no comparison, or `None` if it built.
+///
+/// A build that ran out of budget is not a build that failed. Both leave a
+/// non-zero status — a timeout leaves 124 — so the status alone cannot tell
+/// them apart, and reporting one as the other says the generated code is wrong
+/// when what happened is that nothing was learned about it. The budget is
+/// checked before the status for exactly that reason.
+fn classify_build(build: &crate::agent_process::Outcome, timeout_ms: u64) -> Option<String> {
+    if build.timed_out {
+        return Some(format!(
+            "replacement build reached its {timeout_ms} ms budget, so nothing was compared"
+        ));
+    }
+    if let Some(limit) = &build.limit_exceeded {
+        return Some(format!(
+            "replacement build reached its {limit} limit, so nothing was compared"
+        ));
+    }
+    if build.exit_code != 0 {
+        return Some(format!(
+            "replacement build failed with exit {}",
+            build.exit_code
+        ));
+    }
+    None
+}
+
+/// The budget for building the replacement.
+///
+/// A scenario's limits bound the script under verification. Building the
+/// replacement is de-shell's own toolchain invocation, which happens to share
+/// the field — so the two were already separated for memory and for process
+/// count, and the omission of time was the one that showed: a `cargo build` on
+/// a busy machine ran out of the script's budget and was reported as the
+/// replacement failing to build.
 fn verification_build_limits(
     argv: &[String],
     mut limits: crate::config::ResourceLimits,
@@ -5109,9 +8374,17 @@ fn verification_build_limits(
     {
         limits.memory_bytes = limits.memory_bytes.max(8 * 1024 * 1024 * 1024);
         limits.processes = 60_000;
+        limits.timeout_ms = limits.timeout_ms.max(TOOLCHAIN_BUILD_TIMEOUT_MS);
     }
     limits
 }
+
+/// How long a compiler is given to build the replacement.
+///
+/// Not a threshold tuned until a test passed: a scenario's timeout describes
+/// the script, and this describes a toolchain. Ten minutes is the same budget
+/// the workflows give a build step.
+const TOOLCHAIN_BUILD_TIMEOUT_MS: u64 = 600_000;
 
 fn observe_ir(
     root: &Path,
@@ -5134,18 +8407,31 @@ fn observe_ir(
         .iter()
         .map(|value| (value.name.clone(), value.value.clone()))
         .collect::<BTreeMap<_, _>>();
-    let mut visited = BTreeSet::new();
-    let outcome = execute_ir_node(
-        workspace.path(),
-        &task.body,
-        &variables,
-        &arguments,
-        &scenario.argv,
-        &scenario_stdin(scenario)?,
-        scenario.cwd.as_deref(),
-        scenario.limits,
-        &mut visited,
-    )?;
+    // The scenario's argv reaches the entrypoint the way a call would pass it,
+    // rather than being dropped. It used to be handed to the walk and discarded
+    // there (`let _ = positional;`), so a script that read `$1` was verified
+    // against an empty string.
+    let arguments = bind_ir_positional(task, arguments, &scenario.argv)?;
+    let mut verifier = IrVerifier {
+        root: workspace.path(),
+        tasks: &plan.tasks,
+        variables,
+        arguments,
+        default_cwd: scenario.cwd.as_deref(),
+        limits: scenario.limits,
+        unset: if task.nounset {
+            crate::ir::UnsetPolicy::Refuse
+        } else {
+            crate::ir::UnsetPolicy::Empty
+        },
+        visited: BTreeSet::new(),
+        depth: 0,
+    };
+    let outcome = verifier
+        .node(&task.body, &scenario_stdin(scenario)?)
+        .map_err(|error| error.to_string())?
+        .outcome;
+    let visited = verifier.visited;
     let network = finish_replay_proxy(proxy)?;
     Ok((
         observation_from_outcome(workspace.path(), &before, outcome, network)?,
@@ -5153,214 +8439,861 @@ fn observe_ir(
     ))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn execute_ir_node(
-    root: &Path,
-    node: &crate::ir::Node,
-    variables: &BTreeMap<String, String>,
-    arguments: &BTreeMap<String, String>,
+/// The entrypoint task's positional arguments, bound to its declared inputs.
+///
+/// The same rule a `TaskCall` uses, stated once: a shell function reads `$1`
+/// through an input named `1`, and a task that declares no inputs at all takes
+/// the argv without binding anything.
+fn bind_ir_positional(
+    task: &crate::ir::Task,
+    mut arguments: BTreeMap<String, String>,
     positional: &[String],
-    stdin: &[u8],
-    default_cwd: Option<&str>,
-    limits: crate::config::ResourceLimits,
-    visited: &mut BTreeSet<String>,
-) -> Result<crate::agent_process::Outcome, String> {
-    visited.insert(node.id.clone());
-    match &node.operation {
-        crate::ir::Operation::Exec {
-            argv,
-            environment,
-            working_directory,
-        } => {
-            let argv = argv
-                .iter()
-                .map(|value| value.evaluate(variables, arguments))
-                .collect::<Result<Vec<_>, _>>()?;
-            let mut process_environment = variables.clone();
-            for value in environment {
-                process_environment.insert(
-                    value.name.clone(),
-                    value.value.evaluate(variables, arguments)?,
-                );
+) -> Result<BTreeMap<String, String>, String> {
+    if positional.is_empty() || task.inputs.is_empty() {
+        return Ok(arguments);
+    }
+    for (index, value) in positional.iter().enumerate() {
+        let numeric = (index + 1).to_string();
+        let binding = task
+            .inputs
+            .iter()
+            .find(|binding| binding.name == numeric)
+            .or_else(|| task.inputs.get(index));
+        let Some(binding) = binding else {
+            return Err(format!(
+                "scenario passes positional argument {} that task {} does not declare",
+                index + 1,
+                task.name
+            ));
+        };
+        // A scenario can name `$1` twice — once in `argv`, once in `arguments`.
+        // Saying it twice is not an error; saying two different things is, and
+        // it used to be neither: `arguments` was read by the IR walk and `argv`
+        // by the shell, so a contradiction was observed as the replacement
+        // disagreeing with the original rather than as a scenario that describes
+        // two different runs.
+        match arguments.entry(binding.name.clone()) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(value.clone());
             }
-            let working_directory = working_directory
-                .as_ref()
-                .map(|value| value.evaluate(variables, arguments))
-                .transpose()?
-                .or_else(|| default_cwd.map(str::to_owned));
-            let _ = positional;
-            crate::agent_process::execute(
-                root,
-                crate::agent_process::Request {
-                    argv,
-                    environment: process_environment.into_iter().collect(),
-                    working_directory,
-                    stdin: stdin.to_vec(),
-                    limits: limits.into(),
-                },
-            )
+            std::collections::btree_map::Entry::Occupied(slot) if slot.get() == value => {}
+            std::collections::btree_map::Entry::Occupied(slot) => {
+                return Err(format!(
+                    "scenario argv[{index}] is {value:?} but input {} is {:?}; the two name the same argument and cannot differ",
+                    binding.name,
+                    slot.get()
+                ));
+            }
         }
-        crate::ir::Operation::Sequence { nodes } => {
-            let mut aggregate = crate::agent_process::Outcome {
-                exit_code: 0,
-                stdout: Vec::new(),
-                stderr: Vec::new(),
-                timed_out: false,
-                limit_exceeded: None,
-                signal: None,
-            };
-            for (index, child) in nodes.iter().enumerate() {
-                let result = execute_ir_node(
-                    root,
-                    child,
-                    variables,
-                    arguments,
-                    positional,
-                    if index == 0 { stdin } else { &[] },
-                    default_cwd,
-                    limits,
-                    visited,
-                )?;
-                aggregate.stdout.extend(result.stdout);
-                aggregate.stderr.extend(result.stderr);
-                aggregate.exit_code = result.exit_code;
-                aggregate.timed_out |= result.timed_out;
-                aggregate.signal = result.signal;
-                aggregate.limit_exceeded = result.limit_exceeded;
-            }
-            Ok(aggregate)
+    }
+    Ok(arguments)
+}
+
+/// Whether the task carries on after a node.
+///
+/// The verifier used to have no term for this, so `Operation::Exit` had nowhere
+/// to report that the task had ended and was refused outright. Reusing
+/// `crate::runner::Flow` would have tied the two implementations together; this
+/// is the same distinction stated separately, which is the point of a second
+/// implementation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IrFlow {
+    Continue,
+    Exited,
+}
+
+/// What a node left behind: the bytes and status, and whether the task ended.
+struct IrStep {
+    outcome: crate::agent_process::Outcome,
+    flow: IrFlow,
+}
+
+impl IrStep {
+    fn next(outcome: crate::agent_process::Outcome) -> Self {
+        Self {
+            outcome,
+            flow: IrFlow::Continue,
         }
-        crate::ir::Operation::Pipeline { nodes, status } => {
-            let mut requests = Vec::new();
-            for (index, child) in nodes.iter().enumerate() {
-                visited.insert(child.id.clone());
-                requests.push(ir_exec_request(
-                    root,
-                    child,
-                    variables,
-                    arguments,
-                    if index == 0 { stdin } else { &[] },
-                    default_cwd,
-                    limits,
-                )?);
-            }
-            let outcomes = crate::agent_process::execute_pipeline(root, requests)?;
-            let selected = match status {
-                crate::ir::PipelineStatus::Last => outcomes.len().saturating_sub(1),
-                crate::ir::PipelineStatus::Pipefail => outcomes
-                    .iter()
-                    .rposition(|outcome| outcome.exit_code != 0)
-                    .unwrap_or_else(|| outcomes.len().saturating_sub(1)),
-            };
-            let mut aggregate = crate::agent_process::Outcome {
-                exit_code: outcomes
-                    .get(selected)
-                    .map_or(0, |outcome| outcome.exit_code),
-                stdout: outcomes
-                    .last()
-                    .map_or_else(Vec::new, |outcome| outcome.stdout.clone()),
-                stderr: Vec::new(),
-                timed_out: outcomes.iter().any(|outcome| outcome.timed_out),
-                limit_exceeded: outcomes
-                    .iter()
-                    .find_map(|outcome| outcome.limit_exceeded.clone()),
-                signal: outcomes.get(selected).and_then(|outcome| outcome.signal),
-            };
-            for outcome in outcomes {
-                aggregate.stderr.extend(outcome.stderr);
-            }
-            Ok(aggregate)
-        }
-        crate::ir::Operation::Condition {
-            predicate,
-            if_true,
-            if_false,
-        } => {
-            let mut aggregate = execute_ir_node(
-                root,
-                predicate,
-                variables,
-                arguments,
-                positional,
-                stdin,
-                default_cwd,
-                limits,
-                visited,
-            )?;
-            let branch = if aggregate.exit_code == 0 {
-                Some(if_true.as_ref())
-            } else {
-                if_false.as_deref()
-            };
-            if let Some(branch) = branch {
-                let outcome = execute_ir_node(
-                    root,
-                    branch,
-                    variables,
-                    arguments,
-                    positional,
-                    &[],
-                    default_cwd,
-                    limits,
-                    visited,
-                )?;
-                aggregate.stdout.extend(outcome.stdout);
-                aggregate.stderr.extend(outcome.stderr);
-                aggregate.exit_code = outcome.exit_code;
-                aggregate.timed_out |= outcome.timed_out;
-                aggregate.limit_exceeded = outcome.limit_exceeded;
-                aggregate.signal = outcome.signal;
-            }
-            Ok(aggregate)
-        }
-        other => Err(format!(
-            "independent IR verifier does not support {}",
-            other.name()
-        )),
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn ir_exec_request(
-    _root: &Path,
-    node: &crate::ir::Node,
-    variables: &BTreeMap<String, String>,
-    arguments: &BTreeMap<String, String>,
-    stdin: &[u8],
-    default_cwd: Option<&str>,
-    limits: crate::config::ResourceLimits,
-) -> Result<crate::agent_process::Request, String> {
-    let crate::ir::Operation::Exec {
-        argv,
-        environment,
-        working_directory,
-    } = &node.operation
-    else {
-        return Err("independent IR verifier pipeline supports only Exec stages".into());
-    };
-    let argv = argv
-        .iter()
-        .map(|value| value.evaluate(variables, arguments))
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut process_environment = variables.clone();
-    for value in environment {
-        process_environment.insert(
-            value.name.clone(),
-            value.value.evaluate(variables, arguments)?,
-        );
+fn ir_empty_outcome() -> crate::agent_process::Outcome {
+    crate::agent_process::Outcome {
+        exit_code: 0,
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+        timed_out: false,
+        limit_exceeded: None,
+        signal: None,
     }
-    let working_directory = working_directory
-        .as_ref()
-        .map(|value| value.evaluate(variables, arguments))
-        .transpose()?
-        .or_else(|| default_cwd.map(str::to_owned));
-    Ok(crate::agent_process::Request {
-        argv,
-        environment: process_environment.into_iter().collect(),
-        working_directory,
-        stdin: stdin.to_vec(),
-        limits: limits.into(),
+}
+
+/// One outcome followed by another.
+///
+/// The status is the later node's, the bytes are both in order, and a limit hit
+/// by the earlier node is not forgotten — the field used to be overwritten with
+/// the later node's `None`, which turned "the first statement ran out of time"
+/// into "nothing was limited".
+fn ir_combine(
+    mut aggregate: crate::agent_process::Outcome,
+    next: crate::agent_process::Outcome,
+) -> crate::agent_process::Outcome {
+    aggregate.stdout.extend(next.stdout);
+    aggregate.stderr.extend(next.stderr);
+    aggregate.exit_code = next.exit_code;
+    aggregate.timed_out |= next.timed_out;
+    aggregate.signal = next.signal;
+    aggregate.limit_exceeded = next.limit_exceeded.or(aggregate.limit_exceeded);
+    aggregate
+}
+
+/// Why the independent IR verifier does not run an operation.
+///
+/// A type rather than only a sentence, because a sentence is not checked. Each
+/// value carries one consequence a test can hold it to, which is the whole
+/// reason to have the type at all — a classification nothing branches on is a
+/// summary whose mistakes are merely harder to notice than a paragraph's.
+///
+/// Three values rather than two, for the same reason the builtin ledger has
+/// three: when a thirty-sixth operation arrives, "nobody has decided yet" needs
+/// somewhere to land that is not a wrong claim. That is how this verifier ran
+/// four of thirty-five for as long as it did.
+/// How many operations the verifier could run and does not.
+///
+/// A ceiling, compared for equality: above it is a new gap, and below it is a
+/// ceiling that has stopped holding anything. Implementing one of these is
+/// welcome — lower the number in the same change.
+#[cfg(test)]
+const IR_VERIFIER_UNIMPLEMENTED_CEILING: usize = 15;
+
+/// How many operations nobody has classified. Zero, and it stays zero unless
+/// somebody raises it deliberately and says why.
+#[cfg(test)]
+const IR_VERIFIER_UNEXAMINED_CEILING: usize = 0;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IrRefusal {
+    /// Running it here would be wrong, not merely absent. The consequence:
+    /// it must never become verified, and the golden ledger fails if it does.
+    Permanent,
+    /// It could be run here and is not. The consequence: the count is a tight
+    /// ratchet, so it can only go down.
+    Unimplemented,
+    /// Nobody has decided which of the two it is. The consequence: the count is
+    /// a tight ratchet at zero, so landing here is a deliberate, visible act
+    /// rather than the quiet default a catch-all used to provide.
+    ///
+    /// Unconstructed on purpose, and that is the assertion, not an oversight:
+    /// `IR_VERIFIER_UNEXAMINED_CEILING` is zero. The value exists so that the
+    /// thirty-sixth operation has somewhere honest to land instead of being
+    /// given a classification somebody guessed.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the ledger's ceiling for this value is zero, so nothing constructs it until an operation arrives that nobody has classified; the vocabulary test constructs it"
+        )
+    )]
+    Unexamined,
+}
+
+impl IrRefusal {
+    /// The name the coverage ledger records.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the coverage ledger is the only consumer, and it is a test; the release build carries the classification without naming it"
+        )
+    )]
+    fn name(self) -> &'static str {
+        match self {
+            Self::Permanent => "permanent",
+            Self::Unimplemented => "unimplemented",
+            Self::Unexamined => "unexamined",
+        }
+    }
+}
+
+/// What went wrong in the independent IR verifier.
+///
+/// A refusal is a different thing from a failure, and the two used to be one
+/// `String`. Separating them is what lets the coverage ledger be derived from
+/// the verifier instead of written beside it: the classification is the value
+/// the ledger branches on, and the sentence is the explanation next to it, so a
+/// wrong sentence cannot make the classification wrong.
+#[derive(Clone, Debug)]
+enum IrError {
+    Refused {
+        operation: &'static str,
+        /// Read by the coverage ledger, which is a test; the `Display` below
+        /// deliberately does not render it, because a reader of a diagnostic
+        /// wants the sentence and a machine wants the value.
+        #[cfg_attr(
+            not(test),
+            expect(
+                dead_code,
+                reason = "the coverage ledger is the only consumer and it is a test; `Display` renders the reason, not the classification"
+            )
+        )]
+        refusal: IrRefusal,
+        reason: &'static str,
+    },
+    Failed(String),
+}
+
+impl std::fmt::Display for IrError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused {
+                operation,
+                refusal: _,
+                reason,
+            } => write!(
+                formatter,
+                "independent IR verifier does not run {operation}: {reason}"
+            ),
+            Self::Failed(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl From<String> for IrError {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
+fn ir_refuse(
+    operation: &crate::ir::Operation,
+    refusal: IrRefusal,
+    reason: &'static str,
+) -> Result<IrStep, IrError> {
+    Err(IrError::Refused {
+        operation: operation.name(),
+        refusal,
+        reason,
     })
+}
+
+/// How deep a chain of task calls may go before the verifier gives up.
+///
+/// A shell function that calls itself is a program the verifier would follow
+/// until the stack ran out, which reports as a crash rather than as a refusal.
+/// The bound is stated rather than tuned: nothing the frontend lowers nests
+/// task calls this far, so reaching it means recursion.
+const IR_CALL_DEPTH_LIMIT: usize = 64;
+
+/// The independent IR verifier.
+///
+/// Independent of [`crate::runner`] on purpose: the runner is what executes a
+/// plan in production, so a verifier that called it would be comparing a program
+/// with itself. What the two do share is the *definition* of the IR — pattern
+/// matching lives in [`crate::ir::PatternExpression::matches`] and is called
+/// from both, so a `case` cannot mean two things.
+struct IrVerifier<'a> {
+    root: &'a Path,
+    tasks: &'a [crate::ir::Task],
+    variables: BTreeMap<String, String>,
+    arguments: BTreeMap<String, String>,
+    default_cwd: Option<&'a str>,
+    limits: crate::config::ResourceLimits,
+    /// `set -u`. Carried from the task rather than fixed at
+    /// [`crate::ir::UnsetPolicy::Empty`], which is what it was: a script under
+    /// `set -u` that read an unset name failed, and the verifier read an empty
+    /// string and called the two the same.
+    unset: crate::ir::UnsetPolicy,
+    visited: BTreeSet<String>,
+    depth: usize,
+}
+
+impl IrVerifier<'_> {
+    fn text(&self, expression: &crate::ir::TextExpression) -> Result<String, String> {
+        expression.evaluate(&self.variables, &self.arguments, self.unset)
+    }
+
+    fn list(&self, expressions: &[crate::ir::TextExpression]) -> Result<Vec<String>, String> {
+        expressions.iter().map(|value| self.text(value)).collect()
+    }
+
+    /// The process a node names, if it names one.
+    ///
+    /// Takes the node rather than its pieces so that the destructuring below is
+    /// the only place the pieces are named, and so that it can be exhaustive: a
+    /// field added to `Exec` fails to compile here until it is given a
+    /// destination, which an argument list could never do.
+    fn exec_request(
+        &self,
+        node: &crate::ir::Node,
+        stdin: &[u8],
+    ) -> Result<crate::agent_process::Request, String> {
+        let crate::ir::Operation::Exec {
+            argv,
+            environment,
+            working_directory,
+        } = &node.operation
+        else {
+            return Err(format!(
+                "independent IR verifier starts a process for {}, and only exec names one",
+                node.operation.name()
+            ));
+        };
+        let argv = self.list(argv)?;
+        let mut process_environment = self.variables.clone();
+        for value in environment {
+            process_environment.insert(value.name.clone(), self.text(&value.value)?);
+        }
+        let working_directory = working_directory
+            .as_ref()
+            .map(|value| self.text(value))
+            .transpose()?
+            .or_else(|| self.default_cwd.map(str::to_owned));
+        Ok(crate::agent_process::Request {
+            argv,
+            environment: process_environment.into_iter().collect(),
+            working_directory,
+            stdin: stdin.to_vec(),
+            limits: self.limits.into(),
+        })
+    }
+
+    /// The pieces of a `case` pattern with each literal already expanded.
+    ///
+    /// Expanded first and matched second, which is the order the shell uses:
+    /// quoting is resolved during word expansion, so whether a `*` is a glob was
+    /// already decided by the time anything is compared.
+    fn pattern_pieces<'p>(
+        &self,
+        pattern: &'p crate::ir::PatternExpression,
+    ) -> Result<Vec<crate::ir::MatchPiece<'p>>, String> {
+        pattern
+            .pieces
+            .iter()
+            .map(|piece| match piece {
+                crate::ir::PatternPiece::Literal { value } => {
+                    Ok(crate::ir::MatchPiece::Literal(self.text(value)?.into()))
+                }
+                crate::ir::PatternPiece::AnyRun => Ok(crate::ir::MatchPiece::AnyRun),
+                crate::ir::PatternPiece::AnyCharacter => Ok(crate::ir::MatchPiece::AnyCharacter),
+            })
+            .collect()
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one arm per operation: splitting the match would let an operation be handled in a helper that no exhaustiveness check covers"
+    )]
+    fn node(&mut self, node: &crate::ir::Node, stdin: &[u8]) -> Result<IrStep, IrError> {
+        self.visited.insert(node.id.clone());
+        // No `_ =>` arm and no `..` in a destructuring: an operation added to the
+        // IR, or a field added to one, has to be given a destination here before
+        // this compiles. Both mechanisms are load-bearing — `Sequence { nodes, .. }`
+        // is how `set -e` went missing from this verifier.
+        match &node.operation {
+            crate::ir::Operation::Exec {
+                argv: _,
+                environment: _,
+                working_directory: _,
+            } => {
+                // Destructured inside `exec_request`, which is the one place the
+                // fields are read.
+                let request = self.exec_request(node, stdin)?;
+                Ok(IrStep::next(crate::agent_process::execute(
+                    self.root, request,
+                )?))
+            }
+            crate::ir::Operation::Sequence { nodes, on_failure } => {
+                let mut aggregate = ir_empty_outcome();
+                let mut input = stdin;
+                for child in nodes {
+                    let step = self.node(child, input)?;
+                    input = &[];
+                    let failed = step.outcome.exit_code != 0;
+                    let flow = step.flow;
+                    aggregate = ir_combine(aggregate, step.outcome);
+                    // `exit` ends the task whatever `on_failure` says, and
+                    // whether or not the statement failed.
+                    if flow == IrFlow::Exited {
+                        return Ok(IrStep {
+                            outcome: aggregate,
+                            flow,
+                        });
+                    }
+                    // `set -e`. A sequence's statements are the only untested
+                    // position; a failure inside `&&`, an `if` condition or a
+                    // `!` belongs to another node and never reaches this loop.
+                    if failed && *on_failure == crate::ir::SequenceFailure::Stop {
+                        break;
+                    }
+                }
+                Ok(IrStep::next(aggregate))
+            }
+            crate::ir::Operation::Pipeline { nodes, status } => {
+                let mut requests = Vec::new();
+                for (index, child) in nodes.iter().enumerate() {
+                    self.visited.insert(child.id.clone());
+                    requests.push(self.exec_request(child, if index == 0 { stdin } else { &[] })?);
+                }
+                let outcomes = crate::agent_process::execute_pipeline(self.root, requests)?;
+                let selected = match status {
+                    crate::ir::PipelineStatus::Last => outcomes.len().saturating_sub(1),
+                    crate::ir::PipelineStatus::Pipefail => outcomes
+                        .iter()
+                        .rposition(|outcome| outcome.exit_code != 0)
+                        .unwrap_or_else(|| outcomes.len().saturating_sub(1)),
+                };
+                let mut aggregate = crate::agent_process::Outcome {
+                    exit_code: outcomes
+                        .get(selected)
+                        .map_or(0, |outcome| outcome.exit_code),
+                    stdout: outcomes
+                        .last()
+                        .map_or_else(Vec::new, |outcome| outcome.stdout.clone()),
+                    stderr: Vec::new(),
+                    timed_out: outcomes.iter().any(|outcome| outcome.timed_out),
+                    limit_exceeded: outcomes
+                        .iter()
+                        .find_map(|outcome| outcome.limit_exceeded.clone()),
+                    signal: outcomes.get(selected).and_then(|outcome| outcome.signal),
+                };
+                for outcome in outcomes {
+                    aggregate.stderr.extend(outcome.stderr);
+                }
+                Ok(IrStep::next(aggregate))
+            }
+            crate::ir::Operation::Condition {
+                predicate,
+                if_true,
+                if_false,
+            } => {
+                let step = self.node(predicate, stdin)?;
+                // An `exit` in the condition ends the task: neither branch runs,
+                // and the status is not read as a branch selector.
+                if step.flow == IrFlow::Exited {
+                    return Ok(step);
+                }
+                let passed = step.outcome.exit_code == 0;
+                let mut aggregate = step.outcome;
+                let branch = if passed {
+                    Some(if_true.as_ref())
+                } else {
+                    if_false.as_deref()
+                };
+                match branch {
+                    None => Ok(IrStep::next(aggregate)),
+                    Some(branch) => {
+                        let step = self.node(branch, &[])?;
+                        aggregate = ir_combine(aggregate, step.outcome);
+                        Ok(IrStep {
+                            outcome: aggregate,
+                            flow: step.flow,
+                        })
+                    }
+                }
+            }
+            crate::ir::Operation::Match {
+                value,
+                cases,
+                default,
+            } => {
+                let subject = self.text(value)?;
+                let mut selected = None;
+                for case in cases {
+                    let pieces = self.pattern_pieces(&case.pattern)?;
+                    if crate::ir::PatternExpression::matches(&pieces, &subject) {
+                        selected = Some(&case.body);
+                        break;
+                    }
+                }
+                match selected.or(default.as_deref()) {
+                    Some(branch) => self.node(branch, stdin),
+                    // `case x in a) ;; esac` with nothing matching succeeds and
+                    // writes nothing, which is what every measured shell does.
+                    None => Ok(IrStep::next(ir_empty_outcome())),
+                }
+            }
+            crate::ir::Operation::While { condition, body } => {
+                let mut aggregate = ir_empty_outcome();
+                let mut input = stdin;
+                loop {
+                    let test = self.node(condition, &[])?;
+                    let passed = test.outcome.exit_code == 0;
+                    // An `exit` in the condition ends the task with its own
+                    // status, so unlike a condition that merely failed, this one
+                    // does become the loop's status.
+                    if test.flow == IrFlow::Exited {
+                        return Ok(IrStep {
+                            outcome: ir_combine(aggregate, test.outcome),
+                            flow: IrFlow::Exited,
+                        });
+                    }
+                    // The condition's own status is not the loop's: a `while`
+                    // that never enters its body reports 0, not the failing test.
+                    let carried = aggregate.exit_code;
+                    aggregate = ir_combine(aggregate, test.outcome);
+                    aggregate.exit_code = carried;
+                    if !passed {
+                        return Ok(IrStep::next(aggregate));
+                    }
+                    let step = self.node(body, input)?;
+                    input = &[];
+                    let flow = step.flow;
+                    aggregate = ir_combine(aggregate, step.outcome);
+                    if flow == IrFlow::Exited {
+                        return Ok(IrStep {
+                            outcome: aggregate,
+                            flow,
+                        });
+                    }
+                }
+            }
+            crate::ir::Operation::Foreach {
+                variable,
+                items,
+                body,
+            } => {
+                let values = self.list(items)?;
+                let previous = self.variables.get(variable).cloned();
+                let mut aggregate = ir_empty_outcome();
+                let mut exited = false;
+                for value in values {
+                    self.variables.insert(variable.clone(), value);
+                    let step = self.node(body, stdin)?;
+                    let flow = step.flow;
+                    aggregate = ir_combine(aggregate, step.outcome);
+                    if flow == IrFlow::Exited {
+                        exited = true;
+                        break;
+                    }
+                }
+                match previous {
+                    Some(value) => self.variables.insert(variable.clone(), value),
+                    None => self.variables.remove(variable),
+                };
+                Ok(IrStep {
+                    outcome: aggregate,
+                    flow: if exited {
+                        IrFlow::Exited
+                    } else {
+                        IrFlow::Continue
+                    },
+                })
+            }
+            // `! cmd` inverts the status to a boolean: a body that exits 2 makes
+            // this exit 0, the same as one that exits 1. Output passes through.
+            crate::ir::Operation::Not { body } => {
+                let step = self.node(body, stdin)?;
+                // `! exit 1` never reaches the inversion: the shell has already
+                // left, and inverting would report 0 for a task that ended with 1.
+                if step.flow == IrFlow::Exited {
+                    return Ok(step);
+                }
+                let mut outcome = step.outcome;
+                outcome.exit_code = i32::from(outcome.exit_code == 0);
+                Ok(IrStep::next(outcome))
+            }
+            crate::ir::Operation::Test { predicate } => {
+                let truth = match predicate {
+                    crate::ir::TestPredicate::NonEmpty { value } => !self.text(value)?.is_empty(),
+                    crate::ir::TestPredicate::Empty { value } => self.text(value)?.is_empty(),
+                    crate::ir::TestPredicate::StringEqual { left, right } => {
+                        self.text(left)? == self.text(right)?
+                    }
+                    crate::ir::TestPredicate::StringNotEqual { left, right } => {
+                        self.text(left)? != self.text(right)?
+                    }
+                    crate::ir::TestPredicate::StartsWith { value, prefix } => {
+                        self.text(value)?.starts_with(prefix)
+                    }
+                    crate::ir::TestPredicate::EndsWith { value, suffix } => {
+                        self.text(value)?.ends_with(suffix)
+                    }
+                    crate::ir::TestPredicate::Contains { value, infix } => {
+                        self.text(value)?.contains(infix)
+                    }
+                };
+                let mut outcome = ir_empty_outcome();
+                outcome.exit_code = i32::from(!truth);
+                Ok(IrStep::next(outcome))
+            }
+            crate::ir::Operation::WriteStdout { contents } => {
+                let mut outcome = ir_empty_outcome();
+                outcome.stdout = self.text(contents)?.into_bytes();
+                Ok(IrStep::next(outcome))
+            }
+            crate::ir::Operation::Exit {
+                status,
+                // Read to say the two cases are the same here: the verifier stops
+                // either way, and the difference is whether the lowering had
+                // already ruled the value out. The generated programs do differ,
+                // because one of them is a constant.
+                non_numeric: _,
+            } => {
+                let text = self.text(status)?;
+                let parsed = text.trim().parse::<i64>().map_err(|_error| {
+                    // The shells disagree here — bash exits 255 with a message
+                    // naming itself, zsh exits 0 in silence — so there is no
+                    // status to report that is not one shell impersonating
+                    // another.
+                    format!("exit status is not an integer: {text}")
+                })?;
+                // Measured: every shell reduces modulo 256, negatives and values
+                // above 255 alike.
+                let exit_code = i32::try_from(parsed.rem_euclid(256))
+                    .map_err(|error| format!("exit status is out of range: {error}"))?;
+                Ok(IrStep {
+                    outcome: crate::agent_process::Outcome {
+                        exit_code,
+                        ..ir_empty_outcome()
+                    },
+                    flow: IrFlow::Exited,
+                })
+            }
+            crate::ir::Operation::NoOp => Ok(IrStep::next(ir_empty_outcome())),
+            crate::ir::Operation::TryFinally { body, finalizer } => {
+                let body_step = self.node(body, stdin)?;
+                // The finalizer runs even when the body exited — that is what it
+                // is for — but the task still ends afterwards.
+                let finalizer_step = self.node(finalizer, &[])?;
+                let exit_code = if finalizer_step.outcome.exit_code == 0 {
+                    body_step.outcome.exit_code
+                } else {
+                    finalizer_step.outcome.exit_code
+                };
+                let mut outcome = ir_combine(body_step.outcome, finalizer_step.outcome);
+                outcome.exit_code = exit_code;
+                Ok(IrStep {
+                    outcome,
+                    flow: match (body_step.flow, finalizer_step.flow) {
+                        (IrFlow::Continue, IrFlow::Continue) => IrFlow::Continue,
+                        (IrFlow::Exited, _) | (_, IrFlow::Exited) => IrFlow::Exited,
+                    },
+                })
+            }
+            crate::ir::Operation::TaskCall {
+                task,
+                arguments,
+                positional,
+            } => {
+                let callee = self
+                    .tasks
+                    .iter()
+                    .find(|candidate| candidate.name == *task)
+                    .ok_or_else(|| format!("IR calls task {task}, which the plan does not hold"))?;
+                // A property of this callee, not of `task_call`, so it is a
+                // failure rather than a refusal the coverage ledger records.
+                if callee.invocation.is_some() {
+                    return Err(IrError::Failed(format!(
+                        "task {task} declares a PowerShell invocation, whose parameter binding this verifier does not model"
+                    )));
+                }
+                if self.depth >= IR_CALL_DEPTH_LIMIT {
+                    return Err(IrError::Failed(format!(
+                        "IR task calls nested more than {IR_CALL_DEPTH_LIMIT} deep at {task}, which reads as recursion"
+                    )));
+                }
+                let mut provided = BTreeMap::new();
+                for argument in arguments {
+                    provided.insert(argument.name.clone(), self.text(&argument.value)?);
+                }
+                for (index, value) in self.list(positional)?.into_iter().enumerate() {
+                    let numeric = (index + 1).to_string();
+                    let binding = callee
+                        .inputs
+                        .iter()
+                        .find(|binding| binding.name == numeric)
+                        .or_else(|| callee.inputs.get(index))
+                        .ok_or_else(|| {
+                            format!("IR call to {task} passes an unexpected positional argument")
+                        })?;
+                    if provided.insert(binding.name.clone(), value).is_some() {
+                        return Err(IrError::Failed(format!(
+                            "IR call to {task} gives input {} twice",
+                            binding.name
+                        )));
+                    }
+                }
+                // A call has its own argument frame and its own `set -u`; the
+                // caller's are restored below whatever the body did.
+                let outer_arguments = std::mem::replace(&mut self.arguments, provided);
+                let outer_unset = std::mem::replace(
+                    &mut self.unset,
+                    if callee.nounset {
+                        crate::ir::UnsetPolicy::Refuse
+                    } else {
+                        crate::ir::UnsetPolicy::Empty
+                    },
+                );
+                self.depth += 1;
+                let step = self.node(&callee.body, &[]);
+                self.depth -= 1;
+                self.arguments = outer_arguments;
+                self.unset = outer_unset;
+                // `exit` inside a shell function ends the whole task, so the flow
+                // travels out of the call rather than stopping at it.
+                step
+            }
+            crate::ir::Operation::SetVariable {
+                name,
+                value_type,
+                value,
+            } => {
+                // Not `ir_refuse`: the verifier does run `set_variable`, and
+                // this is one value type inside it. A refusal is about a whole
+                // operation, which is the axis the coverage ledger carries; a
+                // per-value one recorded there would make the ledger say
+                // something about `set_variable` that is true of only some of
+                // them.
+                if !value_type.is_plain_text() {
+                    return Err(IrError::Failed(format!(
+                        "assignment to {name} has a type the runner's value model normalises, and a second definition of that normalisation here could disagree with it"
+                    )));
+                }
+                let value = self.text(value)?;
+                self.variables.insert(name.clone(), value);
+                Ok(IrStep::next(ir_empty_outcome()))
+            }
+            crate::ir::Operation::CaptureStdout {
+                name,
+                value_type,
+                body,
+            } => {
+                // See the note on `set_variable` above.
+                if !value_type.is_text() {
+                    return Err(IrError::Failed(format!(
+                        "capture into {name} has a type the runner's value model normalises, and a second definition of that normalisation here could disagree with it"
+                    )));
+                }
+                // A substitution runs in its own process, so `$(exit 3)` ends
+                // that process and leaves 3 as its status; the shell reading it
+                // carries on. The captured bytes do not reach stdout.
+                let step = self.node(body, stdin)?;
+                let mut captured = step.outcome;
+                while captured.stdout.last() == Some(&b'\n') {
+                    captured.stdout.pop();
+                }
+                let text = std::str::from_utf8(&captured.stdout)
+                    .map_err(|error| format!("stdout capture {name} is not valid UTF-8: {error}"))?
+                    .to_owned();
+                self.variables.insert(name.clone(), text);
+                captured.stdout.clear();
+                Ok(IrStep::next(captured))
+            }
+            // Everything below is refused by name. Each says what it would take
+            // to run it honestly, so that "not implemented" and "cannot be
+            // claimed here" stay different sentences.
+            crate::ir::Operation::Parallel { nodes: _ } => ir_refuse(
+                &node.operation,
+                IrRefusal::Unimplemented,
+                "the branches run at once, and running them one after another would compare a different program",
+            ),
+            crate::ir::Operation::ExpandWords {
+                name: _,
+                value: _,
+                field_splitting: _,
+                glob: _,
+            } => ir_refuse(
+                &node.operation,
+                IrRefusal::Unimplemented,
+                "field splitting and globbing are the shell's, and this verifier has no measured model of either",
+            ),
+            crate::ir::Operation::Redirect {
+                redirections: _,
+                body: _,
+            } => ir_refuse(
+                &node.operation,
+                IrRefusal::Unimplemented,
+                "a redirection binds file descriptors around a child, which this verifier does not set up",
+            ),
+            crate::ir::Operation::Scope {
+                variables: _,
+                environment: _,
+                working_directory: _,
+                body: _,
+            }
+            | crate::ir::Operation::SetEnvironment {
+                name: _,
+                value: _,
+                secret: _,
+            } => ir_refuse(
+                &node.operation,
+                IrRefusal::Unimplemented,
+                "the binding may be a secret, and this verifier has no redaction path to keep one out of the evidence it writes",
+            ),
+            crate::ir::Operation::SetWorkingDirectory { path: _ } => ir_refuse(
+                &node.operation,
+                IrRefusal::Unimplemented,
+                "the directory outlives the node, and this verifier holds no working directory that a later node would read",
+            ),
+            crate::ir::Operation::Spawn { handle: _, body: _ }
+            | crate::ir::Operation::Wait { handle: _ }
+            | crate::ir::Operation::SendSignal {
+                handle: _,
+                signal: _,
+                process_group: _,
+            } => ir_refuse(
+                &node.operation,
+                IrRefusal::Unimplemented,
+                "background jobs need a process table that outlives the node, which this verifier does not keep",
+            ),
+            crate::ir::Operation::FileRead { path: _ }
+            | crate::ir::Operation::FileWrite {
+                path: _,
+                contents: _,
+                append: _,
+            }
+            | crate::ir::Operation::FileRemove { path: _ }
+            | crate::ir::Operation::FileMetadata {
+                path: _,
+                output: _,
+                follow_symlinks: _,
+            }
+            | crate::ir::Operation::FileSetMetadata {
+                path: _,
+                permissions: _,
+                executable: _,
+                follow_symlinks: _,
+            } => ir_refuse(
+                &node.operation,
+                IrRefusal::Unimplemented,
+                "a direct file effect bypasses the sandbox that bounds every process this verifier starts",
+            ),
+            crate::ir::Operation::NetworkRequest { method: _, uri: _ } => ir_refuse(
+                &node.operation,
+                IrRefusal::Unimplemented,
+                "a request would have to go through the replay proxy, which this verifier starts for child processes only",
+            ),
+            crate::ir::Operation::ClockRead {
+                clock: _,
+                output: _,
+            }
+            | crate::ir::Operation::RandomBytes {
+                output: _,
+                length: _,
+            } => ir_refuse(
+                &node.operation,
+                IrRefusal::Permanent,
+                "the value differs on every run, so an observation of it could not be compared with another",
+            ),
+            crate::ir::Operation::InterpreterCall {
+                interpreter: _,
+                interpreter_pin: _,
+                source: _,
+                source_span: _,
+                capabilities: _,
+                reason: _,
+            }
+            | crate::ir::Operation::OpaqueCapsule {
+                interpreter: _,
+                source: _,
+                path: _,
+            } => ir_refuse(
+                &node.operation,
+                IrRefusal::Permanent,
+                "running the pinned interpreter here would re-run the original shell, and an oracle that consults the original is not independent of it",
+            ),
+        }
+    }
 }
 
 fn prepared_workspace(
@@ -5420,14 +9353,31 @@ fn scenario_stdin(scenario: &crate::config::Scenario) -> Result<Vec<u8>, String>
         .map(|value| value.unwrap_or_default())
 }
 
-fn execute_exact(
-    root: &Path,
-    argv: &[String],
-    environment: &[(String, String)],
+/// The inputs of [`execute_exact`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`execute_exact`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct ExecuteExactArgs<'a> {
+    root: &'a Path,
+    argv: &'a [String],
+    environment: &'a [(String, String)],
     cwd: Option<String>,
-    stdin: &[u8],
+    stdin: &'a [u8],
     limits: crate::config::ResourceLimits,
-) -> Result<crate::agent_process::Outcome, String> {
+}
+
+fn execute_exact(parts: ExecuteExactArgs<'_>) -> Result<crate::agent_process::Outcome, String> {
+    // Destructured without `..`: see `ExecuteExactArgs`.
+    let ExecuteExactArgs {
+        root,
+        argv,
+        environment,
+        cwd,
+        stdin,
+        limits,
+    } = parts;
     validate_exact_argv(argv)?;
     let mut argv = argv.to_vec();
     if argv[0].contains('/') && !Path::new(&argv[0]).is_absolute() {
@@ -5446,11 +9396,15 @@ fn execute_exact(
 }
 
 fn apply_generator_patches(root: &Path, proposal: &Proposal) -> Result<(), String> {
+    apply_patch_set(root, &proposal.patches)
+}
+
+fn apply_patch_set(root: &Path, patches_to_apply: &[GeneratorPatch]) -> Result<(), String> {
     let canonical = canonical_root(root)?;
-    let created_directories = ensure_patch_directories(&canonical, &proposal.patches)?;
+    let created_directories = ensure_patch_directories(&canonical, patches_to_apply)?;
     let result = (|| {
         let mut patches = Vec::new();
-        for patch in &proposal.patches {
+        for patch in patches_to_apply {
             let path = safe_target(&canonical, &patch.path)?;
             let contents = patch.contents()?;
             patches.push(match patch.operation {
@@ -5627,8 +9581,12 @@ fn verify_validation_commands(
         return Ok(Vec::new());
     }
     let workspace = crate::workspace::private_snapshot(root)?;
-    let _ = ensure_retirement_directories(workspace.path())?;
-    let _ = ensure_plan_patch_directories(workspace.path(), directory, plan)?;
+    drop(ensure_retirement_directories(workspace.path())?);
+    drop(ensure_plan_patch_directories(
+        workspace.path(),
+        directory,
+        plan,
+    )?);
     let retirement = prepare_retirement(workspace.path(), directory, plan)?;
     crate::patch::apply_all(&retirement)?;
     require_shell_free_tree(workspace.path(), "validation")?;
@@ -5639,14 +9597,14 @@ fn verify_validation_commands(
     let validation_environment = verification_validation_environment(workspace.path());
     let mut output = Vec::new();
     for command in &plan.validation_commands {
-        let outcome = execute_exact(
-            workspace.path(),
-            &command.argv,
-            &validation_environment,
-            None,
-            &[],
-            plan.validation_limits,
-        )?;
+        let outcome = execute_exact(ExecuteExactArgs {
+            root: workspace.path(),
+            argv: &command.argv,
+            environment: &validation_environment,
+            cwd: None,
+            stdin: &[],
+            limits: plan.validation_limits,
+        })?;
         output.push(ValidationEvidence {
             name: command.name.clone(),
             argv: command.argv.clone(),
@@ -5718,7 +9676,7 @@ fn validate_evidence_document(evidence: &MigrationEvidence) -> Result<(), String
                 return Err("migration Evidence key contains an invalid digest".into());
             }
         }
-        if check.status == EvidenceStatus::Verified
+        if check.status.is_verified()
             && check
                 .comparisons
                 .iter()
@@ -5995,8 +9953,12 @@ pub(crate) fn apply(root: &Path, digest: &str) -> Result<(), String> {
     // live tree. The scanner sees generated project-native code but ignores
     // the content-addressed non-execution archive under .deshell.
     let staged = crate::workspace::private_snapshot(root)?;
-    let _ = ensure_retirement_directories(staged.path())?;
-    let _ = ensure_plan_patch_directories(staged.path(), &directory, &plan)?;
+    drop(ensure_retirement_directories(staged.path())?);
+    drop(ensure_plan_patch_directories(
+        staged.path(),
+        &directory,
+        &plan,
+    )?);
     let staged_proposals = prepare_retirement(staged.path(), &directory, &plan)?;
     crate::patch::apply_all(&staged_proposals)?;
     require_shell_free_tree(staged.path(), "staged")?;
@@ -6130,9 +10092,9 @@ fn load_complete_evidence(
         }
         validate_evidence_against(root, directory, plan, &document)?;
         if document.repetitions < 2
-            || document.status != EvidenceStatus::Verified
+            || !document.status.is_verified()
             || document.checks.iter().any(|check| {
-                check.status != EvidenceStatus::Verified
+                !check.status.is_verified()
                     || check
                         .comparisons
                         .iter()
@@ -6233,11 +10195,22 @@ fn ensure_retirement_directories(root: &Path) -> Result<Vec<PathBuf>, String> {
                 ));
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                if let Err(error) = std::fs::create_dir(&path) {
-                    cleanup_empty_directories(&created);
-                    return Err(format!("cannot create {}: {error}", path.display()));
+                match crate::patch::ensure_directory(&path) {
+                    Ok(crate::patch::DirectoryState::Created) => created.push(path),
+                    // A concurrent writer created it, so rollback must leave it alone.
+                    Ok(crate::patch::DirectoryState::Existing) => {}
+                    Err(crate::patch::DirectoryError::Occupied) => {
+                        cleanup_empty_directories(&created);
+                        return Err(format!(
+                            "retirement directory is not a regular directory: {}",
+                            path.display()
+                        ));
+                    }
+                    Err(crate::patch::DirectoryError::Io(error)) => {
+                        cleanup_empty_directories(&created);
+                        return Err(format!("cannot create {}: {error}", path.display()));
+                    }
                 }
-                created.push(path);
             }
             Err(error) => {
                 cleanup_empty_directories(&created);
@@ -6281,11 +10254,22 @@ fn ensure_patch_directories(
                     ));
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    if let Err(error) = std::fs::create_dir(&current) {
-                        cleanup_empty_directories(&created);
-                        return Err(format!("cannot create {}: {error}", current.display()));
+                    match crate::patch::ensure_directory(&current) {
+                        Ok(crate::patch::DirectoryState::Created) => created.push(current.clone()),
+                        // A concurrent writer created it, so rollback must leave it alone.
+                        Ok(crate::patch::DirectoryState::Existing) => {}
+                        Err(crate::patch::DirectoryError::Occupied) => {
+                            cleanup_empty_directories(&created);
+                            return Err(format!(
+                                "generator patch parent is not a regular directory: {}",
+                                current.display()
+                            ));
+                        }
+                        Err(crate::patch::DirectoryError::Io(error)) => {
+                            cleanup_empty_directories(&created);
+                            return Err(format!("cannot create {}: {error}", current.display()));
+                        }
                     }
-                    created.push(current.clone());
                 }
                 Err(error) => {
                     cleanup_empty_directories(&created);
@@ -6311,7 +10295,7 @@ fn ensure_plan_patch_directories(
 
 fn cleanup_empty_directories(paths: &[PathBuf]) {
     for path in paths.iter().rev() {
-        let _ = std::fs::remove_dir(path);
+        crate::patch::remove_empty_directory(path);
     }
 }
 
@@ -6322,29 +10306,32 @@ fn prepare_retirement(
 ) -> Result<Vec<crate::patch::Proposal>, String> {
     let root = canonical_root(root)?;
     let mut proposals = Vec::new();
-    for digest in &plan.proposals {
-        let proposal = load_proposal(plan_directory, digest)?;
-        for patch in &proposal.patches {
-            let target = safe_target(&root, &patch.path)?;
-            let contents = patch.contents()?;
-            proposals.push(match patch.operation {
-                PatchOperation::Create => {
-                    crate::patch::prepare_create(&target, contents, patch.permissions)?
-                }
-                PatchOperation::Update => crate::patch::prepare_expected(
-                    &target,
-                    patch
-                        .expected_digest
-                        .as_deref()
-                        .ok_or("update proposal omitted expected digest")?,
-                    contents,
-                )?,
-            });
-        }
+    let loaded = plan
+        .proposals
+        .iter()
+        .map(|digest| load_proposal(plan_directory, digest))
+        .collect::<Result<Vec<_>, _>>()?;
+    // One edit per path: see `unique_patches`.
+    for patch in unique_patches(&loaded.iter().collect::<Vec<_>>())? {
+        let target = safe_target(&root, &patch.path)?;
+        let contents = patch.contents()?;
+        proposals.push(match patch.operation {
+            PatchOperation::Create => {
+                crate::patch::prepare_create(&target, contents, patch.permissions)?
+            }
+            PatchOperation::Update => crate::patch::prepare_expected(
+                &target,
+                patch
+                    .expected_digest
+                    .as_deref()
+                    .ok_or("update proposal omitted expected digest")?,
+                contents,
+            )?,
+        });
     }
 
     let mut archive = load_archive_manifest(&root, &plan.plan_digest)?;
-    archive.plan_digest = plan.plan_digest.clone();
+    archive.plan_digest.clone_from(&plan.plan_digest);
     let mut retired_paths = BTreeSet::new();
     let mut retired_locations = BTreeSet::new();
     let mut scheduled_archive_blobs = BTreeSet::new();
@@ -6575,11 +10562,28 @@ fn require_shell_free_tree(root: &Path, phase: &str) -> Result<(), String> {
     {
         return Ok(());
     }
+    // Named, not counted. A reader told that a retirement rolled back because
+    // the tree still holds one error, one finding or one candidate then goes
+    // looking for which — and this function already knows.
+    let mut detail = Vec::new();
+    for finding in &inventory.findings {
+        detail.push(format!("shell at {}", finding.path));
+    }
+    for skipped in &inventory.skipped {
+        detail.push(format!("unresolved candidate at {}", skipped.path));
+    }
+    for error in &inventory.errors {
+        detail.push(match &error.path {
+            Some(path) => format!("{} error at {path}: {}", error.stage, error.message),
+            None => format!("{} error: {}", error.stage, error.message),
+        });
+    }
     Err(format!(
-        "DESHELL_BLOCKER_POST_SCAN: {phase} scan found {} shell findings, {} unresolved candidates, and {} errors",
+        "DESHELL_BLOCKER_POST_SCAN: {phase} scan found {} shell findings, {} unresolved candidates, and {} errors: {}",
         inventory.findings.len(),
         inventory.skipped.len(),
-        inventory.errors.len()
+        inventory.errors.len(),
+        detail.join("; ")
     ))
 }
 
@@ -6899,7 +10903,7 @@ pub(crate) fn status(root: &Path) -> Result<Status, String> {
             "shell-free".into(),
         ]
     } else if status.active_state == ActiveState::Blocked && pending_approval_argv.is_some() {
-        pending_approval_argv.expect("checked pending approval argv")
+        pending_approval_argv.ok_or("blocked migration lost its pending approval command")?
     } else {
         match status.active_state {
             ActiveState::Blocked
@@ -6917,7 +10921,15 @@ pub(crate) fn status(root: &Path) -> Result<Status, String> {
             ActiveState::Planned => {
                 let digest = status.active_plan.clone().unwrap_or_default();
                 let cell = next_cell.unwrap_or_else(|| "<approved-cell>".into());
-                let output = format!(".deshell/{digest}-{cell}-evidence.json");
+                // Under the root the argv already names, because `--output` is
+                // resolved against the current directory and the rest of the
+                // command is not. A relative path here is a next step that only
+                // works when the caller happens to be standing in the project.
+                let output = std::path::Path::new(&root_value)
+                    .join(".deshell")
+                    .join(format!("{digest}-{cell}-evidence.json"))
+                    .to_string_lossy()
+                    .into_owned();
                 vec![
                     "deshell".into(),
                     "migrate".into(),
@@ -7225,8 +11237,1053 @@ fn archive_executable(_metadata: &std::fs::Metadata) -> bool {
 }
 
 #[cfg(test)]
+// Tests reach for the raw APIs on purpose: they stage corrupt trees, race two
+// writers against one path, and assert on what the transactional layer does with
+// the result. Constructing those situations is precisely what the production ban
+// exists to prevent, so the ban is lifted here and nowhere else.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "tests construct the races and corrupt trees the production ban prevents"
+)]
 mod tests {
     use super::*;
+
+    /// A verifier for building the coverage ledger and for the behaviour tests
+    /// below: no variables, no arguments, and the workspace it is given.
+    fn ir_verifier<'a>(root: &'a Path, tasks: &'a [crate::ir::Task]) -> IrVerifier<'a> {
+        IrVerifier {
+            root,
+            tasks,
+            variables: BTreeMap::new(),
+            arguments: BTreeMap::new(),
+            default_cwd: None,
+            limits: crate::config::ResourceLimits {
+                timeout_ms: 30_000,
+                memory_bytes: 1 << 30,
+                processes: 512,
+                stdout_bytes: 16 << 20,
+                stderr_bytes: 16 << 20,
+            },
+            unset: crate::ir::UnsetPolicy::Empty,
+            visited: BTreeSet::new(),
+            depth: 0,
+        }
+    }
+
+    /// One harmless node per operation the IR can name.
+    ///
+    /// Built here rather than derived, so that an operation added to the enum
+    /// fails `ir_verifier_coverage_ledger_names_every_operation` until somebody
+    /// says what the verifier does with it.
+    fn one_node_per_operation() -> Vec<(&'static str, crate::ir::Node)> {
+        let nothing = || Box::new(node(crate::ir::Operation::NoOp));
+        let text = crate::ir::TextExpression::literal;
+        vec![
+            (
+                "exec",
+                node(crate::ir::Operation::Exec {
+                    argv: vec![text("/usr/bin/true")],
+                    environment: Vec::new(),
+                    working_directory: None,
+                }),
+            ),
+            (
+                "expand_words",
+                node(crate::ir::Operation::ExpandWords {
+                    name: "words".into(),
+                    value: text(""),
+                    field_splitting: crate::ir::FieldSplitting::None,
+                    glob: crate::ir::GlobBehavior::Disabled,
+                }),
+            ),
+            (
+                "redirect",
+                node(crate::ir::Operation::Redirect {
+                    redirections: Vec::new(),
+                    body: nothing(),
+                }),
+            ),
+            (
+                "pipeline",
+                node(crate::ir::Operation::Pipeline {
+                    nodes: Vec::new(),
+                    status: crate::ir::PipelineStatus::Last,
+                }),
+            ),
+            (
+                "sequence",
+                node(crate::ir::Operation::Sequence {
+                    nodes: Vec::new(),
+                    on_failure: crate::ir::SequenceFailure::Continue,
+                }),
+            ),
+            (
+                "parallel",
+                node(crate::ir::Operation::Parallel { nodes: Vec::new() }),
+            ),
+            (
+                "write_stdout",
+                node(crate::ir::Operation::WriteStdout { contents: text("") }),
+            ),
+            (
+                "exit",
+                node(crate::ir::Operation::Exit {
+                    status: text("0"),
+                    non_numeric: crate::ir::NonNumericStatus::Unreachable,
+                }),
+            ),
+            ("no_op", node(crate::ir::Operation::NoOp)),
+            (
+                "condition",
+                node(crate::ir::Operation::Condition {
+                    predicate: nothing(),
+                    if_true: nothing(),
+                    if_false: None,
+                }),
+            ),
+            (
+                "test",
+                node(crate::ir::Operation::Test {
+                    predicate: crate::ir::TestPredicate::Empty { value: text("") },
+                }),
+            ),
+            (
+                "while",
+                node(crate::ir::Operation::While {
+                    // Fails on the first test, so the loop ends.
+                    condition: Box::new(node(crate::ir::Operation::Test {
+                        predicate: crate::ir::TestPredicate::NonEmpty { value: text("") },
+                    })),
+                    body: nothing(),
+                }),
+            ),
+            ("not", node(crate::ir::Operation::Not { body: nothing() })),
+            (
+                "match",
+                node(crate::ir::Operation::Match {
+                    value: text(""),
+                    cases: Vec::new(),
+                    default: None,
+                }),
+            ),
+            (
+                "foreach",
+                node(crate::ir::Operation::Foreach {
+                    variable: "item".into(),
+                    items: Vec::new(),
+                    body: nothing(),
+                }),
+            ),
+            (
+                "scope",
+                node(crate::ir::Operation::Scope {
+                    variables: Vec::new(),
+                    environment: Vec::new(),
+                    working_directory: None,
+                    body: nothing(),
+                }),
+            ),
+            (
+                "try_finally",
+                node(crate::ir::Operation::TryFinally {
+                    body: nothing(),
+                    finalizer: nothing(),
+                }),
+            ),
+            (
+                "task_call",
+                node(crate::ir::Operation::TaskCall {
+                    task: "main".into(),
+                    arguments: Vec::new(),
+                    positional: Vec::new(),
+                }),
+            ),
+            (
+                "set_variable",
+                node(crate::ir::Operation::SetVariable {
+                    name: "name".into(),
+                    value_type: crate::ir::ValueType::Primitive(crate::ir::PrimitiveType::Text),
+                    value: text(""),
+                }),
+            ),
+            (
+                "set_environment",
+                node(crate::ir::Operation::SetEnvironment {
+                    name: "NAME".into(),
+                    value: None,
+                    secret: false,
+                }),
+            ),
+            (
+                "set_working_directory",
+                node(crate::ir::Operation::SetWorkingDirectory { path: text(".") }),
+            ),
+            (
+                "capture_stdout",
+                node(crate::ir::Operation::CaptureStdout {
+                    name: "name".into(),
+                    value_type: crate::ir::PrimitiveType::Text,
+                    body: nothing(),
+                }),
+            ),
+            (
+                "spawn",
+                node(crate::ir::Operation::Spawn {
+                    handle: "handle".into(),
+                    body: nothing(),
+                }),
+            ),
+            (
+                "wait",
+                node(crate::ir::Operation::Wait {
+                    handle: "handle".into(),
+                }),
+            ),
+            (
+                "send_signal",
+                node(crate::ir::Operation::SendSignal {
+                    handle: "handle".into(),
+                    signal: 15,
+                    process_group: false,
+                }),
+            ),
+            (
+                "file_read",
+                node(crate::ir::Operation::FileRead { path: text("f") }),
+            ),
+            (
+                "file_write",
+                node(crate::ir::Operation::FileWrite {
+                    path: text("f"),
+                    contents: text(""),
+                    append: false,
+                }),
+            ),
+            (
+                "file_remove",
+                node(crate::ir::Operation::FileRemove { path: text("f") }),
+            ),
+            (
+                "file_metadata",
+                node(crate::ir::Operation::FileMetadata {
+                    path: text("f"),
+                    output: "out".into(),
+                    follow_symlinks: false,
+                }),
+            ),
+            (
+                "file_set_metadata",
+                node(crate::ir::Operation::FileSetMetadata {
+                    path: text("f"),
+                    permissions: None,
+                    executable: None,
+                    follow_symlinks: false,
+                }),
+            ),
+            (
+                "network_request",
+                node(crate::ir::Operation::NetworkRequest {
+                    method: text("GET"),
+                    uri: text("https://example.invalid/"),
+                }),
+            ),
+            (
+                "clock_read",
+                node(crate::ir::Operation::ClockRead {
+                    clock: crate::ir::ClockKind::Monotonic,
+                    output: "out".into(),
+                }),
+            ),
+            (
+                "random_bytes",
+                node(crate::ir::Operation::RandomBytes {
+                    output: "out".into(),
+                    length: 1,
+                }),
+            ),
+            (
+                "interpreter_call",
+                node(crate::ir::Operation::InterpreterCall {
+                    interpreter: "bash".into(),
+                    interpreter_pin: "sha256:0".into(),
+                    source: crate::ir::SourceBytes::from_bytes(b""),
+                    source_span: crate::ir::SourceSpan {
+                        file: "build.sh".into(),
+                        start_line: 0,
+                        start_column: 0,
+                        end_line: 0,
+                        end_column: 0,
+                        start_byte: 0,
+                        end_byte: 0,
+                    },
+                    capabilities: Vec::new(),
+                    reason: "test".into(),
+                }),
+            ),
+            (
+                "opaque_capsule",
+                node(crate::ir::Operation::OpaqueCapsule {
+                    interpreter: "bash".into(),
+                    source: crate::ir::SourceBytes::from_bytes(b""),
+                    path: None,
+                }),
+            ),
+        ]
+    }
+
+    /// Every generator-side classifier and emitter must make an explicit
+    /// decision for every IR operation. This is deliberately driven by the
+    /// same exhaustive fixture as the independent verifier: adding an
+    /// operation cannot leave a quiet wildcard or an unexecuted refusal arm.
+    #[test]
+    fn generator_classifiers_and_emitters_decide_every_ir_operation() {
+        let mut captures = Vec::new();
+        let mut sets_variables = Vec::new();
+        let mut redirects = Vec::new();
+        let mut exits = Vec::new();
+        let mut starts_process = Vec::new();
+        let mut uses_pipeline = Vec::new();
+
+        for (name, subject) in one_node_per_operation() {
+            assert_eq!(subject.operation.name(), name);
+            if node_captures_stdout(&subject) {
+                captures.push(name);
+            }
+            if rust_node_sets_variables(&subject) {
+                sets_variables.push(name);
+            }
+            if rust_node_redirects(&subject) {
+                redirects.push(name);
+            }
+            if node_always_exits(&subject) {
+                exits.push(name);
+            }
+            if rust_node_starts_a_process(&subject) {
+                starts_process.push(name);
+            }
+            if rust_node_uses_pipeline(&subject) {
+                uses_pipeline.push(name);
+            }
+            assert!(!rust_node_uses_arguments(&subject), "{name}");
+            assert!(!go_node_uses_defaults(&subject), "{name}");
+            assert!(!go_node_checks_exit_status(&subject), "{name}");
+            assert_eq!(go_pattern_packages(&subject), (false, false), "{name}");
+
+            let mut rust = String::new();
+            match emit_rust_node(&subject, &mut rust, 1, Locals::Kept) {
+                Ok(()) => assert!(!rust.is_empty(), "Rust silently erased {name}"),
+                Err(error) => assert!(!error.trim().is_empty(), "Rust refused {name} silently"),
+            }
+            let mut go = String::new();
+            match emit_go_node(&subject, &mut go, 1) {
+                Ok(()) if name == "sequence" => assert!(go.is_empty()),
+                Ok(()) => assert!(!go.is_empty(), "Go silently erased {name}"),
+                Err(error) => assert!(!error.trim().is_empty(), "Go refused {name} silently"),
+            }
+
+            let plan = plan_with_body(subject.clone());
+            let top_level = literal_exec_sequence(&plan, "exhaustive host classifier");
+            if matches!(name, "exec" | "set_variable") {
+                assert!(top_level.is_ok(), "host refused {name}: {top_level:?}");
+            } else {
+                let error = top_level.unwrap_err();
+                assert!(error.starts_with("DESHELL_BLOCKER_GENERATOR_UNSUPPORTED:"));
+            }
+
+            let mut steps = Vec::new();
+            let flattened = flatten_literal_commands(
+                &subject,
+                crate::ir::SequenceFailure::Continue,
+                "exhaustive host classifier",
+                &mut steps,
+            );
+            if matches!(
+                name,
+                "exec" | "sequence" | "write_stdout" | "exit" | "set_variable"
+            ) {
+                assert!(flattened.is_ok(), "host step refused {name}: {flattened:?}");
+            } else {
+                let error = flattened.unwrap_err();
+                assert!(error.starts_with("DESHELL_BLOCKER_GENERATOR_UNSUPPORTED:"));
+            }
+        }
+
+        assert_eq!(captures, ["capture_stdout"]);
+        assert_eq!(sets_variables, ["set_variable", "capture_stdout"]);
+        assert_eq!(redirects, ["redirect"]);
+        assert_eq!(exits, ["exit"]);
+        assert_eq!(starts_process, ["exec", "pipeline", "interpreter_call"]);
+        assert_eq!(uses_pipeline, ["pipeline"]);
+    }
+
+    /// What the independent IR verifier does with every operation, recorded.
+    ///
+    /// The ledger is *derived by running the verifier*, not written beside it:
+    /// a second hand-maintained table would be a second claim that could
+    /// disagree with the code. The golden file is what makes a change loud —
+    /// the verifier ran four of the thirty-five operations behind an
+    /// `other => Err(...)` catch-all arm, and no test said so, because "nobody
+    /// implemented this" had no place to be a value.
+    ///
+    /// A `verified: false` entry is not a defect to be cleared. Some of these
+    /// must stay refused: running `interpreter_call` here would re-run the
+    /// original shell, and an oracle that consults the original is not
+    /// independent of it.
+    #[test]
+    fn ir_verifier_coverage_ledger_names_every_operation() {
+        let workspace = tempfile::tempdir().unwrap();
+        let tasks: Vec<crate::ir::Task> = Vec::new();
+        let mut ledger = Vec::new();
+        for (name, subject) in one_node_per_operation() {
+            assert_eq!(
+                subject.operation.name(),
+                name,
+                "the ledger case labelled {name} builds a different operation"
+            );
+            let outcome = ir_verifier(workspace.path(), &tasks).node(&subject, &[]);
+            // A refusal is the value; the sentence beside it is the
+            // explanation. A wrong sentence cannot make the classification
+            // wrong, which is the only reason to carry both.
+            let refused = match &outcome {
+                Err(IrError::Refused {
+                    operation,
+                    refusal,
+                    reason,
+                }) => {
+                    assert_eq!(*operation, name, "a refusal named a different operation");
+                    Some((*refusal, *reason))
+                }
+                Err(IrError::Failed(_)) | Ok(_) => None,
+            };
+            ledger.push(serde_json::json!({
+                "operation": name,
+                "verified": refused.is_none(),
+                "refusal": refused.map(|(refusal, _)| refusal.name()),
+                "reason": refused.map(|(_, reason)| reason),
+            }));
+        }
+        let names: Vec<&str> = ledger
+            .iter()
+            .map(|entry| entry["operation"].as_str().unwrap())
+            .collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            sorted,
+            crate::ir::Operation::ALL_NAMES,
+            "the ledger and Operation::ALL_NAMES disagree about which operations exist"
+        );
+
+        // Each value carries one consequence a test holds it to. Without that a
+        // classification is a summary whose mistakes are merely harder to
+        // notice than a paragraph's.
+        let count = |wanted: &str| {
+            ledger
+                .iter()
+                .filter(|entry| entry["refusal"].as_str() == Some(wanted))
+                .count()
+        };
+        // `permanent` means running it would be wrong, not that nobody has got
+        // to it. The consequence is that it never becomes verified — which the
+        // golden below fails on, because a verified entry has no `refusal` at
+        // all.
+        assert!(
+            count("permanent") > 0,
+            "the ledger records no permanent refusal, so the value branches on nothing"
+        );
+        // Tight ratchets: below the ceiling means the ceiling is stale and has
+        // stopped holding anything.
+        assert_eq!(
+            count("unimplemented"),
+            IR_VERIFIER_UNIMPLEMENTED_CEILING,
+            "implementing one of these is welcome; lower IR_VERIFIER_UNIMPLEMENTED_CEILING with it"
+        );
+        assert_eq!(
+            count("unexamined"),
+            IR_VERIFIER_UNEXAMINED_CEILING,
+            "an operation nobody has classified; decide whether it is permanent or unimplemented, or raise the ceiling and say why"
+        );
+
+        let mut sorted_ledger = ledger;
+        sorted_ledger.sort_by_key(|entry| entry["operation"].as_str().unwrap().to_owned());
+        let document = serde_json::json!({
+            "schema_version": 1,
+            "operations": sorted_ledger,
+        });
+        let produced =
+            String::from_utf8(crate::canonical_json::canonical_bytes(&document).unwrap()).unwrap();
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("contracts/golden/ir-verifier-coverage-v1.json");
+        if std::env::var_os("DESHELL_UPDATE_GOLDEN").is_some() {
+            std::fs::write(&path, format!("{produced}\n")).unwrap();
+        }
+        let recorded = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            recorded.trim_end(),
+            produced,
+            "the IR verifier's coverage changed; re-record with DESHELL_UPDATE_GOLDEN=1 and say why in the commit"
+        );
+    }
+
+    /// A step that only writes and ends is a program.
+    ///
+    /// The generator required a step to start at least one process, so
+    /// `if [ "$r" != "success" ]; then echo "..."; exit 1; fi` — the commonest
+    /// shape a workflow gate has, and the one this repository's own `ci.yml`
+    /// ends with — was refused as "runs nothing". The generated action is
+    /// started as `node index.js` either way.
+    ///
+    /// The written text joins literal pieces and names, because a step writes
+    /// `"the result was: $RESULT"` far more often than it writes a constant.
+    #[test]
+    fn a_step_that_only_writes_and_ends_is_a_program() {
+        let plan =
+            crate::frontend::lower_with_interpreter(crate::frontend::LowerWithInterpreterArgs {
+                path: ".github/workflows/ci.yml",
+                source:
+                    b"if [ \"$R\" != \"success\" ]; then\necho \"result was: $R\"\nexit 1\nfi\n",
+                unknown_policy: crate::config::UnknownInterpreter::Reject,
+                configured: "bash",
+                host: crate::frontend::HostShell::default(),
+            })
+            .unwrap();
+        let (steps, _) = literal_exec_sequence(&plan, "test").unwrap();
+        let [HostStep::When { test: _, body }] = steps.as_slice() else {
+            panic!("one branch: {steps:#?}");
+        };
+        let [HostStep::Write(written), HostStep::Exit(status)] = body.as_slice() else {
+            panic!("a write and an exit: {body:#?}");
+        };
+        assert_eq!(*status, 1);
+        assert!(
+            written.contains(&HostWord::Variable("R".to_owned())),
+            "the written text lost the name it interpolates: {written:#?}"
+        );
+        assert!(
+            written.iter().any(
+                |word| matches!(word, HostWord::Literal(value) if value.contains("result was"))
+            ),
+            "{written:#?}"
+        );
+    }
+
+    /// A branch keeps its own steps, and an `&&` chain does not.
+    ///
+    /// `if TEST; then BODY; fi` and `a && b` both lower to a `Condition`, and
+    /// they are not the same program. A branch that is not taken must not run,
+    /// so its steps stay nested; an `&&` chain under `set -e` is the two
+    /// commands in a list that stops on failure, so it flattens. Reading either
+    /// as the other would run something the step does not.
+    #[test]
+    fn a_branch_keeps_its_steps_and_a_chain_flattens() {
+        let step = |source: &str| {
+            let plan = crate::frontend::lower_with_interpreter(
+                crate::frontend::LowerWithInterpreterArgs {
+                    path: ".github/workflows/ci.yml",
+                    source: source.as_bytes(),
+                    unknown_policy: crate::config::UnknownInterpreter::Reject,
+                    configured: "bash",
+                    host: crate::frontend::HostShell::default(),
+                },
+            )
+            .unwrap();
+            literal_exec_sequence(&plan, "test").unwrap().0
+        };
+
+        let branch = step("if [ \"$A\" != \"b\" ]; then\necho no\nfi\n/bin/echo done\n");
+        let [HostStep::When { test, body }, HostStep::Run(_)] = branch.as_slice() else {
+            panic!("a branch and a command: {branch:#?}");
+        };
+        assert!(matches!(test, HostTest::NotEqual(..)));
+        assert_eq!(body.len(), 1, "the branch keeps its own step: {body:#?}");
+        assert!(matches!(body[0], HostStep::Write(_)));
+
+        let chain = step("/bin/echo one && /bin/echo two\n");
+        assert_eq!(chain.len(), 2, "a chain flattens: {chain:#?}");
+        assert!(chain.iter().all(|step| matches!(step, HostStep::Run(_))));
+    }
+
+    /// A workflow step with several commands becomes a program that runs them
+    /// in order and stops where the step stops.
+    ///
+    /// Refusing a multi-command step was ten of this repository's own blockers.
+    /// The generated program writes each command with its own literal argv
+    /// rather than looping over a list: a loop puts a variable where the program
+    /// name goes, and de-shell's own scanner reads `spawnSync(program, ...)` as
+    /// a dynamic candidate — correctly. The first version of this failed the
+    /// shell-free gate it exists to satisfy.
+    #[test]
+    fn a_step_with_several_commands_runs_them_in_order_and_stops_where_it_stops() {
+        let step = |source: &str| {
+            let plan = crate::frontend::lower(
+                ".github/workflows/ci.yml.deshell.sh",
+                source.as_bytes(),
+                crate::config::UnknownInterpreter::Reject,
+            )
+            .unwrap();
+            literal_exec_sequence(&plan, "test").unwrap()
+        };
+
+        let (commands, on_failure) = step("/bin/echo one\n/bin/echo two\n/bin/echo three\n");
+        assert_eq!(commands.len(), 3);
+        assert_eq!(
+            commands[0],
+            HostStep::Run(vec![
+                HostWord::Literal("/bin/echo".to_owned()),
+                HostWord::Literal("one".to_owned()),
+            ])
+        );
+        // The runner executes `bash -e {0}`, so a step stops at the first
+        // failure whether or not it says `set -e`.
+        assert_eq!(on_failure, crate::ir::SequenceFailure::Stop);
+
+        let (single, _) = step("/bin/echo only\n");
+        assert_eq!(single.len(), 1);
+    }
+
+    /// A workflow step is run the way the runner runs it, per interpreter.
+    ///
+    /// A bash step is `bash -e {0}` over a file and a pwsh step is a file
+    /// carrying `$ErrorActionPreference = 'stop'` and `exit $LASTEXITCODE`,
+    /// dot-sourced. Both are the host's rules rather than the interpreter's, and
+    /// reading a step as `bash -c <text>` is what made a `set -e` step's
+    /// baseline carry on after a failure.
+    ///
+    /// No end-to-end case reaches the pwsh difference yet — the PowerShell
+    /// frontend lowers external command invocations, and those behave the same
+    /// under both forms — so this pins the shape and
+    /// `contracts/golden/powershell-step-invocation-semantics-v1.json` records
+    /// the measurement that says the forms are not interchangeable.
+    #[test]
+    fn a_workflow_step_is_run_the_way_the_runner_runs_it() {
+        let bash = embedded_original_invocation(
+            ".github/workflows/ci.yml",
+            "bash",
+            b"/bin/echo one\n".to_vec(),
+        )
+        .unwrap();
+        assert_eq!(&bash.argv[..2], ["bash", "-e"]);
+        assert_eq!(bash.argv.len(), 3);
+        assert!(bash.argv[2].ends_with("step.sh"), "{:?}", bash.argv);
+
+        let pwsh = embedded_original_invocation(
+            ".github/workflows/ci.yml",
+            "powershell",
+            b"& '/bin/echo' one\n".to_vec(),
+        )
+        .unwrap();
+        assert_eq!(
+            &pwsh.argv[..5],
+            [
+                "pwsh",
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command"
+            ]
+        );
+        assert!(pwsh.argv[5].starts_with(". '"), "{:?}", pwsh.argv);
+        let script = std::fs::read_to_string(
+            pwsh.argv[5]
+                .trim_start_matches(". '")
+                .trim_end_matches('\''),
+        )
+        .unwrap();
+        assert!(
+            script.starts_with("$ErrorActionPreference = 'stop'\n"),
+            "{script}"
+        );
+        assert!(script.contains("& '/bin/echo' one"), "{script}");
+        assert!(
+            script.contains(
+                "if ((Test-Path -LiteralPath variable:/LASTEXITCODE)) { exit $LASTEXITCODE }"
+            ),
+            "{script}"
+        );
+
+        // A host with no such rule is left alone.
+        let plain =
+            embedded_original_invocation("Makefile", "bash", b"/bin/echo one\n".to_vec()).unwrap();
+        assert_eq!(&plain.argv[..2], ["bash", "-c"]);
+    }
+
+    /// An `&&` chain in a workflow step is the commands in order.
+    ///
+    /// It lowers to a `Condition`, and the generator refused one — two of this
+    /// repository's own blockers were
+    /// `sudo apt-get update && sudo apt-get install ...`. Under `Stop` the two
+    /// are the same program: a failing left side ends the step with its status,
+    /// and a succeeding one runs the right side whose status is the step's.
+    ///
+    /// Under `Continue` they are not, which is what the second half of this
+    /// checks: `a && b` followed by `c` still runs `c` when `a` fails, and a
+    /// flat list with no stop would run `b` as well.
+    #[test]
+    fn an_and_chain_in_a_step_is_the_commands_in_order() {
+        let step = |source: &str| {
+            let plan = crate::frontend::lower(
+                ".github/workflows/ci.yml.deshell.sh",
+                source.as_bytes(),
+                crate::config::UnknownInterpreter::Reject,
+            )
+            .unwrap();
+            literal_exec_sequence(&plan, "test")
+        };
+        let (commands, on_failure) = step("/bin/echo one && /bin/echo two\n").unwrap();
+        assert_eq!(
+            commands,
+            vec![
+                HostStep::Run(vec![
+                    HostWord::Literal("/bin/echo".to_owned()),
+                    HostWord::Literal("one".to_owned()),
+                ]),
+                HostStep::Run(vec![
+                    HostWord::Literal("/bin/echo".to_owned()),
+                    HostWord::Literal("two".to_owned()),
+                ]),
+            ]
+        );
+        assert_eq!(on_failure, crate::ir::SequenceFailure::Stop);
+
+        // A chain the host does not run under `set -e` is not this program.
+        let mut commands = Vec::new();
+        let condition = node(crate::ir::Operation::Condition {
+            predicate: Box::new(exec(vec![crate::ir::TextExpression::literal("/bin/true")])),
+            if_true: Box::new(exec(vec![crate::ir::TextExpression::literal("/bin/true")])),
+            if_false: None,
+        });
+        assert!(
+            flatten_literal_commands(
+                &condition,
+                crate::ir::SequenceFailure::Continue,
+                "test",
+                &mut commands
+            )
+            .is_err(),
+            "a chain was flattened where a failure would not stop the list"
+        );
+    }
+
+    /// Several shell blocks in one workflow retire together.
+    ///
+    /// A host rewrite replaces the whole file. Each proposal used to carry the
+    /// rewrite of its own block only, so two proposals for one workflow
+    /// described the same file differently and only one could be applied —
+    /// which is what `DESHELL_BLOCKER_DUPLICATE_TARGET` said, correctly, 37
+    /// times on de-shell's own repository.
+    ///
+    /// Every proposal now carries the same rewrite, with every block replaced,
+    /// and `unique_patches` makes the repeats one edit. That is sound because
+    /// `apply` applies a plan in one transaction: there is no state where some
+    /// blocks are replaced and the rest are not.
+    #[test]
+    fn several_run_steps_in_one_workflow_become_one_rewrite() {
+        let directory = tempfile::tempdir().unwrap();
+        let workflow = concat!(
+            "name: ci\n",
+            "on:\n",
+            "  push:\n",
+            "jobs:\n",
+            "  build:\n",
+            "    runs-on: ubuntu-latest\n",
+            "    steps:\n",
+            "      - name: one\n",
+            "        run: /bin/echo one\n",
+            "      - name: two\n",
+            "        run: |\n",
+            "          /bin/echo two\n",
+            "      - name: three\n",
+            "        run: /bin/echo three\n",
+        );
+        let path = directory.path().join(".github/workflows");
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("ci.yml"), workflow).unwrap();
+        let inventory = crate::scanner::scan(directory.path()).unwrap();
+        let steps: Vec<_> = inventory
+            .findings
+            .iter()
+            .filter(|finding| finding.kind.is_embedded())
+            .cloned()
+            .collect();
+        assert_eq!(steps.len(), 3, "{inventory:#?}");
+
+        let host = std::fs::read(path.join("ci.yml")).unwrap();
+        let rewrite = |_step: &crate::scanner::Finding| {
+            let mut replacements = Vec::new();
+            for each in &steps {
+                replacements.push(github_run_replacement(&host, each).unwrap());
+            }
+            replacements.sort_by_key(|(start, _, _)| std::cmp::Reverse(*start));
+            let mut bytes = host.clone();
+            for (start, end, uses) in &replacements {
+                let mut next = Vec::new();
+                next.extend_from_slice(&bytes[..*start]);
+                next.extend_from_slice(uses.as_bytes());
+                next.extend_from_slice(&bytes[*end..]);
+                bytes = next;
+            }
+            bytes
+        };
+        // Each step's rewrite replaces every step, so the three agree byte for
+        // byte. Two that did not would be a real conflict, and the plan still
+        // refuses those.
+        let rewritten: std::collections::BTreeSet<_> = steps.iter().map(rewrite).collect();
+        assert_eq!(
+            rewritten.len(),
+            1,
+            "the steps disagree about what the file becomes"
+        );
+        let only = String::from_utf8(rewritten.into_iter().next().unwrap()).unwrap();
+        assert_eq!(
+            only.matches("uses: ./.github/actions/deshell-").count(),
+            3,
+            "{only}"
+        );
+        assert!(!only.contains("run:"), "{only}");
+    }
+
+    /// A set of checks reports the worst status in it, and `unavailable` is
+    /// worse than `verified`.
+    ///
+    /// The aggregation was an `if`/`else` chain over three questions — is
+    /// anything nondeterministic, is anything different, did a validation
+    /// command fail — and everything answering no to all three came out
+    /// `Verified`. `Unavailable` answers no to all three, so a plan holding a
+    /// check whose run could not be made was reported as verified, with exit 0.
+    ///
+    /// Nothing produced an `Unavailable` check at that level until the
+    /// interpreter probe did. The hole had been there the whole time, waiting
+    /// for its first caller rather than announcing itself, which is the reason
+    /// the ordering is now a total one over an exhaustive `match`.
+    #[test]
+    fn a_status_that_is_not_a_difference_is_still_not_a_verification() {
+        let ranked = |status| evidence_severity(status);
+        assert_eq!(ranked(EvidenceStatus::Verified), 0);
+        for status in [
+            EvidenceStatus::Unavailable,
+            EvidenceStatus::Failed,
+            EvidenceStatus::Different,
+            EvidenceStatus::Nondeterministic,
+        ] {
+            assert!(
+                ranked(status) > ranked(EvidenceStatus::Verified),
+                "{} ranked no worse than verified",
+                status.as_str()
+            );
+            assert!(!status.is_verified(), "{}", status.as_str());
+        }
+
+        // The aggregation the verifier runs, over the shape that used to come
+        // out `verified`: one check that could not be run and nothing else.
+        let worst = |statuses: &[EvidenceStatus]| {
+            statuses
+                .iter()
+                .copied()
+                .max_by_key(|status| evidence_severity(*status))
+                .unwrap_or(EvidenceStatus::Verified)
+        };
+        assert_eq!(
+            worst(&[EvidenceStatus::Unavailable]),
+            EvidenceStatus::Unavailable
+        );
+        assert_eq!(
+            worst(&[EvidenceStatus::Verified, EvidenceStatus::Unavailable]),
+            EvidenceStatus::Unavailable
+        );
+        assert_eq!(
+            worst(&[EvidenceStatus::Unavailable, EvidenceStatus::Different]),
+            EvidenceStatus::Different
+        );
+        assert_eq!(worst(&[]), EvidenceStatus::Verified);
+    }
+
+    /// Every status has a place in the ordering.
+    ///
+    /// `evidence_severity` is an exhaustive `match`, so a status added to the
+    /// enum fails to compile until it is ranked. This says the ranks are also
+    /// distinct, so two statuses cannot share a place and make `max_by_key`
+    /// pick by accident of iteration order.
+    #[test]
+    fn the_evidence_statuses_are_totally_ordered() {
+        let statuses = [
+            EvidenceStatus::Verified,
+            EvidenceStatus::Unavailable,
+            EvidenceStatus::Failed,
+            EvidenceStatus::Different,
+            EvidenceStatus::Nondeterministic,
+        ];
+        let ranks: BTreeSet<u8> = statuses.iter().map(|s| evidence_severity(*s)).collect();
+        assert_eq!(ranks.len(), statuses.len(), "two statuses share a rank");
+    }
+
+    /// The refusal vocabulary is the three values the ledger can record.
+    ///
+    /// Pinned because the names go into
+    /// `contracts/golden/ir-verifier-coverage-v1.json`, which something outside
+    /// this repository may branch on. This is also what constructs
+    /// `IrRefusal::Unexamined`, whose ceiling is zero.
+    #[test]
+    fn the_refusal_vocabulary_is_permanent_unimplemented_and_unexamined() {
+        assert_eq!(
+            [
+                IrRefusal::Permanent,
+                IrRefusal::Unimplemented,
+                IrRefusal::Unexamined,
+            ]
+            .map(IrRefusal::name),
+            ["permanent", "unimplemented", "unexamined"]
+        );
+    }
+
+    /// `set -e` reaches the independent verifier.
+    ///
+    /// It did not: the arm read `Sequence { nodes, .. }`, and the `..` dropped
+    /// `on_failure`. A script of `set -e; /usr/bin/false; echo unreachable`
+    /// exited 1 in the shell and in the generated program, and the verifier —
+    /// the thing that decides whether the two agree — ran the `echo` and
+    /// reported 0. It disagreed with both, so the migration was reported
+    /// `different`; a verifier that is wrong in the other direction reports
+    /// agreement that is not there.
+    #[test]
+    fn a_sequence_under_set_e_stops_at_the_first_failure() {
+        let workspace = tempfile::tempdir().unwrap();
+        let tasks: Vec<crate::ir::Task> = Vec::new();
+        let statements = || {
+            vec![
+                node(crate::ir::Operation::Test {
+                    predicate: crate::ir::TestPredicate::NonEmpty {
+                        value: crate::ir::TextExpression::literal(""),
+                    },
+                }),
+                node(crate::ir::Operation::WriteStdout {
+                    contents: crate::ir::TextExpression::literal("unreachable\n"),
+                }),
+            ]
+        };
+
+        let stopped = ir_verifier(workspace.path(), &tasks)
+            .node(
+                &node(crate::ir::Operation::Sequence {
+                    nodes: statements(),
+                    on_failure: crate::ir::SequenceFailure::Stop,
+                }),
+                &[],
+            )
+            .unwrap();
+        assert_eq!(stopped.outcome.exit_code, 1);
+        assert_eq!(stopped.outcome.stdout, b"");
+
+        // The other half of the option, so the test cannot pass by the verifier
+        // refusing to run the second statement at all.
+        let carried_on = ir_verifier(workspace.path(), &tasks)
+            .node(
+                &node(crate::ir::Operation::Sequence {
+                    nodes: statements(),
+                    on_failure: crate::ir::SequenceFailure::Continue,
+                }),
+                &[],
+            )
+            .unwrap();
+        assert_eq!(carried_on.outcome.exit_code, 0);
+        assert_eq!(carried_on.outcome.stdout, b"unreachable\n");
+    }
+
+    /// `exit` ends the task in the independent verifier.
+    ///
+    /// The operation was refused outright before, because the verifier had no
+    /// term for "the task ended" — so a plan holding a native `exit` could not
+    /// be verified and could not retire.
+    #[test]
+    fn exit_ends_the_task_and_the_statements_after_it_do_not_run() {
+        let workspace = tempfile::tempdir().unwrap();
+        let tasks: Vec<crate::ir::Task> = Vec::new();
+        let step = ir_verifier(workspace.path(), &tasks)
+            .node(
+                &node(crate::ir::Operation::Sequence {
+                    nodes: vec![
+                        node(crate::ir::Operation::Exit {
+                            status: crate::ir::TextExpression::literal("3"),
+                            non_numeric: crate::ir::NonNumericStatus::Unreachable,
+                        }),
+                        node(crate::ir::Operation::WriteStdout {
+                            contents: crate::ir::TextExpression::literal("after\n"),
+                        }),
+                    ],
+                    // `exit` ends the task whatever this says.
+                    on_failure: crate::ir::SequenceFailure::Continue,
+                }),
+                &[],
+            )
+            .unwrap();
+        assert_eq!(step.flow, IrFlow::Exited);
+        assert_eq!(step.outcome.exit_code, 3);
+        assert_eq!(step.outcome.stdout, b"");
+    }
+
+    /// `set -u` reaches the independent verifier.
+    ///
+    /// The walk passed `UnsetPolicy::Empty` as a constant, so a script that read
+    /// an unset name under `set -u` failed in the shell and expanded to an empty
+    /// string here.
+    #[test]
+    fn nounset_makes_an_unset_name_an_error_rather_than_an_empty_string() {
+        let workspace = tempfile::tempdir().unwrap();
+        let tasks: Vec<crate::ir::Task> = Vec::new();
+        let subject = node(crate::ir::Operation::WriteStdout {
+            contents: crate::ir::TextExpression {
+                parts: vec![crate::ir::TextPart::Variable {
+                    name: "DESHELL_NEVER_SET".into(),
+                }],
+            },
+        });
+
+        let mut permissive = ir_verifier(workspace.path(), &tasks);
+        assert_eq!(permissive.node(&subject, &[]).unwrap().outcome.stdout, b"");
+
+        let mut strict = ir_verifier(workspace.path(), &tasks);
+        strict.unset = crate::ir::UnsetPolicy::Refuse;
+        assert!(strict.node(&subject, &[]).is_err());
+    }
+
+    /// A scenario cannot say two different things about one argument.
+    ///
+    /// `argv` and `arguments` both name `$1`. The walk read `arguments` and the
+    /// shell read `argv`, so a scenario that disagreed with itself was observed
+    /// as the replacement disagreeing with the original — a real difference
+    /// reported for a reason that was not in either program.
+    #[test]
+    fn a_scenario_that_names_one_argument_twice_must_not_contradict_itself() {
+        let task = crate::ir::Task {
+            name: "main".into(),
+            inputs: vec![crate::ir::Binding {
+                name: "1".into(),
+                value_type: crate::ir::ValueType::Primitive(crate::ir::PrimitiveType::Text),
+            }],
+            outputs: Vec::new(),
+            environment: Vec::new(),
+            secrets: Vec::new(),
+            platform_capabilities: Vec::new(),
+            cacheable: false,
+            nounset: false,
+            invocation: None,
+            body: node(crate::ir::Operation::NoOp),
+        };
+        let agreeing = BTreeMap::from([("1".to_owned(), "a".to_owned())]);
+        assert_eq!(
+            bind_ir_positional(&task, agreeing.clone(), &["a".to_owned()]).unwrap(),
+            agreeing
+        );
+        let message =
+            bind_ir_positional(&task, agreeing, &["b".to_owned()]).expect_err("contradiction");
+        assert!(message.contains("cannot differ"), "{message}");
+
+        // Nothing declared, nothing bound: the argv still reaches the shell.
+        assert!(
+            bind_ir_positional(&task, BTreeMap::new(), &[])
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     #[test]
     fn go_build_environment_is_private_complete_and_not_applied_to_other_tools() {
@@ -7366,7 +12423,7 @@ mod tests {
     #[test]
     fn embedded_cmd_snippet_is_materialized_as_an_exact_batch_file() {
         let snippet = b"@echo off\ntarget\\deshell-corpus-helper.exe branch".to_vec();
-        let invocation = embedded_original_invocation("cmd", snippet.clone()).unwrap();
+        let invocation = embedded_original_invocation("build.cmd", "cmd", snippet.clone()).unwrap();
         assert!(invocation._script_directory.is_some());
         assert_eq!(&invocation.argv[..4], ["cmd", "/D", "/S", "/C"]);
         assert_eq!(invocation.argv.len(), 5);
@@ -7490,14 +12547,14 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
         .unwrap();
         std::fs::set_permissions(&generator, std::fs::Permissions::from_mode(0o500)).unwrap();
 
-        let error = execute_external_rpc(
-            directory.path(),
-            &generator,
-            &serde_json::json!({"id": "proposal", "jsonrpc": "2.0", "method": "test"}),
-            &serde_json::json!("proposal"),
-            crate::config::ResourceLimits::DEFAULT,
-            1024,
-        )
+        let error = execute_external_rpc(ExecuteExternalRpcArgs {
+            root: directory.path(),
+            executable: &generator,
+            request: &serde_json::json!({"id": "proposal", "jsonrpc": "2.0", "method": "test"}),
+            id: &serde_json::json!("proposal"),
+            project_limits: crate::config::ResourceLimits::DEFAULT,
+            frame_limit: 1024,
+        })
         .unwrap_err();
         assert!(error.contains("negotiated frame limit"), "{error}");
     }
@@ -7682,15 +12739,25 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
     }
 
     fn plan_with_body(body: crate::ir::Node) -> crate::ir::Plan {
-        let mut plan = crate::frontend::lower_with_interpreter(
-            "build.sh",
-            b"true\n",
-            crate::config::UnknownInterpreter::Reject,
-            "sh",
-        )
-        .unwrap();
+        let mut plan =
+            crate::frontend::lower_with_interpreter(crate::frontend::LowerWithInterpreterArgs {
+                path: "build.sh",
+                source: b"true\n",
+                unknown_policy: crate::config::UnknownInterpreter::Reject,
+                configured: "sh",
+                host: crate::frontend::HostShell::default(),
+            })
+            .unwrap();
         plan.tasks[0].body = body;
         plan
+    }
+
+    /// An executable produced for the current test host.
+    ///
+    /// Passing the suffix to both compilers avoids relying on `PATHEXT` lookup
+    /// or on a compiler silently changing the requested output name on Windows.
+    fn test_executable(root: &Path, stem: &str) -> PathBuf {
+        root.join(format!("{stem}{}", std::env::consts::EXE_SUFFIX))
     }
 
     fn node(operation: crate::ir::Operation) -> crate::ir::Node {
@@ -7732,7 +12799,7 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
                 node(crate::ir::Operation::Match {
                     value: crate::ir::TextExpression::literal("value"),
                     cases: vec![crate::ir::MatchCase {
-                        pattern: crate::ir::TextExpression::literal("pattern"),
+                        pattern: crate::ir::PatternExpression::literal("pattern"),
                         body: leaf(),
                     }],
                     default: Some(Box::new(leaf())),
@@ -7766,6 +12833,7 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
                     finalizer: Box::new(leaf()),
                 }),
             ],
+            on_failure: crate::ir::SequenceFailure::Continue,
         });
         let plan = plan_with_body(tree);
         let mut ids = Vec::new();
@@ -7796,6 +12864,7 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
         };
         let plan = plan_with_body(node(crate::ir::Operation::Sequence {
             nodes: vec![native, delegated, residual],
+            on_failure: crate::ir::SequenceFailure::Continue,
         }));
         assert_eq!(
             classify_coverage(&plan, 10),
@@ -7909,6 +12978,7 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
         ]);
         let plan = plan_with_body(node(crate::ir::Operation::Sequence {
             nodes: vec![network, curl],
+            on_failure: crate::ir::SequenceFailure::Continue,
         }));
         let requests = network_replay_requests(&plan).unwrap();
         assert_eq!(requests.len(), 2);
@@ -7978,18 +13048,30 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
                 "no",
             )]))),
         });
+        let capture = node(crate::ir::Operation::CaptureStdout {
+            name: "captured".into(),
+            value_type: crate::ir::PrimitiveType::Text,
+            body: Box::new(exec(vec![
+                crate::ir::TextExpression::literal("/usr/bin/printf"),
+                crate::ir::TextExpression::literal("captured\n\n"),
+            ])),
+        });
         let plan = plan_with_body(node(crate::ir::Operation::Sequence {
-            nodes: vec![command, pipeline, condition],
+            nodes: vec![command, pipeline, condition, capture],
+            on_failure: crate::ir::SequenceFailure::Continue,
         }));
         let rust = String::from_utf8(generate_rust(&plan).unwrap()).unwrap();
         let go = String::from_utf8(generate_go(&plan).unwrap()).unwrap();
         for expected in [
             "VALUE",
-            "deshell_args.first()",
+            // Every positional read goes through one helper, so `set -u` is
+            // answered in one place rather than at each site.
+            "deshell_argument(deshell_args, 0)",
             ".env(\"LOCAL\"",
             ".current_dir",
             "deshell_run_pipeline",
             "if deshell_predicate == 0",
+            "deshell_captured.trim_end_matches('\\n')",
         ] {
             assert!(
                 rust.contains(expected),
@@ -7997,12 +13079,15 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
             );
         }
         for expected in [
-            "os.Getenv(\"VALUE\")",
+            // Locals shadow the environment, so an expansion goes through the
+            // lookup rather than straight to `os.Getenv`.
+            "deshellValue(deshellVars, \"VALUE\")",
             "deshellArgument(deshellArgs, 0)",
             ".Env = append",
             ".Dir =",
             "deshellRunPipeline",
             "if deshellLast == 0",
+            "strings.TrimRight(string(deshellOut), \"\\n\")",
         ] {
             assert!(go.contains(expected), "missing {expected:?} in Go output");
         }
@@ -8017,7 +13102,7 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
             }],
         };
         assert!(
-            rust_expression(&named)
+            rust_expression(&named, Locals::None)
                 .unwrap_err()
                 .contains("named argument")
         );
@@ -8068,7 +13153,7 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
                 .contains("only Exec stages")
         );
 
-        let mut metadata = plan.clone();
+        let mut metadata = plan;
         metadata.tasks[0].outputs.push(crate::ir::Binding {
             name: "result".into(),
             value_type: crate::ir::ValueType::Primitive(crate::ir::PrimitiveType::Text),
@@ -8130,6 +13215,7 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
         });
         let plan = plan_with_body(node(crate::ir::Operation::Sequence {
             nodes: vec![simple, pipeline, condition],
+            on_failure: crate::ir::SequenceFailure::Continue,
         }));
         let directory = tempfile::tempdir().unwrap();
         let literal_rust_path = directory.path().join("literal.rs");
@@ -8235,6 +13321,1200 @@ print(json.dumps({"id": "proposal", "jsonrpc": "2.0", "result": "x" * 2048}))
                 String::from_utf8_lossy(&output.stderr)
             );
         }
+    }
+
+    /// A pipeline inside a loop or a `case` arm must still get its helper.
+    ///
+    /// The walk that decides whether to define `deshell_run_pipeline` listed
+    /// `Sequence` and `Condition` by hand and fell through on everything else,
+    /// so this plan generated a call to a function the generator had chosen not
+    /// to emit — code its own `-D warnings` gate rejects. The plan also carries
+    /// an empty `case` arm and an `echo`, which are the other two operations
+    /// that reach the generators without starting a process.
+    #[test]
+    fn a_pipeline_nested_in_a_loop_or_a_case_arm_still_defines_its_helper() {
+        let pipeline = || {
+            node(crate::ir::Operation::Pipeline {
+                nodes: vec![
+                    exec(vec![crate::ir::TextExpression::literal("/bin/first")]),
+                    exec(vec![crate::ir::TextExpression::literal("/bin/second")]),
+                ],
+                status: crate::ir::PipelineStatus::Pipefail,
+            })
+        };
+        let loop_node = node(crate::ir::Operation::While {
+            condition: Box::new(node(crate::ir::Operation::Test {
+                predicate: crate::ir::TestPredicate::Empty {
+                    value: crate::ir::TextExpression::literal(""),
+                },
+            })),
+            body: Box::new(pipeline()),
+        });
+        let match_node = node(crate::ir::Operation::Match {
+            value: crate::ir::TextExpression::literal("a"),
+            cases: vec![
+                crate::ir::MatchCase {
+                    pattern: crate::ir::PatternExpression::literal("a"),
+                    body: pipeline(),
+                },
+                crate::ir::MatchCase {
+                    pattern: crate::ir::PatternExpression::literal("b"),
+                    body: node(crate::ir::Operation::NoOp),
+                },
+            ],
+            default: Some(Box::new(node(crate::ir::Operation::WriteStdout {
+                contents: crate::ir::TextExpression::literal("::error::unknown\n"),
+            }))),
+        });
+        let plan = plan_with_body(node(crate::ir::Operation::Sequence {
+            nodes: vec![loop_node, match_node],
+            on_failure: crate::ir::SequenceFailure::Stop,
+        }));
+
+        let directory = tempfile::tempdir().unwrap();
+        let rust = directory.path().join("nested.rs");
+        let go = directory.path().join("nested.go");
+        std::fs::write(&rust, generate_rust(&plan).unwrap()).unwrap();
+        std::fs::write(&go, generate_go(&plan).unwrap()).unwrap();
+
+        let rustc = std::process::Command::new("rustc")
+            .arg(&rust)
+            .args(["--edition=2024", "-D", "warnings", "-o"])
+            .arg(directory.path().join("nested-rust"))
+            .output()
+            .unwrap();
+        assert!(
+            rustc.status.success(),
+            "rustc rejected generated source:\n{}",
+            String::from_utf8_lossy(&rustc.stderr)
+        );
+        let vet = std::process::Command::new("go")
+            .args(["vet", "nested.go"])
+            .current_dir(directory.path())
+            .output()
+            .unwrap();
+        assert!(
+            vet.status.success(),
+            "go vet rejected generated source:\n{}",
+            String::from_utf8_lossy(&vet.stderr)
+        );
+    }
+
+    /// A status read at run time ends where the shells end, and stops where
+    /// they part.
+    ///
+    /// `exit "${CODE}"` is the last thing standing between a real workflow and
+    /// a migration, and it is the one model that claims less than the whole of
+    /// its operation. Every measured shell reduces a decimal status modulo 256
+    /// and agrees; outside that bash ends with 255 and zsh with 0, so there is
+    /// nothing to reproduce. The generated programs match the shells inside the
+    /// domain and stop loudly outside it.
+    #[test]
+    fn a_run_time_exit_status_matches_the_shells_and_stops_where_they_part() {
+        let script = "exit \"${DESHELL_TEST_CODE}\"\n";
+        let plan = crate::frontend::lower(
+            "end.sh",
+            format!("#!/bin/bash\n{script}").as_bytes(),
+            crate::config::UnknownInterpreter::TraceOnly,
+        )
+        .unwrap();
+        let crate::ir::Operation::Exit {
+            status,
+            non_numeric,
+        } = &plan.tasks[0].body.operation
+        else {
+            panic!("expected an exit: {plan:#?}")
+        };
+        // bash, which this script pins. Measured, not assumed.
+        assert_eq!(
+            *non_numeric,
+            crate::ir::NonNumericStatus::Ends { status: 255 }
+        );
+        assert_eq!(
+            status.parts,
+            [crate::ir::TextPart::Variable {
+                name: "DESHELL_TEST_CODE".into()
+            }]
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("end.rs"),
+            generate_rust(&plan).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(directory.path().join("end.go"), generate_go(&plan).unwrap()).unwrap();
+        let rust_program = test_executable(directory.path(), "end-rust");
+        let go_program = test_executable(directory.path(), "end-go");
+        let built = std::process::Command::new("rustc")
+            .arg("end.rs")
+            .args(["--edition=2024", "-D", "warnings", "-o"])
+            .arg(&rust_program)
+            .current_dir(directory.path())
+            .output()
+            .unwrap();
+        assert!(
+            built.status.success(),
+            "rustc rejected generated source:\n{}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        let built = std::process::Command::new("go")
+            .args(["build", "-o"])
+            .arg(&go_program)
+            .arg("end.go")
+            .current_dir(directory.path())
+            .output()
+            .unwrap();
+        assert!(
+            built.status.success(),
+            "go build rejected generated source:\n{}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+
+        // Inside the measured domain, the semantic model is the oracle. An
+        // ambient `bash` is not: on Windows that name can be the WSL launcher,
+        // and even native Bash versions disagree outside this domain.
+        for code in ["0", "1", "2", "255", "256", "300", "-1", " 7 "] {
+            let expected =
+                i32::try_from(code.trim().parse::<i64>().unwrap().rem_euclid(256)).unwrap();
+            for program in [&rust_program, &go_program] {
+                let ran = std::process::Command::new(program)
+                    .env("DESHELL_TEST_CODE", code)
+                    .current_dir(directory.path())
+                    .status()
+                    .unwrap();
+                assert_eq!(
+                    ran.code(),
+                    Some(expected),
+                    "{} ended differently for {code:?}",
+                    program.display()
+                );
+            }
+        }
+
+        // Outside it: the generated status is the one recorded for the pinned
+        // interpreter in `exit-builtin-semantics-v1.json`. Do not ask the CI
+        // runner's ambient bash for this value: bash 3.2 exits 255 while newer
+        // Linux builds exit 2, and that host accident is not this plan's
+        // declared semantic model. The message is the part that cannot be
+        // reproduced — bash names its own path and a line number — so the
+        // program names the value instead.
+        for program in [&rust_program, &go_program] {
+            let ran = std::process::Command::new(program)
+                .env("DESHELL_TEST_CODE", "not-a-number")
+                .current_dir(directory.path())
+                .output()
+                .unwrap();
+            assert_eq!(ran.status.code(), Some(255), "{}", program.display());
+            assert!(ran.stdout.is_empty(), "{}", program.display());
+            let stderr = String::from_utf8_lossy(&ran.stderr);
+            assert!(
+                stderr.contains("not-a-number"),
+                "{}: {stderr}",
+                program.display()
+            );
+        }
+    }
+
+    /// A redirection target is expanded, and the generated programs write where
+    /// the shell writes.
+    ///
+    /// `>>"${GITHUB_OUTPUT}"` is how a workflow appends to a file whose path
+    /// arrives in the environment. The target used to have to be a literal, so
+    /// the most common redirection in CI was the one that delegated.
+    #[test]
+    fn a_redirection_target_is_expanded_like_any_other_word() {
+        let script = "/bin/echo appended >>\"${DESHELL_TEST_OUT}\"\n";
+        let mut plan = crate::frontend::lower(
+            "write.sh",
+            format!("#!/bin/bash\n{script}").as_bytes(),
+            crate::config::UnknownInterpreter::TraceOnly,
+        )
+        .unwrap();
+        let crate::ir::Operation::Redirect { redirections, .. } = &plan.tasks[0].body.operation
+        else {
+            panic!("expected a redirect: {plan:#?}")
+        };
+        let [crate::ir::Redirection::Write { fd, path, append }] = redirections.as_slice() else {
+            panic!("expected one write: {redirections:#?}")
+        };
+        assert_eq!(*fd, 1);
+        assert!(*append);
+        assert_eq!(
+            path.parts,
+            [crate::ir::TextPart::Variable {
+                name: "DESHELL_TEST_OUT".into()
+            }]
+        );
+
+        // The frontend assertion above deliberately uses an external command:
+        // it proves that redirection around an Exec survives lowering. For the
+        // generator assertion below, replace only that body with `rustc
+        // --version`, an external command required on every test host. The
+        // redirection and its expanded target remain the ones the frontend
+        // produced, while the generated binaries no longer depend on
+        // `/bin/echo` existing on the host that runs this test.
+        let crate::ir::Operation::Redirect { body, .. } = &mut plan.tasks[0].body.operation else {
+            panic!("the immutable assertion above established this shape")
+        };
+        **body = node(crate::ir::Operation::Exec {
+            argv: ["rustc", "--version"]
+                .map(crate::ir::TextExpression::literal)
+                .into(),
+            environment: Vec::new(),
+            working_directory: None,
+        });
+
+        let rustc_version = std::process::Command::new("rustc")
+            .arg("--version")
+            .output()
+            .unwrap();
+        assert!(rustc_version.status.success());
+        let expected = [
+            rustc_version.stdout.as_slice(),
+            rustc_version.stdout.as_slice(),
+        ]
+        .concat();
+
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("write.rs"),
+            generate_rust(&plan).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("write.go"),
+            generate_go(&plan).unwrap(),
+        )
+        .unwrap();
+        let rust_program = test_executable(directory.path(), "write-rust");
+        let go_program = test_executable(directory.path(), "write-go");
+        let built = std::process::Command::new("rustc")
+            .arg("write.rs")
+            .args(["--edition=2024", "-D", "warnings", "-o"])
+            .arg(&rust_program)
+            .current_dir(directory.path())
+            .output()
+            .unwrap();
+        assert!(
+            built.status.success(),
+            "rustc rejected generated source:\n{}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        let built = std::process::Command::new("go")
+            .args(["build", "-o"])
+            .arg(&go_program)
+            .arg("write.go")
+            .current_dir(directory.path())
+            .output()
+            .unwrap();
+        assert!(
+            built.status.success(),
+            "go build rejected generated source:\n{}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+
+        for program in [&rust_program, &go_program] {
+            let target = directory.path().join(format!(
+                "{}.out",
+                program.file_stem().unwrap().to_string_lossy()
+            ));
+            // Appended twice: the second run has to add to the first, which is
+            // what separates `>>` from `>`.
+            for _ in 0..2 {
+                let status = std::process::Command::new(program)
+                    .env("DESHELL_TEST_OUT", &target)
+                    .current_dir(directory.path())
+                    .status()
+                    .unwrap();
+                assert!(status.success(), "{}", program.display());
+            }
+            assert_eq!(
+                std::fs::read(&target).unwrap(),
+                expected,
+                "{} wrote other bytes",
+                program.display()
+            );
+        }
+    }
+
+    /// A program with no locals carries no map for them.
+    ///
+    /// A script that assigns to no shell-local name has none, and the generated
+    /// program used to carry an always-empty `BTreeMap`, a type and a parameter
+    /// threading it — three things for a reader of the migration to follow to
+    /// find out they do nothing. The OComment session named it reading a
+    /// generated file.
+    ///
+    /// The answer is the plan's, so it is carried as a value rather than looked
+    /// up: a first attempt used a thread-local, which is the hidden global this
+    /// repository removes from its walks.
+    #[test]
+    fn a_program_with_no_locals_carries_no_map_for_them() {
+        let read_only = crate::frontend::lower(
+            "read.sh",
+            b"#!/bin/bash\n/bin/echo \"${GITHUB_OUTPUT}\"\n",
+            crate::config::UnknownInterpreter::TraceOnly,
+        )
+        .unwrap();
+        let rust = String::from_utf8(generate_rust(&read_only).unwrap()).unwrap();
+        assert!(!rust.contains("BTreeMap"), "{rust}");
+        assert!(rust.contains("deshell_lookup(\"GITHUB_OUTPUT\")"), "{rust}");
+
+        // A script that assigns keeps the map, and the lookups take it.
+        let assigns = crate::frontend::lower(
+            "assign.sh",
+            b"#!/bin/bash\nname=value\n/bin/echo \"${name}\"\n",
+            crate::config::UnknownInterpreter::TraceOnly,
+        )
+        .unwrap();
+        let rust = String::from_utf8(generate_rust(&assigns).unwrap()).unwrap();
+        assert!(rust.contains("deshell_vars"), "{rust}");
+        assert!(
+            rust.contains("deshell_lookup(\"name\", &deshell_vars)"),
+            "{rust}"
+        );
+
+        // Both still compile under the gate a reader would use.
+        let directory = tempfile::tempdir().unwrap();
+        for (name, plan) in [("read", &read_only), ("assign", &assigns)] {
+            let path = directory.path().join(format!("{name}.rs"));
+            std::fs::write(&path, generate_rust(plan).unwrap()).unwrap();
+            let built = std::process::Command::new("rustc")
+                .arg(&path)
+                .args([
+                    "--edition=2024",
+                    "-D",
+                    "warnings",
+                    "-D",
+                    "missing_docs",
+                    "-o",
+                ])
+                .arg(directory.path().join(name))
+                .output()
+                .unwrap();
+            assert!(
+                built.status.success(),
+                "rustc rejected {name}:\n{}",
+                String::from_utf8_lossy(&built.stderr)
+            );
+        }
+    }
+
+    /// `set -u` reaches the generated programs.
+    ///
+    /// Reported by the OComment session, reading a generated file: the script
+    /// ran under `set -euo pipefail`, `-e` was carried and `-u` was not.
+    /// `deshell_lookup` ended in `unwrap_or_default()`, which answers an empty
+    /// string for a name that is unset — and `set -u` is the rule that says
+    /// those two are different. The `Option` was already there; the answer was
+    /// being thrown away.
+    ///
+    /// This is the same distinction that was wrong in the other direction when
+    /// the two projects started: the frontend refused every unset name whether
+    /// or not the script asked it to.
+    #[test]
+    fn set_u_reaches_the_generated_programs() {
+        let script = concat!(
+            "set -u\n",
+            "printf '%s\\n' \"${DESHELL_ABSENT}\"\n",
+            "printf 'reached\\n'\n"
+        );
+        let plan = crate::frontend::lower(
+            "unset.sh",
+            format!("#!/bin/bash\n{script}").as_bytes(),
+            crate::config::UnknownInterpreter::TraceOnly,
+        )
+        .unwrap();
+        assert!(plan.tasks[0].nounset, "the plan records the option");
+
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("unset.rs"),
+            generate_rust(&plan).unwrap(),
+        )
+        .unwrap();
+        let unset_rust = test_executable(directory.path(), "unset-rust");
+        let unset_go = test_executable(directory.path(), "unset-go");
+        let built = std::process::Command::new("rustc")
+            .args(["unset.rs", "--edition=2024", "-D", "warnings", "-o"])
+            .arg(&unset_rust)
+            .current_dir(directory.path())
+            .output()
+            .unwrap();
+        assert!(
+            built.status.success(),
+            "rustc rejected generated source:\n{}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        std::fs::write(
+            directory.path().join("unset.go"),
+            generate_go(&plan).unwrap(),
+        )
+        .unwrap();
+        let built = std::process::Command::new("go")
+            .args(["build", "-o"])
+            .arg(&unset_go)
+            .arg("unset.go")
+            .current_dir(directory.path())
+            .output()
+            .unwrap();
+        assert!(
+            built.status.success(),
+            "go build rejected generated source:\n{}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+
+        // Unset: expansion fails before the following write. These are the
+        // exact native semantics carried by `Task.nounset`; no ambient shell
+        // is allowed to redefine the oracle on a test runner.
+        for program in [&unset_rust, &unset_go] {
+            let ran = std::process::Command::new(program)
+                .env_remove("DESHELL_ABSENT")
+                .current_dir(directory.path())
+                .output()
+                .unwrap();
+            assert_eq!(
+                ran.stdout,
+                b"",
+                "{} ran past the unset name",
+                program.display()
+            );
+            assert_eq!(ran.status.code(), Some(1), "{}", program.display());
+            assert!(
+                String::from_utf8_lossy(&ran.stderr).contains("DESHELL_ABSENT"),
+                "{}: the message names the variable: {}",
+                program.display(),
+                String::from_utf8_lossy(&ran.stderr)
+            );
+        }
+
+        // Set but empty: `set -u` says that is a value, and both carry on.
+        for (value, expected) in [("", "\nreached\n"), ("value", "value\nreached\n")] {
+            for program in [&unset_rust, &unset_go] {
+                let ran = std::process::Command::new(program)
+                    .env("DESHELL_ABSENT", value)
+                    .current_dir(directory.path())
+                    .output()
+                    .unwrap();
+                assert_eq!(
+                    ran.stdout,
+                    expected.as_bytes(),
+                    "{value:?}: {}",
+                    program.display()
+                );
+                assert_eq!(
+                    ran.status.code(),
+                    Some(0),
+                    "{value:?}: {}",
+                    program.display()
+                );
+            }
+        }
+
+        // A positional the call did not pass is the same rule.
+        let script = concat!(
+            "set -u\n",
+            "printf '%s\\n' \"$1\"\n",
+            "printf 'reached\\n'\n"
+        );
+        let plan = crate::frontend::lower(
+            "arg.sh",
+            format!("#!/bin/bash\n{script}").as_bytes(),
+            crate::config::UnknownInterpreter::TraceOnly,
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("arg.rs"),
+            generate_rust(&plan).unwrap(),
+        )
+        .unwrap();
+        let arg_rust = test_executable(directory.path(), "arg-rust");
+        let built = std::process::Command::new("rustc")
+            .args(["arg.rs", "--edition=2024", "-D", "warnings", "-o"])
+            .arg(&arg_rust)
+            .current_dir(directory.path())
+            .output()
+            .unwrap();
+        assert!(
+            built.status.success(),
+            "rustc rejected generated source:\n{}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        for (arguments, stdout, status) in [
+            (Vec::<&str>::new(), "", 1),
+            (vec!["given"], "given\nreached\n", 0),
+        ] {
+            let ran = std::process::Command::new(&arg_rust)
+                .args(&arguments)
+                .current_dir(directory.path())
+                .output()
+                .unwrap();
+            assert_eq!(ran.stdout, stdout.as_bytes(), "{arguments:?}");
+            assert_eq!(ran.status.code(), Some(status), "{arguments:?}");
+        }
+    }
+
+    /// `set -e` reaches the generated programs.
+    ///
+    /// The sequence emitters read `on_failure` with `..`, so every statement
+    /// but the last became `let _ =` in Rust and a bare call in Go: a program
+    /// that runs on past a failure the script would have stopped at, with the
+    /// wrong exit status at the end of it. The plan said `Stop` the whole time.
+    #[test]
+    fn set_e_stops_generated_programs_at_the_first_failure() {
+        let script = concat!(
+            "set -e\n",
+            "rustc --deshell-intentional-invalid-option\n",
+            "echo reached\n"
+        );
+        let plan = crate::frontend::lower(
+            "stop.sh",
+            format!("#!/bin/bash\n{script}").as_bytes(),
+            crate::config::UnknownInterpreter::TraceOnly,
+        )
+        .unwrap();
+        let crate::ir::Operation::Sequence { on_failure, .. } = &plan.tasks[0].body.operation
+        else {
+            panic!("expected a sequence: {plan:#?}")
+        };
+        assert_eq!(*on_failure, crate::ir::SequenceFailure::Stop);
+
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("stop.rs"),
+            generate_rust(&plan).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("stop.go"),
+            generate_go(&plan).unwrap(),
+        )
+        .unwrap();
+        let stop_rust = test_executable(directory.path(), "stop-rust");
+        let stop_go = test_executable(directory.path(), "stop-go");
+        let built = std::process::Command::new("rustc")
+            .args(["stop.rs", "--edition=2024", "-D", "warnings", "-o"])
+            .arg(&stop_rust)
+            .current_dir(directory.path())
+            .output()
+            .unwrap();
+        assert!(
+            built.status.success(),
+            "rustc rejected generated source:\n{}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        let built = std::process::Command::new("go")
+            .args(["build", "-o"])
+            .arg(&stop_go)
+            .arg("stop.go")
+            .current_dir(directory.path())
+            .output()
+            .unwrap();
+        assert!(
+            built.status.success(),
+            "go rejected generated source:\n{}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+
+        // rustc is already a required tool on every runner and its unknown
+        // option is a portable, real process failure. The emitted sequence must
+        // return that status without writing the following line.
+        for program in [&stop_rust, &stop_go] {
+            let ran = std::process::Command::new(program)
+                .current_dir(directory.path())
+                .output()
+                .unwrap();
+            assert_eq!(
+                ran.stdout,
+                b"",
+                "{} ran past the failure",
+                program.display()
+            );
+            assert_eq!(ran.status.code(), Some(1), "{}", program.display());
+        }
+
+        // Without `set -e` the sequence runs on and its final write succeeds.
+        let script = concat!(
+            "rustc --deshell-intentional-invalid-option\n",
+            "echo reached\n"
+        );
+        let plan = crate::frontend::lower(
+            "go-on.sh",
+            format!("#!/bin/bash\n{script}").as_bytes(),
+            crate::config::UnknownInterpreter::TraceOnly,
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("go-on.rs"),
+            generate_rust(&plan).unwrap(),
+        )
+        .unwrap();
+        let go_on_rust = test_executable(directory.path(), "go-on-rust");
+        let built = std::process::Command::new("rustc")
+            .args(["go-on.rs", "--edition=2024", "-D", "warnings", "-o"])
+            .arg(&go_on_rust)
+            .current_dir(directory.path())
+            .output()
+            .unwrap();
+        assert!(
+            built.status.success(),
+            "{}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        let ran = std::process::Command::new(&go_on_rust)
+            .current_dir(directory.path())
+            .output()
+            .unwrap();
+        assert_eq!(ran.stdout, b"reached\n");
+        assert_eq!(ran.status.code(), Some(0));
+    }
+
+    /// A shell function arrives as a function, and behaves like one.
+    ///
+    /// The point of not inlining is that the definition is where "these call
+    /// sites are the same check" is written down. So this asserts both: that
+    /// one function is emitted and called twice, and that both generated
+    /// programs produce the exact modelled bytes and statuses on every path.
+    #[test]
+    fn a_shell_function_arrives_as_a_function_and_behaves_like_one() {
+        let script = concat!(
+            "reject() {\n",
+            "  case \"$2\" in\n",
+            "    *x*)\n",
+            "      echo \"$1 holds an x\"\n",
+            "      exit 2\n",
+            "      ;;\n",
+            "  esac\n",
+            "}\n",
+            "reject first \"$1\"\n",
+            "reject second \"$2\"\n",
+            "echo accepted\n"
+        );
+        let plan = crate::frontend::lower(
+            "check.sh",
+            format!("#!/bin/bash\n{script}").as_bytes(),
+            crate::config::UnknownInterpreter::TraceOnly,
+        )
+        .unwrap();
+        assert_eq!(plan.tasks.len(), 2, "{plan:#?}");
+
+        let rust = String::from_utf8(generate_rust(&plan).unwrap()).unwrap();
+        let go = String::from_utf8(generate_go(&plan).unwrap()).unwrap();
+        if std::env::var("DESHELL_SHOW_GENERATED").is_ok() {
+            eprintln!("--- rust ---\n{rust}\n--- go ---\n{go}");
+        }
+        assert_eq!(
+            rust.matches("fn reject(").count(),
+            1,
+            "one definition:\n{rust}"
+        );
+        assert_eq!(rust.matches("reject(&[").count(), 2, "two calls:\n{rust}");
+        assert_eq!(go.matches("func reject(").count(), 1, "{go}");
+        assert_eq!(go.matches("reject([]string{").count(), 2, "{go}");
+
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("check.rs"), &rust).unwrap();
+        std::fs::write(directory.path().join("check.go"), &go).unwrap();
+        let rust_program = test_executable(directory.path(), "check-rust");
+        let go_program = test_executable(directory.path(), "check-go");
+        // The project receiving this code decides which lints it runs, and the
+        // one this was written for denies `missing_docs` and runs
+        // `clippy::pedantic`. Building under both here is how the generator
+        // learns what a reader's settings would say, rather than what its own
+        // gate happens to allow.
+        let built = std::process::Command::new("rustc")
+            .arg("check.rs")
+            .args([
+                "--edition=2024",
+                "-D",
+                "warnings",
+                "-D",
+                "missing_docs",
+                "-o",
+            ])
+            .arg(&rust_program)
+            .current_dir(directory.path())
+            .output()
+            .unwrap();
+        assert!(
+            built.status.success(),
+            "rustc rejected generated source:\n{}\n{rust}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        let pedantic = std::process::Command::new("clippy-driver")
+            // de-shell's own `clippy.toml` is not the receiving project's:
+            // without this the generated program is judged by the rules of the
+            // tool that wrote it, which bans `std::process::exit` for reasons
+            // that belong to a transactional file layer and not to a script.
+            .env("CLIPPY_CONF_DIR", directory.path())
+            .arg("check.rs")
+            .args([
+                "--edition=2024",
+                "-D",
+                "warnings",
+                "-W",
+                "clippy::pedantic",
+                "--emit=metadata",
+            ])
+            .current_dir(directory.path())
+            .output();
+        match pedantic {
+            Ok(pedantic) => assert!(
+                pedantic.status.success(),
+                "clippy::pedantic rejected generated source:\n{}\n{rust}",
+                String::from_utf8_lossy(&pedantic.stderr)
+            ),
+            // A runner without clippy still checks everything above.
+            Err(error) => eprintln!("clippy-driver unavailable, skipped: {error}"),
+        }
+        let built = std::process::Command::new("go")
+            .args(["build", "-o"])
+            .arg(&go_program)
+            .arg("check.go")
+            .current_dir(directory.path())
+            .output()
+            .unwrap();
+        assert!(
+            built.status.success(),
+            "go build rejected generated source:\n{}\n{go}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+
+        for (arguments, expected_stdout, expected_status) in [
+            (["ok", "fine"], "accepted\n", 0),
+            (["oops", "xyz"], "second holds an x\n", 2),
+            (["xray", "ok"], "first holds an x\n", 2),
+            (["bad", "ok"], "accepted\n", 0),
+        ] {
+            for program in [&rust_program, &go_program] {
+                let ran = std::process::Command::new(program)
+                    .args(arguments)
+                    .current_dir(directory.path())
+                    .output()
+                    .unwrap();
+                assert_eq!(
+                    ran.stdout,
+                    expected_stdout.as_bytes(),
+                    "{} wrote other bytes for {arguments:?}",
+                    program.display()
+                );
+                assert_eq!(
+                    ran.status.code(),
+                    Some(expected_status),
+                    "{} ended with another status for {arguments:?}",
+                    program.display()
+                );
+            }
+        }
+    }
+
+    /// What a reader of the migration receives for a `case`.
+    ///
+    /// The generated program is read and maintained by the project being
+    /// migrated, so a pattern becomes an expression rather than a call into a
+    /// matcher: a generic machine is code its author never wrote and now has
+    /// to keep, and a plan that used `*` and not `?` would carry a branch of it
+    /// that nothing reaches. This asserts the shape of what comes out, not just
+    /// that it compiles.
+    #[test]
+    fn a_compiled_case_pattern_is_an_expression_and_not_a_machine() {
+        let arm = |pattern: crate::ir::PatternExpression| crate::ir::MatchCase {
+            pattern,
+            body: node(crate::ir::Operation::NoOp),
+        };
+        let run =
+            |pieces: Vec<crate::ir::PatternPiece>| arm(crate::ir::PatternExpression { pieces });
+        let literal = |value: &str| crate::ir::PatternPiece::Literal {
+            value: crate::ir::TextExpression::literal(value),
+        };
+        let plan = plan_with_body(node(crate::ir::Operation::Match {
+            value: crate::ir::TextExpression::literal("x"),
+            cases: vec![
+                run(vec![
+                    crate::ir::PatternPiece::AnyRun,
+                    literal("\n"),
+                    crate::ir::PatternPiece::AnyRun,
+                ]),
+                run(vec![literal("v"), crate::ir::PatternPiece::AnyRun]),
+                run(vec![crate::ir::PatternPiece::AnyRun, literal(".log")]),
+                run(vec![literal("Linux/X64")]),
+            ],
+            default: None,
+        }));
+        let rust = String::from_utf8(generate_rust(&plan).unwrap()).unwrap();
+        let go = String::from_utf8(generate_go(&plan).unwrap()).unwrap();
+
+        for fragment in [
+            // A one-character needle is a `char`: the string form compiles and
+            // `clippy::pedantic` rejects it, and which lints run is the
+            // receiving project's decision.
+            "deshell_subject.contains('\\n')",
+            "deshell_subject.starts_with('v')",
+            "deshell_subject.ends_with(\".log\")",
+            "deshell_subject == \"Linux/X64\"",
+        ] {
+            assert!(rust.contains(fragment), "missing {fragment}:\n{rust}");
+        }
+        for fragment in [
+            "strings.Contains(deshellSubject, \"\\n\")",
+            "strings.HasPrefix(deshellSubject, \"v\")",
+            "strings.HasSuffix(deshellSubject, \".log\")",
+            "deshellSubject == \"Linux/X64\"",
+        ] {
+            assert!(go.contains(fragment), "missing {fragment}:\n{go}");
+        }
+
+        // No machine, and no suppression: both are things the reader would
+        // inherit without having asked for them.
+        for (name, source) in [("rust", &rust), ("go", &go)] {
+            for unwanted in ["DeshellPiece", "deshellPiece", "allow(", "expect(", "kind:"] {
+                assert!(
+                    !source.contains(unwanted),
+                    "generated {name} carries {unwanted}:\n{source}"
+                );
+            }
+        }
+
+        // `unicode/utf8` appears only where a `?` counts characters, because Go
+        // rejects an unused import.
+        assert!(!go.contains("unicode/utf8"), "{go}");
+        let counted = plan_with_body(node(crate::ir::Operation::Match {
+            value: crate::ir::TextExpression::literal("x"),
+            cases: vec![run(vec![
+                literal("a"),
+                crate::ir::PatternPiece::AnyCharacter,
+                literal("c"),
+            ])],
+            default: None,
+        }));
+        let counted = String::from_utf8(generate_go(&counted).unwrap()).unwrap();
+        assert!(counted.contains("unicode/utf8"), "{counted}");
+        assert!(
+            counted.contains("utf8.RuneCountInString(deshellSubject) == 3"),
+            "{counted}"
+        );
+    }
+
+    /// Every pattern the frontend lowers compiles to an expression that
+    /// answers what the shells answer.
+    ///
+    /// The frontend's matcher and the generators' expressions are two separate
+    /// implementations of the same rule, so one test reading the measurement is
+    /// not enough: this builds a Rust program out of the compiled expressions
+    /// and runs it over the same words, which is the only way to find a shape
+    /// that reduces wrongly.
+    #[test]
+    fn every_compiled_pattern_answers_what_the_shells_answer() {
+        let raw = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/contracts/golden/case-pattern-semantics-v1.json"
+        ))
+        .expect("corpus is readable");
+        let corpus: serde_json::Value = serde_json::from_str(&raw).expect("corpus is JSON");
+
+        let mut checks = String::new();
+        let mut expected = Vec::new();
+        for case in corpus["cases"].as_array().expect("corpus has cases") {
+            let id = case["id"].as_str().expect("case has an id");
+            let script = case["script"].as_str().expect("case has a script");
+            let Some(pattern) = script
+                .strip_prefix("case \"$1\" in\n  ")
+                .and_then(|rest| rest.split(") printf MATCH").next())
+            else {
+                continue;
+            };
+            let word = String::from_utf8(crate::frontend::decode_base64(
+                case["word_base64"].as_str().expect("case has a word"),
+            ))
+            .expect("word is UTF-8");
+            // Bash, because that is the interpreter the patterns are read for.
+            let answer = case["bash"].as_str().expect("case records bash");
+            let models: Option<Vec<crate::ir::PatternExpression>> = pattern
+                .split('|')
+                .map(crate::frontend::case_pattern_for_tests)
+                .collect();
+            let Some(models) = models else { continue };
+            let tests: Result<Vec<String>, String> = models
+                .iter()
+                .map(|model| rust_pattern_test(model, "subject"))
+                .collect();
+            let Ok(tests) = tests else { continue };
+
+            expected.push((id.to_owned(), answer == "MATCH"));
+            checks.push_str(&format!(
+                // `let _ = &subject` because a pattern that matches anything
+                // compiles to `true` and reads nothing, and this program is
+                // built under `-D warnings` like the generated ones are.
+                "    {{ let subject = {word:?}; let _ = &subject; println!(\"{{}}\", {}); }}\n",
+                tests.join(" || ")
+            ));
+        }
+        assert!(expected.len() >= 20, "{} patterns compiled", expected.len());
+
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("patterns.rs");
+        std::fs::write(&source, format!("fn main() {{\n{checks}}}\n")).unwrap();
+        let built = std::process::Command::new("rustc")
+            .arg(&source)
+            .args(["--edition=2024", "-D", "warnings", "-o"])
+            .arg(directory.path().join("patterns"))
+            .output()
+            .unwrap();
+        assert!(
+            built.status.success(),
+            "rustc rejected the compiled patterns:\n{}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        let ran = std::process::Command::new(directory.path().join("patterns"))
+            .output()
+            .unwrap();
+        let answers: Vec<&str> = std::str::from_utf8(&ran.stdout).unwrap().lines().collect();
+        assert_eq!(answers.len(), expected.len());
+        for ((id, wanted), answer) in expected.iter().zip(answers) {
+            assert_eq!(
+                answer,
+                if *wanted { "true" } else { "false" },
+                "{id}: the compiled expression answers differently than the shells"
+            );
+        }
+    }
+
+    /// The generated programs implement the exact modelled `case` table.
+    ///
+    /// Both are built and run against an explicit word/output table, because a
+    /// generator that compared for equality where the model matches a pattern
+    /// would compile and still take the wrong arm. The frontend tests bind the
+    /// same model to the measured shell corpus; this test has no ambient shell
+    /// executable that can silently become a different oracle on Windows.
+    #[test]
+    fn generated_programs_match_the_exact_case_pattern_table() {
+        let arm = |pattern: crate::ir::PatternExpression, text: &str| crate::ir::MatchCase {
+            pattern,
+            body: node(crate::ir::Operation::WriteStdout {
+                contents: crate::ir::TextExpression::literal(text),
+            }),
+        };
+        let any_newline = crate::ir::PatternExpression {
+            pieces: vec![
+                crate::ir::PatternPiece::AnyRun,
+                crate::ir::PatternPiece::Literal {
+                    value: crate::ir::TextExpression::literal("\n"),
+                },
+                crate::ir::PatternPiece::AnyRun,
+            ],
+        };
+        let plan = plan_with_body(node(crate::ir::Operation::Match {
+            value: crate::ir::TextExpression {
+                parts: vec![crate::ir::TextPart::Argument { name: "1".into() }],
+            },
+            cases: vec![
+                arm(any_newline, "REJECTED\n"),
+                // A quoted star is a character: this arm is an equality test,
+                // and the generator has to emit it as one.
+                arm(crate::ir::PatternExpression::literal("a*c"), "STAR\n"),
+            ],
+            default: Some(Box::new(node(crate::ir::Operation::WriteStdout {
+                contents: crate::ir::TextExpression::literal("ACCEPTED\n"),
+            }))),
+        }));
+
+        let directory = tempfile::tempdir().unwrap();
+        let rust = directory.path().join("matching.rs");
+        let rust_program = test_executable(directory.path(), "matching-rust");
+        let go_program = test_executable(directory.path(), "matching-go");
+        std::fs::write(&rust, generate_rust(&plan).unwrap()).unwrap();
+        let built = std::process::Command::new("rustc")
+            .arg(&rust)
+            .args(["--edition=2024", "-D", "warnings", "-o"])
+            .arg(&rust_program)
+            .output()
+            .unwrap();
+        assert!(
+            built.status.success(),
+            "rustc rejected generated source:\n{}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        std::fs::write(
+            directory.path().join("matching.go"),
+            generate_go(&plan).unwrap(),
+        )
+        .unwrap();
+        let built = std::process::Command::new("go")
+            .args(["build", "-o"])
+            .arg(&go_program)
+            .arg("matching.go")
+            .current_dir(directory.path())
+            .output()
+            .unwrap();
+        assert!(
+            built.status.success(),
+            "go build rejected generated source:\n{}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+
+        for (word, expected) in [
+            ("a\nb", "REJECTED\n"),
+            ("abc", "ACCEPTED\n"),
+            ("a*c", "STAR\n"),
+            ("", "ACCEPTED\n"),
+            ("\n", "REJECTED\n"),
+            ("aXc", "ACCEPTED\n"),
+        ] {
+            for program in [&rust_program, &go_program] {
+                let ran = std::process::Command::new(program)
+                    .arg(word)
+                    .output()
+                    .unwrap();
+                assert_eq!(
+                    ran.stdout,
+                    expected.as_bytes(),
+                    "{} took a different arm for {word:?}",
+                    program.display()
+                );
+                assert!(ran.status.success(), "{}", program.display());
+            }
+        }
+    }
+
+    /// The generated programs end at `exit`, with exact bytes and status.
+    ///
+    /// Compiling is not enough for `exit`: a generator that emitted it as a
+    /// status rather than as a jump would produce a program that compiles and
+    /// keeps running. Both are therefore built and run against the explicit IR
+    /// result; shell measurements belong to the frontend semantic corpus.
+    #[test]
+    fn generated_programs_stop_at_exit_with_exact_bytes_and_status() {
+        let plan = plan_with_body(node(crate::ir::Operation::Match {
+            value: crate::ir::TextExpression::literal("1"),
+            cases: vec![
+                crate::ir::MatchCase {
+                    pattern: crate::ir::PatternExpression::literal("0"),
+                    body: node(crate::ir::Operation::NoOp),
+                },
+                crate::ir::MatchCase {
+                    pattern: crate::ir::PatternExpression::literal("1"),
+                    body: node(crate::ir::Operation::Sequence {
+                        nodes: vec![
+                            node(crate::ir::Operation::WriteStdout {
+                                contents: crate::ir::TextExpression::literal("before\n"),
+                            }),
+                            node(crate::ir::Operation::Exit {
+                                status: crate::ir::TextExpression::literal("3"),
+                                non_numeric: crate::ir::NonNumericStatus::Unreachable,
+                            }),
+                            node(crate::ir::Operation::WriteStdout {
+                                contents: crate::ir::TextExpression::literal("after\n"),
+                            }),
+                        ],
+                        on_failure: crate::ir::SequenceFailure::Continue,
+                    }),
+                },
+            ],
+            default: None,
+        }));
+        let directory = tempfile::tempdir().unwrap();
+
+        let rust = directory.path().join("exiting.rs");
+        let rust_program = test_executable(directory.path(), "exiting-rust");
+        let go_program = test_executable(directory.path(), "exiting-go");
+        std::fs::write(&rust, generate_rust(&plan).unwrap()).unwrap();
+        let built = std::process::Command::new("rustc")
+            .arg(&rust)
+            .args(["--edition=2024", "-D", "warnings", "-o"])
+            .arg(&rust_program)
+            .output()
+            .unwrap();
+        assert!(
+            built.status.success(),
+            "rustc rejected generated source:\n{}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        let ran = std::process::Command::new(&rust_program).output().unwrap();
+        assert_eq!(ran.stdout, b"before\n", "generated Rust wrote other bytes");
+        assert_eq!(ran.status.code(), Some(3));
+
+        std::fs::write(
+            directory.path().join("exiting.go"),
+            generate_go(&plan).unwrap(),
+        )
+        .unwrap();
+        let vet = std::process::Command::new("go")
+            .args(["vet", "exiting.go"])
+            .current_dir(directory.path())
+            .output()
+            .unwrap();
+        assert!(
+            vet.status.success(),
+            "go vet rejected generated source:\n{}",
+            String::from_utf8_lossy(&vet.stderr)
+        );
+        // Built rather than `go run`: `go run` reports 1 for any non-zero exit
+        // and prints the real status to its own stderr, which would hide exactly
+        // what this checks.
+        let built = std::process::Command::new("go")
+            .args(["build", "-o"])
+            .arg(&go_program)
+            .arg("exiting.go")
+            .current_dir(directory.path())
+            .output()
+            .unwrap();
+        assert!(
+            built.status.success(),
+            "go build rejected generated source:\n{}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        let ran = std::process::Command::new(&go_program).output().unwrap();
+        assert_eq!(ran.stdout, b"before\n", "generated Go wrote other bytes");
+        assert_eq!(ran.status.code(), Some(3));
+    }
+
+    /// A build that ran out of time is not a build that failed.
+    ///
+    /// A timeout leaves exit 124, so a check that reads the status first calls
+    /// it a build failure — which is what it did, and what sent a reader to
+    /// inspect generated code that had compiled fine the run before.
+    #[test]
+    fn a_build_that_ran_out_of_budget_is_not_reported_as_one_that_failed() {
+        let outcome = |exit_code, timed_out, limit_exceeded| crate::agent_process::Outcome {
+            exit_code,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            timed_out,
+            limit_exceeded,
+            signal: None,
+        };
+
+        assert_eq!(classify_build(&outcome(0, false, None), 1000), None);
+
+        let timed_out = classify_build(&outcome(124, true, None), 30_000).unwrap();
+        assert!(
+            timed_out.contains("30000 ms budget") && !timed_out.contains("failed"),
+            "{timed_out}"
+        );
+
+        let limited = classify_build(&outcome(137, false, Some("memory".into())), 1000).unwrap();
+        assert!(
+            limited.contains("memory limit") && !limited.contains("failed"),
+            "{limited}"
+        );
+
+        // A real failure still reads as one, and still names the status.
+        let failed = classify_build(&outcome(101, false, None), 1000).unwrap();
+        assert!(failed.contains("failed with exit 101"), "{failed}");
+
+        // A toolchain gets a build-sized budget; a script keeps the scenario's.
+        let scenario = crate::config::ResourceLimits {
+            timeout_ms: 30_000,
+            memory_bytes: 1024,
+            processes: 8,
+            stdout_bytes: 1024,
+            stderr_bytes: 1024,
+        };
+        let build = verification_build_limits(&["cargo".into(), "build".into()], scenario);
+        assert_eq!(build.timeout_ms, TOOLCHAIN_BUILD_TIMEOUT_MS);
+        let script = verification_build_limits(&["./build.sh".into()], scenario);
+        assert_eq!(script.timeout_ms, scenario.timeout_ms);
     }
 
     #[test]

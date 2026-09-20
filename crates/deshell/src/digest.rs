@@ -3,17 +3,33 @@ use std::io::Read;
 use std::path::Path;
 
 pub(crate) fn sha256(bytes: &[u8]) -> String {
-    lowercase_hex(Sha256::digest(bytes))
+    let digest = lowercase_hex(Sha256::digest(bytes));
+    // The length and the answer, never the input. Two runs that disagree
+    // disagree here first, and this is where a reader sees which bytes moved
+    // without the bytes themselves being written down.
+    crate::trace::record(|| crate::trace::Event::Digest {
+        bytes: bytes.len() as u64,
+        digest: digest.clone(),
+    });
+    digest
 }
 
 pub(crate) fn lowercase_hex(bytes: impl AsRef<[u8]>) -> String {
     let bytes = bytes.as_ref();
     let mut output = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
-        use std::fmt::Write as _;
-        write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
+        output.push(hex_digit(byte >> 4));
+        output.push(hex_digit(byte & 0x0f));
     }
     output
+}
+
+fn hex_digit(nibble: u8) -> char {
+    char::from(match nibble {
+        0..=9 => b'0' + nibble,
+        10..=15 => b'a' + (nibble - 10),
+        _ => b'?',
+    })
 }
 
 pub(crate) fn valid_sha256(value: &str) -> bool {
@@ -41,7 +57,7 @@ pub(crate) fn file_sha256(path: &Path) -> Result<(u64, String), String> {
         .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
     let mut digest = Sha256::new();
     let mut bytes = 0_u64;
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 64 * 1024];
     loop {
         let count = file
             .read(&mut buffer)
@@ -61,6 +77,14 @@ pub(crate) fn file_sha256(path: &Path) -> Result<(u64, String), String> {
 }
 
 #[cfg(test)]
+// Tests reach for the raw APIs on purpose: they stage corrupt trees, race two
+// writers against one path, and assert on what the transactional layer does with
+// the result. Constructing those situations is precisely what the production ban
+// exists to prevent, so the ban is lifted here and nowhere else.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "tests construct the races and corrupt trees the production ban prevents"
+)]
 mod tests {
     use super::*;
 

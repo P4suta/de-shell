@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "contract": "exit-builtin-semantics-v1",
+  "purpose": "Pin what each shell's `exit` builtin ends with, so the frontend's native domain for `exit` is checked against a measurement rather than against a reading of the specification.",
+  "note": "A status the shells agree on is a decimal integer reduced modulo 256 — negatives and values above 255 alike. They agree on nothing else: bash and /bin/sh end with 255 and write a message naming the interpreter's own path and a line number, while zsh ends with 0 in silence. A case marked modelled is one the frontend lowers, and its recorded status must equal that reduction in every shell; a case marked unmodelled is one where no status can be reported without impersonating one shell.",
+  "cases": [
+    {"name": "zero", "status": "0", "modelled": true, "bash": 0, "sh": 0, "zsh": 0},
+    {"name": "one", "status": "1", "modelled": true, "bash": 1, "sh": 1, "zsh": 1},
+    {"name": "two", "status": "2", "modelled": true, "bash": 2, "sh": 2, "zsh": 2},
+    {"name": "largest-byte", "status": "255", "modelled": true, "bash": 255, "sh": 255, "zsh": 255},
+    {"name": "wraps-to-zero", "status": "256", "modelled": true, "bash": 0, "sh": 0, "zsh": 0},
+    {"name": "wraps-above-a-byte", "status": "300", "modelled": true, "bash": 44, "sh": 44, "zsh": 44},
+    {"name": "negative-wraps", "status": "-1", "modelled": true, "bash": 255, "sh": 255, "zsh": 255},
+    {"name": "surrounding-space-is-ignored", "status": " 7 ", "modelled": true, "bash": 7, "sh": 7, "zsh": 7},
+    {"name": "not-a-number", "status": "abc", "modelled": false, "bash": 255, "sh": 255, "zsh": 0},
+    {"name": "empty-is-a-bare-exit", "status": "", "modelled": false, "bash": 0, "sh": 0, "zsh": 0}
+  ]
+}

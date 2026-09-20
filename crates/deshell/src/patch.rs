@@ -4,6 +4,16 @@ use std::path::{Path, PathBuf};
 pub(crate) enum Expectation {
     Existing(String),
     Missing,
+    /// Content-addressed creation. The target path is derived from the digest of
+    /// the very bytes being written, so any writer that reached this path wrote
+    /// these bytes. Observing the file already present is the same write completing
+    /// twice, not a conflict. Differing content at the path means the digest no
+    /// longer addresses the content, which stays an error.
+    ///
+    /// Unlike `Missing`, this intent carries no pre-check: a caller cannot inspect
+    /// the path first and then decide, so there is no window between the decision
+    /// and the write for a racing writer to invalidate.
+    MissingOrIdentical,
 }
 
 #[derive(Clone, Debug)]
@@ -108,6 +118,222 @@ pub(crate) fn prepare_create(
     })
 }
 
+/// Remove a directory that this process created and then abandoned.
+///
+/// Used only on the rollback path, where the directories being removed are the
+/// ones [`ensure_directory`] reported as [`DirectoryState::Created`]. A directory
+/// a concurrent writer created is never passed here, and a non-empty directory is
+/// left alone rather than emptied, so a failure is not worth propagating: the
+/// caller is already unwinding a different error.
+pub(crate) fn remove_empty_directory(path: &Path) {
+    let _remove_result = std::fs::remove_dir(path);
+}
+
+/// Operations on a scratch tree that lies outside the project.
+///
+/// Isolated generator copies, decoded snippets handed to an interpreter, and
+/// private workspace snapshots all live in a temporary directory that is deleted
+/// wholesale afterwards. They need no staging, no rollback and no digest
+/// expectation, because nothing in the project can observe them.
+///
+/// They still do not get the raw API. Naming the destination as scratch is what
+/// keeps "this is outside the project" an assertion a reader can check, rather
+/// than something inferred from how the path was built several frames up.
+pub(crate) mod scratch {
+    use std::io::{BufRead as _, BufReader, BufWriter, Write as _};
+    use std::path::Path;
+
+    /// Write `bytes` to a path inside a scratch tree.
+    pub(crate) fn write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        std::fs::write(path, bytes)
+    }
+
+    /// Copy a file's bytes into a scratch tree.
+    ///
+    /// Callers set the destination permissions explicitly. Keeping that policy
+    /// separate also avoids platform-specific clone syscalls here, so the same
+    /// byte-copying path is exercised under Miri on every host.
+    pub(crate) fn copy(from: &Path, to: &Path) -> std::io::Result<u64> {
+        // `io::copy` sees through `BufReader<File>` on Linux and specializes to
+        // `copy_file_range`, a syscall Miri cannot interpret. Drive the buffered
+        // Read/Write contract explicitly so production and every Miri host take
+        // the same path instead of giving the interpreter a weaker substitute.
+        let mut source = BufReader::new(std::fs::File::open(from)?);
+        let mut destination = BufWriter::new(std::fs::File::create(to)?);
+        let mut copied = 0_u64;
+        loop {
+            let available = source.fill_buf()?;
+            if available.is_empty() {
+                break;
+            }
+            destination.write_all(available)?;
+            let consumed = available.len();
+            let consumed_u64 = u64::try_from(consumed).map_err(|error| {
+                std::io::Error::other(format!("scratch copy length does not fit u64: {error}"))
+            })?;
+            copied = copied
+                .checked_add(consumed_u64)
+                .ok_or_else(|| std::io::Error::other("scratch copy length overflow"))?;
+            source.consume(consumed);
+        }
+        destination.flush()?;
+        Ok(copied)
+    }
+
+    /// Set permissions on a path inside a scratch tree.
+    pub(crate) fn set_permissions(
+        path: &Path,
+        permissions: std::fs::Permissions,
+    ) -> std::io::Result<()> {
+        std::fs::set_permissions(path, permissions)
+    }
+
+    /// Remove a file inside a scratch tree.
+    pub(crate) fn remove_file(path: &Path) -> std::io::Result<()> {
+        std::fs::remove_file(path)
+    }
+}
+
+/// Whether [`ensure_directory`] is what brought the directory into existence.
+///
+/// Callers that roll back on a later failure must remove only what they created;
+/// deleting a directory a concurrent writer created would destroy someone else's
+/// work. Returning that distinction as a value — rather than leaving each caller
+/// to infer it from an error kind — is what makes the rollback decision checkable.
+#[must_use]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DirectoryState {
+    /// This call created the directory, so this call owns removing it.
+    Created,
+    /// The directory was already present. It is not ours to remove.
+    Existing,
+}
+
+/// Why [`ensure_directory`] could not establish a directory at the path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum DirectoryError {
+    /// Something that is not a directory (or is a symlink) occupies the path.
+    /// This is a genuine conflict, not a lost race.
+    Occupied,
+    /// The directory could not be created or inspected.
+    Io(String),
+}
+
+#[cfg(test)]
+mod directory_attempt_testing {
+    use std::path::PathBuf;
+
+    struct WriterArrival {
+        parent: PathBuf,
+        target: PathBuf,
+    }
+
+    std::thread_local! {
+        static AFTER_ATTEMPT: std::cell::RefCell<Option<WriterArrival>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn writer_arrives_after_next_attempt(parent: PathBuf, target: PathBuf) {
+        AFTER_ATTEMPT.with(|slot| {
+            assert!(
+                slot.borrow().is_none(),
+                "a directory-attempt hook is already installed"
+            );
+            *slot.borrow_mut() = Some(WriterArrival { parent, target });
+        });
+    }
+
+    pub(super) fn run() {
+        AFTER_ATTEMPT.with(|slot| {
+            if let Some(arrival) = slot.borrow_mut().take() {
+                std::fs::create_dir(&arrival.parent).unwrap();
+                std::fs::create_dir(&arrival.target).unwrap();
+            }
+        });
+    }
+}
+
+/// Establish a directory at `path`, tolerating a writer that got there first.
+///
+/// The postcondition callers need is "a directory exists at this path", never
+/// "this call is what created it" — and where the latter does matter, it comes
+/// back as [`DirectoryState`] instead of being recovered from an error kind.
+///
+/// `std::fs::create_dir` reports only the latter, so every call site had to decide
+/// for itself what `AlreadyExists` means, and an existence check placed *before* it
+/// merely narrows the race window rather than closing it. Here the attempt comes
+/// first and the inspection second, so no window exists between deciding and acting.
+pub(crate) fn ensure_directory(path: &Path) -> Result<DirectoryState, DirectoryError> {
+    let attempted = std::fs::create_dir(path);
+    #[cfg(test)]
+    directory_attempt_testing::run();
+    match attempted {
+        Ok(()) => {
+            crate::trace::record(|| crate::trace::Event::DirectoryCreate {
+                path: crate::trace::path_name(path),
+                created: true,
+            });
+            Ok(DirectoryState::Created)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = path
+                .symlink_metadata()
+                .map_err(|error| DirectoryError::Io(error.to_string()))?;
+            if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+                return Err(DirectoryError::Occupied);
+            }
+            crate::trace::record(|| crate::trace::Event::DirectoryCreate {
+                path: crate::trace::path_name(path),
+                created: false,
+            });
+            Ok(DirectoryState::Existing)
+        }
+        Err(error) => Err(DirectoryError::Io(error.to_string())),
+    }
+}
+
+/// Create a directory that must not already exist.
+///
+/// The counterpart to [`ensure_directory`]. Isolation boundaries — a private
+/// workspace root, a fresh snapshot tree — are only isolated because nothing was
+/// there before, so a pre-existing directory is a failure rather than a race that
+/// was lost. Making the caller name which of the two it means is the point: the
+/// raw `std::fs::create_dir` has one behaviour and two possible intents, and
+/// picking the wrong one silently is exactly how the concurrent-approval defect
+/// and six untreated `AlreadyExists` sites happened.
+pub(crate) fn create_new_directory(path: &Path) -> Result<(), DirectoryError> {
+    match std::fs::create_dir(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(DirectoryError::Occupied)
+        }
+        Err(error) => Err(DirectoryError::Io(error.to_string())),
+    }
+}
+
+/// Propose a content-addressed creation.
+///
+/// This deliberately performs no existence pre-check. `prepare_create` asks
+/// whether the target is absent *now* and then writes later, which is a
+/// time-of-check/time-of-use window: a racing writer between the two makes the
+/// proposal fail even when it wrote byte-identical content. Content-addressed
+/// writes cannot express that as a conflict, so the intent is declared instead
+/// and resolved once, inside this module.
+pub(crate) fn prepare_create_idempotent(
+    path: &Path,
+    replacement: Vec<u8>,
+    permissions: u32,
+) -> Result<Proposal, String> {
+    checked_parent_directory(path, "create target")?;
+    Ok(Proposal {
+        path: path.to_path_buf(),
+        expected: Expectation::MissingOrIdentical,
+        replacement,
+        permissions,
+        mutation: Mutation::Write,
+    })
+}
+
 fn checked_parent_directory<'a>(path: &'a Path, label: &str) -> Result<&'a Path, String> {
     let parent = path
         .parent()
@@ -152,6 +378,31 @@ pub(crate) fn apply_all(proposals: &[Proposal]) -> Result<(), String> {
     apply_all_inner(proposals, None)
 }
 
+/// Persist a staged file without replacing a writer that reached the target.
+fn persist_without_clobber(
+    temporary: tempfile::NamedTempFile,
+    target: &Path,
+) -> Result<(), std::io::Error> {
+    #[cfg(not(miri))]
+    {
+        temporary
+            .persist_noclobber(target)
+            .map(|_persisted| ())
+            .map_err(|error| error.error)
+    }
+
+    #[cfg(miri)]
+    {
+        // tempfile first asks Linux for renameat2(RENAME_NOREPLACE), which
+        // Miri does not implement. Its own fallback is the same hard-link then
+        // unlink sequence used here. Keep this compatibility branch confined
+        // to the interpreter so production retains tempfile's native fast path.
+        std::fs::hard_link(temporary.path(), target)?;
+        let _cleanup_result = temporary.close();
+        Ok(())
+    }
+}
+
 fn apply_all_inner(
     proposals: &[Proposal],
     fail_after_commits: Option<usize>,
@@ -186,6 +437,10 @@ fn apply_all_inner(
                 item.canonical.display()
             )
         })?;
+        crate::trace::record(|| crate::trace::Event::FileStage {
+            path: crate::trace::path_name(&item.canonical),
+            bytes: item.proposal.replacement.len() as u64,
+        });
         staged.push(Some(temporary));
     }
     // Revalidate the complete read set after all writes are staged. No target
@@ -231,20 +486,55 @@ fn apply_all_inner(
     let mut commit_count = 0;
     for (item, temporary) in validated.iter().zip(staged) {
         let mut commit_error = if item.proposal.mutation == Mutation::Delete {
+            crate::trace::record(|| crate::trace::Event::FileRemove {
+                path: crate::trace::path_name(&item.canonical),
+            });
             sync_parent(&item.canonical).err()
         } else {
-            match temporary
-                .expect("write mutation has a staged file")
-                .persist(&item.canonical)
-            {
-                Ok(_) => {
-                    committed.push((
-                        item.canonical.clone(),
-                        crate::digest::sha256(&item.proposal.replacement),
-                    ));
-                    sync_parent(&item.canonical).err()
-                }
-                Err(error) => Some(format!("{}", error.error)),
+            match temporary {
+                Some(temporary) => match persist_without_clobber(temporary, &item.canonical) {
+                    Ok(()) => {
+                        let digest = crate::digest::sha256(&item.proposal.replacement);
+                        crate::trace::record(|| crate::trace::Event::FileCommit {
+                            path: crate::trace::path_name(&item.canonical),
+                            digest: digest.clone(),
+                        });
+                        committed.push((item.canonical.clone(), digest));
+                        sync_parent(&item.canonical).err()
+                    }
+                    Err(error) => match &item.proposal.expected {
+                        Expectation::MissingOrIdentical => {
+                            // Revalidate the original canonical pathname, not
+                            // the caller's spelling of it. An alias whose
+                            // ancestor changed after staging cannot satisfy the
+                            // immutable target this transaction validated.
+                            let mut verification = item.proposal.clone();
+                            verification.path.clone_from(&item.canonical);
+                            match validate_proposal(&verification) {
+                                Ok(_) => {
+                                    // Another content-addressed writer won. This
+                                    // intent is complete, but this transaction does
+                                    // not own that writer's file and must therefore
+                                    // not add it to its rollback set.
+                                    crate::trace::record(|| crate::trace::Event::FileCommit {
+                                        path: crate::trace::path_name(&item.canonical),
+                                        digest: crate::digest::sha256(&item.proposal.replacement),
+                                    });
+                                    None
+                                }
+                                Err(validation_error) => Some(format!(
+                                    "{}; cannot verify concurrent content-addressed target: {validation_error}",
+                                    error
+                                )),
+                            }
+                        }
+                        Expectation::Existing(_) | Expectation::Missing => Some(error.to_string()),
+                    },
+                },
+                None => Some(format!(
+                    "write mutation for {} has no staged file",
+                    item.canonical.display()
+                )),
             }
         };
         commit_count += usize::from(commit_error.is_none());
@@ -266,8 +556,8 @@ fn apply_all_inner(
         }
     }
     for (_, backup) in backups {
-        let _ = std::fs::remove_file(&backup);
-        let _ = sync_parent(&backup);
+        let _remove_result = std::fs::remove_file(&backup);
+        let _sync_result = sync_parent(&backup);
     }
     Ok(())
 }
@@ -355,6 +645,44 @@ fn validate_proposal(proposal: &Proposal) -> Result<PathBuf, String> {
             })?;
             Ok(parent.join(name))
         }
+        Expectation::MissingOrIdentical => {
+            let parent = checked_parent_directory(&proposal.path, "create target")?;
+            match proposal.path.symlink_metadata() {
+                Ok(metadata)
+                    if metadata.file_type().is_file() && !metadata.file_type().is_symlink() =>
+                {
+                    let canonical = proposal.path.canonicalize().map_err(|error| {
+                        format!("cannot resolve {}: {error}", proposal.path.display())
+                    })?;
+                    let current = std::fs::read(&canonical)
+                        .map_err(|error| format!("cannot read {}: {error}", canonical.display()))?;
+                    if current != proposal.replacement {
+                        return Err(format!(
+                            "content-addressed target differs: {}",
+                            proposal.path.display()
+                        ));
+                    }
+                    Ok(canonical)
+                }
+                Ok(_) => Err(format!(
+                    "content-addressed target is not a regular non-symlink file: {}",
+                    proposal.path.display()
+                )),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    let parent = parent.canonicalize().map_err(|error| {
+                        format!("cannot resolve create parent {}: {error}", parent.display())
+                    })?;
+                    let name = proposal.path.file_name().ok_or_else(|| {
+                        format!("create target has no filename: {}", proposal.path.display())
+                    })?;
+                    Ok(parent.join(name))
+                }
+                Err(error) => Err(format!(
+                    "cannot inspect {}: {error}",
+                    proposal.path.display()
+                )),
+            }
+        }
     }
 }
 
@@ -380,6 +708,25 @@ fn validate_current(validated: &[Validated]) -> Result<(), String> {
                 ));
             }
             Expectation::Missing => {}
+            Expectation::MissingOrIdentical => match std::fs::read(&item.canonical) {
+                // A writer that won the race wrote these exact bytes, so the
+                // no-clobber commit below may treat that writer as completing
+                // the same content-addressed intent.
+                Ok(current) if current == item.proposal.replacement => {}
+                Ok(_) => {
+                    return Err(format!(
+                        "content-addressed target differs: {}",
+                        item.canonical.display()
+                    ));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "cannot re-read {}: {error}",
+                        item.canonical.display()
+                    ));
+                }
+            },
         }
     }
     Ok(())
@@ -397,7 +744,12 @@ fn restore_backups(backups: &[(PathBuf, PathBuf)]) -> Vec<String> {
         }
         if let Err(error) = std::fs::rename(backup, target) {
             errors.push(format!("{}: {error}", target.display()));
-        } else if let Err(error) = sync_parent(target) {
+        } else if let Err(error) = {
+            crate::trace::record(|| crate::trace::Event::FileRollback {
+                path: crate::trace::path_name(target),
+            });
+            sync_parent(target)
+        } {
             errors.push(format!(
                 "cannot sync {} after rollback: {error}",
                 target.display()
@@ -479,15 +831,17 @@ fn sync_parent(_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(unix)]
 fn file_permissions(metadata: &std::fs::Metadata) -> u32 {
-    use std::os::unix::fs::PermissionsExt as _;
-    metadata.permissions().mode() & 0o7777
-}
-
-#[cfg(not(unix))]
-fn file_permissions(_metadata: &std::fs::Metadata) -> u32 {
-    0o666
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        metadata.permissions().mode() & 0o7777
+    }
+    #[cfg(not(unix))]
+    {
+        let _metadata = metadata;
+        0o666
+    }
 }
 
 fn set_permissions(path: &Path, mode: u32) -> Result<(), String> {
@@ -503,15 +857,241 @@ fn set_permissions(path: &Path, mode: u32) -> Result<(), String> {
     }
     #[cfg(not(unix))]
     {
-        let _ = (path, mode);
+        let _path = path;
+        let _mode = mode;
     }
     Ok(())
 }
 
 #[cfg(test)]
+// Tests reach for the raw APIs on purpose: they stage corrupt trees, race two
+// writers against one path, and assert on what the transactional layer does with
+// the result. Constructing those situations is precisely what the production ban
+// exists to prevent, so the ban is lifted here and nowhere else.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "tests construct the races and corrupt trees the production ban prevents"
+)]
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn preparation_and_rollback_refuse_non_regular_targets_at_the_boundary() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary.path().join("directory");
+        fs::create_dir(&directory).unwrap();
+        let digest = crate::digest::sha256(b"");
+
+        for error in [
+            prepare(&directory, vec![]).unwrap_err(),
+            prepare_expected(&directory, &digest, vec![]).unwrap_err(),
+            prepare_delete(&directory).unwrap_err(),
+        ] {
+            assert!(error.contains("not a regular non-symlink file"), "{error}");
+        }
+
+        let proposal = prepare_create_idempotent(&directory, vec![], 0o644).unwrap();
+        let error = validate_proposal(&proposal).unwrap_err();
+        assert!(
+            error.contains("content-addressed target is not a regular non-symlink file"),
+            "{error}"
+        );
+
+        let errors = remove_committed(&[(directory, digest)]);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].contains("refusing to remove a non-regular rollback target"),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn directory_creation_distinguishes_created_existing_occupied_and_io() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary.path().join("directory");
+        assert_eq!(
+            ensure_directory(&directory).unwrap(),
+            DirectoryState::Created
+        );
+        assert_eq!(
+            ensure_directory(&directory).unwrap(),
+            DirectoryState::Existing
+        );
+
+        let occupied = temporary.path().join("occupied");
+        fs::write(&occupied, b"file").unwrap();
+        assert_eq!(
+            ensure_directory(&occupied).unwrap_err(),
+            DirectoryError::Occupied
+        );
+
+        let isolated = temporary.path().join("isolated");
+        create_new_directory(&isolated).unwrap();
+        assert_eq!(
+            create_new_directory(&isolated).unwrap_err(),
+            DirectoryError::Occupied
+        );
+        assert!(matches!(
+            create_new_directory(&temporary.path().join("missing/child")),
+            Err(DirectoryError::Io(_))
+        ));
+    }
+
+    #[test]
+    fn a_non_already_exists_failure_stays_an_error_if_a_writer_arrives_after_it() {
+        let temporary = tempfile::tempdir().unwrap();
+        let parent = temporary.path().join("parent");
+        let target = parent.join("target");
+        directory_attempt_testing::writer_arrives_after_next_attempt(parent, target.clone());
+
+        assert!(matches!(
+            ensure_directory(&target),
+            Err(DirectoryError::Io(_))
+        ));
+        assert!(target.is_dir());
+    }
+
+    #[test]
+    fn content_addressed_validation_distinguishes_every_current_state() {
+        let temporary = tempfile::tempdir().unwrap();
+        let missing_path = temporary.path().join("missing");
+        let missing =
+            prepare_create_idempotent(&missing_path, b"expected".to_vec(), 0o644).unwrap();
+        let canonical = validate_proposal(&missing).unwrap();
+        assert_eq!(
+            canonical,
+            temporary.path().canonicalize().unwrap().join("missing")
+        );
+        validate_current(&[Validated {
+            proposal: missing,
+            canonical,
+        }])
+        .unwrap();
+
+        let target = temporary.path().join("target");
+        fs::write(&target, b"different").unwrap();
+        let differing = Validated {
+            proposal: Proposal {
+                path: target.clone(),
+                expected: Expectation::MissingOrIdentical,
+                replacement: b"expected".to_vec(),
+                permissions: 0o644,
+                mutation: Mutation::Write,
+            },
+            canonical: target.canonicalize().unwrap(),
+        };
+        let error = validate_current(&[differing]).unwrap_err();
+        assert!(
+            error.contains("content-addressed target differs"),
+            "{error}"
+        );
+
+        let unreadable = temporary.path().join("unreadable");
+        fs::create_dir(&unreadable).unwrap();
+        let unreadable = Validated {
+            proposal: Proposal {
+                path: unreadable.clone(),
+                expected: Expectation::MissingOrIdentical,
+                replacement: vec![],
+                permissions: 0o644,
+                mutation: Mutation::Write,
+            },
+            canonical: unreadable,
+        };
+        let error = validate_current(&[unreadable]).unwrap_err();
+        assert!(error.contains("cannot re-read"), "{error}");
+
+        let invalid_path = temporary.path().join("invalid\0target");
+        let invalid = prepare_create_idempotent(&invalid_path, vec![], 0o644).unwrap();
+        let error = validate_proposal(&invalid).unwrap_err();
+        assert!(error.contains("cannot inspect"), "{error}");
+    }
+
+    #[test]
+    fn scratch_permission_changes_reach_the_filesystem() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let original = file.as_file().metadata().unwrap().permissions();
+        assert!(!original.readonly());
+        let mut readonly = original.clone();
+        readonly.set_readonly(true);
+
+        scratch::set_permissions(file.path(), readonly).unwrap();
+        assert!(file.as_file().metadata().unwrap().permissions().readonly());
+        scratch::set_permissions(file.path(), original).unwrap();
+    }
+
+    #[test]
+    fn scratch_file_helpers_change_the_real_filesystem() {
+        let temporary = tempfile::tempdir().unwrap();
+        let written = temporary.path().join("written");
+        scratch::write(&written, b"written bytes").unwrap();
+        assert_eq!(fs::read(&written).unwrap(), b"written bytes");
+
+        let copied = temporary.path().join("copied");
+        assert_eq!(scratch::copy(&written, &copied).unwrap(), 13);
+        assert_eq!(fs::read(&copied).unwrap(), b"written bytes");
+        scratch::remove_file(&copied).unwrap();
+        assert!(!copied.exists());
+
+        let empty = temporary.path().join("empty");
+        fs::create_dir(&empty).unwrap();
+        remove_empty_directory(&empty);
+        assert!(!empty.exists());
+    }
+
+    #[test]
+    fn prepared_permissions_are_carried_through_the_commit() {
+        let temporary = tempfile::tempdir().unwrap();
+        let target = temporary.path().join("target");
+        fs::write(&target, b"before").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o640)).unwrap();
+        }
+
+        let proposal = prepare(&target, b"after".to_vec()).unwrap();
+        #[cfg(unix)]
+        assert_eq!(proposal.permissions, 0o640);
+        #[cfg(not(unix))]
+        assert_eq!(proposal.permissions, 0o666);
+        apply_all(&[proposal]).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                fs::metadata(&target).unwrap().permissions().mode() & 0o7777,
+                0o640
+            );
+        }
+    }
+
+    #[test]
+    fn file_commit_trace_names_the_exact_committed_path() {
+        let temporary = tempfile::tempdir().unwrap();
+        let target = temporary.path().join("target");
+        fs::write(&target, b"before").unwrap();
+        let proposal = prepare(&target, b"after".to_vec()).unwrap();
+
+        let trace = crate::trace::testing::recorded(|| apply_all(&[proposal]).unwrap());
+        let paths = crate::trace::testing::events(&trace)
+            .into_iter()
+            .filter(|event| event["event"] == "file_commit")
+            .map(|event| event["path"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            vec![
+                target
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            ]
+        );
+    }
 
     #[test]
     fn applies_existing_and_created_files_as_one_transaction() {
@@ -780,8 +1360,8 @@ mod tests {
 
         let canonical = existing.canonicalize().unwrap();
         let validated = Validated {
-            proposal: valid.clone(),
-            canonical: canonical.clone(),
+            proposal: valid,
+            canonical,
         };
         fs::write(&existing, b"drift").unwrap();
         assert!(validate_current(std::slice::from_ref(&validated)).is_err());
@@ -880,5 +1460,56 @@ mod tests {
             assert!(sync_parent(Path::new("/")).is_err());
             assert!(set_permissions(&temporary.path().join("absent"), 0o600).is_err());
         }
+    }
+
+    #[test]
+    fn identical_concurrent_creation_is_not_a_conflict() {
+        // A content-addressed path is derived from the digest of its own bytes, so a
+        // racing writer that produced the same path necessarily produced the same
+        // bytes. Losing that race is not a conflict; it is the same write completing
+        // twice. Callers must not have to re-check or retry to discover that.
+        let temporary = tempfile::tempdir().unwrap();
+        let target = temporary.path().join("a61b1897.json");
+        let bytes = b"{\n  \"schema_version\": 1\n}\n".to_vec();
+
+        let create = prepare_create_idempotent(&target, bytes.clone(), 0o644).unwrap();
+        fs::write(&target, &bytes).unwrap();
+
+        apply_all(&[create]).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), bytes);
+    }
+
+    #[test]
+    fn a_losing_transaction_never_claims_an_idempotent_winner_for_rollback() {
+        let temporary = tempfile::tempdir().unwrap();
+        let shared = temporary.path().join("shared.json");
+        let owned = temporary.path().join("owned.json");
+        let bytes = b"content-addressed".to_vec();
+        let shared_proposal = prepare_create_idempotent(&shared, bytes.clone(), 0o644).unwrap();
+        fs::write(&shared, &bytes).unwrap();
+        let owned_proposal = prepare_create(&owned, b"owned".to_vec(), 0o644).unwrap();
+
+        let error = apply_all_inner(&[shared_proposal, owned_proposal], Some(2)).unwrap_err();
+        assert!(error.contains("injected commit failure"), "{error}");
+        assert_eq!(fs::read(&shared).unwrap(), bytes);
+        assert!(!owned.exists());
+    }
+
+    #[test]
+    fn differing_concurrent_creation_is_still_a_conflict() {
+        // Same path, different bytes, means the digest no longer addresses the
+        // content. That must stay an error even under the idempotent intent.
+        let temporary = tempfile::tempdir().unwrap();
+        let target = temporary.path().join("a61b1897.json");
+
+        let create = prepare_create_idempotent(&target, b"expected".to_vec(), 0o644).unwrap();
+        fs::write(&target, b"different").unwrap();
+
+        assert!(
+            apply_all(&[create])
+                .unwrap_err()
+                .contains("content-addressed target")
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"different");
     }
 }

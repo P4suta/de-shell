@@ -15,17 +15,22 @@ impl Generator {
     }
 
     fn bytes(&mut self, maximum: usize) -> Vec<u8> {
-        let length = (self.next() as usize) % (maximum + 1);
-        (0..length).map(|_| self.next() as u8).collect()
+        let modulus = u64::try_from(maximum + 1).unwrap();
+        let length = usize::try_from(self.next() % modulus).unwrap();
+        (0..length)
+            .map(|_| u8::try_from(self.next() & u64::from(u8::MAX)).unwrap())
+            .collect()
     }
 
     fn identifier(&mut self) -> String {
-        let length = 1 + (self.next() as usize % 24);
+        let length = 1 + usize::try_from(self.next() % 24).unwrap();
         let mut output = String::with_capacity(length);
-        output.push((b'a' + (self.next() % 26) as u8) as char);
+        output.push(char::from(b'a' + u8::try_from(self.next() % 26).unwrap()));
         for _ in 1..length {
             let alphabet = b"abcdefghijklmnopqrstuvwxyz0123456789_";
-            output.push(alphabet[self.next() as usize % alphabet.len()] as char);
+            let index =
+                usize::try_from(self.next() % u64::try_from(alphabet.len()).unwrap()).unwrap();
+            output.push(char::from(alphabet[index]));
         }
         output
     }
@@ -77,8 +82,10 @@ fn generated_expressions_never_reparse_expanded_dollar_text() {
         let variables = BTreeMap::from([(variable_name, variable_value.clone())]);
         let arguments = BTreeMap::from([(argument_name, argument_value.clone())]);
         assert_eq!(
-            expression.evaluate(&variables, &arguments).unwrap(),
-            literal + &variable_value + &argument_value
+            expression
+                .evaluate(&variables, &arguments, crate::ir::UnsetPolicy::Empty)
+                .unwrap(),
+            format!("{literal}{variable_value}{argument_value}")
         );
     }
 }
@@ -90,9 +97,30 @@ fn generated_node_ids_are_stable_and_domain_separated() {
         let path = format!("{}/{}.sh", generator.identifier(), generator.identifier());
         let start = generator.next() % 10_000;
         let end = start + generator.next() % 1_000;
-        let first = crate::ir::node_id(&path, start, end, "exec", preorder).unwrap();
-        let second = crate::ir::node_id(&path, start, end, "exec", preorder).unwrap();
-        let other_operation = crate::ir::node_id(&path, start, end, "file_read", preorder).unwrap();
+        let first = crate::ir::node_id(crate::ir::NodeIdArgs {
+            normalized_path: &path,
+            start_byte: start,
+            end_byte: end,
+            operation: "exec",
+            preorder,
+        })
+        .unwrap();
+        let second = crate::ir::node_id(crate::ir::NodeIdArgs {
+            normalized_path: &path,
+            start_byte: start,
+            end_byte: end,
+            operation: "exec",
+            preorder,
+        })
+        .unwrap();
+        let other_operation = crate::ir::node_id(crate::ir::NodeIdArgs {
+            normalized_path: &path,
+            start_byte: start,
+            end_byte: end,
+            operation: "file_read",
+            preorder,
+        })
+        .unwrap();
         assert_eq!(first, second);
         assert_ne!(first, other_operation);
         assert_eq!(first.len(), 32);
@@ -148,5 +176,76 @@ fn generated_duplicate_keys_and_traversal_paths_are_rejected() {
         ] {
             assert!(crate::ir::normalize_path(&path).is_err(), "accepted {path}");
         }
+    }
+}
+
+/// A span always names bytes a reader can slice out of the source.
+///
+/// Both ends inside the source, in order, and on character boundaries. The
+/// scanner has had two defects in exactly this shape already: a search over the
+/// whole file gave four identical `run:` lines one span between them, and a
+/// search of decoded text against encoded bytes put seven blockers at `@0..1`.
+/// A span that cannot be sliced is the third way to get the same wrong answer.
+#[test]
+fn a_span_always_names_sliceable_bytes_of_its_source() {
+    let mut generator = Generator(0x5eed_1234_9abc_def0);
+    let sources = [
+        "",
+        "\n",
+        "run: printf hi\n",
+        "  run: printf hi\nrun: printf hi\n",
+        // Multi-byte characters, so an offset can land inside one.
+        "接頭辞 run: printf hi\n",
+        "é\né\n",
+        "🐚 shell\n",
+    ];
+    for source in sources {
+        for from in 0..=source.len() + 2 {
+            for value in ["", "run:", "printf", "é", "🐚", "absent"] {
+                let span = crate::scanner::span_of(source, from, value);
+                assert!(
+                    span.start_byte <= span.end_byte,
+                    "{source:?} {from} {value:?}"
+                );
+                assert!(
+                    usize::try_from(span.end_byte).unwrap() <= source.len(),
+                    "{source:?} {from} {value:?}"
+                );
+                let sliced = source.get(
+                    usize::try_from(span.start_byte).unwrap()
+                        ..usize::try_from(span.end_byte).unwrap(),
+                );
+                assert!(sliced.is_some(), "{source:?} {from} {value:?} {span:?}");
+                // When the value is there from `from` onward, the span is it.
+                if !value.is_empty()
+                    && let Some(rest) = source.get(from..)
+                    && rest.contains(value)
+                {
+                    assert_eq!(sliced, Some(value), "{source:?} {from} {value:?}");
+                }
+            }
+        }
+    }
+    // And the same over generated bytes, where the offsets are not chosen to be
+    // kind.
+    for _ in 0..512 {
+        let source = String::from_utf8_lossy(&generator.bytes(48)).into_owned();
+        let modulus = u64::try_from(source.len() + 4).unwrap();
+        let from = usize::try_from(generator.next() % modulus).unwrap();
+        let value = String::from_utf8_lossy(&generator.bytes(4)).into_owned();
+        let span = crate::scanner::span_of(&source, from, &value);
+        assert!(
+            span.start_byte <= span.end_byte,
+            "{source:?} {from} {value:?}"
+        );
+        assert!(
+            source
+                .get(
+                    usize::try_from(span.start_byte).unwrap()
+                        ..usize::try_from(span.end_byte).unwrap(),
+                )
+                .is_some(),
+            "{source:?} {from} {value:?} {span:?}"
+        );
     }
 }

@@ -149,8 +149,87 @@ mod tests {
             "contracts/schema/harden-evidence-v1.schema.json",
             "contracts/golden/frontend-v1.json",
             "contracts/golden/transform-export-v1.json",
+            "contracts/golden/bash-set-semantics-v1.json",
+            "contracts/golden/test-builtin-semantics-v1.json",
+            "contracts/golden/echo-builtin-semantics-v1.json",
+            "contracts/golden/exit-builtin-semantics-v1.json",
+            "contracts/golden/shell-builtin-inventory-v1.json",
+            "contracts/golden/posix-sh-divergence-v1.json",
+            "contracts/golden/printf-builtin-semantics-v1.json",
+            "contracts/golden/case-pattern-semantics-v1.json",
+            "contracts/golden/shell-variable-inventory-v1.json",
+            "contracts/golden/ir-verifier-coverage-v1.json",
+            "contracts/golden/powershell-invocation-semantics-v1.json",
+            "contracts/golden/powershell-step-invocation-semantics-v1.json",
+            "contracts/golden/powershell-variable-inventory-v1.json",
+            "contracts/golden/powershell-preference-semantics-v1.json",
+            "contracts/semantic-models-v1.json",
         ] {
             assert!(root().join(relative).is_file(), "missing {relative}");
+        }
+    }
+
+    /// Every operation the IR can name is in the Effect IR schema.
+    ///
+    /// Six were not: `no_op`, `write_stdout`, `exit`, `not`, `while` and
+    /// `test`. Each was added to the enum, lowered, generated and tested, and
+    /// the schema that is supposed to describe the IR said nothing about any of
+    /// them — so a plan holding one failed validation, and nothing noticed
+    /// until the schema validator was run by hand.
+    ///
+    /// `Operation::name` is the schema's `type` string, which is what makes
+    /// this checkable: the enum is exhaustive, so the list cannot be short
+    /// without somebody removing a variant.
+    #[test]
+    fn every_operation_the_ir_names_is_in_the_effect_ir_schema() {
+        let schema = json("contracts/schema/effect-ir-v1.schema.json");
+        let mut described = std::collections::BTreeSet::new();
+        for variant in schema["$defs"]["operation"]["oneOf"]
+            .as_array()
+            .expect("the operation definition is a union")
+        {
+            let kind = &variant["properties"]["type"];
+            if let Some(name) = kind["const"].as_str() {
+                described.insert(name.to_owned());
+            }
+            if let Some(names) = kind["enum"].as_array() {
+                described.extend(
+                    names
+                        .iter()
+                        .filter_map(|name| name.as_str().map(str::to_owned)),
+                );
+            }
+        }
+
+        for operation in crate::ir::Operation::ALL_NAMES {
+            assert!(
+                described.contains(*operation),
+                "the Effect IR schema does not describe {operation}"
+            );
+        }
+        for name in &described {
+            assert!(
+                crate::ir::Operation::ALL_NAMES.contains(&name.as_str()),
+                "the Effect IR schema describes {name}, which the IR cannot name"
+            );
+        }
+
+        // A task's fields are the same kind of claim, and `nounset` was missing
+        // from the schema for as long as the six operations were.
+        let task = &schema["$defs"]["task"];
+        for field in ["nounset", "body", "inputs", "environment", "secrets"] {
+            assert!(
+                task["properties"][field].is_object(),
+                "the Effect IR schema does not describe a task's {field}"
+            );
+            assert!(
+                task["required"]
+                    .as_array()
+                    .expect("a task has required fields")
+                    .iter()
+                    .any(|name| name.as_str() == Some(field)),
+                "a task's {field} is described and not required"
+            );
         }
     }
 
@@ -375,7 +454,7 @@ mod tests {
                         external_references(value, output);
                     }
                 }
-                _ => {}
+                Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
             }
         }
 
@@ -466,13 +545,22 @@ mod tests {
         assert!(schema["$defs"]["file"]["properties"].get("error").is_some());
     }
 
+    /// The corpus audit is a 0.1.0 release gate, so every release runner had to
+    /// carry a PowerShell to run it. It is `cargo xtask corpus-audit` now, and
+    /// the sorted two-space LF persistence it used to hand-roll belongs to
+    /// `serde_json` — `the_corpus_audit_counts_every_location_and_refuses_a_
+    /// residual_node` in `xtask` checks the bytes it writes.
     #[test]
-    fn corpus_auditor_persists_sorted_two_space_lf_json() {
-        let script = fs::read_to_string(root().join("scripts/audit-corpus.ps1")).unwrap();
-        assert!(script.contains("function ConvertTo-SortedJsonValue"));
-        assert!(script.contains("ConvertTo-SortedJsonValue $report"));
-        assert!(script.contains("$json + \"`n\""));
-        assert!(!script.contains("$json + [Environment]::NewLine"));
+    fn corpus_auditor_is_not_a_shell_script() {
+        assert!(
+            !root().join("scripts/audit-corpus.ps1").exists(),
+            "the corpus auditor was retired into xtask; it must not return as a script"
+        );
+        let mise = fs::read_to_string(root().join("mise.toml")).unwrap();
+        assert!(
+            mise.contains("cargo run --locked -p xtask -- corpus-audit"),
+            "mise must run the corpus audit through xtask"
+        );
     }
 
     #[test]

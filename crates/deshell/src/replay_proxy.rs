@@ -41,10 +41,12 @@ impl ReplayProxy {
                         let result =
                             serve_one(&mut stream, &replay, &worker_observations, socket_timeout);
                         if let Err(error) = result {
-                            let _ = write_error_response(&mut stream, &error);
+                            let _response_result = write_error_response(&mut stream, &error);
                             worker_errors
                                 .lock()
-                                .map_err(|_| "replay proxy error lock was poisoned".to_owned())?
+                                .map_err(|_error| {
+                                    "replay proxy error lock was poisoned".to_owned()
+                                })?
                                 .push(error);
                         }
                     }
@@ -78,19 +80,24 @@ impl ReplayProxy {
         if let Some(worker) = self.worker.take() {
             worker
                 .join()
-                .map_err(|_| "replay proxy worker panicked".to_owned())??;
+                .map_err(|_error| "replay proxy worker panicked".to_owned())??;
         }
-        let errors = self
-            .errors
-            .lock()
-            .map_err(|_| "replay proxy error lock was poisoned".to_owned())?;
-        if !errors.is_empty() {
-            return Err(errors.join("; "));
+        let error_message = {
+            let errors = self
+                .errors
+                .lock()
+                .map_err(|_error| "replay proxy error lock was poisoned".to_owned())?;
+            (!errors.is_empty()).then(|| errors.join("; "))
+        };
+        if let Some(message) = error_message {
+            return Err(message);
         }
-        self.observations
+        let observations = self
+            .observations
             .lock()
-            .map_err(|_| "replay proxy observation lock was poisoned".to_owned())
-            .map(|observations| observations.clone())
+            .map_err(|_error| "replay proxy observation lock was poisoned".to_owned())?
+            .clone();
+        Ok(observations)
     }
 }
 
@@ -98,7 +105,7 @@ impl Drop for ReplayProxy {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
         if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+            let _join_result = worker.join();
         }
     }
 }
@@ -126,7 +133,7 @@ fn serve_one(
     let response = entry.body.to_bytes()?;
     let mut log = observations
         .lock()
-        .map_err(|_| "replay proxy observation lock was poisoned".to_owned())?;
+        .map_err(|_error| "replay proxy observation lock was poisoned".to_owned())?;
     let sequence = log.len() as u64;
     log.push(crate::replay::NetworkExchange {
         sequence,
@@ -191,7 +198,7 @@ fn read_request(stream: &mut impl std::io::Read) -> Result<HttpRequest, String> 
         }
     };
     let headers = std::str::from_utf8(&bytes[..header_end])
-        .map_err(|_| "replay request headers are not UTF-8")?;
+        .map_err(|_error| "replay request headers are not UTF-8")?;
     let mut lines = headers.split("\r\n");
     let request_line = lines.next().ok_or("replay request line is missing")?;
     let mut request_parts = request_line.split_ascii_whitespace();
@@ -235,7 +242,7 @@ fn read_request(stream: &mut impl std::io::Read) -> Result<HttpRequest, String> 
                 value
                     .trim()
                     .parse::<usize>()
-                    .map_err(|_| "replay request Content-Length is invalid")?,
+                    .map_err(|_error| "replay request Content-Length is invalid")?,
             );
         } else if name.eq_ignore_ascii_case("transfer-encoding") {
             return Err("chunked replay requests are unavailable".into());

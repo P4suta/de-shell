@@ -12,11 +12,26 @@ mod evidence;
 mod exporter;
 mod frontend;
 mod harden;
+// The ambient-input layer. Every raw clock and environment read that
+// `clippy.toml` bans elsewhere is implemented here exactly once, so the set of
+// things de-shell reads from outside the repository is a list a reader can
+// finish and a test can supply.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "host implements the readings the ban redirects callers to; it is the one place the raw APIs may appear"
+)]
+mod host;
 mod ir;
-#[allow(dead_code)]
 mod lab;
 mod local_backend;
 mod migration;
+// The transactional filesystem layer. Every raw API that `clippy.toml` bans
+// elsewhere is implemented here exactly once, in terms of a named intent, so this
+// is the only module that reaches for them directly.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "patch implements the intents the ban redirects callers to; it is the one place the raw APIs may appear"
+)]
 mod patch;
 mod project;
 #[cfg(test)]
@@ -29,14 +44,22 @@ mod rewrite;
 mod runner;
 mod scanner;
 mod strict_json;
+mod trace;
 mod verify;
 mod workspace;
 
-fn main() {
+fn main() -> std::process::ExitCode {
     let code = cli::run_from(
         std::env::args_os(),
         &mut std::io::stdout().lock(),
         &mut std::io::stderr().lock(),
     );
-    std::process::exit(code);
+    // Returning rather than calling `std::process::exit` lets destructors run, so
+    // a staged temporary file or a rollback backup held by the transactional layer
+    // is released instead of being abandoned on the way out.
+    //
+    // Exit codes are the fixed categories in the CLI contract plus, for `run`, the
+    // exit code of the plan itself; all fit in a byte. A value that does not is an
+    // invariant violation, which is what 70 means.
+    std::process::ExitCode::from(u8::try_from(code).unwrap_or(70))
 }

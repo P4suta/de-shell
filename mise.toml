@@ -31,11 +31,17 @@ run = "cargo run --locked -p deshell --"
 [tasks."corpus:audit"]
 description = "Audit sibling or curated repositories without executing source scripts"
 depends = ["build"]
-run = "pwsh -NoLogo -NoProfile -File scripts/audit-corpus.ps1"
+run = "cargo run --locked -p xtask -- corpus-audit"
 
 [tasks.lint]
 description = "Lint Rust, repository metadata, and GitHub Actions"
 run = [
+  "cargo run --locked -p xtask -- enum-equality",
+  "cargo run --locked -p xtask -- lint-expectations",
+  "cargo run --locked -p xtask -- rust-policy",
+  "cargo run --locked -p xtask -- report-item-kinds",
+  "cargo run --locked -p xtask -- trace-events",
+  "cargo run --locked -p xtask -- fuzz-modules",
   "cargo clippy --locked --workspace --all-targets -- -D warnings",
   "mise run repository:guardrails",
   "actionlint .github/workflows/ci.yml .github/workflows/release.yml .github/workflows/nightly.yml .github/workflows/dependency-review.yml .github/workflows/scorecard.yml",
@@ -43,7 +49,7 @@ run = [
 
 [tasks."repository:guardrails"]
 description = "Reject tracked files over 10 MiB or paths over 240 characters"
-run = "pwsh -NoLogo -NoProfile -File scripts/repository-guardrails.ps1"
+run = "cargo run --locked -p xtask -- repository-guardrails"
 
 [tasks."github:apply"]
 description = "Apply the canonical GitHub repository settings and Rulesets"
@@ -96,6 +102,51 @@ run = [
   "cargo test --locked -p deshell protocol::tests",
 ]
 
+[tasks."test:fuzz-smoke"]
+description = "Build every fuzz target and run each briefly over the saved corpus"
+# The nightly job runs these for fifteen minutes each. This is the short form,
+# for a change: building the targets at all is most of the value, because the
+# fuzz crate re-declares every module of the binary and nothing else builds it.
+run = [
+  "cargo run --locked -p xtask -- fuzz-modules",
+  "cargo +nightly-2026-08-21 fuzz run frontend fuzz/corpus/frontend -- -runs=2000 -timeout=10 -max_len=16384",
+  "cargo +nightly-2026-08-21 fuzz run scanner fuzz/corpus/scanner -- -runs=2000 -timeout=10 -max_len=16384",
+  "cargo +nightly-2026-08-21 fuzz run protocol fuzz/corpus/protocol -- -runs=2000 -timeout=10 -max_len=16384",
+  "cargo +nightly-2026-08-21 fuzz run schema fuzz/corpus/schema -- -runs=2000 -timeout=10 -max_len=16384",
+]
+
+[tasks."test:miri"]
+description = "Check the pure logic and the transactional layer for undefined behaviour"
+# Miri interprets the program, so it cannot call into foreign code. Every module
+# that reaches a tree-sitter parser is therefore out, and so is the private
+# workspace snapshot, which clones files with `fclonefileat`. What is left is
+# where undefined behaviour would be worst anyway: the canonical byte forms, the
+# IR, the digests, and the transactional filesystem layer.
+#
+# Isolation is disabled because `patch::` is about real files: staging beside a
+# destination, committing by rename, and rolling back. Checking it against a
+# filesystem that is not there would check nothing.
+env = { MIRIFLAGS = "-Zmiri-disable-isolation" }
+run = [
+  "cargo +nightly-2026-08-21 miri test -p deshell canonical_json::",
+  "cargo +nightly-2026-08-21 miri test -p deshell strict_json::",
+  "cargo +nightly-2026-08-21 miri test -p deshell ir::",
+  "cargo +nightly-2026-08-21 miri test -p deshell digest::",
+  "cargo +nightly-2026-08-21 miri test -p deshell report::",
+  "cargo +nightly-2026-08-21 miri test -p deshell trace::",
+  "cargo +nightly-2026-08-21 miri test -p deshell patch::",
+]
+
+[tasks."test:mutation"]
+description = "Check that the tests fail when the code they cover is changed"
+# Scoped to the layers a wrong answer is worst in: the approval record, the
+# transactional filesystem layer, the ambient inputs, and the trace. Run in a
+# git worktree rather than in place, because cargo-mutants edits the tree it
+# tests and this one is being worked in.
+run = [
+  "cargo mutants --in-place --file crates/deshell/src/approval.rs --file crates/deshell/src/patch.rs --file crates/deshell/src/host.rs --file crates/deshell/src/trace.rs --file crates/deshell/src/migration.rs --file crates/deshell/src/frontend.rs --timeout 300",
+]
+
 [tasks."test:supply-chain"]
 description = "Audit advisories, licenses, duplicate dependencies, and dependency sources"
 run = [
@@ -108,11 +159,36 @@ description = "Validate schemas and generated v1 documents with an independent e
 depends = ["build"]
 run = "python3 scripts/validate-json-contracts.py target/debug/deshell"
 
-[tasks.coverage]
-description = "Measure line coverage and enforce the v0.1 90 percent release floor"
+[tasks."coverage:collect"]
+description = "Collect unit, conformance, semantic-corpus, migration, and performance coverage"
 run = [
   "rustup component add llvm-tools-preview",
-  "cargo llvm-cov --locked --workspace --all-targets --summary-only --fail-under-lines 90 -- --test-threads=1",
+  "cargo llvm-cov clean --workspace",
+  "cargo llvm-cov --locked --workspace --all-targets --no-report -- --test-threads=1",
+  "cargo llvm-cov --locked --no-report run -p deshell --bin deshell -- --version",
+  "cargo llvm-cov --locked --no-report run -p xtask -- coverage-exercise target/llvm-cov-target/debug/deshell",
+]
+
+[tasks.coverage]
+description = "Measure line coverage and enforce the v0.1 90 percent release floor"
+depends = ["coverage:collect"]
+run = "cargo llvm-cov report -p deshell -p xtask --summary-only --fail-under-lines 90"
+
+[tasks."test:builtin-semantics"]
+description = "Measure the builtins against their recordings and the table"
+run = [
+  "cargo run --locked -p xtask -- test-semantics",
+  "cargo run --locked -p xtask -- echo-semantics",
+  "cargo run --locked -p xtask -- exit-semantics",
+  "cargo run --locked -p xtask -- powershell-invocation",
+  "cargo run --locked -p xtask -- powershell-step-invocation",
+  "cargo run --locked -p xtask -- powershell-variables",
+  "cargo run --locked -p xtask -- powershell-preference",
+  "cargo run --locked -p xtask -- builtin-table",
+  "cargo run --locked -p xtask -- posix-divergence",
+  "cargo run --locked -p xtask -- printf-semantics",
+  "cargo run --locked -p xtask -- case-patterns",
+  "cargo run --locked -p xtask -- shell-variables",
 ]
 
 [tasks.test]
@@ -121,6 +197,21 @@ run = [
   "cargo test --locked --workspace -- --test-threads=1",
   "cargo build --locked -p deshell",
   "cargo run --locked -p xtask -- conformance target/debug/deshell",
+  "cargo run --locked -p xtask -- test-semantics",
+  "cargo run --locked -p xtask -- echo-semantics",
+  "cargo run --locked -p xtask -- exit-semantics",
+  "cargo run --locked -p xtask -- powershell-invocation",
+  "cargo run --locked -p xtask -- powershell-step-invocation",
+  "cargo run --locked -p xtask -- powershell-variables",
+  "cargo run --locked -p xtask -- powershell-preference",
+  "cargo run --locked -p xtask -- builtin-table",
+  "cargo run --locked -p xtask -- posix-divergence",
+  "cargo run --locked -p xtask -- printf-semantics",
+  "cargo run --locked -p xtask -- case-patterns",
+  "cargo run --locked -p xtask -- shell-variables",
+  # An independent engine reading the schemas against real generated documents.
+  # The IR schema was six operations behind the enum until this was run by hand.
+  "python3 scripts/validate-json-contracts.py target/debug/deshell",
 ]
 
 [tasks.performance]

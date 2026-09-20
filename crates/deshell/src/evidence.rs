@@ -55,6 +55,17 @@ pub(crate) enum ObservationStatus {
     Nondeterministic,
 }
 
+impl ObservationStatus {
+    /// Whether the observation says the two behaved differently, as opposed to
+    /// saying nothing because the run could not be made.
+    pub(crate) fn is_a_difference(self) -> bool {
+        match self {
+            Self::Different => true,
+            Self::Verified | Self::Unavailable | Self::Failed | Self::Nondeterministic => false,
+        }
+    }
+}
+
 impl Evidence {
     pub(crate) fn from_plan(plan: &Plan, source_path: &str, source: &[u8]) -> Result<Self, String> {
         plan.validate().map_err(|errors| errors.join("; "))?;
@@ -199,7 +210,9 @@ impl Evidence {
                 Guarantee::Residual { reason } if reason.trim().is_empty() => {
                     errors.push("evidence residual reason must not be empty".into());
                 }
-                _ => {}
+                Guarantee::Native { .. }
+                | Guarantee::Delegated { .. }
+                | Guarantee::Residual { .. } => {}
             }
         }
         for observation in &self.observations {
@@ -229,8 +242,12 @@ fn collect_nodes(node: &crate::ir::Node, output: &mut Vec<NodeEvidence>) {
         guarantee: node.guarantee.clone(),
     });
     match &node.operation {
+        crate::ir::Operation::NoOp
+        | crate::ir::Operation::WriteStdout { .. }
+        | crate::ir::Operation::Exit { .. } => {}
+        crate::ir::Operation::Test { .. } => {}
         crate::ir::Operation::Pipeline { nodes, .. }
-        | crate::ir::Operation::Sequence { nodes }
+        | crate::ir::Operation::Sequence { nodes, .. }
         | crate::ir::Operation::Parallel { nodes } => {
             for child in nodes {
                 collect_nodes(child, output);
@@ -257,10 +274,15 @@ fn collect_nodes(node: &crate::ir::Node, output: &mut Vec<NodeEvidence>) {
         }
         crate::ir::Operation::Foreach { body, .. }
         | crate::ir::Operation::Scope { body, .. }
+        | crate::ir::Operation::Not { body }
         | crate::ir::Operation::Redirect { body, .. }
         | crate::ir::Operation::CaptureStdout { body, .. }
         | crate::ir::Operation::Spawn { body, .. } => collect_nodes(body, output),
-        crate::ir::Operation::TryFinally { body, finalizer } => {
+        crate::ir::Operation::While {
+            condition: body,
+            body: finalizer,
+        }
+        | crate::ir::Operation::TryFinally { body, finalizer } => {
             collect_nodes(body, output);
             collect_nodes(finalizer, output);
         }
@@ -314,7 +336,7 @@ fn validate_observation(observation: &ObservationEvidence) -> Result<(), Vec<Str
             {
                 errors.push("verified or different observation requires a SHA-256 digest".into());
             }
-            if observation.status == ObservationStatus::Different
+            if observation.status.is_a_difference()
                 && observation.reason.as_deref().is_none_or(str::is_empty)
             {
                 errors.push("different observation requires a reason".into());
@@ -360,6 +382,7 @@ mod tests {
                 secrets: vec![],
                 platform_capabilities: vec![],
                 cacheable: false,
+                nounset: false,
                 invocation: None,
                 body: Node {
                     id: String::new(),
@@ -599,7 +622,7 @@ mod tests {
         );
         assert_eq!(evidence.observations.len(), 1);
 
-        let mut invalid_plan = plan.clone();
+        let mut invalid_plan = plan;
         invalid_plan.generator.clear();
         evidence.nodes.clear();
         let errors = evidence
@@ -637,7 +660,7 @@ mod tests {
                 native(Operation::Match {
                     value: TextExpression::literal("value"),
                     cases: vec![MatchCase {
-                        pattern: TextExpression::literal("value"),
+                        pattern: crate::ir::PatternExpression::literal("value"),
                         body: leaf(),
                     }],
                     default: Some(Box::new(leaf())),
@@ -671,6 +694,7 @@ mod tests {
                     finalizer: Box::new(leaf()),
                 }),
             ],
+            on_failure: crate::ir::SequenceFailure::Continue,
         });
         let mut nodes = Vec::new();
         collect_nodes(&root, &mut nodes);

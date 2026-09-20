@@ -3,20 +3,36 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-static PYTHON_OS_SYSTEM: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r#"os\.system\s*\(\s*([^\)]*)\)"#).expect("static scanner regex")
+type CompiledRegex = Result<regex::Regex, String>;
+
+static PYTHON_OS_SYSTEM: LazyLock<CompiledRegex> =
+    LazyLock::new(|| compile_regex("Python os.system", r#"os\.system\s*\(\s*([^\)]*)\)"#));
+static PYTHON_SUBPROCESS_START: LazyLock<CompiledRegex> = LazyLock::new(|| {
+    compile_regex(
+        "Python subprocess",
+        r#"subprocess\.(?:run|call|Popen)\s*\("#,
+    )
 });
-static PYTHON_SUBPROCESS_START: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r#"subprocess\.(?:run|call|Popen)\s*\("#).expect("static scanner regex")
+static JAVASCRIPT_EXEC_START: LazyLock<CompiledRegex> = LazyLock::new(|| {
+    compile_regex(
+        "JavaScript shell execution",
+        r#"(?:child_process\.)?(?:exec|execSync)\s*\("#,
+    )
 });
-static JAVASCRIPT_EXEC_START: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r#"(?:child_process\.)?(?:exec|execSync)\s*\("#)
-        .expect("static scanner regex")
+static JAVASCRIPT_PROCESS_START: LazyLock<CompiledRegex> = LazyLock::new(|| {
+    compile_regex(
+        "JavaScript process launch",
+        r#"(?:child_process\.)?(?:spawn|spawnSync|execFile|execFileSync)\s*\("#,
+    )
 });
-static JAVASCRIPT_PROCESS_START: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r#"(?:child_process\.)?(?:spawn|spawnSync|execFile|execFileSync)\s*\("#)
-        .expect("static scanner regex")
-});
+
+fn compile_regex(name: &str, expression: &str) -> CompiledRegex {
+    regex::Regex::new(expression).map_err(|error| format!("invalid {name} scanner regex: {error}"))
+}
+
+fn compiled_regex(value: &LazyLock<CompiledRegex>) -> Result<&regex::Regex, String> {
+    value.as_ref().map_err(Clone::clone)
+}
 
 pub(crate) const INVENTORY_SCHEMA_VERSION: u32 = 1;
 
@@ -82,6 +98,41 @@ pub(crate) enum FindingKind {
     Candidate,
 }
 
+impl FindingKind {
+    /// Whether the finding is a file that is shell, rather than shell inside
+    /// something else or a guess at one.
+    ///
+    /// A method rather than `== FindingKind::ShellFile` at each site: `==` is
+    /// outside the exhaustiveness check a `match` gets, so a kind added later
+    /// compiles everywhere and answers "no" everywhere. Asking here means a new
+    /// kind does not compile until somebody answers for it.
+    pub(crate) fn is_a_shell_file(&self) -> bool {
+        match self {
+            Self::ShellFile => true,
+            Self::EmbeddedShell | Self::Candidate => false,
+        }
+    }
+
+    /// Whether the shell is inside a file of another kind — a workflow, an
+    /// action, a Dockerfile — so retiring it rewrites that file rather than
+    /// replacing it.
+    pub(crate) fn is_embedded(&self) -> bool {
+        match self {
+            Self::EmbeddedShell => true,
+            Self::ShellFile | Self::Candidate => false,
+        }
+    }
+
+    /// Whether the finding is a guess rather than a reading: something that
+    /// looks like shell and has not been confirmed to be.
+    pub(crate) fn is_a_candidate(&self) -> bool {
+        match self {
+            Self::Candidate => true,
+            Self::ShellFile | Self::EmbeddedShell => false,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Finding {
@@ -90,6 +141,19 @@ pub(crate) struct Finding {
     pub interpreter: Option<String>,
     pub interpreter_confidence: InterpreterConfidence,
     pub locator: Option<String>,
+    /// Whether the host names the shell this block runs under.
+    ///
+    /// A GitHub workflow step with no `shell:` key runs as `bash -e {0}`, and
+    /// one that says `shell: bash` runs as
+    /// `bash --noprofile --norc -eo pipefail {0}`. Both are bash, so
+    /// `interpreter` says `bash` for each and the frontend could not tell which
+    /// options were in effect — a pipeline reports a different status under
+    /// each, so it had to be delegated rather than guessed.
+    ///
+    /// `false` is not "no shell": it is the host's default, which is a
+    /// different thing from the host having been asked.
+    #[serde(default)]
+    pub host_named_the_shell: bool,
     pub span: ByteSpan,
     pub content_digest: String,
     #[serde(skip)]
@@ -159,7 +223,7 @@ pub(crate) fn scan(_root: &Path) -> Result<Inventory, String> {
         });
         results
             .into_inner()
-            .map_err(|_| "scanner result lock poisoned".to_owned())?
+            .map_err(|_error| "scanner result lock poisoned".to_owned())?
     };
     let mut findings = Vec::new();
     let mut skipped = Vec::new();
@@ -220,15 +284,16 @@ pub(crate) fn scan_with_interpreters(
             &source,
             configured.interpreter.name(),
         ) {
-            Ok(interpreter) => inventory.findings.push(finding(
-                &configured.path,
-                FindingKind::ShellFile,
-                Some(interpreter.name().into()),
-                InterpreterConfidence::High,
-                None,
-                ByteSpan::whole(&source),
+            Ok(interpreter) => inventory.findings.push(finding(FindingParts {
+                path: &configured.path,
+                kind: FindingKind::ShellFile,
+                interpreter: Some(interpreter.name().into()),
+                interpreter_confidence: InterpreterConfidence::High,
+                locator: None,
+                host_named_the_shell: false,
+                span: ByteSpan::whole(&source),
                 source,
-            )),
+            })),
             Err(message) => {
                 push_interpreter_error(&mut inventory.errors, &configured.path, message)
             }
@@ -348,10 +413,12 @@ pub(crate) fn static_script_references(
             append_docker_exec_references(&mut output, &relative, source, targets);
             continue;
         }
-        let syntax = syntax.expect("a non-Docker reference source has process syntax");
+        let Some(syntax) = syntax else {
+            continue;
+        };
         let start_regex = match syntax {
-            ProcessSyntax::Python => &*PYTHON_SUBPROCESS_START,
-            ProcessSyntax::Javascript => &*JAVASCRIPT_PROCESS_START,
+            ProcessSyntax::Python => compiled_regex(&PYTHON_SUBPROCESS_START)?,
+            ProcessSyntax::Javascript => compiled_regex(&JAVASCRIPT_PROCESS_START)?,
         };
         for start in start_regex.find_iter(source) {
             let Some((end, arguments)) = balanced_call_arguments(source, start.end()) else {
@@ -401,6 +468,20 @@ pub(crate) fn static_script_references(
     });
     output.dedup();
     Ok(output)
+}
+
+/// Whether this program name is an interpreter that runs what it is given.
+///
+/// The distinction a process launch turns on: `spawnSync("/bin/echo", [word])`
+/// runs `echo` whatever `word` holds, and `spawnSync("/bin/sh", [word])` runs
+/// whatever `word` holds. Only the second is a shell location.
+fn names_a_shell(program: &str) -> bool {
+    let name = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    let name = name.strip_suffix(".exe").unwrap_or(name);
+    matches!(
+        name,
+        "sh" | "bash" | "zsh" | "fish" | "dash" | "ksh" | "pwsh" | "powershell" | "cmd" | "nu"
+    )
 }
 
 fn direct_invoked_target(
@@ -604,19 +685,15 @@ fn valid_git_marker(root: &Path) -> bool {
 }
 
 fn git_inventory(root: &Path) -> Result<Vec<(String, PathBuf)>, String> {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args([
-            "ls-files",
-            "--cached",
-            "--others",
-            "--exclude-standard",
-            "-z",
-            "--",
-        ])
-        .output()
-        .map_err(|error| format!("cannot run git inventory: {error}"))?;
+    let output = crate::host::output(std::process::Command::new("git").arg("-C").arg(root).args([
+        "ls-files",
+        "--cached",
+        "--others",
+        "--exclude-standard",
+        "-z",
+        "--",
+    ]))
+    .map_err(|error| format!("cannot run git inventory: {error}"))?;
     if !output.status.success() {
         return Err(format!(
             "git inventory failed with status {}: {}",
@@ -631,7 +708,7 @@ fn git_inventory(root: &Path) -> Result<Vec<(String, PathBuf)>, String> {
         .filter(|value| !value.is_empty())
     {
         let relative = std::str::from_utf8(raw)
-            .map_err(|_| "git inventory returned a non-UTF-8 path".to_owned())?
+            .map_err(|_error| "git inventory returned a non-UTF-8 path".to_owned())?
             .replace('\\', "/");
         if relative
             .split('/')
@@ -640,9 +717,20 @@ fn git_inventory(root: &Path) -> Result<Vec<(String, PathBuf)>, String> {
             continue;
         }
         let absolute = root.join(&relative);
-        let metadata = absolute
-            .symlink_metadata()
-            .map_err(|error| format!("cannot inspect git inventory path {relative}: {error}"))?;
+        let metadata = match absolute.symlink_metadata() {
+            Ok(metadata) => metadata,
+            // A path git knows and the tree does not is a file that has been
+            // deleted and not yet staged — which is what a retirement leaves
+            // behind, so reading it as a scan error made the post-apply check
+            // roll back every retirement that removed a tracked file. There is
+            // nothing at the path to scan, which is the whole of it.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!(
+                    "cannot inspect git inventory path {relative}: {error}"
+                ));
+            }
+        };
         if metadata.file_type().is_file() {
             files.push((relative, absolute));
         }
@@ -692,15 +780,16 @@ fn findings_for_file(relative: &str, absolute: &Path) -> FileScan {
     };
     if let Some(detected) = detected {
         let interpreter = detected.name().to_owned();
-        return FileScan::findings(vec![finding(
-            relative,
-            FindingKind::ShellFile,
-            Some(interpreter),
-            InterpreterConfidence::High,
-            None,
-            ByteSpan::whole(&source),
+        return FileScan::findings(vec![finding(FindingParts {
+            path: relative,
+            kind: FindingKind::ShellFile,
+            interpreter: Some(interpreter),
+            interpreter_confidence: InterpreterConfidence::High,
+            locator: None,
+            host_named_the_shell: false,
+            span: ByteSpan::whole(&source),
             source,
-        )]);
+        })]);
     }
     if !path_is_relevant && !potential_structured_host {
         return FileScan::default();
@@ -754,7 +843,10 @@ fn findings_for_file(relative: &str, absolute: &Path) -> FileScan {
             Err(message) => FileScan::error(relative, "parse_toml", message),
         };
     }
-    FileScan::findings(host_findings(relative, text, &lower))
+    match host_findings(relative, text, &lower) {
+        Ok(findings) => FileScan::findings(findings),
+        Err(message) => FileScan::error(relative, "scan_host", message),
+    }
 }
 
 fn ignored_structured_host(filename: &str) -> bool {
@@ -799,6 +891,11 @@ fn is_known_structured_host(lower: &str, filename: &str) -> bool {
         return true;
     }
     [
+        // A composite action can live in any directory, so it is recognised by
+        // filename rather than by prefix. Its `shell:` key is mandatory, which
+        // makes it the easier of the two GitHub hosts to classify.
+        "action.yml",
+        "action.yaml",
         ".gitlab-ci.yml",
         ".gitlab-ci.yaml",
         "azure-pipelines.yml",
@@ -941,35 +1038,132 @@ fn extension_interpreter(path: &str) -> Option<&'static str> {
     Some(value)
 }
 
-fn finding(
-    path: &str,
+/// The parts of a [`Finding`] that a caller supplies.
+///
+/// An argument list cannot be taken apart exhaustively, so a parameter added to
+/// a seven-argument function is invisible to every call site that already
+/// compiles. A struct can: [`finding`] destructures this without `..`, so a
+/// field added here fails to compile until it is given a destination.
+///
+/// `content_digest` is absent by construction. It is derived from `source`, and
+/// deriving it rather than accepting it is what stops the two from disagreeing.
+struct FindingParts<'a> {
+    path: &'a str,
     kind: FindingKind,
     interpreter: Option<String>,
     interpreter_confidence: InterpreterConfidence,
     locator: Option<String>,
+    /// See [`Finding::host_named_the_shell`]. `false` for every host that has no
+    /// way of naming one, which is every host but a GitHub workflow today.
+    host_named_the_shell: bool,
     span: ByteSpan,
     source: Vec<u8>,
-) -> Finding {
+}
+
+fn finding(parts: FindingParts<'_>) -> Finding {
+    // Destructured without `..` on purpose: see `FindingParts`.
+    let FindingParts {
+        path,
+        kind,
+        interpreter,
+        interpreter_confidence,
+        locator,
+        host_named_the_shell,
+        span,
+        source,
+    } = parts;
     Finding {
         path: path.to_owned(),
         kind,
         interpreter,
         interpreter_confidence,
         locator,
+        host_named_the_shell,
         span,
         content_digest: crate::digest::sha256(&source),
         source,
     }
 }
 
-fn span_of(source: &str, value: &str) -> ByteSpan {
-    source.find(value).map_or_else(
-        || ByteSpan::whole(source.as_bytes()),
-        |start| ByteSpan {
-            start_byte: start as u64,
-            end_byte: (start + value.len()) as u64,
+/// Where `value` sits in `source`, searched from `from`.
+///
+/// `from` is what makes this exact rather than a guess. Searching the whole
+/// file returns the *first* occurrence, so four identical `run:` lines in one
+/// workflow all reported the same byte span — the line numbers were right and
+/// the spans named one line four times. `deshell init` then refused its own
+/// output as duplicate location overrides, which was the correct refusal of an
+/// incorrect inventory; had it not refused, a migration would have rewritten
+/// one occurrence four times.
+///
+/// The fallback is the span of the line at `from` rather than the whole file.
+/// A span covering every byte of a file is not a location, and a rewrite
+/// reading one would replace the file with a single block.
+/// Where a string value sits in the document that holds it, when the document
+/// says so unambiguously.
+///
+/// A parsed value carries no position, and searching the source for its decoded
+/// text finds nothing whenever the document escaped anything — `"printf 'a\\nb'"`
+/// in JSON holds the two characters `\\` and `n`, and the decoded value holds a
+/// newline. Every such value fell to the whole-file fallback, so seven blockers
+/// on one golden corpus all read `contracts/golden/posix-sh-divergence-v1.json@0..1`
+/// and no reader could tell which value each was about.
+///
+/// Searching for the *encoded* form is what the document actually contains. It
+/// is required to occur exactly once: a second occurrence means the document
+/// cannot tell the two apart from text alone, and a first-occurrence guess there
+/// is how repeated `run:` lines came to share a span.
+///
+/// `None` means the bytes are not identifiable from text, and the caller falls
+/// back to the span of the first line. That span is imprecise and the finding is
+/// not: `locator` carries the path within the document — `tasks[3].command` —
+/// which is what names it. These are low-confidence candidates that block a
+/// migration rather than being rewritten, so no byte range is ever applied from
+/// one. A parser that reports positions would remove the fallback; nothing here
+/// has one.
+fn span_of_encoded_string(source: &str, value: &str) -> Option<ByteSpan> {
+    let encoded = serde_json::Value::String(value.to_owned()).to_string();
+    let inner = encoded.get(1..encoded.len() - 1)?;
+    let first = source.find(inner)?;
+    if source[first + inner.len()..].contains(inner) {
+        return None;
+    }
+    Some(ByteSpan {
+        start_byte: first as u64,
+        end_byte: (first + inner.len()) as u64,
+    })
+}
+
+pub(crate) fn span_of(source: &str, from: usize, value: &str) -> ByteSpan {
+    // `from` is an unchecked byte offset, and an offset can land inside a
+    // multi-byte character. The search below asks `get` and survives that; the
+    // arm for "not found" indexed with `[from..]` and did not, so the function
+    // answered safely or panicked depending on which branch it took.
+    //
+    // Every caller today passes a boundary — a `find` result, or a line start
+    // — so this was a precondition nothing stated and nothing checked rather
+    // than a crash anybody had seen. The property test reaches it directly.
+    //
+    // Moving down to the character that contains the offset keeps the span
+    // sliceable and keeps the position it names.
+    let mut from = from.min(source.len());
+    while !source.is_char_boundary(from) {
+        from -= 1;
+    }
+    match source.get(from..).and_then(|rest| rest.find(value)) {
+        Some(offset) => ByteSpan {
+            start_byte: (from + offset) as u64,
+            end_byte: (from + offset + value.len()) as u64,
         },
-    )
+        None => {
+            let end = source[from..]
+                .find('\n')
+                .map_or(source.len(), |offset| from + offset);
+            ByteSpan {
+                start_byte: from as u64,
+                end_byte: end as u64,
+            }
+        }
+    }
 }
 
 fn line_offsets(source: &str) -> Vec<usize> {
@@ -995,15 +1189,21 @@ fn package_findings(path: &str, source: &str) -> Result<Vec<Finding>, String> {
                 .as_str()
                 .filter(|script| !script.is_empty())
                 .map(|script| {
-                    finding(
+                    // Anchored on the key, which is unique within the object,
+                    // so two scripts running the same command get their own
+                    // spans instead of both getting the first one's.
+                    let key = format!("\"{name}\"");
+                    let after_key = source.find(&key).map_or(0, |offset| offset + key.len());
+                    finding(FindingParts {
                         path,
-                        FindingKind::EmbeddedShell,
-                        Some("package-shell".into()),
-                        InterpreterConfidence::Medium,
-                        Some(format!("scripts.{name}")),
-                        span_of(source, script),
-                        script.as_bytes().to_vec(),
-                    )
+                        kind: FindingKind::EmbeddedShell,
+                        interpreter: Some("package-shell".into()),
+                        interpreter_confidence: InterpreterConfidence::Medium,
+                        locator: Some(format!("scripts.{name}")),
+                        host_named_the_shell: false,
+                        span: span_of(source, after_key, script),
+                        source: script.as_bytes().to_vec(),
+                    })
                 })
         })
         .collect())
@@ -1019,18 +1219,19 @@ fn makefile_findings(path: &str, source: &str) -> Vec<Finding> {
                 .filter(|command| !command.trim().is_empty())
                 .map(|command| {
                     let start = offsets[index] + 1;
-                    finding(
+                    finding(FindingParts {
                         path,
-                        FindingKind::EmbeddedShell,
-                        Some("sh".into()),
-                        InterpreterConfidence::High,
-                        Some(format!("recipe:{}", index + 1)),
-                        ByteSpan {
+                        kind: FindingKind::EmbeddedShell,
+                        interpreter: Some("sh".into()),
+                        interpreter_confidence: InterpreterConfidence::High,
+                        locator: Some(format!("recipe:{}", index + 1)),
+                        host_named_the_shell: false,
+                        span: ByteSpan {
                             start_byte: start as u64,
                             end_byte: (start + command.len()) as u64,
                         },
-                        command.as_bytes().to_vec(),
-                    )
+                        source: command.as_bytes().to_vec(),
+                    })
                 })
         })
         .collect()
@@ -1066,18 +1267,19 @@ fn dockerfile_findings(path: &str, source: &str) -> Result<Vec<Finding>, String>
                     ));
                 }
             } else {
-                findings.push(finding(
+                findings.push(finding(FindingParts {
                     path,
-                    FindingKind::EmbeddedShell,
-                    Some("sh".into()),
-                    InterpreterConfidence::High,
-                    Some(format!("RUN:{line}")),
-                    ByteSpan {
+                    kind: FindingKind::EmbeddedShell,
+                    interpreter: Some("sh".into()),
+                    interpreter_confidence: InterpreterConfidence::High,
+                    locator: Some(format!("RUN:{line}")),
+                    host_named_the_shell: false,
+                    span: ByteSpan {
                         start_byte: offsets[first_index] as u64,
                         end_byte: (offsets[index] + lines[index].len()) as u64,
                     },
-                    command.into_bytes(),
-                ));
+                    source: command.into_bytes(),
+                }));
             }
         }
         index += 1;
@@ -1092,6 +1294,10 @@ fn yaml_findings(path: &str, source: &str, lower: &str) -> Result<Vec<Finding>, 
     }
     let known = lower.starts_with(".github/workflows/")
         || lower.starts_with(".github/actions/")
+        || lower == "action.yml"
+        || lower == "action.yaml"
+        || lower.ends_with("/action.yml")
+        || lower.ends_with("/action.yaml")
         || lower == ".gitlab-ci.yml"
         || lower == ".gitlab-ci.yaml"
         || lower == "azure-pipelines.yml"
@@ -1126,6 +1332,14 @@ fn yaml_findings(path: &str, source: &str, lower: &str) -> Result<Vec<Finding>, 
             continue;
         }
         let key = raw_key.to_ascii_lowercase();
+        // Whether the host named the shell, as opposed to leaving the runner's
+        // default. Both are `bash` here and they are not the same shell: see
+        // `Finding::host_named_the_shell`.
+        let host_named_the_shell = key != "run" || yaml_step_shell(&lines, index).is_some() || {
+            let (job_start, job_end) = yaml_job_range(&lines, index);
+            yaml_defaults_shell(&lines, job_start, job_end).is_some()
+                || yaml_defaults_shell(&lines, 0, lines.len()).is_some()
+        };
         let interpreter = if key == "pwsh" || key == "powershell" {
             "powershell"
         } else if key == "bash" {
@@ -1153,21 +1367,22 @@ fn yaml_findings(path: &str, source: &str, lower: &str) -> Result<Vec<Finding>, 
             }
             let command = yaml_scalar(&block, &style);
             if !command.trim().is_empty() {
-                findings.push(finding(
+                findings.push(finding(FindingParts {
                     path,
-                    if known {
+                    kind: if known {
                         FindingKind::EmbeddedShell
                     } else {
                         FindingKind::Candidate
                     },
-                    Some(interpreter.into()),
-                    if known {
+                    interpreter: Some(interpreter.into()),
+                    interpreter_confidence: if known {
                         InterpreterConfidence::High
                     } else {
                         InterpreterConfidence::Low
                     },
-                    Some(format!("{key}:{line}")),
-                    ByteSpan {
+                    locator: Some(format!("{key}:{line}")),
+                    host_named_the_shell,
+                    span: ByteSpan {
                         start_byte: offsets[line - 1] as u64,
                         end_byte: if index < offsets.len() {
                             offsets[index].saturating_sub(1) as u64
@@ -1175,29 +1390,33 @@ fn yaml_findings(path: &str, source: &str, lower: &str) -> Result<Vec<Finding>, 
                             source.len() as u64
                         },
                     },
-                    command.into_bytes(),
-                ));
+                    source: command.into_bytes(),
+                }));
             }
             continue;
         }
         if !value.is_empty() && (known || looks_like_shell(&value)) {
-            findings.push(finding(
+            findings.push(finding(FindingParts {
                 path,
-                if known {
+                kind: if known {
                     FindingKind::EmbeddedShell
                 } else {
                     FindingKind::Candidate
                 },
-                Some((*interpreter).into()),
-                if known {
+                interpreter: Some((*interpreter).into()),
+                interpreter_confidence: if known {
                     InterpreterConfidence::High
                 } else {
                     InterpreterConfidence::Low
                 },
-                Some(format!("{key}:{line}")),
-                span_of(source, &value),
-                value.into_bytes(),
-            ));
+                locator: Some(format!("{key}:{line}")),
+                host_named_the_shell,
+                // Anchored at the line the key is on, the same way the block
+                // form above uses `offsets[line - 1]`. Searching the whole file
+                // gave every repeat of a one-line `run:` the first one's span.
+                span: span_of(source, offsets[line - 1], &value),
+                source: value.into_bytes(),
+            }));
         }
         index += 1;
     }
@@ -1392,7 +1611,14 @@ fn json_candidate_findings(path: &str, source: &str) -> Result<Vec<Finding>, Str
     let value = crate::strict_json::parse_host(&normalized)
         .map_err(|error| format!("malformed JSON: {error}"))?;
     let mut output = Vec::new();
-    collect_json_candidates(path, source, "$", false, &value, &mut output);
+    collect_json_candidates(CollectJsonCandidatesArgs {
+        path,
+        source,
+        locator: "$",
+        executable: false,
+        value: &value,
+        output: &mut output,
+    });
     Ok(output)
 }
 
@@ -1491,50 +1717,76 @@ fn normalize_jsonc(source: &str) -> Result<Vec<u8>, String> {
     Ok(output)
 }
 
-fn collect_json_candidates(
-    path: &str,
-    source: &str,
-    locator: &str,
+/// The inputs of [`collect_json_candidates`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`collect_json_candidates`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct CollectJsonCandidatesArgs<'a> {
+    path: &'a str,
+    source: &'a str,
+    locator: &'a str,
     executable: bool,
-    value: &serde_json::Value,
-    output: &mut Vec<Finding>,
-) {
+    value: &'a serde_json::Value,
+    output: &'a mut Vec<Finding>,
+}
+
+fn collect_json_candidates(parts: CollectJsonCandidatesArgs<'_>) {
+    // Destructured without `..`: see `CollectJsonCandidatesArgs`.
+    let CollectJsonCandidatesArgs {
+        path,
+        source,
+        locator,
+        executable,
+        value,
+        output,
+    } = parts;
     match value {
         serde_json::Value::Object(fields) => {
             for (name, value) in fields {
-                collect_json_candidates(
+                collect_json_candidates(CollectJsonCandidatesArgs {
                     path,
                     source,
-                    &format!("{locator}.{name}"),
-                    executable || executable_field(name),
+                    locator: &format!("{locator}.{name}"),
+                    executable: executable || executable_field(name),
                     value,
                     output,
-                );
+                });
             }
         }
         serde_json::Value::Array(values) => {
             for (index, value) in values.iter().enumerate() {
-                collect_json_candidates(
+                collect_json_candidates(CollectJsonCandidatesArgs {
                     path,
                     source,
-                    &format!("{locator}[{index}]"),
+                    locator: &format!("{locator}[{index}]"),
                     executable,
                     value,
                     output,
-                );
+                });
             }
         }
         serde_json::Value::String(command) if executable && looks_like_shell(command) => output
-            .push(finding(
+            .push(finding(FindingParts {
                 path,
-                FindingKind::Candidate,
-                None,
-                InterpreterConfidence::Low,
-                Some(locator.into()),
-                span_of(source, command),
-                command.as_bytes().to_vec(),
-            )),
-        _ => {}
+                kind: FindingKind::Candidate,
+                interpreter: None,
+                interpreter_confidence: InterpreterConfidence::Low,
+                locator: Some(locator.into()),
+                host_named_the_shell: false,
+                // A parsed value has no position; this is the closest the
+                // document can get to giving it one. See
+                // `span_of_encoded_string` for why it is the encoded form and
+                // why one occurrence is required.
+                span: span_of_encoded_string(source, command)
+                    .unwrap_or_else(|| span_of(source, 0, command)),
+                source: command.as_bytes().to_vec(),
+            })),
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => {}
     }
 }
 
@@ -1542,95 +1794,139 @@ fn toml_candidate_findings(path: &str, source: &str) -> Result<Vec<Finding>, Str
     let value = toml::from_str::<toml::Value>(source)
         .map_err(|error| format!("malformed TOML: {error}"))?;
     let mut output = Vec::new();
-    collect_toml_candidates(path, source, "$", false, &value, &mut output);
+    collect_toml_candidates(CollectTomlCandidatesArgs {
+        path,
+        source,
+        locator: "$",
+        executable: false,
+        value: &value,
+        output: &mut output,
+    });
     Ok(output)
 }
 
-fn collect_toml_candidates(
-    path: &str,
-    source: &str,
-    locator: &str,
+/// The inputs of [`collect_toml_candidates`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`collect_toml_candidates`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct CollectTomlCandidatesArgs<'a> {
+    path: &'a str,
+    source: &'a str,
+    locator: &'a str,
     executable: bool,
-    value: &toml::Value,
-    output: &mut Vec<Finding>,
-) {
+    value: &'a toml::Value,
+    output: &'a mut Vec<Finding>,
+}
+
+fn collect_toml_candidates(parts: CollectTomlCandidatesArgs<'_>) {
+    // Destructured without `..`: see `CollectTomlCandidatesArgs`.
+    let CollectTomlCandidatesArgs {
+        path,
+        source,
+        locator,
+        executable,
+        value,
+        output,
+    } = parts;
     match value {
         toml::Value::Table(fields) => {
             for (name, value) in fields {
-                collect_toml_candidates(
+                collect_toml_candidates(CollectTomlCandidatesArgs {
                     path,
                     source,
-                    &format!("{locator}.{name}"),
-                    executable || executable_field(name),
+                    locator: &format!("{locator}.{name}"),
+                    executable: executable || executable_field(name),
                     value,
                     output,
-                );
+                });
             }
         }
         toml::Value::Array(values) => {
             for (index, value) in values.iter().enumerate() {
-                collect_toml_candidates(
+                collect_toml_candidates(CollectTomlCandidatesArgs {
                     path,
                     source,
-                    &format!("{locator}[{index}]"),
+                    locator: &format!("{locator}[{index}]"),
                     executable,
                     value,
                     output,
-                );
+                });
             }
         }
         toml::Value::String(command) if executable && looks_like_shell(command) => {
-            output.push(finding(
+            output.push(finding(FindingParts {
                 path,
-                FindingKind::Candidate,
-                None,
-                InterpreterConfidence::Low,
-                Some(locator.into()),
-                span_of(source, command),
-                command.as_bytes().to_vec(),
-            ));
+                kind: FindingKind::Candidate,
+                interpreter: None,
+                interpreter_confidence: InterpreterConfidence::Low,
+                locator: Some(locator.into()),
+                host_named_the_shell: false,
+                // See the JSON walker above.
+                span: span_of_encoded_string(source, command)
+                    .unwrap_or_else(|| span_of(source, 0, command)),
+                source: command.as_bytes().to_vec(),
+            }));
         }
-        _ => {}
+        toml::Value::String(_)
+        | toml::Value::Integer(_)
+        | toml::Value::Float(_)
+        | toml::Value::Boolean(_)
+        | toml::Value::Datetime(_) => {}
     }
 }
 
-fn host_findings(path: &str, source: &str, lower: &str) -> Vec<Finding> {
+fn host_findings(path: &str, source: &str, lower: &str) -> Result<Vec<Finding>, String> {
     let offsets = line_offsets(source);
     let mut output = Vec::new();
     if lower.ends_with(".py") {
-        append_host_findings(&mut output, path, source, &offsets, &PYTHON_OS_SYSTEM, "sh");
-        append_process_reference_findings(
-            &mut output,
+        append_host_findings(AppendHostFindingsArgs {
+            output: &mut output,
             path,
             source,
-            &offsets,
-            &PYTHON_SUBPROCESS_START,
-            ProcessSyntax::Python,
-        );
+            line_offsets: &offsets,
+            regex: compiled_regex(&PYTHON_OS_SYSTEM)?,
+            interpreter: "sh",
+        })?;
+        append_process_reference_findings(AppendProcessReferenceFindingsArgs {
+            output: &mut output,
+            path,
+            source,
+            line_offsets: &offsets,
+            start_regex: compiled_regex(&PYTHON_SUBPROCESS_START)?,
+            syntax: ProcessSyntax::Python,
+        });
     } else if [".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx"]
         .iter()
         .any(|extension| lower.ends_with(extension))
     {
-        append_javascript_shell_findings(&mut output, path, source, &offsets);
-        append_process_reference_findings(
+        append_javascript_shell_findings(
             &mut output,
             path,
             source,
-            &offsets,
-            &JAVASCRIPT_PROCESS_START,
-            ProcessSyntax::Javascript,
+            compiled_regex(&JAVASCRIPT_EXEC_START)?,
         );
+        append_process_reference_findings(AppendProcessReferenceFindingsArgs {
+            output: &mut output,
+            path,
+            source,
+            line_offsets: &offsets,
+            start_regex: compiled_regex(&JAVASCRIPT_PROCESS_START)?,
+            syntax: ProcessSyntax::Javascript,
+        });
     }
-    output
+    Ok(output)
 }
 
 fn append_javascript_shell_findings(
     output: &mut Vec<Finding>,
     path: &str,
     source: &str,
-    line_offsets: &[usize],
+    start_regex: &regex::Regex,
 ) {
-    for start in JAVASCRIPT_EXEC_START.find_iter(source) {
+    let line_offsets = line_offsets(source);
+    for start in start_regex.find_iter(source) {
         let Some((end, arguments)) = balanced_call_arguments(source, start.end()) else {
             continue;
         };
@@ -1655,18 +1951,126 @@ fn append_javascript_shell_findings(
         let line_start = line_offsets[line_index];
         let line = line_index + 1;
         let column = source[line_start..start.start()].chars().count();
-        output.push(finding(
+        output.push(finding(FindingParts {
             path,
             kind,
-            Some("sh".into()),
-            confidence,
-            Some(format!("line:{line}:column:{column}")),
-            ByteSpan {
+            interpreter: Some("sh".into()),
+            interpreter_confidence: confidence,
+            locator: Some(format!("line:{line}:column:{column}")),
+            host_named_the_shell: false,
+            span: ByteSpan {
                 start_byte: start.start() as u64,
                 end_byte: end as u64,
             },
-            command.into_bytes(),
-        ));
+            source: command.into_bytes(),
+        }));
+    }
+}
+
+/// What a process launch is, once its program has been read.
+///
+/// Three outcomes and not two. The rule used to answer "safe or not", and a
+/// launch that is plainly shell but plainly resolved — `["sh", "build.sh"]`,
+/// which `find_script_references` rewrites — has no honest answer to that
+/// question. It is not safe, and reporting it as an unresolvable candidate
+/// says the opposite of what the scan knows about it.
+enum ProcessReading {
+    /// The program is not a shell. No shell starts here, whatever the
+    /// arguments are.
+    NotAShell,
+    /// A shell handed a command in the call itself: shell that is nowhere else
+    /// and can be retired.
+    Command {
+        interpreter: &'static str,
+        command: String,
+    },
+    /// A shell handed a script file. The file is its own location and the call
+    /// site is a script reference; reporting it again here would double-count
+    /// it and call a resolved call site dynamic.
+    ShellScript,
+    /// The program, or the command it was handed, is not in the source.
+    Unreadable,
+}
+
+/// The interpreter name the frontend knows this program by.
+///
+/// `None` for a program that is not a shell, and for `ksh`, which
+/// [`names_a_shell`] recognizes and no frontend models — so a `ksh` call is
+/// read as unresolvable rather than lowered as something else.
+fn shell_interpreter(program: &str) -> Option<&'static str> {
+    let name = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    let name = name.strip_suffix(".exe").unwrap_or(name);
+    match name {
+        // dash is the POSIX shell this models; `sh` is what the frontend calls
+        // it.
+        "sh" | "dash" => Some("sh"),
+        "bash" => Some("bash"),
+        "zsh" => Some("zsh"),
+        "fish" => Some("fish"),
+        "nu" => Some("nu"),
+        "pwsh" | "powershell" => Some("powershell"),
+        "cmd" => Some("cmd"),
+        "ksh" => None,
+        _ => None,
+    }
+}
+
+/// The command a shell was handed inline, when it was handed one.
+///
+/// Each shell's own spelling, because that is the thing this keeps getting
+/// wrong: `-c` is not `cmd`'s and `-Command` is not `sh`'s.
+fn inline_shell_command(interpreter: &str, argv: &[String]) -> Option<String> {
+    let names_the_command = |argument: &str| match interpreter {
+        // Short options bundle: `bash -lc 'printf x'` and `sh -euc 'printf x'`
+        // hand over a command exactly as `-c` does, and reading only `-c` was
+        // the same mistake in a smaller place.
+        "sh" | "bash" | "zsh" | "fish" => {
+            argument.starts_with('-')
+                && !argument.starts_with("--")
+                && argument.contains('c')
+                && argument[1..]
+                    .chars()
+                    .all(|letter| letter.is_ascii_alphabetic())
+        }
+        "nu" => argument == "-c" || argument == "--commands",
+        // PowerShell's CLI parameters are case-insensitive and `-c` is the
+        // documented abbreviation of `-Command`.
+        "powershell" => {
+            let lower = argument.to_ascii_lowercase();
+            "-command".starts_with(&lower) && lower.starts_with("-c")
+        }
+        // `/k` runs the command too; it keeps the shell afterwards.
+        "cmd" => {
+            let lower = argument.to_ascii_lowercase();
+            lower == "/c" || lower == "/k"
+        }
+        _ => false,
+    };
+    let index = argv
+        .iter()
+        .position(|argument| names_the_command(argument))?;
+    argv.get(index + 1).cloned()
+}
+
+/// Read a launch from its program and the arguments that follow it.
+///
+/// `argv` is `None` when some argument is not in the source.
+fn read_process_launch(program: Option<&str>, argv: Option<&[String]>) -> ProcessReading {
+    let Some(program) = program else {
+        return ProcessReading::Unreadable;
+    };
+    if !names_a_shell(program) {
+        return ProcessReading::NotAShell;
+    }
+    let (Some(interpreter), Some(argv)) = (shell_interpreter(program), argv) else {
+        return ProcessReading::Unreadable;
+    };
+    match inline_shell_command(interpreter, argv) {
+        Some(command) => ProcessReading::Command {
+            interpreter,
+            command,
+        },
+        None => ProcessReading::ShellScript,
     }
 }
 
@@ -1676,14 +2080,31 @@ enum ProcessSyntax {
     Javascript,
 }
 
-fn append_process_reference_findings(
-    output: &mut Vec<Finding>,
-    path: &str,
-    source: &str,
-    line_offsets: &[usize],
-    start_regex: &regex::Regex,
+/// The inputs of [`append_process_reference_findings`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`append_process_reference_findings`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct AppendProcessReferenceFindingsArgs<'a> {
+    output: &'a mut Vec<Finding>,
+    path: &'a str,
+    source: &'a str,
+    line_offsets: &'a [usize],
+    start_regex: &'a regex::Regex,
     syntax: ProcessSyntax,
-) {
+}
+
+fn append_process_reference_findings(parts: AppendProcessReferenceFindingsArgs<'_>) {
+    // Destructured without `..`: see `AppendProcessReferenceFindingsArgs`.
+    let AppendProcessReferenceFindingsArgs {
+        output,
+        path,
+        source,
+        line_offsets,
+        start_regex,
+        syntax,
+    } = parts;
     for start in start_regex.find_iter(source) {
         let Some((end, arguments)) = balanced_call_arguments(source, start.end()) else {
             continue;
@@ -1698,26 +2119,77 @@ fn append_process_reference_findings(
                     .split_once('=')
                     .is_some_and(|(name, value)| name.trim() == "shell" && value.trim() == "True")
             });
-        let safe = match syntax {
-            ProcessSyntax::Python => !shell_true && static_argv_collection(first),
+        // The program is `args[0]`, and the arguments are not the program.
+        // The rule asked whether the whole call was literal, which is a
+        // different question, and answered this one wrongly in both
+        // directions: `["/bin/sh", "-c", "printf x"]` was excluded because
+        // every element was a literal, and `["/bin/echo", name]` was reported
+        // as shell because one element was not.
+        let reading = match syntax {
+            ProcessSyntax::Python => {
+                if shell_true {
+                    // `shell=True` runs `args[0]` through a shell whatever it
+                    // says, and hands the rest of a sequence to it as `$0`,
+                    // `$1` and so on — so the command is `args[0]` either way.
+                    quoted_literal(first)
+                        .or_else(|| collection_program(first).literal())
+                        .map_or(ProcessReading::Unreadable, |command| {
+                            ProcessReading::Command {
+                                interpreter: "sh",
+                                command,
+                            }
+                        })
+                } else if let Some(command) = quoted_literal(first) {
+                    // A string rather than a sequence. POSIX hands the whole
+                    // string to `execvp` as a program name, and Windows hands
+                    // it to `CreateProcess`, so this is a command written as
+                    // one string either way.
+                    ProcessReading::Command {
+                        interpreter: "sh",
+                        command,
+                    }
+                } else {
+                    let argv = static_argv_literals(first);
+                    let program = collection_program(first).literal();
+                    read_process_launch(program.as_deref(), argv.as_ref().map(|argv| &argv[1..]))
+                }
+            }
             ProcessSyntax::Javascript => {
-                quoted_literal(first).is_some()
-                    && values
-                        .get(1)
-                        .is_none_or(|value| static_argv_collection(value.trim()))
+                let argv = values
+                    .get(1)
+                    .and_then(|value| static_argv_literals(value.trim()));
+                read_process_launch(
+                    quoted_literal(first).as_deref(),
+                    // A launch with no argument array was handed none, which is
+                    // a readable empty one.
+                    if values.len() < 2 {
+                        Some(&[][..])
+                    } else {
+                        argv.as_deref()
+                    },
+                )
             }
         };
-        if safe {
-            continue;
-        }
-        let quoted = quoted_literal(first);
-        let quoted_command = quoted.is_some();
-        let (kind, command) = if matches!(syntax, ProcessSyntax::Python) {
-            quoted
-                .map(|value| (FindingKind::EmbeddedShell, value))
-                .unwrap_or_else(|| (FindingKind::Candidate, first.into()))
-        } else {
-            (FindingKind::Candidate, arguments.trim().to_owned())
+        let (kind, interpreter, command, confidence) = match reading {
+            ProcessReading::NotAShell | ProcessReading::ShellScript => continue,
+            ProcessReading::Command {
+                interpreter,
+                command,
+            } => (
+                FindingKind::EmbeddedShell,
+                interpreter,
+                command,
+                InterpreterConfidence::High,
+            ),
+            ProcessReading::Unreadable => (
+                FindingKind::Candidate,
+                "sh",
+                match syntax {
+                    ProcessSyntax::Python => first.to_owned(),
+                    ProcessSyntax::Javascript => arguments.trim().to_owned(),
+                },
+                InterpreterConfidence::Low,
+            ),
         };
         let line_index = line_offsets
             .partition_point(|offset| *offset <= start.start())
@@ -1725,22 +2197,19 @@ fn append_process_reference_findings(
         let line_start = line_offsets[line_index];
         let line = line_index + 1;
         let column = source[line_start..start.start()].chars().count();
-        output.push(finding(
+        output.push(finding(FindingParts {
             path,
             kind,
-            Some("sh".into()),
-            if quoted_command {
-                InterpreterConfidence::High
-            } else {
-                InterpreterConfidence::Low
-            },
-            Some(format!("line:{line}:column:{column}")),
-            ByteSpan {
+            interpreter: Some(interpreter.into()),
+            interpreter_confidence: confidence,
+            locator: Some(format!("line:{line}:column:{column}")),
+            host_named_the_shell: false,
+            span: ByteSpan {
                 start_byte: start.start() as u64,
                 end_byte: end as u64,
             },
-            command.into_bytes(),
-        ));
+            source: command.into_bytes(),
+        }));
     }
 }
 
@@ -1813,8 +2282,43 @@ pub(crate) fn split_top_level_arguments(arguments: &str) -> Vec<&str> {
     output
 }
 
-fn static_argv_collection(value: &str) -> bool {
-    static_argv_literals(value).is_some()
+/// The program a sequence argument names, when the argument is a sequence.
+///
+/// Three answers, not two: the value may not be a collection, its first element
+/// may be dynamic, or it may name a literal program. A caller that folds the
+/// first two together would have to guess which it was looking at.
+enum CollectionProgram {
+    NotCollection,
+    Dynamic,
+    Literal(String),
+}
+
+impl CollectionProgram {
+    fn literal(self) -> Option<String> {
+        match self {
+            Self::Literal(program) => Some(program),
+            Self::NotCollection | Self::Dynamic => None,
+        }
+    }
+}
+
+fn collection_program(value: &str) -> CollectionProgram {
+    let value = value.trim();
+    let inner = match value
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .or_else(|| {
+            value
+                .strip_prefix('(')
+                .and_then(|value| value.strip_suffix(')'))
+        }) {
+        Some(inner) => inner,
+        None => return CollectionProgram::NotCollection,
+    };
+    split_top_level_arguments(inner)
+        .first()
+        .and_then(|argument| quoted_literal(argument.trim()))
+        .map_or(CollectionProgram::Dynamic, CollectionProgram::Literal)
 }
 
 pub(crate) fn static_argv_literals(value: &str) -> Option<Vec<String>> {
@@ -1832,19 +2336,38 @@ pub(crate) fn static_argv_literals(value: &str) -> Option<Vec<String>> {
         .collect()
 }
 
-fn append_host_findings(
-    output: &mut Vec<Finding>,
-    path: &str,
-    source: &str,
-    line_offsets: &[usize],
-    regex: &regex::Regex,
-    interpreter: &str,
-) {
+/// The inputs of [`append_host_findings`].
+///
+/// An argument list admits no exhaustive destructuring, so a parameter added to a
+/// many-argument function stays invisible to every call site that already
+/// compiles. [`append_host_findings`] takes this apart without `..`, so a field added here fails
+/// to compile until somebody gives it a destination.
+struct AppendHostFindingsArgs<'a> {
+    output: &'a mut Vec<Finding>,
+    path: &'a str,
+    source: &'a str,
+    line_offsets: &'a [usize],
+    regex: &'a regex::Regex,
+    interpreter: &'a str,
+}
+
+fn append_host_findings(parts: AppendHostFindingsArgs<'_>) -> Result<(), String> {
+    // Destructured without `..`: see `AppendHostFindingsArgs`.
+    let AppendHostFindingsArgs {
+        output,
+        path,
+        source,
+        line_offsets,
+        regex,
+        interpreter,
+    } = parts;
     for capture in regex.captures_iter(source) {
-        let whole = capture.get(0).expect("host regex has a whole match");
+        let whole = capture
+            .get(0)
+            .ok_or("host scanner regex matched without a whole capture")?;
         let argument = capture
             .get(1)
-            .expect("host regex has an argument capture")
+            .ok_or("host scanner regex matched without its argument capture")?
             .as_str()
             .trim();
         let quoted = quoted_literal(argument);
@@ -1862,19 +2385,21 @@ fn append_host_findings(
         let line_start = line_offsets[line_index];
         let line = line_index + 1;
         let column = source[line_start..whole.start()].chars().count();
-        output.push(finding(
+        output.push(finding(FindingParts {
             path,
             kind,
-            Some(interpreter.into()),
-            confidence,
-            Some(format!("line:{line}:column:{column}")),
-            ByteSpan {
+            interpreter: Some(interpreter.into()),
+            interpreter_confidence: confidence,
+            locator: Some(format!("line:{line}:column:{column}")),
+            host_named_the_shell: false,
+            span: ByteSpan {
                 start_byte: whole.start() as u64,
                 end_byte: whole.end() as u64,
             },
-            command.into_bytes(),
-        ));
+            source: command.into_bytes(),
+        }));
     }
+    Ok(())
 }
 
 pub(crate) fn quoted_literal(value: &str) -> Option<String> {
@@ -1963,7 +2488,67 @@ fn kind_order(kind: &FindingKind) -> u8 {
 }
 
 #[cfg(test)]
+// Tests reach for the raw APIs on purpose: they stage corrupt trees, race two
+// writers against one path, and assert on what the transactional layer does with
+// the result. Constructing those situations is precisely what the production ban
+// exists to prevent, so the ban is lifted here and nowhere else.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "tests construct the races and corrupt trees the production ban prevents"
+)]
 mod tests {
+
+    /// A path git knows and the tree does not is not a scan error.
+    ///
+    /// It is a deleted file that has not been staged — which is exactly what a
+    /// retirement leaves behind. Reading it as an error made the post-apply
+    /// check roll back every retirement that removed a tracked file, which is
+    /// every retirement of a shell file: the end-to-end flow could reach
+    /// `verified` and never reach `retired`.
+    #[test]
+    fn a_tracked_path_the_tree_no_longer_holds_is_not_a_scan_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        for argv in [
+            vec!["init", "-q", "."],
+            vec!["config", "user.email", "a@b"],
+            vec!["config", "user.name", "a"],
+        ] {
+            let status = std::process::Command::new("git")
+                .args(&argv)
+                .current_dir(root)
+                .status()
+                .unwrap();
+            assert!(status.success(), "{argv:?}");
+        }
+        std::fs::write(root.join("kept.txt"), b"kept\n").unwrap();
+        std::fs::write(root.join("retired.sh"), b"/usr/bin/true\n").unwrap();
+        for argv in [vec!["add", "-A"], vec!["commit", "-qm", "i"]] {
+            let status = std::process::Command::new("git")
+                .args(&argv)
+                .current_dir(root)
+                .status()
+                .unwrap();
+            assert!(status.success(), "{argv:?}");
+        }
+        // What a retirement does: the file is gone and the index still has it.
+        std::fs::remove_file(root.join("retired.sh")).unwrap();
+
+        let inventory = scan(root).unwrap();
+        assert!(
+            inventory.errors.is_empty(),
+            "a deleted tracked path is not an error: {:?}",
+            inventory.errors
+        );
+        assert!(
+            inventory
+                .findings
+                .iter()
+                .all(|finding| finding.path != "retired.sh"),
+            "{:?}",
+            inventory.findings
+        );
+    }
     use super::*;
     use std::fs;
 
@@ -2286,6 +2871,100 @@ mod tests {
         );
     }
 
+    /// The program is `args[0]`, and the arguments are not the program.
+    ///
+    /// `shell=False` with a sequence is `execvp(args[0], args)`. The rule asked
+    /// whether every element was a literal, which is a different question and
+    /// answered this one wrongly in both directions: a literal
+    /// `["/bin/sh", "-c", "…"]` was excluded as safe because it was all
+    /// literals, and `["/bin/echo", name]` was reported as shell because one
+    /// element was not.
+    ///
+    /// Three answers rather than two, because a shell handed a script file —
+    /// `["sh", "build.sh"]` — is neither. `find_script_references` resolves and
+    /// rewrites that call site, and the script is its own location; calling it
+    /// an unresolvable dynamic candidate says the opposite of what the scan
+    /// knows.
+    #[test]
+    fn a_process_launch_is_read_for_its_program_and_the_command_it_hands_over() {
+        let temporary = tempfile::tempdir().unwrap();
+        write(temporary.path(), "build.sh", b"#!/bin/sh\nprintf built\n");
+        write(
+            temporary.path(),
+            "processes.py",
+            concat!(
+                "import subprocess\n",
+                "subprocess.run([\"/bin/sh\", \"-c\", \"printf one\"], check=True)\n",
+                "subprocess.Popen((\"bash\", \"-lc\", \"printf two\"))\n",
+                "subprocess.run([\"cmd.exe\", \"/C\", \"printf three\"])\n",
+                "subprocess.run([\"pwsh\", \"-Command\", \"printf four\"])\n",
+                "subprocess.run([\"/bin/echo\", name], check=True)\n",
+                "subprocess.run([\"sh\", \"build.sh\"], check=True)\n",
+                "subprocess.run([\"ksh\", \"-c\", \"printf five\"])\n",
+                "subprocess.run([program, \"-c\", \"printf six\"])\n",
+                "subprocess.run([\"/bin/echo\", \"hi\"], shell=True)\n",
+            )
+            .as_bytes(),
+        );
+        write(
+            temporary.path(),
+            "processes.js",
+            concat!(
+                "const {spawnSync} = require('node:child_process');\n",
+                "spawnSync('/bin/sh', ['-c', 'printf seven']);\n",
+                "spawnSync('/bin/echo', [name]);\n",
+                "spawnSync('sh', ['build.sh']);\n",
+            )
+            .as_bytes(),
+        );
+        let inventory = scan(temporary.path()).unwrap();
+        assert!(inventory.errors.is_empty(), "{:#?}", inventory.errors);
+        let read = inventory
+            .findings
+            .iter()
+            .filter(|finding| finding.kind != FindingKind::ShellFile)
+            .map(|finding| {
+                format!(
+                    "{} {:?} {} {}",
+                    finding.locator.clone().unwrap_or_default(),
+                    finding.kind,
+                    finding.interpreter.clone().unwrap_or_default(),
+                    String::from_utf8_lossy(&finding.source),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            read,
+            vec![
+                "line:2:column:0 EmbeddedShell sh printf seven",
+                // The shell is in the call, so the call is the location.
+                "line:2:column:0 EmbeddedShell sh printf one",
+                // Short options bundle: `-lc` hands over a command as `-c` does.
+                "line:3:column:0 EmbeddedShell bash printf two",
+                "line:4:column:0 EmbeddedShell cmd printf three",
+                "line:5:column:0 EmbeddedShell powershell printf four",
+                // `ksh` is a shell no frontend models, so it is not read as one
+                // that is.
+                "line:8:column:0 Candidate sh [\"ksh\", \"-c\", \"printf five\"]",
+                // The program is not in the source, so it might be a shell.
+                "line:9:column:0 Candidate sh [program, \"-c\", \"printf six\"]",
+                // `shell=True` is a shell however the sequence reads.
+                "line:10:column:0 EmbeddedShell sh /bin/echo",
+            ],
+            "{:#?}",
+            inventory.findings
+        );
+        // `/bin/echo` starts no shell, and `sh build.sh` is a script reference
+        // and a shell file, both of which this scan already holds.
+        assert!(
+            inventory
+                .findings
+                .iter()
+                .any(|finding| finding.kind == FindingKind::ShellFile
+                    && finding.path == "build.sh")
+        );
+    }
+
     #[test]
     fn safe_process_argv_arrays_are_excluded_but_dynamic_references_remain_candidates() {
         let temporary = tempfile::tempdir().unwrap();
@@ -2332,7 +3011,8 @@ spawn(dynamicProgram, dynamicArguments);
         assert_eq!(finding.kind, FindingKind::EmbeddedShell);
         assert_eq!(finding.source, b"/usr/bin/printf javascript");
         assert_eq!(
-            &source[finding.span.start_byte as usize..finding.span.end_byte as usize],
+            &source[usize::try_from(finding.span.start_byte).unwrap()
+                ..usize::try_from(finding.span.end_byte).unwrap()],
             "child_process.execSync(\"/usr/bin/printf javascript\", {stdio: \"inherit\"})"
         );
     }
@@ -2506,6 +3186,37 @@ spawn(dynamicProgram, dynamicArguments);
     }
 
     #[test]
+    fn a_composite_action_declares_its_shell_and_is_not_a_mere_candidate() {
+        // `shell:` is optional in a workflow and mandatory in a composite action,
+        // so `action.yml` is the easier of the two to classify, not the harder.
+        // Reading it as an unknown YAML document instead reports `sh` at low
+        // confidence for a step that says `bash`, and sh and bash do not agree on
+        // arrays, `[[`, or `set -f`.
+        let temporary = tempfile::tempdir().unwrap();
+        write(
+            temporary.path(),
+            "action.yml",
+            b"name: probe\nruns:\n  using: composite\n  steps:\n    - run: printf composite\n      shell: bash\n    - run: Write-Output pwsh\n      shell: pwsh\n",
+        );
+        let inventory = scan(temporary.path()).unwrap();
+        assert_eq!(inventory.findings.len(), 2, "{:#?}", inventory.findings);
+        assert_eq!(inventory.findings[0].interpreter.as_deref(), Some("bash"));
+        assert_eq!(
+            inventory.findings[0].kind,
+            FindingKind::EmbeddedShell,
+            "a declared shell is not a guess"
+        );
+        assert_eq!(
+            inventory.findings[0].interpreter_confidence,
+            InterpreterConfidence::High
+        );
+        assert_eq!(
+            inventory.findings[1].interpreter.as_deref(),
+            Some("powershell")
+        );
+    }
+
+    #[test]
     fn malformed_structured_hosts_are_inventory_errors_not_silent_omissions() {
         let temporary = tempfile::tempdir().unwrap();
         write(
@@ -2586,6 +3297,176 @@ spawn(dynamicProgram, dynamicArguments);
         assert_eq!(inventory.skipped[0].reason, "unsupported_encoding");
     }
 
+    /// A process launch is a shell location when the program is a shell, not
+    /// when its arguments are not literal.
+    ///
+    /// The rule wanted the argument array to be literal too, so
+    /// `spawnSync("/bin/echo", [name], ...)` was a shell candidate. de-shell's
+    /// own generated action is exactly that once a step assigns a variable and
+    /// passes it on, so the generated program failed the shell-free gate it
+    /// exists to satisfy.
+    ///
+    /// `/bin/echo` runs `echo` whatever the argument holds. `/bin/sh` runs
+    /// whatever the argument holds, and that is the case the rule is for.
+    #[test]
+    fn a_process_launch_is_a_shell_location_when_the_program_is_a_shell() {
+        let directory = tempfile::tempdir().unwrap();
+        write(
+            directory.path(),
+            "run.js",
+            br#"const {spawnSync} = require('node:child_process');
+const word = process.env.WORD;
+spawnSync("/bin/echo", [word], { shell: false });
+spawnSync("/bin/sh", [word], { shell: false });
+spawnSync(program, ["status"], { shell: false });
+"#,
+        );
+        let inventory = scan(directory.path()).unwrap();
+        assert!(inventory.errors.is_empty(), "{:#?}", inventory.errors);
+        let sources: Vec<_> = inventory
+            .findings
+            .iter()
+            .map(|finding| String::from_utf8_lossy(&finding.source).into_owned())
+            .collect();
+        assert_eq!(sources.len(), 2, "{sources:#?}");
+        assert!(
+            sources.iter().all(|source| !source.contains("/bin/echo")),
+            "a launch of a program that is not a shell was reported: {sources:#?}"
+        );
+        assert!(
+            sources.iter().any(|source| source.contains("/bin/sh")),
+            "a launch of a shell with a dynamic argument was not reported: {sources:#?}"
+        );
+        assert!(
+            sources.iter().any(|source| source.contains("program")),
+            "a launch of a dynamic program was not reported: {sources:#?}"
+        );
+    }
+
+    /// Two locations holding the same text get their own byte spans.
+    ///
+    /// They did not. The span came from searching the whole file for the text,
+    /// which returns the first occurrence, so four identical
+    /// `run: ./scripts/install-nushell.ps1` lines in de-shell's own CI workflow
+    /// all reported bytes 1036..1065. The line numbers beside them were right,
+    /// which is what made it look fine.
+    ///
+    /// It surfaced as `deshell init` refusing its own inventory —
+    /// "duplicate exact location override" — and that refusal was correct: two
+    /// locations cannot occupy one span. Had the validator not caught it, a
+    /// migration would have rewritten one of the four occurrences four times.
+    #[test]
+    fn repeated_identical_commands_in_one_file_each_get_their_own_span() {
+        let directory = tempfile::tempdir().unwrap();
+        let workflow = b"name: ci\non:\n  push:\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - name: one\n        run: ./tools/setup.sh\n      - name: two\n        run: ./tools/setup.sh\n      - name: three\n        run: |\n          ./tools/setup.sh\n";
+        write(directory.path(), ".github/workflows/ci.yml", workflow);
+        // Two scripts whose bodies are byte-identical, in a format whose keys
+        // are unique so each body can still be placed exactly.
+        let package = br#"{"scripts": {"a": "node build.js", "b": "node build.js"}}"#;
+        write(directory.path(), "package.json", package);
+
+        let inventory = scan(directory.path()).unwrap();
+        assert!(inventory.errors.is_empty(), "{:#?}", inventory.errors);
+
+        for (path, source) in [
+            (".github/workflows/ci.yml", workflow.as_slice()),
+            ("package.json", package.as_slice()),
+        ] {
+            let spans: Vec<_> = inventory
+                .findings
+                .iter()
+                .filter(|finding| finding.path == path)
+                .map(|finding| (finding.span.start_byte, finding.span.end_byte))
+                .collect();
+            assert!(spans.len() >= 2, "{path} produced {} findings", spans.len());
+            let unique: std::collections::BTreeSet<_> = spans.iter().collect();
+            assert_eq!(unique.len(), spans.len(), "{path} reused a span: {spans:?}");
+            for (start, end) in spans {
+                let start = usize::try_from(start).unwrap();
+                let end = usize::try_from(end).unwrap();
+                assert!(start < end && end <= source.len(), "{path} {start}..{end}");
+                assert!(
+                    source[start..end]
+                        .windows(9)
+                        .any(|window| window == b"setup.sh\n" || window == b"build.js\"")
+                        || source[start..end].ends_with(b"setup.sh")
+                        || source[start..end].ends_with(b"build.js"),
+                    "{path} {start}..{end} is {:?}",
+                    String::from_utf8_lossy(&source[start..end])
+                );
+            }
+        }
+    }
+
+    /// A candidate in a parsed document gets the bytes the document holds, not
+    /// the bytes the value decodes to.
+    ///
+    /// A parsed value carries no position, and searching the source for its
+    /// decoded text finds nothing the moment the document escaped anything.
+    /// Every such candidate fell to the fallback, so running de-shell on its own
+    /// repository produced seven blockers on one golden corpus that all read
+    /// `@0..1` — one byte, the opening brace — and nothing told a reader which
+    /// value each was about.
+    #[test]
+    fn a_candidate_in_a_parsed_document_is_located_by_what_the_document_holds() {
+        let directory = tempfile::tempdir().unwrap();
+        // Two shell commands with an escape in them, and a third that repeats
+        // the first: the document cannot tell the repeats apart from text, so
+        // that one is not claimed to be anywhere in particular.
+        let source = br#"{"tasks": [
+  {"command": "printf 'a\nb'"},
+  {"command": "printf 'c\td'"},
+  {"command": "printf 'e\nf'"},
+  {"command": "printf 'e\nf'"}
+]}"#;
+        write(directory.path(), ".vscode/tasks.json", source);
+
+        let inventory = scan(directory.path()).unwrap();
+        assert!(inventory.errors.is_empty(), "{:#?}", inventory.errors);
+        let located: Vec<_> = inventory
+            .findings
+            .iter()
+            .map(|finding| {
+                let start = usize::try_from(finding.span.start_byte).unwrap();
+                let end = usize::try_from(finding.span.end_byte).unwrap();
+                std::str::from_utf8(&source[start..end]).unwrap()
+            })
+            .collect();
+        assert!(
+            located.contains(&r"printf 'a\nb'"),
+            "the escaped command was not located: {located:?}"
+        );
+        assert!(
+            located.contains(&r"printf 'c\td'"),
+            "the escaped command was not located: {located:?}"
+        );
+        // The repeated one is ambiguous from text alone, so it takes the
+        // fallback rather than a first-occurrence guess that would put two
+        // findings on one span.
+        assert_eq!(
+            located
+                .iter()
+                .filter(|text| **text == r"printf 'e\nf'")
+                .count(),
+            0,
+            "an ambiguous value was placed anyway: {located:?}"
+        );
+    }
+
+    /// A value the scanner cannot find in the source gets the line it was on,
+    /// not the whole file.
+    ///
+    /// `span_of` used to fall back to every byte of the file. A span that wide
+    /// is not a location: a rewrite reading one would replace the file with a
+    /// single block.
+    #[test]
+    fn an_unlocatable_value_falls_back_to_its_line_and_not_the_file() {
+        let source = "first line\nsecond line\nthird line\n";
+        let span = span_of(source, 11, "not in the file");
+        assert_eq!((span.start_byte, span.end_byte), (11, 22));
+        assert_eq!(&source[11..22], "second line");
+    }
+
     #[test]
     fn jsonc_hosts_accept_comments_and_trailing_commas_without_moving_spans() {
         let directory = tempfile::tempdir().unwrap();
@@ -2601,8 +3482,8 @@ spawn(dynamicProgram, dynamicArguments);
         assert!(inventory.skipped.is_empty());
         assert_eq!(inventory.findings.len(), 1);
         assert_eq!(inventory.findings[0].source, b"printf jsonc");
-        let start = inventory.findings[0].span.start_byte as usize;
-        let end = inventory.findings[0].span.end_byte as usize;
+        let start = usize::try_from(inventory.findings[0].span.start_byte).unwrap();
+        let end = usize::try_from(inventory.findings[0].span.end_byte).unwrap();
         assert_eq!(&source[start..end], b"printf jsonc");
     }
 

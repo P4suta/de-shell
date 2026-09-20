@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "contract": "test-builtin-semantics-v1",
+  "purpose": "Pin what the modelled `test` operators do, measured against the shell builtin and the external utility, so the operator table can be checked against a measurement rather than against a reading of the specification.",
+  "note": "`[` is a builtin and never reaches the PATH lookup, so the builtin column is the one de-shell models. The external column is measured too: an operator where they disagree is a difference this tool exists to report, not one to model away.",
+  "cases": [
+    {"name": "non-empty-string", "operands": ["-n", "x"], "expected": 0},
+    {"name": "non-empty-of-empty", "operands": ["-n", ""], "expected": 1},
+    {"name": "empty-of-empty", "operands": ["-z", ""], "expected": 0},
+    {"name": "empty-of-non-empty", "operands": ["-z", "x"], "expected": 1},
+    {"name": "string-equal", "operands": ["a", "=", "a"], "expected": 0},
+    {"name": "string-unequal", "operands": ["a", "=", "b"], "expected": 1},
+    {"name": "string-not-equal", "operands": ["a", "!=", "b"], "expected": 0},
+    {"name": "empty-equals-empty", "operands": ["", "=", ""], "expected": 0}
+  ]
+}

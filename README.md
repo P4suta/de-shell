@@ -69,12 +69,21 @@ capability report.
 
 ## Advanced contracts
 
-Reporting commands accept `--format human|json`. Both forms are rendered from
-the same strict `*-report-v1` value with `schema_version`, `command`, `status`,
-`summary`, and typed `next_actions`. Command actions contain exact argv arrays;
-review actions contain project paths. A blocked or not-ready completed command
-writes its report to stdout and leaves stderr empty. Syntax, I/O, invalid
-contract, and internal failures write Diagnostic v1 to stderr instead.
+Reporting commands accept `--format human|json|agent`. All three are rendered
+from the same strict `*-report-v1` value with `schema_version`, `command`,
+`status`, `summary`, and typed `next_actions`. Command actions contain exact
+argv arrays; review actions contain project paths. A blocked or not-ready
+completed command writes its report to stdout and leaves stderr empty. Syntax,
+I/O, invalid contract, and internal failures write Diagnostic v1 to stderr
+instead.
+
+`agent` is for a reader that cannot ask a follow-up question. It carries the
+JSON values unchanged and adds two things a consumer would otherwise spend a
+second read of the repository on: the source each anchored message points at,
+resolved from `path@start..end` into the file, the line range and the text; and
+a `schema` block saying what each field means, so the shape does not have to be
+learned from an example. Nothing is removed, so a consumer that already knows
+the shape reads the same fields it always did.
 
 `audit` additionally supports Finding-only JSONL, SARIF, and GitHub annotation
 streams. With no findings, human and JSON still return a summary while JSONL is
@@ -159,7 +168,9 @@ Generated Rust is gated by rustfmt, rustc, and Clippy with `-D warnings`;
 generated Go by gofmt, build/test, and vet. Structured JavaScript and Python
 rewrites use the official `node --check` and `py_compile` syntax checks. Node
 and Python are pinned in the same mise toolchain; no third-party language lint
-dependency is required.
+dependency is required. The repository's stricter Rust rules—including the
+syntax-level ban on every trait object—are documented in
+[`CONTRIBUTING.md`](CONTRIBUTING.md#rust-design-policy).
 
 ```console
 mise trust
@@ -250,7 +261,9 @@ caller also supplies `--backend local`. Residual nodes never execute, and
 delegation is available only inside a pinned disposable runtime.
 
 This source tree directly connects the supervised Podman and rootless-Docker
-process transports. Windows Sandbox/Hyper-V and Virtualization.framework have
+process transports on Linux and on macOS, where a `podman machine` is a Linux
+VM running rootless containers. Windows Sandbox/Hyper-V and
+Virtualization.framework have
 validated launch contracts, but `doctor` reports them unavailable until their
 signed helper transport is installed and connected; they never fall back to a
 host shell.
