@@ -241,21 +241,27 @@ impl PosixPrograms {
     }
 
     /// Preserve `-c` invocation semantics while keeping measured script bytes
-    /// on standard input. The fixed wrapper contains no corpus data for the
-    /// Windows/MSYS argv boundary to reinterpret.
-    fn command_string_status(
+    /// on standard input. The fixed wrapper decodes one generated octal line;
+    /// no corpus data or host-dependent `/dev/stdin` path crosses argv.
+    fn bash_command_string_status(
         &self,
-        name: &str,
         script: &str,
     ) -> std::io::Result<std::process::ExitStatus> {
-        let mut command = self.command(name)?;
+        const DECODE_AND_EVAL: &str = "IFS= read -r __deshell_xtask_encoded || exit 125
+__deshell_xtask_command=$(printf '%b' \"$__deshell_xtask_encoded\")
+__deshell_xtask_command=${__deshell_xtask_command%x}
+unset __deshell_xtask_encoded
+eval \"$__deshell_xtask_command\"";
+
+        let encoded = encode_posix_shell_argument(script)?;
+        let mut command = self.command("bash")?;
         let mut child = command
-            .args(["-c", ". /dev/stdin"])
+            .args(["-c", DECODE_AND_EVAL])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()?;
-        write_posix_script(&mut child, script)?;
+        write_posix_script(&mut child, &format!("{encoded}\n"))?;
         child.wait()
     }
 
@@ -302,7 +308,7 @@ fn encode_posix_shell_argument(value: &str) -> std::io::Result<String> {
     if value.contains('\0') {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "a POSIX shell word cannot contain NUL",
+            "POSIX shell text cannot contain NUL",
         ));
     }
     let mut encoded = String::with_capacity((value.len() + 1) * 4);
@@ -455,7 +461,7 @@ fn run_bash_semantics(root: &Path) -> Result<(), Vec<String>> {
             .as_i64()
             .ok_or_else(|| vec!["case has no expected".to_owned()])?;
         let status = shells
-            .command_string_status("bash", script)
+            .bash_command_string_status(script)
             .map_err(|error| vec![format!("cannot run case {name}: {error}")])?;
         let actual = i64::from(status.code().unwrap_or(-1));
         if actual == expected {
@@ -4835,7 +4841,7 @@ mod tests {
         assert_eq!(output.stdout, argument.as_bytes());
 
         let status = programs
-            .command_string_status("bash", "value='a\\\\b'; [ \"$value\" = 'a\\\\b' ]")
+            .bash_command_string_status("value='a\\\\b'; [ \"$value\" = 'a\\\\b' ]")
             .expect("command-string input must cross the native process boundary unchanged");
         assert!(status.success(), "{status:#?}");
 

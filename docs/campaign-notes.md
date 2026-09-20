@@ -243,13 +243,14 @@ as fixed-width octal by one NUL-rejecting encoder, reconstructed inside the
 shell, and protected by a removable sentinel from command substitution's
 trailing-newline deletion. Embedded newlines, carriage returns, Unicode,
 apostrophes, dollars and backslashes therefore never cross the native argv or
-raw source boundary. The corpus that specifically measures `bash -c`
-uses a fixed `. /dev/stdin` wrapper, preserving command-string exit semantics
-without putting corpus bytes in argv. Tests cover every one of those boundary
-characters and doubled backslashes. Cross-platform tests also require the
-selected Bash to expose `BASH_VERSION`, run an absolute `/bin/echo` through the
-same resolver, and require unknown or absent names to fail closed. Neither a
-shell observation nor a PowerShell native-command observation can silently
+raw source boundary. The corpus that specifically measures `bash -c` sends the
+same octal transport to a fixed `read -r`/decode/`eval` wrapper, preserving
+command-string exit semantics without relying on Git Bash's host-dependent
+`/dev/stdin` or putting corpus bytes in argv. Tests cover every one of those
+boundary characters and doubled backslashes. Cross-platform tests also require
+the selected Bash to expose `BASH_VERSION`, run an absolute `/bin/echo` through
+the same resolver, and require unknown or absent names to fail closed. Neither
+a shell observation nor a PowerShell native-command observation can silently
 fall back to an unrelated Windows command or a missing Unix mount.
 
 Program names are not treated as semantic versions. Git for Windows carries a
@@ -282,7 +283,7 @@ smaller test surface.
 
 The trusted clean run on 2026-09-20 passed all 525 workspace tests (482
 `deshell`, 43 `xtask`) and finished at **90.23% line coverage**: 54,876 lines,
-5,364 missed. `cargo llvm-cov` enforced `--fail-under-lines 90` on the result.
+5,363 missed. `cargo llvm-cov` enforced `--fail-under-lines 90` on the result.
 
 ## Next, in the order I would take it
 
