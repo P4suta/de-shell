@@ -317,3 +317,21 @@ jobs:
             echo "The saved-corpus fuzz smoke result was: $FUZZ_RESULT"
             exit 1
           fi
+
+  # The one status check branch protection requires,
+  # named the same in every P4suta repository.
+  # It passes only when every job it needs succeeded or was skipped.
+  required:
+    name: required
+    if: always()
+    needs: [test, security-and-coverage, dynamic-analysis, official-exporters, reference-conformance, fuzz-smoke, required-gate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Fail unless every needed job succeeded or was skipped
+        env:
+          RESULTS: ${{ toJSON(needs.*.result) }}
+        run: |
+          echo "${RESULTS}"
+          jq -e 'all(.[]; IN("success", "skipped"))' <<< "${RESULTS}"
