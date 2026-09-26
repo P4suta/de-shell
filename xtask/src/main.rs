@@ -6925,9 +6925,20 @@ fn main() {
         assert!(contributing.contains("Green"));
         assert!(contributing.contains("cargo test --locked --workspace"));
 
-        let dependabot = std::fs::read_to_string(root.join(".github/dependabot.yml")).unwrap();
-        assert!(dependabot.contains("package-ecosystem: cargo\n    directory: /\n"));
-        assert!(!dependabot.contains("directory: /adapters/nushell"));
+        assert!(!root.join(".github/dependabot.yml").exists());
+        let renovate: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(root.join("renovate.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            renovate["extends"],
+            serde_json::json!(["github>P4suta/renovate-config"])
+        );
+        for narrowing_key in ["enabledManagers", "includePaths", "ignorePaths"] {
+            assert!(
+                renovate.get(narrowing_key).is_none(),
+                "Renovate discovery was narrowed by {narrowing_key}"
+            );
+        }
     }
 
     #[test]
