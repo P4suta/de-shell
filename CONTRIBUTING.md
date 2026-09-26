@@ -40,6 +40,9 @@ locked. The public package contains one `deshell` binary; do not expose Rust
 library APIs, standalone agent executables, legacy shims, or OCaml install
 artifacts.
 
+Mend-hosted Renovate inherits the shared P4suta policy through `renovate.json`.
+Keep manifest discovery unrestricted so the root Rust workspace and GitHub Actions remain on the same reviewed update path.
+
 The OCaml tree is an unpublished reference implementation. Work on it is
 explicit through `mise run reference:build` and `mise run reference:test`; it
 must not become a dependency of the Rust CLI, CI default, or release archives.
