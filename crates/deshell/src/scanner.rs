@@ -3266,6 +3266,38 @@ spawn(dynamicProgram, dynamicArguments);
     }
 
     #[test]
+    fn yaml_hosts_preserve_tags_aliases_complex_keys_and_stream_spans() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = b"---\ndefaults: &defaults {greeting: hello}\ncopy: *defaults\ntagged: !metadata note\n? [one, two]\n: complex-key\n---\njobs:\n  build:\n    steps:\n      - run: echo preserved\n";
+        write(directory.path(), ".github/workflows/stream.yml", source);
+
+        let inventory = scan(directory.path()).unwrap();
+        assert!(inventory.errors.is_empty(), "{:?}", inventory.errors);
+        assert_eq!(inventory.findings.len(), 1, "{:?}", inventory.findings);
+        let finding = &inventory.findings[0];
+        assert_eq!(finding.source, b"echo preserved");
+        let start = usize::try_from(finding.span.start_byte).unwrap();
+        let end = usize::try_from(finding.span.end_byte).unwrap();
+        assert_eq!(&source[start..end], finding.source.as_slice());
+    }
+
+    #[test]
+    fn yaml_hosts_reject_a_malformed_later_document_without_partial_findings() {
+        let directory = tempfile::tempdir().unwrap();
+        write(
+            directory.path(),
+            ".github/workflows/stream.yml",
+            b"---\njobs:\n  build:\n    steps:\n      - run: echo first\n---\ninvalid: [unterminated\n",
+        );
+
+        let inventory = scan(directory.path()).unwrap();
+        assert!(inventory.findings.is_empty(), "{:?}", inventory.findings);
+        assert_eq!(inventory.errors.len(), 1, "{:?}", inventory.errors);
+        assert_eq!(inventory.errors[0].stage, "parse_yaml");
+        assert!(inventory.errors[0].message.contains("malformed YAML"));
+    }
+
+    #[test]
     fn yaml_hosts_reject_duplicate_mapping_keys() {
         let directory = tempfile::tempdir().unwrap();
         write(
