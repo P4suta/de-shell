@@ -1288,8 +1288,8 @@ fn dockerfile_findings(path: &str, source: &str) -> Result<Vec<Finding>, String>
 }
 
 fn yaml_findings(path: &str, source: &str, lower: &str) -> Result<Vec<Finding>, String> {
-    for document in serde_yaml_ng::Deserializer::from_str(source) {
-        serde_yaml_ng::Value::deserialize(document)
+    for document in serde_yaml_bw::Deserializer::from_str(source) {
+        serde_yaml_bw::Value::deserialize(document)
             .map_err(|error| format!("malformed YAML: {error}"))?;
     }
     let known = lower.starts_with(".github/workflows/")
