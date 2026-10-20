@@ -44,7 +44,7 @@ run = [
   "cargo run --locked -p xtask -- fuzz-modules",
   "cargo clippy --locked --workspace --all-targets -- -D warnings",
   "mise run repository:guardrails",
-  "actionlint .github/workflows/ci.yml .github/workflows/release.yml .github/workflows/nightly.yml .github/workflows/dependency-review.yml .github/workflows/scorecard.yml",
+  "actionlint .github/workflows/ci.yml .github/workflows/release.yml .github/workflows/dependency-review.yml .github/workflows/scorecard.yml",
 ]
 
 [tasks."repository:guardrails"]
@@ -104,15 +104,14 @@ run = [
 
 [tasks."test:fuzz-smoke"]
 description = "Build every fuzz target and run each briefly over the saved corpus"
-# The nightly job runs these for fifteen minutes each. This is the short form,
-# for a change: building the targets at all is most of the value, because the
-# fuzz crate re-declares every module of the binary and nothing else builds it.
+# Build every re-declared production module and replay saved inputs with bounded work.
+# CI uses this task as its single saved-corpus sanitizer smoke.
 run = [
   "cargo run --locked -p xtask -- fuzz-modules",
-  "cargo +nightly-2026-08-21 fuzz run frontend fuzz/corpus/frontend -- -runs=2000 -timeout=10 -max_len=16384",
-  "cargo +nightly-2026-08-21 fuzz run scanner fuzz/corpus/scanner -- -runs=2000 -timeout=10 -max_len=16384",
-  "cargo +nightly-2026-08-21 fuzz run protocol fuzz/corpus/protocol -- -runs=2000 -timeout=10 -max_len=16384",
-  "cargo +nightly-2026-08-21 fuzz run schema fuzz/corpus/schema -- -runs=2000 -timeout=10 -max_len=16384",
+  "cargo +nightly-2026-08-21 fuzz run frontend fuzz/corpus/frontend -- -runs=2000 -timeout=10 -max_len=65536",
+  "cargo +nightly-2026-08-21 fuzz run scanner fuzz/corpus/scanner -- -runs=2000 -timeout=10 -max_len=65536",
+  "cargo +nightly-2026-08-21 fuzz run protocol fuzz/corpus/protocol -- -runs=2000 -timeout=10 -max_len=65536",
+  "cargo +nightly-2026-08-21 fuzz run schema fuzz/corpus/schema -- -runs=2000 -timeout=10 -max_len=65536",
 ]
 
 [tasks."test:miri"]

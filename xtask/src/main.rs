@@ -6247,7 +6247,11 @@ fn main() {
     #[test]
     fn public_docs_describe_the_retirement_oracle_and_release_gate() {
         let root = repository_root();
-        let readme = std::fs::read_to_string(root.join("README.md")).unwrap();
+        let readme = format!(
+            "{}\n{}",
+            std::fs::read_to_string(root.join("README.md")).unwrap(),
+            std::fs::read_to_string(root.join("docs/usage.md")).unwrap()
+        );
         assert!(readme.contains("migration oracle"));
         assert!(readme.contains("deshell migrate plan"));
         assert!(readme.contains("deshell verify --require shell-free"));
@@ -6885,7 +6889,11 @@ fn main() {
     #[test]
     fn public_docs_and_dependency_updates_are_rust_first_v1() {
         let root = repository_root();
-        let readme = std::fs::read_to_string(root.join("README.md")).unwrap();
+        let readme = format!(
+            "{}\n{}",
+            std::fs::read_to_string(root.join("README.md")).unwrap(),
+            std::fs::read_to_string(root.join("docs/usage.md")).unwrap()
+        );
         assert!(readme.contains("`de-shell` is a Rust"));
         assert!(readme.contains("Effect IR v1"));
         assert!(readme.contains("Evidence v1"));
