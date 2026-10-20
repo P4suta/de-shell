@@ -6534,7 +6534,6 @@ fn main() {
         let root = repository_root();
         let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
         let release = std::fs::read_to_string(root.join(".github/workflows/release.yml")).unwrap();
-        let nightly = std::fs::read_to_string(root.join(".github/workflows/nightly.yml")).unwrap();
         let mise = std::fs::read_to_string(root.join("mise.toml")).unwrap();
         let mise_lock = std::fs::read_to_string(root.join("mise.lock")).unwrap();
         let installer_path = root.join("scripts/install-nushell.ps1");
@@ -6584,11 +6583,8 @@ fn main() {
                 "mise.lock omitted the Python artifact for {platform}"
             );
         }
-        for (name, workflow, minimum) in [
-            ("ci", ci.as_str(), 4),
-            ("release", release.as_str(), 4),
-            ("nightly", nightly.as_str(), 1),
-        ] {
+        for (name, workflow, minimum) in [("ci", ci.as_str(), 4), ("release", release.as_str(), 4)]
+        {
             assert!(
                 workflow.matches("scripts/install-nushell.ps1").count() >= minimum,
                 "{name} must provision pinned Nushell for every parser/test job"
@@ -6805,7 +6801,8 @@ fn main() {
                 "fuzz library omitted the production {module} module"
             );
         }
-        for target in ["frontend", "scanner", "protocol", "schema"] {
+        let saved_targets = ["frontend", "scanner", "protocol", "schema"];
+        for target in saved_targets {
             assert!(
                 root.join(format!("fuzz/fuzz_targets/{target}.rs"))
                     .is_file(),
@@ -6842,20 +6839,19 @@ fn main() {
         let publish = &release[release.find("  publish:").unwrap()..];
         assert!(publish.contains("- dynamic-analysis"));
         let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
-        assert!(ci.contains("fuzz-smoke:"));
-        assert!(ci.contains(nightly_fuzz));
-        assert!(ci.contains("nightly-2026-07-15"));
-        assert!(ci.contains("- fuzz-smoke"));
-        let nightly = std::fs::read_to_string(root.join(".github/workflows/nightly.yml")).unwrap();
-        assert!(nightly.contains("schedule:"));
-        assert!(nightly.contains(nightly_fuzz));
-        assert!(nightly.contains("nightly-2026-07-15"));
+        assert!(ci.contains("- dynamic-analysis"));
+        assert!(ci.contains("FUZZ_RESULT: ${{ needs.dynamic-analysis.result }}"));
+        assert!(ci.contains("run: mise run test:fuzz-smoke"));
+        assert!(!ci.contains("  fuzz-smoke:"));
+        assert!(!root.join(".github/workflows/nightly.yml").exists());
+        let mise = std::fs::read_to_string(root.join("mise.toml")).unwrap();
+        assert_eq!(
+            mise.matches("-runs=2000 -timeout=10 -max_len=65536")
+                .count(),
+            saved_targets.len()
+        );
         let install = "cargo install --locked --version 0.13.2 cargo-fuzz";
-        for (name, workflow) in [
-            ("release", release.as_str()),
-            ("ci", ci.as_str()),
-            ("nightly", nightly.as_str()),
-        ] {
+        for (name, workflow) in [("release", release.as_str()), ("ci", ci.as_str())] {
             assert!(
                 workflow.contains(install),
                 "{name} must install the exact cargo-fuzz crate through Cargo's checksummed registry"
@@ -6865,10 +6861,10 @@ fn main() {
                 "{name} must not ask install-action for an unsupported tool"
             );
         }
-        for target in ["frontend", "scanner", "protocol", "schema"] {
+        for target in saved_targets {
             assert!(
-                nightly.contains(&format!("fuzz/corpus/{target}")),
-                "nightly workflow omitted saved corpus {target}"
+                mise.contains(&format!("fuzz run {target} fuzz/corpus/{target}")),
+                "local smoke omitted saved corpus {target}"
             );
         }
     }
