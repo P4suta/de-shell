@@ -11,6 +11,7 @@ dagger = "0.21.8"
 "cargo:cargo-audit" = "0.22.2"
 "cargo:cargo-deny" = "0.20.2"
 "cargo:cargo-llvm-cov" = "0.8.7"
+"cargo:kani-verifier" = { version = "0.68.0", os = ["linux"] }
 "pipx:check-jsonschema" = "0.38.0"
 
 [env]
@@ -62,6 +63,10 @@ run = "pwsh -NoLogo -NoProfile -File scripts/github-repository.ps1 -Mode Verify 
 [tasks."test:fast"]
 description = "Run deterministic unit and property tests"
 run = "cargo test --locked -p deshell"
+
+[tasks."verify:rlimit-cap"]
+description = "Prove the inherited resource cap-selection invariant"
+run = "cargo kani --locked -p deshell --harness cap_limit_stays_within_requested_and_inherited_hard_ceilings"
 
 [tasks."test:contract"]
 description = "Run CLI, schema, and adapter contract tests"

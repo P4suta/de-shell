@@ -201,7 +201,12 @@ pub(crate) fn execute_pipeline(
             command.env(name, value);
         }
         #[cfg(unix)]
-        configure_unix_limits(&mut command, limits);
+        if let Err(error) = configure_unix_limits(&mut command, limits) {
+            terminate_children(&mut children);
+            return Err(format!(
+                "failed to prepare pipeline stage {executable} resource limits: {error}"
+            ));
+        }
 
         let mut child = match crate::host::spawn(&mut command) {
             Ok(child) => child,
@@ -408,7 +413,8 @@ pub(crate) fn execute_with_clock<C: Clock>(
         command.env(name, value);
     }
     #[cfg(unix)]
-    configure_unix_limits(&mut command, request.limits);
+    configure_unix_limits(&mut command, request.limits)
+        .map_err(|error| format!("failed to prepare resource limits for {executable}: {error}"))?;
     let mut child = crate::host::spawn(&mut command)
         .map_err(|error| format!("failed to start {executable}: {error}"))?;
     let child_stdout = child
@@ -664,8 +670,133 @@ fn msvc_toolchain_environment() -> &'static [(std::ffi::OsString, std::ffi::OsSt
     &[]
 }
 
+#[cfg(all(
+    unix,
+    not(target_os = "macos"),
+    not(coverage),
+    not(deshell_sanitizer_address),
+    not(deshell_sanitizer_undefined)
+))]
+fn inherited_hard_limit(resource: libc::c_int) -> std::io::Result<libc::rlim_t> {
+    let mut inherited = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    // SAFETY: `getrlimit` writes one complete `rlimit` when it returns success.
+    let result = unsafe { libc::getrlimit(resource, inherited.as_mut_ptr()) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: the successful `getrlimit` call initialized the complete value.
+    let inherited = unsafe { inherited.assume_init() };
+    Ok(inherited.rlim_max)
+}
+
+#[cfg(any(
+    all(
+        unix,
+        not(target_os = "macos"),
+        not(coverage),
+        not(deshell_sanitizer_address),
+        not(deshell_sanitizer_undefined)
+    ),
+    test,
+    kani
+))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HardCeiling {
+    Finite(u64),
+    Infinite,
+}
+
+#[cfg(any(
+    all(
+        unix,
+        not(target_os = "macos"),
+        not(coverage),
+        not(deshell_sanitizer_address),
+        not(deshell_sanitizer_undefined)
+    ),
+    test,
+    kani
+))]
+fn cap_limit(requested: u64, inherited_hard: HardCeiling) -> u64 {
+    match inherited_hard {
+        HardCeiling::Finite(inherited) => requested.min(inherited),
+        HardCeiling::Infinite => requested,
+    }
+}
+
+#[cfg(all(
+    unix,
+    not(target_os = "macos"),
+    not(coverage),
+    not(deshell_sanitizer_address),
+    not(deshell_sanitizer_undefined)
+))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CappedLimitError {
+    NotRepresentable,
+    CollidesWithInfinity,
+    InheritedHardCeilingNotRepresentable,
+}
+
+#[cfg(all(
+    unix,
+    not(target_os = "macos"),
+    not(coverage),
+    not(deshell_sanitizer_address),
+    not(deshell_sanitizer_undefined)
+))]
+impl CappedLimitError {
+    fn description(self) -> &'static str {
+        match self {
+            Self::NotRepresentable => "the requested cap is not representable on this platform",
+            Self::CollidesWithInfinity => "the requested cap collides with RLIM_INFINITY",
+            Self::InheritedHardCeilingNotRepresentable => {
+                "the inherited hard ceiling is not representable by the cap core"
+            }
+        }
+    }
+}
+
+#[cfg(all(
+    unix,
+    not(target_os = "macos"),
+    not(coverage),
+    not(deshell_sanitizer_address),
+    not(deshell_sanitizer_undefined)
+))]
+fn rlimit_for_cap(
+    requested: u64,
+    inherited_hard: libc::rlim_t,
+) -> Result<libc::rlimit, CappedLimitError> {
+    let requested_limit =
+        libc::rlim_t::try_from(requested).map_err(|_| CappedLimitError::NotRepresentable)?;
+    if requested_limit == libc::RLIM_INFINITY {
+        return Err(CappedLimitError::CollidesWithInfinity);
+    }
+    let inherited_hard = if inherited_hard == libc::RLIM_INFINITY {
+        HardCeiling::Infinite
+    } else {
+        HardCeiling::Finite(
+            u64::try_from(inherited_hard)
+                .map_err(|_| CappedLimitError::InheritedHardCeilingNotRepresentable)?,
+        )
+    };
+    let effective = libc::rlim_t::try_from(cap_limit(requested, inherited_hard))
+        .map_err(|_| CappedLimitError::NotRepresentable)?;
+    if effective == libc::RLIM_INFINITY {
+        return Err(CappedLimitError::CollidesWithInfinity);
+    }
+    Ok(libc::rlimit {
+        rlim_cur: effective,
+        rlim_max: effective,
+    })
+}
+
 #[cfg(unix)]
-fn configure_unix_limits(command: &mut std::process::Command, limits: Limits) {
+fn configure_unix_limits(
+    command: &mut std::process::Command,
+    _limits: Limits,
+) -> Result<(), String> {
     use std::os::unix::process::CommandExt as _;
     command.process_group(0);
 
@@ -675,54 +806,84 @@ fn configure_unix_limits(command: &mut std::process::Command, limits: Limits) {
     // RLIMIT_NPROC or a production-sized RLIMIT_AS there produces false
     // `cannot fork` failures. Ordinary builds still exercise these limits, and
     // disposable providers enforce their own memory and PID boundaries.
-    let apply_limits = move || {
-        let memory_limit = libc::rlimit {
-            rlim_cur: limits.memory_bytes as libc::rlim_t,
-            rlim_max: limits.memory_bytes as libc::rlim_t,
-        };
-        // SAFETY: the pointer names a fully initialized `rlimit` that remains
-        // alive for the duration of this async-signal-safe system call.
-        let memory_result = unsafe { libc::setrlimit(libc::RLIMIT_AS, &raw const memory_limit) };
-        if memory_result != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let process_limit = libc::rlimit {
-            rlim_cur: limits.processes as libc::rlim_t,
-            rlim_max: limits.processes as libc::rlim_t,
-        };
-        // SAFETY: the pointer names a fully initialized `rlimit` that remains
-        // alive for the duration of this async-signal-safe system call.
-        let process_result =
-            unsafe { libc::setrlimit(libc::RLIMIT_NPROC, &raw const process_limit) };
-        if process_result != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(())
-    };
-    #[cfg(any(
-        target_os = "macos",
-        coverage,
-        deshell_sanitizer_address,
-        deshell_sanitizer_undefined
-    ))]
-    let _unused_apply_limits = apply_limits;
     #[cfg(all(
         not(target_os = "macos"),
         not(coverage),
         not(deshell_sanitizer_address),
         not(deshell_sanitizer_undefined)
     ))]
-    // SAFETY: `pre_exec` installs only the async-signal-safe `setrlimit` calls
-    // above. The closure allocates nothing and touches no shared Rust state
-    // after `fork`.
-    unsafe {
-        command.pre_exec(apply_limits);
+    {
+        // Snapshot inherited ceilings before `fork`; `getrlimit` is not part of the POSIX async-signal-safe set required for a `pre_exec` closure.
+        // If another thread lowers a ceiling before `fork`, applying this stale snapshot can fail, and the spawn must remain fail-closed.
+        let memory_hard = inherited_hard_limit(libc::RLIMIT_AS)
+            .map_err(|error| format!("failed to read inherited RLIMIT_AS: {error}"))?;
+        let memory_limit = rlimit_for_cap(_limits.memory_bytes, memory_hard)
+            .map_err(|error| format!("invalid RLIMIT_AS cap: {}", error.description()))?;
+        let process_hard = inherited_hard_limit(libc::RLIMIT_NPROC)
+            .map_err(|error| format!("failed to read inherited RLIMIT_NPROC: {error}"))?;
+        let process_limit = rlimit_for_cap(_limits.processes, process_hard)
+            .map_err(|error| format!("invalid RLIMIT_NPROC cap: {}", error.description()))?;
+        let apply_limits = move || {
+            // SAFETY: the pointer names a fully initialized `rlimit` that remains
+            // alive for the duration of this system call.
+            let memory_result =
+                unsafe { libc::setrlimit(libc::RLIMIT_AS, &raw const memory_limit) };
+            if memory_result != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: the pointer names a fully initialized `rlimit` that remains
+            // alive for the duration of this system call.
+            let process_result =
+                unsafe { libc::setrlimit(libc::RLIMIT_NPROC, &raw const process_limit) };
+            if process_result != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        };
+        // SAFETY: `pre_exec` applies only the already prepared limits through
+        // the existing setrlimit boundary and allocates no memory after `fork`.
+        unsafe {
+            command.pre_exec(apply_limits);
+        }
     }
+    Ok(())
 }
 
 fn terminate_children(children: &mut [std::process::Child]) {
     for child in children.iter_mut() {
         kill_process_tree(child);
+    }
+}
+
+#[cfg(kani)]
+mod rlimit_proofs {
+    use super::{HardCeiling, cap_limit};
+
+    #[kani::proof]
+    fn cap_limit_stays_within_requested_and_inherited_hard_ceilings() {
+        let requested: u64 = kani::any();
+        let inherited_value: u64 = kani::any();
+        let inherited_is_infinite: bool = kani::any();
+        let inherited_hard = if inherited_is_infinite {
+            HardCeiling::Infinite
+        } else {
+            HardCeiling::Finite(inherited_value)
+        };
+        let effective = cap_limit(requested, inherited_hard);
+
+        assert!(effective <= requested);
+        match inherited_hard {
+            HardCeiling::Finite(inherited) => {
+                assert_eq!(effective, requested.min(inherited));
+                assert!(effective <= inherited);
+                kani::cover!(inherited < requested);
+                kani::cover!(inherited >= requested);
+            }
+            HardCeiling::Infinite => {
+                assert_eq!(effective, requested);
+                kani::cover!(inherited_is_infinite);
+            }
+        }
     }
 }
 
@@ -1027,6 +1188,167 @@ impl Drop for Agent {
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cap_limit_uses_the_finite_minimum_and_preserves_infinite_ceilings() {
+        for (requested, inherited, expected) in [
+            (0, HardCeiling::Finite(0), 0),
+            (100, HardCeiling::Finite(50), 50),
+            (50, HardCeiling::Finite(100), 50),
+            (75, HardCeiling::Infinite, 75),
+        ] {
+            assert_eq!(cap_limit(requested, inherited), expected);
+        }
+    }
+
+    #[cfg(all(
+        unix,
+        not(target_os = "macos"),
+        not(coverage),
+        not(deshell_sanitizer_address),
+        not(deshell_sanitizer_undefined)
+    ))]
+    #[test]
+    fn rlimit_adapter_refines_finite_and_infinite_ceilings() {
+        let finite_50 = libc::rlim_t::try_from(50_u64).unwrap();
+        let finite_75 = libc::rlim_t::try_from(75_u64).unwrap();
+        for (requested, inherited_hard, expected) in [
+            (100_u64, finite_50, finite_50),
+            (50, libc::rlim_t::try_from(100_u64).unwrap(), finite_50),
+            (75, libc::RLIM_INFINITY, finite_75),
+        ] {
+            let limit = rlimit_for_cap(requested, inherited_hard).unwrap();
+            assert_eq!(limit.rlim_cur, expected);
+            assert_eq!(limit.rlim_max, expected);
+        }
+    }
+
+    #[cfg(all(
+        unix,
+        not(target_os = "macos"),
+        not(coverage),
+        not(deshell_sanitizer_address),
+        not(deshell_sanitizer_undefined)
+    ))]
+    #[test]
+    fn rlimit_adapter_rejects_infinity_requests() {
+        assert!(matches!(
+            rlimit_for_cap(u64::MAX, libc::RLIM_INFINITY),
+            Err(CappedLimitError::NotRepresentable | CappedLimitError::CollidesWithInfinity)
+        ));
+        if let Ok(infinity_as_u64) = u64::try_from(libc::RLIM_INFINITY) {
+            assert!(matches!(
+                rlimit_for_cap(infinity_as_u64, libc::RLIM_INFINITY),
+                Err(CappedLimitError::CollidesWithInfinity)
+            ));
+        }
+    }
+
+    #[cfg(all(
+        unix,
+        not(target_os = "macos"),
+        not(coverage),
+        not(deshell_sanitizer_address),
+        not(deshell_sanitizer_undefined)
+    ))]
+    #[test]
+    fn inherited_hard_limit_reports_invalid_resource_queries() {
+        assert!(inherited_hard_limit(-1).is_err());
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        target_pointer_width = "64",
+        not(coverage),
+        not(deshell_sanitizer_address),
+        not(deshell_sanitizer_undefined)
+    ))]
+    #[test]
+    fn inherited_lower_memory_hard_limit_is_clamped_in_an_isolated_test_process() {
+        const CHILD_MARKER: &str = "DESHELL_RLIMIT_REGRESSION_CHILD";
+        const CHILD_HARD_LIMIT: u64 = 16 * 1024 * 1024 * 1024;
+        const REQUESTED_LIMIT: u64 = 32 * 1024 * 1024 * 1024;
+        const CHILD_TEST: &str = "agent_process::tests::inherited_lower_memory_hard_limit_is_clamped_in_an_isolated_test_process";
+        const CAP_SYS_RESOURCE: u32 = 24;
+
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let effective_capabilities = status
+            .lines()
+            .find_map(|line| line.strip_prefix("CapEff:\t"))
+            .and_then(|value| u64::from_str_radix(value, 16).ok())
+            .expect("Linux process status must expose effective capabilities");
+        assert_eq!(
+            effective_capabilities & (1_u64 << CAP_SYS_RESOURCE),
+            0,
+            "this hard-limit regression requires an unprivileged process without CAP_SYS_RESOURCE"
+        );
+
+        if crate::host::variable(CHILD_MARKER).is_none() {
+            let executable = std::env::current_exe().unwrap();
+            let output = std::process::Command::new(executable)
+                .args(["--exact", CHILD_TEST, "--nocapture"])
+                .env(CHILD_MARKER, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated regression process failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let mut inherited = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+        // SAFETY: `getrlimit` writes one complete `rlimit` when it returns success.
+        let read_result = unsafe { libc::getrlimit(libc::RLIMIT_AS, inherited.as_mut_ptr()) };
+        assert_eq!(read_result, 0, "{}", std::io::Error::last_os_error());
+        // SAFETY: the successful `getrlimit` call initialized the complete value.
+        let inherited = unsafe { inherited.assume_init() };
+        let child_hard = libc::rlim_t::try_from(CHILD_HARD_LIMIT).unwrap();
+        if inherited.rlim_max == libc::RLIM_INFINITY || inherited.rlim_max > child_hard {
+            let child_limit = libc::rlimit {
+                rlim_cur: if inherited.rlim_cur == libc::RLIM_INFINITY {
+                    child_hard
+                } else {
+                    inherited.rlim_cur.min(child_hard)
+                },
+                rlim_max: child_hard,
+            };
+            // SAFETY: this regression runs in a dedicated child test process and
+            // only lowers its own hard address-space limit.
+            let limit_result = unsafe { libc::setrlimit(libc::RLIMIT_AS, &raw const child_limit) };
+            assert_eq!(limit_result, 0, "{}", std::io::Error::last_os_error());
+        }
+
+        let outcome = execute(
+            Path::new("/"),
+            Request {
+                argv: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "test \"$(ulimit -H -v)\" = \"$(ulimit -S -v)\" && ! ulimit -S -v 33554433 2>/dev/null && test \"$(ulimit -H -u)\" = \"$(ulimit -S -u)\" && ! ulimit -S -u 65536 2>/dev/null".into(),
+                ],
+                environment: Vec::new(),
+                working_directory: None,
+                stdin: Vec::new(),
+                limits: Limits {
+                    timeout_ms: 5_000,
+                    memory_bytes: REQUESTED_LIMIT,
+                    processes: 65_535,
+                    ..Limits::default()
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.exit_code,
+            0,
+            "{}",
+            String::from_utf8_lossy(&outcome.stderr)
+        );
+        assert!(!outcome.timed_out);
+    }
 
     #[test]
     fn essential_environment_supports_isolated_msvc_discovery_without_ambient_secrets() {
