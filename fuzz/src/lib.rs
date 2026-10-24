@@ -105,6 +105,8 @@ pub fn fuzz_frontend(data: &[u8]) {
     }
 }
 
+const MAX_SCANNER_SOURCE_BYTES: usize = 64 * 1024;
+
 pub fn fuzz_scanner(data: &[u8]) {
     let (selector, source) = data
         .split_first()
@@ -122,7 +124,7 @@ pub fn fuzz_scanner(data: &[u8]) {
     let Ok(directory) = tempfile::tempdir() else {
         return;
     };
-    let bounded = &source[..source.len().min(64 * 1024)];
+    let bounded = &source[..source.len().min(MAX_SCANNER_SOURCE_BYTES)];
     if std::fs::write(
         directory
             .path()
