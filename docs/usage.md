@@ -125,7 +125,7 @@ The public implementation uses Rust 1.98 and edition 2024.
 Generated Rust is gated by rustfmt, rustc, and Clippy with `-D warnings`; generated Go by gofmt, build/test, and vet.
 Structured JavaScript and Python rewrites use the official `node --check` and `py_compile` syntax checks.
 Node and Python are pinned in the same mise toolchain; no third-party language lint dependency is required.
-The repository's stricter Rust rules—including the syntax-level ban on every trait object—are documented in [`CONTRIBUTING.md`](CONTRIBUTING.md#rust-design-policy).
+The repository's stricter Rust rules—including the syntax-level ban on every trait object—are documented in [`CONTRIBUTING.md`](../CONTRIBUTING.md#rust-design-policy).
 
 ```console
 mise trust
@@ -156,7 +156,7 @@ The main tasks are:
 | `mise run reference:test` | Test the unpublished OCaml reference explicitly |
 
 Every implementation phase follows Red, Green, Refactor: first add a failing public contract or focused reproduction, implement the smallest correct change, then refactor while the relevant and full gates stay green.
-See [`CONTRIBUTING.md`](CONTRIBUTING.md).
+See [`CONTRIBUTING.md`](../CONTRIBUTING.md).
 
 ## Performance measurements
 
