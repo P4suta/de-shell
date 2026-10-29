@@ -6494,15 +6494,27 @@ fn main() {
         assert!(workflow.contains("CycloneDX"));
         assert!(workflow.contains("cargo publish"));
         assert!(workflow.contains("v0.1.0-rc.1"));
-        assert!(workflow.contains(
-            "$archivePath = Join-Path (Resolve-Path 'dist').Path '${{ matrix.archive }}'"
-        ));
+        for name in ["Create archive", "Smoke test the installed archive"] {
+            let (_, step) = workflow
+                .split_once(&format!("- name: {name}"))
+                .expect("release must create and verify its archives");
+            let step = step
+                .split_once("\n      - ")
+                .map_or(step, |(current, _)| current);
+            for binding in [
+                "RELEASE_ARCHIVE: ${{ matrix.archive }}",
+                "RELEASE_EXECUTABLE: ${{ matrix.executable }}",
+                "$archivePath = Join-Path (Resolve-Path 'dist').Path $env:RELEASE_ARCHIVE",
+            ] {
+                assert!(step.contains(binding), "{name} omitted {binding}");
+            }
+        }
         assert!(workflow.contains("Compress-Archive -Path $stage -DestinationPath $archivePath"));
         assert!(workflow.contains("tar -C dist -czf $archivePath 'deshell-0.1.0'"));
         assert!(
             workflow.contains("Expand-Archive -Path $archivePath -DestinationPath $installRoot")
         );
-        assert!(workflow.contains("$installed = Join-Path $installRoot (Join-Path 'deshell-0.1.0' '${{ matrix.executable }}')"));
+        assert!(workflow.contains("$installed = Join-Path $installRoot (Join-Path 'deshell-0.1.0' $env:RELEASE_EXECUTABLE)"));
         assert!(workflow.contains("archive schema smoke test failed"));
         assert!(workflow.contains("archive $mode handshake failed"));
         assert_eq!(workflow.matches("install_args: rust@1.98.0").count(), 4);
