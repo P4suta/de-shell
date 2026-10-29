@@ -2509,10 +2509,11 @@ mod tests {
     fn a_tracked_path_the_tree_no_longer_holds_is_not_a_scan_error() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
+        std::fs::write(root.join("kept.txt"), b"kept\n").unwrap();
+        std::fs::write(root.join("retired.sh"), b"/usr/bin/true\n").unwrap();
         for argv in [
             vec!["init", "-q", "."],
-            vec!["config", "user.email", "a@b"],
-            vec!["config", "user.name", "a"],
+            vec!["add", "--", "kept.txt", "retired.sh"],
         ] {
             let status = std::process::Command::new("git")
                 .args(&argv)
@@ -2521,16 +2522,13 @@ mod tests {
                 .unwrap();
             assert!(status.success(), "{argv:?}");
         }
-        std::fs::write(root.join("kept.txt"), b"kept\n").unwrap();
-        std::fs::write(root.join("retired.sh"), b"/usr/bin/true\n").unwrap();
-        for argv in [vec!["add", "-A"], vec!["commit", "-qm", "i"]] {
-            let status = std::process::Command::new("git")
-                .args(&argv)
-                .current_dir(root)
-                .status()
-                .unwrap();
-            assert!(status.success(), "{argv:?}");
-        }
+        let tracked = std::process::Command::new("git")
+            .args(["ls-files", "--cached", "-z"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(tracked.status.success(), "{tracked:?}");
+        assert_eq!(tracked.stdout, b"kept.txt\0retired.sh\0");
         // What a retirement does: the file is gone and the index still has it.
         std::fs::remove_file(root.join("retired.sh")).unwrap();
 
