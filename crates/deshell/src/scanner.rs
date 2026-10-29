@@ -1288,8 +1288,8 @@ fn dockerfile_findings(path: &str, source: &str) -> Result<Vec<Finding>, String>
 }
 
 fn yaml_findings(path: &str, source: &str, lower: &str) -> Result<Vec<Finding>, String> {
-    for document in serde_yaml_ng::Deserializer::from_str(source) {
-        serde_yaml_ng::Value::deserialize(document)
+    for document in serde_yaml_bw::Deserializer::from_str(source) {
+        serde_yaml_bw::Value::deserialize(document)
             .map_err(|error| format!("malformed YAML: {error}"))?;
     }
     let known = lower.starts_with(".github/workflows/")
@@ -2509,10 +2509,11 @@ mod tests {
     fn a_tracked_path_the_tree_no_longer_holds_is_not_a_scan_error() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
+        std::fs::write(root.join("kept.txt"), b"kept\n").unwrap();
+        std::fs::write(root.join("retired.sh"), b"/usr/bin/true\n").unwrap();
         for argv in [
             vec!["init", "-q", "."],
-            vec!["config", "user.email", "a@b"],
-            vec!["config", "user.name", "a"],
+            vec!["add", "--", "kept.txt", "retired.sh"],
         ] {
             let status = std::process::Command::new("git")
                 .args(&argv)
@@ -2521,16 +2522,13 @@ mod tests {
                 .unwrap();
             assert!(status.success(), "{argv:?}");
         }
-        std::fs::write(root.join("kept.txt"), b"kept\n").unwrap();
-        std::fs::write(root.join("retired.sh"), b"/usr/bin/true\n").unwrap();
-        for argv in [vec!["add", "-A"], vec!["commit", "-qm", "i"]] {
-            let status = std::process::Command::new("git")
-                .args(&argv)
-                .current_dir(root)
-                .status()
-                .unwrap();
-            assert!(status.success(), "{argv:?}");
-        }
+        let tracked = std::process::Command::new("git")
+            .args(["ls-files", "--cached", "-z"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(tracked.status.success(), "{tracked:?}");
+        assert_eq!(tracked.stdout, b"kept.txt\0retired.sh\0");
         // What a retirement does: the file is gone and the index still has it.
         std::fs::remove_file(root.join("retired.sh")).unwrap();
 
@@ -3263,6 +3261,38 @@ spawn(dynamicProgram, dynamicArguments);
         assert!(inventory.errors.is_empty(), "{:?}", inventory.errors);
         assert_eq!(inventory.findings.len(), 1);
         assert_eq!(inventory.findings[0].source, b"echo ok");
+    }
+
+    #[test]
+    fn yaml_hosts_preserve_tags_aliases_complex_keys_and_stream_spans() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = b"---\ndefaults: &defaults {greeting: hello}\ncopy: *defaults\ntagged: !metadata note\n? [one, two]\n: complex-key\n---\njobs:\n  build:\n    steps:\n      - run: echo preserved\n";
+        write(directory.path(), ".github/workflows/stream.yml", source);
+
+        let inventory = scan(directory.path()).unwrap();
+        assert!(inventory.errors.is_empty(), "{:?}", inventory.errors);
+        assert_eq!(inventory.findings.len(), 1, "{:?}", inventory.findings);
+        let finding = &inventory.findings[0];
+        assert_eq!(finding.source, b"echo preserved");
+        let start = usize::try_from(finding.span.start_byte).unwrap();
+        let end = usize::try_from(finding.span.end_byte).unwrap();
+        assert_eq!(&source[start..end], finding.source.as_slice());
+    }
+
+    #[test]
+    fn yaml_hosts_reject_a_malformed_later_document_without_partial_findings() {
+        let directory = tempfile::tempdir().unwrap();
+        write(
+            directory.path(),
+            ".github/workflows/stream.yml",
+            b"---\njobs:\n  build:\n    steps:\n      - run: echo first\n---\ninvalid: [unterminated\n",
+        );
+
+        let inventory = scan(directory.path()).unwrap();
+        assert!(inventory.findings.is_empty(), "{:?}", inventory.findings);
+        assert_eq!(inventory.errors.len(), 1, "{:?}", inventory.errors);
+        assert_eq!(inventory.errors[0].stage, "parse_yaml");
+        assert!(inventory.errors[0].message.contains("malformed YAML"));
     }
 
     #[test]

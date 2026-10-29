@@ -6247,7 +6247,11 @@ fn main() {
     #[test]
     fn public_docs_describe_the_retirement_oracle_and_release_gate() {
         let root = repository_root();
-        let readme = std::fs::read_to_string(root.join("README.md")).unwrap();
+        let readme = format!(
+            "{}\n{}",
+            std::fs::read_to_string(root.join("README.md")).unwrap(),
+            std::fs::read_to_string(root.join("docs/usage.md")).unwrap()
+        );
         assert!(readme.contains("migration oracle"));
         assert!(readme.contains("deshell migrate plan"));
         assert!(readme.contains("deshell verify --require shell-free"));
@@ -6490,15 +6494,27 @@ fn main() {
         assert!(workflow.contains("CycloneDX"));
         assert!(workflow.contains("cargo publish"));
         assert!(workflow.contains("v0.1.0-rc.1"));
-        assert!(workflow.contains(
-            "$archivePath = Join-Path (Resolve-Path 'dist').Path '${{ matrix.archive }}'"
-        ));
+        for name in ["Create archive", "Smoke test the installed archive"] {
+            let (_, step) = workflow
+                .split_once(&format!("- name: {name}"))
+                .expect("release must create and verify its archives");
+            let step = step
+                .split_once("\n      - ")
+                .map_or(step, |(current, _)| current);
+            for binding in [
+                "RELEASE_ARCHIVE: ${{ matrix.archive }}",
+                "RELEASE_EXECUTABLE: ${{ matrix.executable }}",
+                "$archivePath = Join-Path (Resolve-Path 'dist').Path $env:RELEASE_ARCHIVE",
+            ] {
+                assert!(step.contains(binding), "{name} omitted {binding}");
+            }
+        }
         assert!(workflow.contains("Compress-Archive -Path $stage -DestinationPath $archivePath"));
         assert!(workflow.contains("tar -C dist -czf $archivePath 'deshell-0.1.0'"));
         assert!(
             workflow.contains("Expand-Archive -Path $archivePath -DestinationPath $installRoot")
         );
-        assert!(workflow.contains("$installed = Join-Path $installRoot (Join-Path 'deshell-0.1.0' '${{ matrix.executable }}')"));
+        assert!(workflow.contains("$installed = Join-Path $installRoot (Join-Path 'deshell-0.1.0' $env:RELEASE_EXECUTABLE)"));
         assert!(workflow.contains("archive schema smoke test failed"));
         assert!(workflow.contains("archive $mode handshake failed"));
         assert_eq!(workflow.matches("install_args: rust@1.98.0").count(), 4);
@@ -6534,7 +6550,6 @@ fn main() {
         let root = repository_root();
         let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
         let release = std::fs::read_to_string(root.join(".github/workflows/release.yml")).unwrap();
-        let nightly = std::fs::read_to_string(root.join(".github/workflows/nightly.yml")).unwrap();
         let mise = std::fs::read_to_string(root.join("mise.toml")).unwrap();
         let mise_lock = std::fs::read_to_string(root.join("mise.lock")).unwrap();
         let installer_path = root.join("scripts/install-nushell.ps1");
@@ -6584,11 +6599,8 @@ fn main() {
                 "mise.lock omitted the Python artifact for {platform}"
             );
         }
-        for (name, workflow, minimum) in [
-            ("ci", ci.as_str(), 4),
-            ("release", release.as_str(), 4),
-            ("nightly", nightly.as_str(), 1),
-        ] {
+        for (name, workflow, minimum) in [("ci", ci.as_str(), 4), ("release", release.as_str(), 4)]
+        {
             assert!(
                 workflow.matches("scripts/install-nushell.ps1").count() >= minimum,
                 "{name} must provision pinned Nushell for every parser/test job"
@@ -6805,7 +6817,8 @@ fn main() {
                 "fuzz library omitted the production {module} module"
             );
         }
-        for target in ["frontend", "scanner", "protocol", "schema"] {
+        let saved_targets = ["frontend", "scanner", "protocol", "schema"];
+        for target in saved_targets {
             assert!(
                 root.join(format!("fuzz/fuzz_targets/{target}.rs"))
                     .is_file(),
@@ -6842,20 +6855,19 @@ fn main() {
         let publish = &release[release.find("  publish:").unwrap()..];
         assert!(publish.contains("- dynamic-analysis"));
         let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
-        assert!(ci.contains("fuzz-smoke:"));
-        assert!(ci.contains(nightly_fuzz));
-        assert!(ci.contains("nightly-2026-07-15"));
-        assert!(ci.contains("- fuzz-smoke"));
-        let nightly = std::fs::read_to_string(root.join(".github/workflows/nightly.yml")).unwrap();
-        assert!(nightly.contains("schedule:"));
-        assert!(nightly.contains(nightly_fuzz));
-        assert!(nightly.contains("nightly-2026-07-15"));
+        assert!(ci.contains("- dynamic-analysis"));
+        assert!(ci.contains("FUZZ_RESULT: ${{ needs.dynamic-analysis.result }}"));
+        assert!(ci.contains("run: mise run test:fuzz-smoke"));
+        assert!(!ci.contains("  fuzz-smoke:"));
+        assert!(!root.join(".github/workflows/nightly.yml").exists());
+        let mise = std::fs::read_to_string(root.join("mise.toml")).unwrap();
+        assert_eq!(
+            mise.matches("-runs=2000 -timeout=10 -max_len=65536")
+                .count(),
+            saved_targets.len()
+        );
         let install = "cargo install --locked --version 0.13.2 cargo-fuzz";
-        for (name, workflow) in [
-            ("release", release.as_str()),
-            ("ci", ci.as_str()),
-            ("nightly", nightly.as_str()),
-        ] {
+        for (name, workflow) in [("release", release.as_str()), ("ci", ci.as_str())] {
             assert!(
                 workflow.contains(install),
                 "{name} must install the exact cargo-fuzz crate through Cargo's checksummed registry"
@@ -6865,10 +6877,10 @@ fn main() {
                 "{name} must not ask install-action for an unsupported tool"
             );
         }
-        for target in ["frontend", "scanner", "protocol", "schema"] {
+        for target in saved_targets {
             assert!(
-                nightly.contains(&format!("fuzz/corpus/{target}")),
-                "nightly workflow omitted saved corpus {target}"
+                mise.contains(&format!("fuzz run {target} fuzz/corpus/{target}")),
+                "local smoke omitted saved corpus {target}"
             );
         }
     }
@@ -6889,7 +6901,11 @@ fn main() {
     #[test]
     fn public_docs_and_dependency_updates_are_rust_first_v1() {
         let root = repository_root();
-        let readme = std::fs::read_to_string(root.join("README.md")).unwrap();
+        let readme = format!(
+            "{}\n{}",
+            std::fs::read_to_string(root.join("README.md")).unwrap(),
+            std::fs::read_to_string(root.join("docs/usage.md")).unwrap()
+        );
         assert!(readme.contains("`de-shell` is a Rust"));
         assert!(readme.contains("Effect IR v1"));
         assert!(readme.contains("Evidence v1"));
