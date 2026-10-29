@@ -681,7 +681,27 @@ fn msvc_toolchain_environment() -> &'static [(std::ffi::OsString, std::ffi::OsSt
     not(deshell_sanitizer_address),
     not(deshell_sanitizer_undefined)
 ))]
-fn inherited_hard_limit(resource: libc::c_int) -> std::io::Result<libc::rlim_t> {
+enum ResourceLimit {
+    AddressSpace,
+    Processes,
+    #[cfg(test)]
+    InvalidForTest,
+}
+
+#[cfg(all(
+    unix,
+    not(target_os = "macos"),
+    not(coverage),
+    not(deshell_sanitizer_address),
+    not(deshell_sanitizer_undefined)
+))]
+fn inherited_hard_limit(resource: ResourceLimit) -> std::io::Result<libc::rlim_t> {
+    let resource = match resource {
+        ResourceLimit::AddressSpace => libc::RLIMIT_AS,
+        ResourceLimit::Processes => libc::RLIMIT_NPROC,
+        #[cfg(test)]
+        ResourceLimit::InvalidForTest => !0,
+    };
     let mut inherited = std::mem::MaybeUninit::<libc::rlimit>::uninit();
     // SAFETY: `getrlimit` writes one complete `rlimit` when it returns success.
     let result = unsafe { libc::getrlimit(resource, inherited.as_mut_ptr()) };
@@ -772,21 +792,27 @@ fn rlimit_for_cap(
     requested: u64,
     inherited_hard: libc::rlim_t,
 ) -> Result<libc::rlimit, CappedLimitError> {
-    let requested_limit =
-        libc::rlim_t::try_from(requested).map_err(|_| CappedLimitError::NotRepresentable)?;
+    fn finite_hard_ceiling<T: TryInto<u64>>(
+        native_limit: T,
+    ) -> Result<HardCeiling, CappedLimitError> {
+        native_limit
+            .try_into()
+            .map(HardCeiling::Finite)
+            .map_err(|_out_of_range| CappedLimitError::InheritedHardCeilingNotRepresentable)
+    }
+
+    let requested_limit = libc::rlim_t::try_from(requested)
+        .map_err(|_out_of_range| CappedLimitError::NotRepresentable)?;
     if requested_limit == libc::RLIM_INFINITY {
         return Err(CappedLimitError::CollidesWithInfinity);
     }
     let inherited_hard = if inherited_hard == libc::RLIM_INFINITY {
         HardCeiling::Infinite
     } else {
-        HardCeiling::Finite(
-            u64::try_from(inherited_hard)
-                .map_err(|_| CappedLimitError::InheritedHardCeilingNotRepresentable)?,
-        )
+        finite_hard_ceiling(inherited_hard)?
     };
     let effective = libc::rlim_t::try_from(cap_limit(requested, inherited_hard))
-        .map_err(|_| CappedLimitError::NotRepresentable)?;
+        .map_err(|_out_of_range| CappedLimitError::NotRepresentable)?;
     if effective == libc::RLIM_INFINITY {
         return Err(CappedLimitError::CollidesWithInfinity);
     }
@@ -819,11 +845,11 @@ fn configure_unix_limits(
     {
         // Snapshot inherited ceilings before `fork`; `getrlimit` is not part of the POSIX async-signal-safe set required for a `pre_exec` closure.
         // If another thread lowers a ceiling before `fork`, applying this stale snapshot can fail, and the spawn must remain fail-closed.
-        let memory_hard = inherited_hard_limit(libc::RLIMIT_AS)
+        let memory_hard = inherited_hard_limit(ResourceLimit::AddressSpace)
             .map_err(|error| format!("failed to read inherited RLIMIT_AS: {error}"))?;
         let memory_limit = rlimit_for_cap(_limits.memory_bytes, memory_hard)
             .map_err(|error| format!("invalid RLIMIT_AS cap: {}", error.description()))?;
-        let process_hard = inherited_hard_limit(libc::RLIMIT_NPROC)
+        let process_hard = inherited_hard_limit(ResourceLimit::Processes)
             .map_err(|error| format!("failed to read inherited RLIMIT_NPROC: {error}"))?;
         let process_limit = rlimit_for_cap(_limits.processes, process_hard)
             .map_err(|error| format!("invalid RLIMIT_NPROC cap: {}", error.description()))?;
@@ -1240,12 +1266,15 @@ mod tests {
             rlimit_for_cap(u64::MAX, libc::RLIM_INFINITY),
             Err(CappedLimitError::NotRepresentable | CappedLimitError::CollidesWithInfinity)
         ));
-        if let Ok(infinity_as_u64) = u64::try_from(libc::RLIM_INFINITY) {
-            assert!(matches!(
-                rlimit_for_cap(infinity_as_u64, libc::RLIM_INFINITY),
-                Err(CappedLimitError::CollidesWithInfinity)
-            ));
+        fn assert_representable_infinity_is_rejected<T: TryInto<u64>>(infinity: T) {
+            if let Ok(infinity_as_u64) = infinity.try_into() {
+                assert!(matches!(
+                    rlimit_for_cap(infinity_as_u64, libc::RLIM_INFINITY),
+                    Err(CappedLimitError::CollidesWithInfinity)
+                ));
+            }
         }
+        assert_representable_infinity_is_rejected(libc::RLIM_INFINITY);
     }
 
     #[cfg(all(
@@ -1257,7 +1286,7 @@ mod tests {
     ))]
     #[test]
     fn inherited_hard_limit_reports_invalid_resource_queries() {
-        assert!(inherited_hard_limit(-1).is_err());
+        assert!(inherited_hard_limit(ResourceLimit::InvalidForTest).is_err());
     }
 
     #[cfg(all(
@@ -1329,7 +1358,7 @@ mod tests {
             Path::new("/"),
             Request {
                 argv: vec![
-                    "/bin/sh".into(),
+                    "/bin/bash".into(),
                     "-c".into(),
                     "test \"$(ulimit -H -v)\" = \"$(ulimit -S -v)\" && ! ulimit -S -v 33554433 2>/dev/null && test \"$(ulimit -H -u)\" = \"$(ulimit -S -u)\" && ! ulimit -S -u 65536 2>/dev/null".into(),
                 ],
@@ -1503,7 +1532,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(outcome.exit_code, 0);
+        assert_eq!(outcome.exit_code, 0, "{outcome:?}");
         assert!(!outcome.timed_out);
         assert!(outcome.stdout.starts_with(b"literal-$HOME\nfrom-env\n"));
         assert!(outcome.stdout.ends_with(&[0, 0xff]));
@@ -1710,7 +1739,11 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(outcome.limit_exceeded.as_deref(), Some("stdout"));
+        assert_eq!(
+            outcome.limit_exceeded.as_deref(),
+            Some("stdout"),
+            "{outcome:?}"
+        );
         assert_eq!(outcome.exit_code, 1);
         assert_eq!(outcome.stdout.len(), 1024);
     }
@@ -1781,7 +1814,8 @@ mod tests {
         assert!(
             outcomes
                 .iter()
-                .all(|outcome| { outcome.limit_exceeded.as_deref() == Some("stderr") })
+                .all(|outcome| { outcome.limit_exceeded.as_deref() == Some("stderr") }),
+            "{outcomes:?}"
         );
         assert!(
             outcomes
