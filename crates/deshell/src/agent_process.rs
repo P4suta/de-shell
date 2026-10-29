@@ -588,6 +588,10 @@ fn add_essential_environment_with(
 ) {
     for name in [
         "PATH",
+        #[cfg(windows)]
+        "TMP",
+        #[cfg(windows)]
+        "TEMP",
         "SystemRoot",
         "SYSTEMROOT",
         "ComSpec",
@@ -1395,6 +1399,48 @@ mod tests {
         }
         assert!(!environment.contains_key("USERPROFILE"));
         assert!(!environment.contains_key("GITHUB_TOKEN"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn essential_environment_preserves_configured_windows_temporary_directories() {
+        for (tmp, temp) in [
+            (None, None),
+            (Some(r"C:\temporary files\tmp"), None),
+            (None, Some(r"C:\temporary files\temp")),
+            (
+                Some(r"C:\temporary files\tmp"),
+                Some(r"C:\temporary files\temp"),
+            ),
+        ] {
+            let mut command = std::process::Command::new("unused");
+            command.env_clear();
+            add_essential_environment_with(
+                &mut command,
+                |name| match name {
+                    "TMP" => tmp.map(std::ffi::OsString::from),
+                    "TEMP" => temp.map(std::ffi::OsString::from),
+                    "GITHUB_TOKEN" | "USERPROFILE" => Some("must-not-leak".into()),
+                    _ => None,
+                },
+                &[],
+            );
+            let actual = command
+                .get_envs()
+                .collect::<std::collections::BTreeMap<_, _>>();
+            let expected = [("TMP", tmp), ("TEMP", temp)]
+                .into_iter()
+                .filter_map(|(name, value)| {
+                    value.map(|value| {
+                        (
+                            std::ffi::OsStr::new(name),
+                            Some(std::ffi::OsStr::new(value)),
+                        )
+                    })
+                })
+                .collect::<std::collections::BTreeMap<_, _>>();
+            assert_eq!(actual, expected);
+        }
     }
 
     #[cfg(windows)]
